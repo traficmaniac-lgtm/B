@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass
 from time import perf_counter
 from typing import Callable
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QRunnable,
+    QSortFilterProxyModel,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtWidgets import (
     QComboBox,
     QGridLayout,
@@ -15,8 +24,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
@@ -58,12 +66,103 @@ class _WsStatusSignals(QObject):
     status = Signal(str, str)
 
 
-@dataclass(frozen=True)
-class _TableColumns:
-    symbol: int = 0
-    price: int = 1
-    source: int = 2
-    updated_ms: int = 3
+class _PairsTableModel(QAbstractTableModel):
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._pairs: list[Pair] = []
+        self._row_by_symbol: dict[str, int] = {}
+        self._price_data: dict[str, tuple[str, str, str]] = {}
+        self._headers = ["Symbol", "Price", "Source", "Updated(ms)"]
+
+    def rowCount(self, parent: QModelIndex | None = None) -> int:  # noqa: N802
+        if parent is not None and parent.isValid():
+            return 0
+        return len(self._pairs)
+
+    def columnCount(self, parent: QModelIndex | None = None) -> int:  # noqa: N802
+        if parent is not None and parent.isValid():
+            return 0
+        return len(self._headers)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> str | None:
+        if not index.isValid():
+            return None
+        pair = self._pairs[index.row()]
+        if role == Qt.DisplayRole:
+            if index.column() == 0:
+                return pair.symbol
+            if index.column() == 1:
+                return self._price_data.get(pair.symbol, ("--", "--", "--"))[0]
+            if index.column() == 2:
+                return self._price_data.get(pair.symbol, ("--", "--", "--"))[1]
+            if index.column() == 3:
+                return self._price_data.get(pair.symbol, ("--", "--", "--"))[2]
+        if role == Qt.UserRole:
+            return pair.symbol
+        if role == Qt.UserRole + 1:
+            return pair.quote_asset
+        return None
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole) -> str | None:  # noqa: N802
+        if role != Qt.DisplayRole or orientation != Qt.Horizontal:
+            return None
+        if 0 <= section < len(self._headers):
+            return self._headers[section]
+        return None
+
+    def set_pairs(self, pairs: list[Pair]) -> None:
+        self.beginResetModel()
+        self._pairs = pairs
+        self._row_by_symbol = {pair.symbol: idx for idx, pair in enumerate(pairs)}
+        self._price_data = {}
+        self.endResetModel()
+
+    def update_price(self, symbol: str, price: str, source: str, age_ms: str) -> None:
+        row = self._row_by_symbol.get(symbol)
+        if row is None:
+            return
+        self._price_data[symbol] = (price, source, age_ms)
+        top_left = self.index(row, 1)
+        bottom_right = self.index(row, 3)
+        self.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole])
+
+    def symbol_for_row(self, row: int) -> str | None:
+        if 0 <= row < len(self._pairs):
+            return self._pairs[row].symbol
+        return None
+
+
+class _PairsFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._quote_filter = ""
+        self._search_text = ""
+
+    def set_quote_filter(self, quote: str) -> None:
+        self._quote_filter = quote.strip().upper()
+        self.invalidateFilter()
+
+    def set_search_text(self, text: str) -> None:
+        self._search_text = text.strip().upper()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
+        model = self.sourceModel()
+        if model is None:
+            return False
+        index = model.index(source_row, 0, source_parent)
+        symbol = model.data(index, Qt.DisplayRole) or ""
+        quote = model.data(index, Qt.UserRole + 1) or ""
+        if self._quote_filter:
+            if quote:
+                if quote.upper() != self._quote_filter:
+                    return False
+            else:
+                if not str(symbol).upper().endswith(self._quote_filter):
+                    return False
+        if self._search_text and self._search_text not in str(symbol).upper():
+            return False
+        return True
 
 
 class OverviewTab(QWidget):
@@ -106,21 +205,32 @@ class OverviewTab(QWidget):
         self._price_timer.setInterval(self._app_state.price_refresh_ms)
         self._price_timer.timeout.connect(self._refresh_prices)
         self._price_update_in_flight = False
-        self._symbol_rows: dict[str, int] = {}
-        self._symbols_order: list[str] = []
-        self._table_columns = _TableColumns()
+        self._all_pairs: list[Pair] = []
+        self._cache_partial = False
+        self._pairs_model = _PairsTableModel(self)
+        self._proxy_model = _PairsFilterProxyModel(self)
+        self._proxy_model.setSourceModel(self._pairs_model)
 
         layout = QVBoxLayout()
         layout.addLayout(self._build_status_row())
         layout.addLayout(self._build_filters())
 
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["Symbol", "Price", "Source", "Updated(ms)"])
+        counts_row = QHBoxLayout()
+        self._shown_label = QLabel("Shown 0 / Total 0")
+        self._filter_status_label = QLabel("")
+        self._filter_status_label.setStyleSheet("color: #ef4444;")
+        counts_row.addWidget(self._shown_label)
+        counts_row.addStretch()
+        counts_row.addWidget(self._filter_status_label)
+        layout.addLayout(counts_row)
+
+        self._table = QTableView()
+        self._table.setModel(self._proxy_model)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._table.itemSelectionChanged.connect(self._update_selected_pair)
-        self._table.itemDoubleClicked.connect(self._handle_double_click)
+        self._table.setSelectionBehavior(QTableView.SelectRows)
+        self._table.setEditTriggers(QTableView.NoEditTriggers)
+        self._table.doubleClicked.connect(self._handle_double_click)
+        self._table.selectionModel().selectionChanged.connect(self._update_selected_pair)
         layout.addWidget(self._table)
 
         self._selected_label = QLabel("Selected pair: -")
@@ -185,6 +295,7 @@ class OverviewTab(QWidget):
 
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText("Search symbol")
+        self._search_input.textChanged.connect(self._handle_search_text)
 
         self._quote_combo = QComboBox()
         self._quote_combo.addItems(["USDT", "USDC", "FDUSD", "EUR"])
@@ -193,8 +304,10 @@ class OverviewTab(QWidget):
 
         self._load_button = QPushButton("Load Pairs")
         self._load_button.clicked.connect(self._handle_load_pairs)
-        self._refresh_button = QPushButton("Refresh")
+        self._refresh_button = QPushButton("Force refresh from exchange")
         self._refresh_button.clicked.connect(self._handle_refresh_pairs)
+        self._cache_status_label = QLabel("Cache: -")
+        self._cache_status_label.setStyleSheet("color: #6b7280;")
 
         layout.addWidget(QLabel("Search"))
         layout.addWidget(self._search_input)
@@ -202,22 +315,38 @@ class OverviewTab(QWidget):
         layout.addWidget(self._quote_combo)
         layout.addWidget(self._load_button)
         layout.addWidget(self._refresh_button)
+        layout.addWidget(self._cache_status_label)
         layout.addStretch()
         return layout
 
     def _update_selected_pair(self) -> None:
-        selected_items = self._table.selectedItems()
-        if not selected_items:
+        selected = self._table.selectionModel().selectedRows()
+        if not selected:
+            self._selected_label.setText("Selected pair: -")
+            self._price_service.set_symbols([])
+            self._price_timer.stop()
+            self._price_service.stop()
             return
-        symbol = selected_items[0].text()
+        proxy_index = selected[0]
+        source_index = self._proxy_model.mapToSource(proxy_index)
+        symbol = self._pairs_model.symbol_for_row(source_index.row())
+        if not symbol:
+            return
         self._selected_label.setText(f"Selected pair: {symbol}")
+        self._price_service.set_symbols([symbol])
+        if not self._price_timer.isActive():
+            self._price_service.start()
+            self._price_timer.start()
 
-    def _handle_double_click(self, _: QTableWidgetItem) -> None:
-        selected_items = self._table.selectedItems()
-        if not selected_items:
+    def _handle_double_click(self, _: QModelIndex) -> None:
+        selected = self._table.selectionModel().selectedRows()
+        if not selected:
             return
-        symbol = selected_items[0].text()
-        self._on_open_pair(symbol)
+        proxy_index = selected[0]
+        source_index = self._proxy_model.mapToSource(proxy_index)
+        symbol = self._pairs_model.symbol_for_row(source_index.row())
+        if symbol:
+            self._on_open_pair(symbol)
 
     def _run_self_check(self) -> None:
         worker = _Worker(self._http_client.get_time)
@@ -288,40 +417,42 @@ class OverviewTab(QWidget):
 
     def _handle_load_pairs(self) -> None:
         self._set_pairs_buttons_enabled(False)
-        self._symbol_rows.clear()
-        self._symbols_order.clear()
-        self._table.setRowCount(0)
-        quote = self._quote_combo.currentText().strip()
+        self._pairs_model.set_pairs([])
+        self._all_pairs = []
+        self._cache_partial = False
+        self._cache_status_label.setText("Cache: -")
         self._logger.info("Loading pairs...")
         self._binance_status_label.setText("Binance: LOADING")
-        worker = _Worker(lambda: self._markets_service.load_pairs_cached(quote))
+        worker = _Worker(self._markets_service.load_pairs_cached_all)
         worker.signals.success.connect(self._handle_pairs_loaded_cached)
         worker.signals.error.connect(self._handle_pairs_error)
         self._thread_pool.start(worker)
 
     def _handle_refresh_pairs(self) -> None:
         self._set_pairs_buttons_enabled(False)
-        self._symbol_rows.clear()
-        self._symbols_order.clear()
-        self._table.setRowCount(0)
-        quote = self._quote_combo.currentText().strip()
+        self._pairs_model.set_pairs([])
+        self._all_pairs = []
+        self._cache_partial = False
+        self._cache_status_label.setText("Cache: Refreshing...")
         self._logger.info("Refreshing pairs...")
         self._binance_status_label.setText("Binance: REFRESHING")
-        worker = _Worker(lambda: self._markets_service.refresh_pairs(quote))
+        worker = _Worker(self._markets_service.refresh_pairs_all)
         worker.signals.success.connect(self._handle_pairs_loaded_http)
         worker.signals.error.connect(self._handle_pairs_error)
         self._thread_pool.start(worker)
 
     def _handle_pairs_loaded_cached(self, payload: object, _: int) -> None:
-        if not isinstance(payload, tuple) or len(payload) != 2:
+        if not isinstance(payload, tuple) or len(payload) != 3:
             self._logger.error("Unexpected cached pairs response: %s", payload)
             self._set_pairs_buttons_enabled(True)
             return
-        pairs, from_cache = payload
+        pairs, from_cache, partial = payload
         source = "CACHE" if from_cache else "HTTP"
+        self._cache_partial = partial
         self._handle_pairs_loaded(pairs, source)
 
     def _handle_pairs_loaded_http(self, pairs: object, _: int) -> None:
+        self._cache_partial = False
         self._handle_pairs_loaded(pairs, "HTTP")
 
     def _handle_pairs_loaded(self, pairs: object, source: str) -> None:
@@ -331,57 +462,73 @@ class OverviewTab(QWidget):
             self._set_pairs_buttons_enabled(True)
             return
         pair_list = [pair for pair in pairs if isinstance(pair, Pair)]
-        self._populate_table(pair_list)
+        self._all_pairs = pair_list
+        self._pairs_model.set_pairs(pair_list)
+        self._apply_filters()
         self._set_pairs_buttons_enabled(True)
         self._price_service.set_symbols([])
         self._logger.info("Loaded %s pairs from %s.", len(pair_list), source)
         self._binance_status_label.setText(f"Binance: CONNECTED ({len(pair_list)} pairs, {source})")
+        if source == "CACHE" and self._cache_partial:
+            self._cache_status_label.setText("Cache: PARTIAL (force refresh recommended)")
+            self._cache_status_label.setStyleSheet("color: #f59e0b;")
+        elif source == "CACHE":
+            self._cache_status_label.setText("Cache: OK")
+            self._cache_status_label.setStyleSheet("color: #16a34a;")
+        else:
+            self._cache_status_label.setText("Cache: Fresh from exchange")
+            self._cache_status_label.setStyleSheet("color: #16a34a;")
 
     def _handle_pairs_error(self, message: str) -> None:
         self._logger.error("Failed to load pairs: %s", message)
         self._set_binance_status_error(message)
         self._set_pairs_buttons_enabled(True)
 
-    def _populate_table(self, pairs: list[Pair]) -> None:
-        self._table.setRowCount(len(pairs))
-        for row_index, pair in enumerate(pairs):
-            self._symbol_rows[pair.symbol] = row_index
-            self._symbols_order.append(pair.symbol)
-            self._set_table_item(row_index, self._table_columns.symbol, pair.symbol)
-            self._set_table_item(row_index, self._table_columns.price, "--")
-            self._set_table_item(row_index, self._table_columns.source, "--")
-            self._set_table_item(row_index, self._table_columns.updated_ms, "--")
-        if pairs:
+    def _apply_filters(self) -> None:
+        quote = self._quote_combo.currentText().strip()
+        search_text = self._search_input.text().strip()
+        self._proxy_model.set_quote_filter(quote)
+        self._proxy_model.set_search_text(search_text)
+        total_symbols = self._pairs_model.rowCount()
+        filtered_symbols = self._proxy_model.rowCount()
+        self._shown_label.setText(f"Shown {filtered_symbols} / Total {total_symbols}")
+        self._filter_status_label.setText(
+            "Pair not present on exchange or filtered" if search_text and filtered_symbols == 0 else ""
+        )
+        self._logger.info(
+            "Pairs filter: total=%s filtered=%s quote=%s search=%s",
+            total_symbols,
+            filtered_symbols,
+            quote,
+            search_text,
+        )
+        if filtered_symbols:
             self._table.selectRow(0)
-            self._selected_label.setText(f"Selected pair: {pairs[0].symbol}")
         else:
             self._selected_label.setText("Selected pair: -")
+            self._price_service.set_symbols([])
+            self._price_timer.stop()
+            self._price_service.stop()
 
     def _refresh_prices(self) -> None:
-        if self._price_update_in_flight or not self._symbol_rows:
+        selected = self._table.selectionModel().selectedRows()
+        if self._price_update_in_flight or not selected:
             return
         self._price_update_in_flight = True
-        symbols_to_update = self._symbols_order[:200]
-        snapshot = self._price_service.snapshot(symbols_to_update)
-        for symbol in symbols_to_update:
+        proxy_index = selected[0]
+        source_index = self._proxy_model.mapToSource(proxy_index)
+        symbol = self._pairs_model.symbol_for_row(source_index.row())
+        if symbol:
+            snapshot = self._price_service.snapshot([symbol])
             price = snapshot.get(symbol)
-            if price is None:
-                continue
-            row_index = self._symbol_rows.get(symbol)
-            if row_index is None:
-                continue
-            self._set_table_item(row_index, self._table_columns.price, f"{price.price:.8f}")
-            self._set_table_item(row_index, self._table_columns.source, price.source)
-            self._set_table_item(row_index, self._table_columns.updated_ms, str(price.age_ms))
+            if price is not None:
+                self._pairs_model.update_price(
+                    symbol,
+                    f"{price.price:.8f}",
+                    price.source,
+                    str(price.age_ms),
+                )
         self._price_update_in_flight = False
-
-    def _set_table_item(self, row: int, column: int, value: str) -> None:
-        item = self._table.item(row, column)
-        if item is None:
-            item = QTableWidgetItem()
-            item.setTextAlignment(Qt.AlignCenter)
-            self._table.setItem(row, column, item)
-        item.setText(value)
 
     def _set_pairs_buttons_enabled(self, enabled: bool) -> None:
         self._load_button.setEnabled(enabled)
@@ -414,10 +561,14 @@ class OverviewTab(QWidget):
     def _handle_quote_change(self, quote: str) -> None:
         self._app_state.default_quote = quote
         self._persist_app_state()
+        self._apply_filters()
 
     def _handle_pnl_period_change(self, period: str) -> None:
         self._app_state.pnl_period = period
         self._persist_app_state()
+
+    def _handle_search_text(self, _: str) -> None:
+        self._apply_filters()
 
     def _persist_app_state(self) -> None:
         if self._app_state.user_config_path is None:

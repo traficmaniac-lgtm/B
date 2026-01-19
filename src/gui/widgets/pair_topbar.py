@@ -29,7 +29,7 @@ class PairTopBar(QWidget):
         self._set_header_policy(self.price_label)
 
         self.period_combo = QComboBox()
-        self.period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
+        self.period_combo.addItems(["1m", "3m", "5m", "15m", "30m", "1h", "4h", "12h", "24h", "1d", "7d"])
         self.period_combo.setCurrentText(default_period)
         self._set_header_policy(self.period_combo)
         period_label = QLabel("Period")
@@ -46,6 +46,7 @@ class PairTopBar(QWidget):
         self.analyze_button = QPushButton("AI Analyze")
         self.apply_button = QPushButton("Apply Plan")
         self.confirm_button = QPushButton("Confirm Start")
+        self.trading_button = QPushButton("Trading")
         self.pause_button = QPushButton("Pause")
         self.stop_button = QPushButton("Stop")
         for button in (
@@ -53,6 +54,7 @@ class PairTopBar(QWidget):
             self.analyze_button,
             self.apply_button,
             self.confirm_button,
+            self.trading_button,
             self.pause_button,
             self.stop_button,
         ):
@@ -62,6 +64,7 @@ class PairTopBar(QWidget):
         self.analyze_button.setToolTip("Step 2: AI analysis only (no execution)")
         self.apply_button.setToolTip("Step 3: Fill strategy parameters (no trading)")
         self.confirm_button.setToolTip("Step 4: Manual confirmation & start")
+        self.trading_button.setToolTip("Open Trading Workspace")
         self.pause_button.setToolTip("Pause bot loop")
         self.stop_button.setToolTip("Stop bot loop (safe stop later)")
 
@@ -111,7 +114,9 @@ class PairTopBar(QWidget):
         row_bottom.addWidget(self.apply_button)
         self._add_separator(row_bottom)
         row_bottom.addWidget(self.confirm_button)
-        self._add_separator(row_bottom, spacing=24)
+        self._add_separator(row_bottom, spacing=16)
+        row_bottom.addWidget(self.trading_button)
+        self._add_separator(row_bottom, spacing=16)
         row_bottom.addWidget(self.pause_button)
         row_bottom.addWidget(self.stop_button)
         row_bottom.addStretch()

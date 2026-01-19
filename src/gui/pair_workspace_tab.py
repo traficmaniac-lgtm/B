@@ -95,6 +95,7 @@ class PairWorkspaceTab(QWidget):
         self._plan_applied = False
         self._market_context: MarketContext | None = None
         self._prepared_mid_price: float | None = None
+        self._prepared_period: str | None = None
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._log_tick)
@@ -110,6 +111,7 @@ class PairWorkspaceTab(QWidget):
         self._last_datapack: dict[str, Any] | None = None
         self._pending_patch: AiStrategyPatch | None = None
         self._ai_block_confirm = False
+        self._trading_windows: list[QWidget] = []
 
         layout = QVBoxLayout()
         self._topbar = PairTopBar(
@@ -138,6 +140,7 @@ class PairWorkspaceTab(QWidget):
         self._topbar.analyze_button.clicked.connect(self._analyze)
         self._topbar.apply_button.clicked.connect(self._apply_plan)
         self._topbar.confirm_button.clicked.connect(self._confirm_start)
+        self._topbar.trading_button.clicked.connect(self._open_trading_workspace)
         self._topbar.pause_button.clicked.connect(self._toggle_pause)
         self._topbar.stop_button.clicked.connect(self._stop_run)
         self._chat_send_button.clicked.connect(self._send_chat)
@@ -706,6 +709,7 @@ class PairWorkspaceTab(QWidget):
         self._data_ready = False
         self._plan_applied = False
         self._ai_block_confirm = False
+        self._prepared_period = None
         self._set_state(BotState.PREPARING_DATA, reason="prepare_data")
         self._log_event("Prepare data requested.")
         self._analysis_summary.setText(self._preparing_summary())
@@ -717,8 +721,16 @@ class PairWorkspaceTab(QWidget):
         self._data_ready = True
         self._prepared_mid_price = round(random.uniform(95, 105), 2)
         self._market_context = self._build_market_context()
-        period = self._topbar.period_combo.currentText()
+        period, fallback_used = self._resolve_period()
+        self._prepared_period = period
         quality = self._topbar.quality_combo.currentText()
+        if fallback_used:
+            QMessageBox.warning(
+                self,
+                "Minute data unavailable",
+                f"Minute candles are unavailable right now. Falling back to {period}.",
+            )
+            self._log_event(f"Minute data unavailable; fallback to {period}.")
         self._analysis_summary.setText(
             f"Prepared demo datapack ({self.symbol}, {period}, {quality})."
         )
@@ -726,6 +738,13 @@ class PairWorkspaceTab(QWidget):
         self._ai_request_card.hide()
         self._set_state(BotState.DATA_READY, reason="prepare_complete")
         self._log_event("Prepared data pack (demo).")
+
+    def _resolve_period(self) -> tuple[str, bool]:
+        period = self._topbar.period_combo.currentText()
+        minute_periods = {"1m", "3m", "5m", "15m", "30m"}
+        if period in minute_periods and self._latest_price is None:
+            return "1h", True
+        return period, False
 
     def _analyze(self) -> None:
         if not self._data_ready:
@@ -1027,6 +1046,66 @@ class PairWorkspaceTab(QWidget):
         self._append_chat("AI", "Patch applied to the strategy form.")
         self.update_controls_by_state()
 
+    def _open_trading_workspace(self) -> None:
+        from src.gui.trading_workspace_window import TradingWorkspaceWindow
+
+        window = TradingWorkspaceWindow(pair_workspace=self, app_state=self._app_state, parent=self)
+        window.show()
+        self._trading_windows.append(window)
+
+    def get_trading_snapshot(self) -> dict[str, Any]:
+        analysis = self._last_ai_analysis
+        control = analysis.control if analysis else None
+        risk = analysis.risk if analysis else None
+        datapack_summary = None
+        if self._last_datapack:
+            datapack_summary = {
+                "period": self._last_datapack.get("user_context", {}).get("selected_period"),
+                "quality": self._last_datapack.get("user_context", {}).get("quality"),
+                "last_price": self._last_datapack.get("market_snapshot", {}).get("last_price"),
+            }
+        return {
+            "symbol": self.symbol,
+            "dry_run": self._topbar.dry_run_toggle.isChecked(),
+            "state": self._pair_state.state.value,
+            "last_reason": self._pair_state.last_reason,
+            "datapack_summary": datapack_summary,
+            "open_orders": self._extract_preview_orders(),
+            "position": {
+                "status": "FLAT",
+                "pnl": 0.0,
+            },
+            "risk": {
+                "hard_stop_pct": risk.hard_stop_pct if risk else None,
+                "cooldown_minutes": risk.cooldown_minutes if risk else None,
+                "volatility_mode": risk.volatility_mode if risk else None,
+            },
+            "recheck_interval_sec": control.recheck_interval_sec if control else 10,
+            "last_ai_analysis": analysis,
+        }
+
+    def build_monitor_datapack(self) -> dict[str, Any]:
+        return self._build_datapack()
+
+    def _extract_preview_orders(self) -> list[dict[str, str]]:
+        orders: list[dict[str, str]] = []
+        for row in range(self._plan_preview_table.rowCount()):
+            side_item = self._plan_preview_table.item(row, 0)
+            price_item = self._plan_preview_table.item(row, 1)
+            qty_item = self._plan_preview_table.item(row, 2)
+            pct_item = self._plan_preview_table.item(row, 3)
+            if side_item is None or price_item is None or qty_item is None or pct_item is None:
+                continue
+            orders.append(
+                {
+                    "side": side_item.text(),
+                    "price": price_item.text(),
+                    "qty": qty_item.text(),
+                    "pct_from_mid": pct_item.text(),
+                }
+            )
+        return orders
+
     def _append_chat(self, sender: str, message: str) -> None:
         self._chat_history.append(f"{sender}: {message}")
 
@@ -1161,7 +1240,7 @@ class PairWorkspaceTab(QWidget):
         return levels
 
     def _build_datapack(self) -> dict[str, Any]:
-        period = self._topbar.period_combo.currentText()
+        period = self._prepared_period or self._topbar.period_combo.currentText()
         quality = self._topbar.quality_combo.currentText()
         now_price = self._latest_price if self._latest_price is not None else self._prepared_mid_price
         source = self._latest_price_source or "None"

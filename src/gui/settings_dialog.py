@@ -62,7 +62,9 @@ class SettingsDialog(QDialog):
         self._openai_model_combo.setCurrentText(self._app_state.openai_model)
 
         self._default_period_combo = QComboBox()
-        self._default_period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
+        self._default_period_combo.addItems(
+            ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "12h", "24h", "1d", "7d"]
+        )
         self._default_period_combo.setCurrentText(self._app_state.default_period)
 
         self._default_quality_combo = QComboBox()

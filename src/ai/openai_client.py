@@ -130,6 +130,86 @@ class OpenAIClient:
             self._logger.warning("OpenAI analyze failed: %s", exc)
             raise
 
+    async def monitor_datapack(self, datapack: dict[str, Any]) -> tuple[AiResponseEnvelope, str]:
+        payload = json.dumps(datapack, ensure_ascii=False, indent=2)
+        system_prompt = (
+            "You are an AI observer monitoring a running strategy.\n"
+            "Return ONLY valid JSON, no markdown, no extra prose.\n"
+            "You MUST return an object that matches this schema:\n"
+            "{\n"
+            '  "type": "analysis_result",\n'
+            '  "status": "OK|WARN|DANGER|ERROR",\n'
+            '  "confidence": 0.0,\n'
+            '  "reason_codes": ["..."],\n'
+            '  "message": "short message",\n'
+            '  "analysis_result": {\n'
+            '    "summary_lines": ["..."],\n'
+            '    "strategy": {\n'
+            '      "strategy_id": "GRID_CLASSIC|GRID_BIASED_LONG|GRID_BIASED_SHORT|RANGE_MEAN_REVERSION|TREND_FOLLOW_GRID|DO_NOT_TRADE",\n'
+            '      "budget_usdt": 500,\n'
+            '      "levels": [],\n'
+            '      "grid_step_pct": 0.3,\n'
+            '      "range_low_pct": 1.5,\n'
+            '      "range_high_pct": 1.8,\n'
+            '      "bias": {"buy_pct": 50, "sell_pct": 50},\n'
+            '      "order_size_mode": "equal|martingale_light|liquidity_weighted",\n'
+            '      "max_orders": 12,\n'
+            '      "max_exposure_pct": 35\n'
+            "    },\n"
+            '    "risk": {\n'
+            '      "hard_stop_pct": 8,\n'
+            '      "cooldown_minutes": 15,\n'
+            '      "soft_stop_rules": ["..."],\n'
+            '      "kill_switch_rules": ["..."],\n'
+            '      "volatility_mode": "low|medium|high"\n'
+            "    },\n"
+            '    "control": {\n'
+            '      "recheck_interval_sec": 10,\n'
+            '      "ai_reanalyze_interval_sec": 60,\n'
+            '      "min_change_to_rebuild_pct": 0.3\n'
+            "    },\n"
+            '    "actions": [\n'
+            '      {"action": "note", "detail": "example", "severity": "info"}\n'
+            "    ]\n"
+            "  }\n"
+            "}\n"
+            "Do not execute trades; only suggest actions."
+        )
+
+        async def _monitor() -> tuple[AiResponseEnvelope, str]:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Monitor this datapack:\n{payload}"},
+            ]
+            response = await self._chat_completion(
+                messages=messages,
+                max_tokens=420,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else None
+            parsed = parse_ai_response(content or "", expected_type="analysis_result")
+            if parsed.status != "ERROR":
+                return parsed, content or ""
+            retry_messages = messages + [
+                {"role": "user", "content": "Your previous response was invalid JSON; output ONLY JSON."},
+            ]
+            response = await self._chat_completion(
+                messages=retry_messages,
+                max_tokens=420,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else None
+            parsed = parse_ai_response(content or "", expected_type="analysis_result")
+            if parsed.status == "ERROR":
+                raise RuntimeError(parsed.message or "Invalid AI JSON")
+            return parsed, content or ""
+
+        try:
+            return await self._run_with_retries(_monitor)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("OpenAI monitor failed: %s", exc)
+            raise
+
     async def chat_adjust(
         self,
         datapack: dict[str, Any],

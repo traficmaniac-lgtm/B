@@ -57,7 +57,7 @@ class PairWorkspaceWindow(QMainWindow):
         layout.addWidget(self._symbol_label)
 
         self._period_combo = QComboBox()
-        self._period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
+        self._period_combo.addItems(["1m", "3m", "5m", "15m", "30m", "1h", "4h", "12h", "24h", "1d", "7d"])
         self._period_combo.setCurrentText(self._app_state.default_period)
         layout.addWidget(QLabel("Period"))
         layout.addWidget(self._period_combo)

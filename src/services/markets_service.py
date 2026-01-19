@@ -76,10 +76,56 @@ class MarketsService:
 
         return pairs
 
+    def load_pairs_all(
+        self,
+        status: str = "TRADING",
+        blacklist_substrings: Iterable[str] | None = None,
+    ) -> list[Pair]:
+        data = self._client.get_exchange_info()
+        symbols = data.get("symbols", []) if isinstance(data, dict) else []
+        status_filter = status.upper()
+        blacklist = (
+            tuple(substring.upper() for substring in blacklist_substrings)
+            if blacklist_substrings is not None
+            else self._blacklist_substrings
+        )
+        pairs: list[Pair] = []
+
+        for item in symbols:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status", "")).upper() != status_filter:
+                continue
+            symbol = str(item.get("symbol", ""))
+            if not symbol:
+                continue
+            if any(substring in symbol for substring in blacklist):
+                continue
+            quote_asset = str(item.get("quoteAsset", "")).upper()
+            if not quote_asset:
+                continue
+            base_asset = str(item.get("baseAsset", ""))
+            filters = self._map_filters(item.get("filters", []))
+            tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
+            step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
+            pairs.append(
+                Pair(
+                    symbol=symbol,
+                    base_asset=base_asset,
+                    quote_asset=quote_asset,
+                    status=str(item.get("status", "TRADING")),
+                    filters=filters,
+                    tick_size=tick_size,
+                    step_size=step_size,
+                )
+            )
+
+        return pairs
+
     def load_pairs_cached(self, quote_asset: str, ttl_hours: int = 24) -> tuple[list[Pair], bool]:
         cached = self._read_cache(quote_asset)
         if cached is not None:
-            saved_at, cached_pairs = cached
+            saved_at, cached_pairs, _ = cached
             if self._cache_is_fresh(saved_at, ttl_hours):
                 return cached_pairs, True
         try:
@@ -93,7 +139,29 @@ class MarketsService:
 
     def refresh_pairs(self, quote_asset: str) -> list[Pair]:
         pairs = self.load_pairs(quote_asset)
-        self._write_cache(quote_asset, pairs)
+        self._write_cache(quote_asset, pairs, scope=f"QUOTE:{quote_asset.strip().upper()}")
+        return pairs
+
+    def load_pairs_cached_all(self, ttl_hours: int = 24) -> tuple[list[Pair], bool, bool]:
+        cached = self._read_cache("ALL")
+        if cached is not None:
+            saved_at, cached_pairs, meta = cached
+            scope = meta.get("scope") if isinstance(meta, dict) else None
+            partial = scope != "ALL"
+            if self._cache_is_fresh(saved_at, ttl_hours):
+                return cached_pairs, True, partial
+        try:
+            pairs = self.refresh_pairs_all()
+            return pairs, False, False
+        except Exception as exc:
+            if cached is not None:
+                self._logger.warning("Failed to refresh all pairs (%s); using cache.", exc)
+                return cached[1], True, True
+            raise
+
+    def refresh_pairs_all(self) -> list[Pair]:
+        pairs = self.load_pairs_all()
+        self._write_cache("ALL", pairs, scope="ALL")
         return pairs
 
     @staticmethod
@@ -112,7 +180,7 @@ class MarketsService:
             return False
         return datetime.now(timezone.utc) - saved_at <= timedelta(hours=ttl_hours)
 
-    def _read_cache(self, quote_asset: str) -> tuple[datetime | None, list[Pair]] | None:
+    def _read_cache(self, quote_asset: str) -> tuple[datetime | None, list[Pair], dict[str, Any]] | None:
         path = self._cache_path(quote_asset)
         if not path.exists():
             return None
@@ -136,14 +204,15 @@ class MarketsService:
         if not isinstance(pairs_payload, list):
             return None
         pairs = [pair for pair in (self._payload_to_pair(item) for item in pairs_payload) if pair]
-        return saved_at, pairs
+        return saved_at, pairs, meta if isinstance(meta, dict) else {}
 
-    def _write_cache(self, quote_asset: str, pairs: list[Pair]) -> None:
+    def _write_cache(self, quote_asset: str, pairs: list[Pair], scope: str) -> None:
         path = self._cache_path(quote_asset)
         meta = {
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "quote": quote_asset.strip().upper(),
             "count": len(pairs),
+            "scope": scope,
         }
         payload = {
             "meta": meta,
