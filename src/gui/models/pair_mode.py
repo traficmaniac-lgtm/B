@@ -5,8 +5,8 @@ from enum import Enum
 
 class PairMode(Enum):
     TRADING = "trading"
-    ADVANCED = "advanced"
+    TRADE_READY = "trade_ready"
 
 
 PAIR_MODE_TRADING = PairMode.TRADING
-PAIR_MODE_ADVANCED = PairMode.ADVANCED
+PAIR_MODE_TRADE_READY = PairMode.TRADE_READY
