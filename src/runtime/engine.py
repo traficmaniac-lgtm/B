@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.core.logging import get_logger
-from src.services.price_feed_service import PriceFeedService, PriceTick
+from src.services.price_feed_manager import MicrostructureSnapshot, PriceFeedManager, PriceUpdate
 from src.runtime.runtime_state import RuntimeState
 from src.runtime.strategy_executor import StrategyExecutor
 from src.runtime.virtual_orders import VirtualOrder, VirtualOrderBook, VirtualOrderSide
@@ -29,7 +29,7 @@ class RuntimeEngine:
         self,
         symbol: str,
         strategy_snapshot: dict[str, Any],
-        price_feed: PriceFeedService | None = None,
+        price_feed_manager: PriceFeedManager,
     ) -> None:
         self._symbol = symbol
         self._strategy_snapshot = strategy_snapshot
@@ -44,8 +44,7 @@ class RuntimeEngine:
         }
         self._order_book = VirtualOrderBook()
         self._strategy = StrategyExecutor(strategy_snapshot, self._order_book)
-        self._price_feed = price_feed or PriceFeedService(symbol)
-        self._owns_price_feed = price_feed is None
+        self._price_feed_manager = price_feed_manager
         self._last_price: float | None = None
         self._last_price_timestamp: datetime | None = None
         self._last_latency: float | None = None
@@ -56,6 +55,7 @@ class RuntimeEngine:
         self._position_qty = 0.0
         self._max_total_pnl = 0.0
         self._ws_status: str = "LOST"
+        self._microstructure: MicrostructureSnapshot | None = None
 
     def subscribe(self, event: str, callback: Any) -> None:
         if event in self._event_handlers:
@@ -71,9 +71,10 @@ class RuntimeEngine:
             self._state = RuntimeState.RUNNING
             self._log_transition(previous, self._state, reason="start")
             self._emit_state()
-            self._price_feed.subscribe(self._on_price_tick)
-            self._price_feed.subscribe_status(self._on_ws_status)
-            self._price_feed.start()
+            self._price_feed_manager.register_symbol(self._symbol)
+            self._price_feed_manager.subscribe(self._symbol, self._on_price_tick)
+            self._price_feed_manager.subscribe_status(self._symbol, self._on_ws_status)
+            self._price_feed_manager.start()
 
     def pause(self) -> None:
         with self._state_lock:
@@ -83,8 +84,8 @@ class RuntimeEngine:
             self._state = RuntimeState.PAUSED
             self._log_transition(previous, self._state, reason="pause")
             self._emit_state()
-            self._price_feed.unsubscribe(self._on_price_tick)
-            self._price_feed.unsubscribe_status(self._on_ws_status)
+            self._price_feed_manager.unsubscribe(self._symbol, self._on_price_tick)
+            self._price_feed_manager.unsubscribe_status(self._symbol, self._on_ws_status)
 
     def stop(self, cancel_orders: bool = False) -> None:
         with self._state_lock:
@@ -94,10 +95,9 @@ class RuntimeEngine:
             self._state = RuntimeState.STOPPED
             self._log_transition(previous, self._state, reason="stop")
             self._emit_state()
-            self._price_feed.unsubscribe(self._on_price_tick)
-            self._price_feed.unsubscribe_status(self._on_ws_status)
-            if self._owns_price_feed:
-                self._price_feed.stop()
+            self._price_feed_manager.unsubscribe(self._symbol, self._on_price_tick)
+            self._price_feed_manager.unsubscribe_status(self._symbol, self._on_ws_status)
+            self._price_feed_manager.unregister_symbol(self._symbol)
             if cancel_orders:
                 self._order_book.cancel_all()
             previous = self._state
@@ -134,6 +134,7 @@ class RuntimeEngine:
         total_pnl = pnl.realized + pnl.unrealized
         self._max_total_pnl = max(self._max_total_pnl, total_pnl)
         drawdown = self._max_total_pnl - total_pnl
+        micro = self._microstructure
         return {
             "open_orders": [self._order_to_dict(o) for o in self._order_book.list_open_orders()],
             "fills": [self._order_to_dict(o) for o in self._fills],
@@ -148,7 +149,17 @@ class RuntimeEngine:
             "volatility": volatility,
             "micro_volatility": micro_volatility,
             "impulse_pct": impulse_pct,
-            "spread_estimate": None,
+            "spread_estimate": micro.spread_pct if micro else None,
+            "best_bid": micro.best_bid if micro else None,
+            "best_ask": micro.best_ask if micro else None,
+            "mid_price": micro.mid_price if micro else None,
+            "spread_abs": micro.spread_abs if micro else None,
+            "spread_pct": micro.spread_pct if micro else None,
+            "tick_size": micro.tick_size if micro else None,
+            "step_size": micro.step_size if micro else None,
+            "price_age_ms": micro.price_age_ms if micro else None,
+            "ws_latency_ms": micro.ws_latency_ms if micro else None,
+            "price_source": micro.source if micro else None,
             "drawdown": drawdown,
             "state": self._state.value,
             "latency_ms": self._last_latency * 1000 if self._last_latency is not None else None,
@@ -228,6 +239,7 @@ class RuntimeEngine:
         self._last_latency = None
         self._max_total_pnl = 0.0
         self._ws_status = "LOST"
+        self._microstructure = None
 
     def _emit(self, event: str, payload: Any) -> None:
         for callback in self._event_handlers.get(event, []):
@@ -250,20 +262,25 @@ class RuntimeEngine:
             (datetime.now(timezone.utc) - self._last_price_timestamp).total_seconds() * 1000,
         )
 
-    def _on_price_tick(self, tick: PriceTick) -> None:
+    def _on_price_tick(self, tick: PriceUpdate) -> None:
         if self._state != RuntimeState.RUNNING:
             return
-        exchange_dt = datetime.fromtimestamp(tick.exchange_timestamp_ms / 1000, tz=timezone.utc)
-        self._last_price = tick.price
+        if tick.last_price is None:
+            return
+        exchange_ts = tick.exchange_timestamp_ms or tick.local_timestamp_ms
+        exchange_dt = datetime.fromtimestamp(exchange_ts / 1000, tz=timezone.utc)
+        self._last_price = tick.last_price
         self._last_price_timestamp = exchange_dt
-        self._last_latency = tick.latency_ms / 1000
-        self._price_history.append((tick.exchange_timestamp_ms, tick.price))
+        if tick.latency_ms is not None:
+            self._last_latency = tick.latency_ms / 1000
+        self._price_history.append((exchange_ts, tick.last_price))
+        self._microstructure = tick.microstructure
 
-        created_orders = self._strategy.initialize(tick.price)
+        created_orders = self._strategy.initialize(tick.last_price)
         for order in created_orders:
             self._emit("order_created", order)
 
-        filled_orders = self._order_book.check_fills(tick.price)
+        filled_orders = self._order_book.check_fills(tick.last_price)
         if filled_orders:
             for order in filled_orders:
                 self._apply_fill(order)
