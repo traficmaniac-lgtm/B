@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from queue import Queue
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from src.core.logging import get_logger
 from src.runtime.engine import PnLSnapshot, RuntimeEngine
 from src.runtime.runtime_state import RuntimeState
+from src.services.price_feed_service import PriceFeedService, PriceTick
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,11 @@ class RuntimeRecommendation:
     confidence: float
     expected_effect: str
     can_apply_patch: bool = False
+
+
+class _PriceFeedSignals(QObject):
+    price_tick = Signal(float, int, int)
+    ws_status = Signal(str, str)
 
 
 class TradingRuntimeWindow(QMainWindow):
@@ -61,8 +67,16 @@ class TradingRuntimeWindow(QMainWindow):
         self._state = RuntimeState.IDLE
         self._uptime_seconds = 0
         self._logger = get_logger(f"gui.trading_runtime.{symbol.lower()}")
-        self._engine = RuntimeEngine(symbol=symbol, strategy_snapshot=strategy_snapshot)
+        self._price_feed = PriceFeedService(symbol=symbol)
+        self._engine = RuntimeEngine(
+            symbol=symbol,
+            strategy_snapshot=strategy_snapshot,
+            price_feed=self._price_feed,
+        )
         self._event_queue: Queue[tuple[str, Any]] = Queue()
+        self._price_signals = _PriceFeedSignals()
+        self._price_signals.price_tick.connect(self._update_price_display)
+        self._price_signals.ws_status.connect(self._update_ws_status)
 
         self.setWindowTitle(f"Trading Runtime — {symbol}")
         self.resize(1380, 900)
@@ -100,6 +114,10 @@ class TradingRuntimeWindow(QMainWindow):
 
         self._apply_state(self._engine.get_state())
 
+        self._price_feed.subscribe(self._handle_price_tick)
+        self._price_feed.subscribe_status(self._handle_ws_status)
+        self._price_feed.start()
+
     def _build_header(self) -> QWidget:
         header = QWidget()
         layout = QHBoxLayout()
@@ -120,6 +138,15 @@ class TradingRuntimeWindow(QMainWindow):
 
         self._session_pnl = QLabel("Session PnL: —")
         layout.addWidget(self._session_pnl)
+
+        self._price_label = QLabel("Price: —")
+        layout.addWidget(self._price_label)
+
+        self._latency_label = QLabel("Latency: —")
+        layout.addWidget(self._latency_label)
+
+        self._ws_status_label = QLabel("WS: LOST")
+        layout.addWidget(self._ws_status_label)
 
         self._uptime_label = QLabel("Uptime: 00:00:00")
         layout.addWidget(self._uptime_label)
@@ -453,10 +480,10 @@ class TradingRuntimeWindow(QMainWindow):
         badge_text = "SAFE"
         if any(rec.rec_type == "PAUSE_TRADING" for rec in recommendations):
             badge_style = "padding: 4px 10px; border-radius: 10px; background: #fecaca; color: #991b1b;"
-            badge_text = "ALERT"
-        elif any(rec.rec_type == "ADJUST_PARAMS" for rec in recommendations):
+            badge_text = "DANGER"
+        elif any(rec.rec_type in {\"ADJUST_PARAMS\", \"REBUILD_GRID\"} for rec in recommendations):
             badge_style = "padding: 4px 10px; border-radius: 10px; background: #fde68a; color: #92400e;"
-            badge_text = "WATCH"
+            badge_text = "WARNING"
         self._observer_badge.setStyleSheet(badge_style)
         self._observer_badge.setText(badge_text)
 
@@ -470,6 +497,19 @@ class TradingRuntimeWindow(QMainWindow):
         self._observer_timer.setInterval(interval)
         self._observer_timer.start()
         self._log_event(f"Observer interval set to {value}.")
+
+    def _handle_price_tick(self, tick: PriceTick) -> None:
+        self._price_signals.price_tick.emit(tick.price, tick.latency_ms, tick.exchange_timestamp_ms)
+
+    def _handle_ws_status(self, status: str, details: str) -> None:
+        self._price_signals.ws_status.emit(status, details)
+
+    def _update_price_display(self, price: float, latency_ms: int, exchange_ts: int) -> None:
+        self._price_label.setText(f"Price: {price:.6f}")
+        self._latency_label.setText(f"Latency: {latency_ms} ms")
+
+    def _update_ws_status(self, status: str, details: str) -> None:
+        self._ws_status_label.setText(f"WS: {status}")
 
     def _format_json(self, payload: dict[str, Any]) -> str:
         try:
@@ -561,4 +601,7 @@ class TradingRuntimeWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         self._engine.stop(cancel_orders=True)
+        self._price_feed.unsubscribe(self._handle_price_tick)
+        self._price_feed.unsubscribe_status(self._handle_ws_status)
+        self._price_feed.stop()
         super().closeEvent(event)

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.core.logging import get_logger
-from src.runtime.price_feed import PriceFeed
+from src.services.price_feed_service import PriceFeedService, PriceTick
 from src.runtime.runtime_state import RuntimeState
 from src.runtime.strategy_executor import StrategyExecutor
 from src.runtime.virtual_orders import VirtualOrder, VirtualOrderBook, VirtualOrderSide
@@ -25,7 +25,12 @@ class PnLSnapshot:
 
 
 class RuntimeEngine:
-    def __init__(self, symbol: str, strategy_snapshot: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        strategy_snapshot: dict[str, Any],
+        price_feed: PriceFeedService | None = None,
+    ) -> None:
         self._symbol = symbol
         self._strategy_snapshot = strategy_snapshot
         self._logger = get_logger(f"runtime.engine.{symbol.lower()}")
@@ -39,16 +44,18 @@ class RuntimeEngine:
         }
         self._order_book = VirtualOrderBook()
         self._strategy = StrategyExecutor(strategy_snapshot, self._order_book)
-        self._price_feed = PriceFeed(symbol, on_price=self._on_price_update)
+        self._price_feed = price_feed or PriceFeedService(symbol)
+        self._owns_price_feed = price_feed is None
         self._last_price: float | None = None
         self._last_price_timestamp: datetime | None = None
         self._last_latency: float | None = None
-        self._price_history: deque[float] = deque(maxlen=120)
+        self._price_history: deque[tuple[int, float]] = deque(maxlen=240)
         self._fills: list[VirtualOrder] = []
         self._realized_pnl = 0.0
         self._avg_price = 0.0
         self._position_qty = 0.0
         self._max_total_pnl = 0.0
+        self._ws_status: str = "LOST"
 
     def subscribe(self, event: str, callback: Any) -> None:
         if event in self._event_handlers:
@@ -64,6 +71,8 @@ class RuntimeEngine:
             self._state = RuntimeState.RUNNING
             self._log_transition(previous, self._state, reason="start")
             self._emit_state()
+            self._price_feed.subscribe(self._on_price_tick)
+            self._price_feed.subscribe_status(self._on_ws_status)
             self._price_feed.start()
 
     def pause(self) -> None:
@@ -74,7 +83,8 @@ class RuntimeEngine:
             self._state = RuntimeState.PAUSED
             self._log_transition(previous, self._state, reason="pause")
             self._emit_state()
-            self._price_feed.stop()
+            self._price_feed.unsubscribe(self._on_price_tick)
+            self._price_feed.unsubscribe_status(self._on_ws_status)
 
     def stop(self, cancel_orders: bool = False) -> None:
         with self._state_lock:
@@ -84,7 +94,10 @@ class RuntimeEngine:
             self._state = RuntimeState.STOPPED
             self._log_transition(previous, self._state, reason="stop")
             self._emit_state()
-            self._price_feed.stop()
+            self._price_feed.unsubscribe(self._on_price_tick)
+            self._price_feed.unsubscribe_status(self._on_ws_status)
+            if self._owns_price_feed:
+                self._price_feed.stop()
             if cancel_orders:
                 self._order_book.cancel_all()
             previous = self._state
@@ -116,6 +129,8 @@ class RuntimeEngine:
     def get_observer_snapshot(self) -> dict[str, Any]:
         pnl = self.get_pnl()
         volatility = self._calculate_volatility()
+        micro_volatility = self._calculate_micro_volatility(window_ms=10_000)
+        impulse_pct = self._calculate_impulse(window_ms=5_000)
         total_pnl = pnl.realized + pnl.unrealized
         self._max_total_pnl = max(self._max_total_pnl, total_pnl)
         drawdown = self._max_total_pnl - total_pnl
@@ -131,17 +146,33 @@ class RuntimeEngine:
                 "last_price": pnl.last_price,
             },
             "volatility": volatility,
+            "micro_volatility": micro_volatility,
+            "impulse_pct": impulse_pct,
+            "spread_estimate": None,
             "drawdown": drawdown,
             "state": self._state.value,
             "latency_ms": self._last_latency * 1000 if self._last_latency is not None else None,
             "last_price_age_ms": self._last_price_age_ms(),
+            "ws_status": self._ws_status,
         }
 
     def get_recommendations(self) -> list[dict[str, Any]]:
         snapshot = self.get_observer_snapshot()
         volatility = snapshot["volatility"]
+        micro_volatility = snapshot["micro_volatility"]
+        impulse_pct = snapshot["impulse_pct"]
         drawdown = snapshot["drawdown"]
         recommendations: list[dict[str, Any]] = []
+        if impulse_pct is not None and impulse_pct >= 0.6:
+            recommendations.append(
+                {
+                    "rec_type": "REBUILD_GRID",
+                    "reason": "Зафиксирован резкий импульс цены, рекомендуется пересчитать сетку.",
+                    "confidence": min(0.95, 0.6 + impulse_pct / 10),
+                    "expected_effect": "Смещение ордеров ближе к текущему диапазону.",
+                    "can_apply_patch": False,
+                }
+            )
         if volatility and volatility > 0:
             recommendations.append(
                 {
@@ -149,6 +180,16 @@ class RuntimeEngine:
                     "reason": "Реальная волатильность повышена, рекомендуется расширить шаг сетки.",
                     "confidence": min(0.9, 0.5 + volatility / 1000),
                     "expected_effect": "Снизит частоту входов и риск резких разворотов.",
+                    "can_apply_patch": False,
+                }
+            )
+        if micro_volatility is not None and micro_volatility >= 0.35:
+            recommendations.append(
+                {
+                    "rec_type": "PAUSE_TRADING",
+                    "reason": "Микроволатильность повышена, возможна турбулентность.",
+                    "confidence": min(0.85, 0.45 + micro_volatility / 5),
+                    "expected_effect": "Защитит от быстрых рыночных рывков.",
                     "can_apply_patch": False,
                 }
             )
@@ -186,6 +227,7 @@ class RuntimeEngine:
         self._last_price_timestamp = None
         self._last_latency = None
         self._max_total_pnl = 0.0
+        self._ws_status = "LOST"
 
     def _emit(self, event: str, payload: Any) -> None:
         for callback in self._event_handlers.get(event, []):
@@ -208,19 +250,20 @@ class RuntimeEngine:
             (datetime.now(timezone.utc) - self._last_price_timestamp).total_seconds() * 1000,
         )
 
-    def _on_price_update(self, price: float, timestamp: datetime, latency: float) -> None:
+    def _on_price_tick(self, tick: PriceTick) -> None:
         if self._state != RuntimeState.RUNNING:
             return
-        self._last_price = price
-        self._last_price_timestamp = timestamp
-        self._last_latency = latency
-        self._price_history.append(price)
+        exchange_dt = datetime.fromtimestamp(tick.exchange_timestamp_ms / 1000, tz=timezone.utc)
+        self._last_price = tick.price
+        self._last_price_timestamp = exchange_dt
+        self._last_latency = tick.latency_ms / 1000
+        self._price_history.append((tick.exchange_timestamp_ms, tick.price))
 
-        created_orders = self._strategy.initialize(price)
+        created_orders = self._strategy.initialize(tick.price)
         for order in created_orders:
             self._emit("order_created", order)
 
-        filled_orders = self._order_book.check_fills(price)
+        filled_orders = self._order_book.check_fills(tick.price)
         if filled_orders:
             for order in filled_orders:
                 self._apply_fill(order)
@@ -231,6 +274,9 @@ class RuntimeEngine:
                 self._emit("order_created", order)
 
         self._emit("pnl_updated", self.get_pnl())
+
+    def _on_ws_status(self, status: str, details: str) -> None:
+        self._ws_status = status
 
     def _apply_fill(self, order: VirtualOrder) -> None:
         qty = order.qty
@@ -280,9 +326,35 @@ class RuntimeEngine:
         return 0.0
 
     def _calculate_volatility(self) -> float:
-        if len(self._price_history) < 2:
+        prices = self._prices_in_window(window_ms=60_000)
+        if len(prices) < 2:
             return 0.0
-        return statistics.pstdev(self._price_history)
+        return statistics.pstdev(prices)
+
+    def _calculate_micro_volatility(self, window_ms: int) -> float | None:
+        prices = self._prices_in_window(window_ms)
+        if len(prices) < 2:
+            return None
+        last_price = prices[-1]
+        if last_price <= 0:
+            return None
+        return statistics.pstdev(prices) / last_price * 100
+
+    def _calculate_impulse(self, window_ms: int) -> float | None:
+        prices = self._prices_in_window(window_ms)
+        if len(prices) < 2:
+            return None
+        start_price = prices[0]
+        end_price = prices[-1]
+        if start_price <= 0:
+            return None
+        return abs(end_price - start_price) / start_price * 100
+
+    def _prices_in_window(self, window_ms: int) -> list[float]:
+        if not self._price_history:
+            return []
+        now_ms = self._price_history[-1][0]
+        return [price for ts, price in self._price_history if now_ms - ts <= window_ms]
 
     def _order_to_dict(self, order: VirtualOrder) -> dict[str, Any]:
         return {
