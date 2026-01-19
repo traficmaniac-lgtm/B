@@ -12,6 +12,14 @@ else:
     PYSIDE_AVAILABLE = True
 
 
+def test_config_loads_defaults() -> None:
+    from src.core.config import load_config
+
+    config = load_config()
+    assert config.prices.ttl_ms > 0
+    assert config.prices.refresh_interval_ms > 0
+
+
 @pytest.mark.skipif(not PYSIDE_AVAILABLE, reason="PySide6 dependencies unavailable")
 def test_imports() -> None:
     from src.app.main import main

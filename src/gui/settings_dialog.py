@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QLineEdit,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -64,6 +65,18 @@ class SettingsDialog(QDialog):
         self._default_quality_combo.addItems(["Standard", "Deep"])
         self._default_quality_combo.setCurrentText(self._app_state.default_quality)
 
+        self._price_ttl_input = QSpinBox()
+        self._price_ttl_input.setRange(500, 60000)
+        self._price_ttl_input.setValue(self._app_state.price_ttl_ms)
+
+        self._price_refresh_input = QSpinBox()
+        self._price_refresh_input.setRange(200, 10000)
+        self._price_refresh_input.setValue(self._app_state.price_refresh_ms)
+
+        self._default_quote_combo = QComboBox()
+        self._default_quote_combo.addItems(["USDT", "USDC", "FDUSD", "EUR"])
+        self._default_quote_combo.setCurrentText(self._app_state.default_quote)
+
         self._allow_ai_more_data = QCheckBox("Allow AI to request more data")
         self._allow_ai_more_data.setChecked(self._app_state.allow_ai_more_data)
 
@@ -72,6 +85,9 @@ class SettingsDialog(QDialog):
         form.addRow(QLabel("OpenAI API key"), self._openai_key_input)
         form.addRow(QLabel("Default period"), self._default_period_combo)
         form.addRow(QLabel("Default quality"), self._default_quality_combo)
+        form.addRow(QLabel("Price TTL (ms)"), self._price_ttl_input)
+        form.addRow(QLabel("Price refresh (ms)"), self._price_refresh_input)
+        form.addRow(QLabel("Default quote"), self._default_quote_combo)
         form.addRow(self._allow_ai_more_data)
         return form
 
@@ -81,6 +97,9 @@ class SettingsDialog(QDialog):
         self._app_state.openai_api_key = self._openai_key_input.text().strip()
         self._app_state.default_period = self._default_period_combo.currentText()
         self._app_state.default_quality = self._default_quality_combo.currentText()
+        self._app_state.price_ttl_ms = self._price_ttl_input.value()
+        self._app_state.price_refresh_ms = self._price_refresh_input.value()
+        self._app_state.default_quote = self._default_quote_combo.currentText()
         self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
         self._on_save(self._app_state)
         config_path = self._app_state.user_config_path or Path("config.user.yaml")

@@ -29,6 +29,7 @@ class RateLimitConfig:
 class PricesConfig:
     ttl_ms: int = 2000
     fallback_enabled: bool = True
+    refresh_interval_ms: int = 500
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,8 @@ class Config:
             raise ValueError("rate_limit.per_minute must be positive")
         if self.prices.ttl_ms <= 0:
             raise ValueError("prices.ttl_ms must be positive")
+        if self.prices.refresh_interval_ms <= 0:
+            raise ValueError("prices.refresh_interval_ms must be positive")
         if self.binance.recv_window <= 0:
             raise ValueError("binance.recv_window must be positive")
 
@@ -102,6 +105,10 @@ def load_config(path: str | Path | None = None) -> Config:
         fallback_enabled=_get_env_bool(
             "PRICE_FALLBACK_ENABLED",
             _get_nested(file_data, ["prices", "fallback_enabled"], True),
+        ),
+        refresh_interval_ms=_get_env_int(
+            "PRICE_REFRESH_MS",
+            _get_nested(file_data, ["prices", "refresh_interval_ms"], 500),
         ),
     )
 

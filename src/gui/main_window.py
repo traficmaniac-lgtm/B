@@ -35,7 +35,11 @@ class MainWindow(QMainWindow):
 
         self._tabs = QTabWidget()
         self._tabs.setTabsClosable(True)
-        self._overview_tab = OverviewTab(self._config, on_open_pair=self.open_pair_tab)
+        self._overview_tab = OverviewTab(
+            self._config,
+            app_state=self._app_state,
+            on_open_pair=self.open_pair_tab,
+        )
         self._tabs.addTab(self._overview_tab, "Overview")
         self._tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
         self._tabs.tabBar().setTabButton(0, QTabBar.LeftSide, None)
@@ -123,3 +127,9 @@ class MainWindow(QMainWindow):
             widget.shutdown()
             self._pair_tabs.pop(symbol, None)
         self._tabs.removeTab(index)
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802
+        self._overview_tab.shutdown()
+        for tab in self._pair_tabs.values():
+            tab.shutdown()
+        super().closeEvent(event)

@@ -11,6 +11,8 @@ class Pair:
     quote_asset: str
     status: str = "TRADING"
     filters: Mapping[str, object] = field(default_factory=dict)
+    tick_size: str | None = None
+    step_size: str | None = None
 
 
 @dataclass(frozen=True)

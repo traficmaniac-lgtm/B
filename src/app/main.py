@@ -26,6 +26,10 @@ def _load_app_state(config_env: str, config_log_level: str, root_path: Path) -> 
         default_period="4h",
         default_quality="Standard",
         allow_ai_more_data=True,
+        price_ttl_ms=config.prices.ttl_ms,
+        price_refresh_ms=config.prices.refresh_interval_ms,
+        default_quote="USDT",
+        pnl_period="24h",
     )
     user_config_path = root_path / "config.user.yaml"
     return AppState.load(user_config_path, defaults)

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -79,6 +80,18 @@ class SettingsTab(QWidget):
         self._default_quality_combo.addItems(["Standard", "Deep"])
         self._default_quality_combo.setCurrentText(self._app_state.default_quality)
 
+        self._price_ttl_input = QSpinBox()
+        self._price_ttl_input.setRange(500, 60000)
+        self._price_ttl_input.setValue(self._app_state.price_ttl_ms)
+
+        self._price_refresh_input = QSpinBox()
+        self._price_refresh_input.setRange(200, 10000)
+        self._price_refresh_input.setValue(self._app_state.price_refresh_ms)
+
+        self._default_quote_combo = QComboBox()
+        self._default_quote_combo.addItems(["USDT", "USDC", "FDUSD", "EUR"])
+        self._default_quote_combo.setCurrentText(self._app_state.default_quote)
+
         self._allow_ai_more_data = QCheckBox("Allow AI to request more data")
         self._allow_ai_more_data.setChecked(self._app_state.allow_ai_more_data)
 
@@ -99,6 +112,9 @@ class SettingsTab(QWidget):
         form.addRow(QLabel("OpenAI key"), self._build_key_row(self._openai_key_input, self._openai_key_hint))
         form.addRow(QLabel("Default period"), self._default_period_combo)
         form.addRow(QLabel("Default quality"), self._default_quality_combo)
+        form.addRow(QLabel("Price TTL (ms)"), self._price_ttl_input)
+        form.addRow(QLabel("Price refresh (ms)"), self._price_refresh_input)
+        form.addRow(QLabel("Default quote"), self._default_quote_combo)
         form.addRow(self._allow_ai_more_data)
         return form
 
@@ -112,6 +128,9 @@ class SettingsTab(QWidget):
         self._app_state.openai_api_key = self._openai_key_input.text().strip()
         self._app_state.default_period = self._default_period_combo.currentText()
         self._app_state.default_quality = self._default_quality_combo.currentText()
+        self._app_state.price_ttl_ms = self._price_ttl_input.value()
+        self._app_state.price_refresh_ms = self._price_refresh_input.value()
+        self._app_state.default_quote = self._default_quote_combo.currentText()
         self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
         self._refresh_key_hints()
         self._on_save(self._app_state)
