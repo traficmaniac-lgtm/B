@@ -4,13 +4,15 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QSignalBlocker, QTimer
+from PySide6.QtCore import QSignalBlocker, QTimer, Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -18,6 +20,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +62,7 @@ class PairWorkspaceTab(QWidget):
         self._state = PairRunState.IDLE
         self._data_ready = False
         self._market_context: MarketContext | None = None
+        self._prepared_mid_price: float | None = None
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._log_tick)
@@ -194,9 +199,33 @@ class PairWorkspaceTab(QWidget):
     def _build_plan_panel(self) -> QWidget:
         group = QGroupBox("Plan preview")
         layout = QVBoxLayout()
-        self._plan_preview = QLabel("Plan preview will appear here after analysis.")
-        self._plan_preview.setWordWrap(True)
-        layout.addWidget(self._plan_preview)
+        self._plan_preview_status = QLabel("Plan preview will appear here after analysis.")
+        self._plan_preview_status.setWordWrap(True)
+        layout.addWidget(self._plan_preview_status)
+
+        self._plan_preview_table = QTableWidget(0, 4)
+        self._plan_preview_table.setHorizontalHeaderLabels(["Side", "Price", "Qty", "% from mid"])
+        self._plan_preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._plan_preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._plan_preview_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._plan_preview_table.verticalHeader().setVisible(False)
+        header = self._plan_preview_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self._plan_preview_table.setFixedHeight(260)
+        layout.addWidget(self._plan_preview_table)
+
+        metrics_layout = QHBoxLayout()
+        self._preview_capital_label = QLabel("Estimated capital usage: —")
+        self._preview_exposure_label = QLabel("Max exposure: —")
+        self._preview_levels_label = QLabel("Levels: 0")
+        metrics_layout.addWidget(self._preview_capital_label)
+        metrics_layout.addWidget(self._preview_exposure_label)
+        metrics_layout.addStretch()
+        metrics_layout.addWidget(self._preview_levels_label)
+        layout.addLayout(metrics_layout)
         group.setLayout(layout)
         return group
 
@@ -272,6 +301,7 @@ class PairWorkspaceTab(QWidget):
 
     def _finish_prepare(self) -> None:
         self._data_ready = True
+        self._prepared_mid_price = round(random.uniform(95, 105), 2)
         self._market_context = self._build_market_context()
         self._analysis_summary.setText(self._format_market_summary(include_ai_note=False))
         self._ai_request_card.hide()
@@ -294,17 +324,20 @@ class PairWorkspaceTab(QWidget):
         if period != "24h" or quality != "Deep":
             self._ai_request_card.show()
             self._analysis_summary.setText(self._format_market_summary(include_ai_note=False))
-            self._plan_preview.setText("Awaiting additional data request resolution.")
+            self._plan_preview_status.setText("Awaiting additional data request resolution.")
+            self._plan_preview_table.setRowCount(0)
+            self._preview_capital_label.setText("Estimated capital usage: —")
+            self._preview_exposure_label.setText("Max exposure: —")
+            self._preview_levels_label.setText("Levels: 0")
             self._set_state(PairRunState.NEED_MORE_DATA)
             self._log_event("AI requested more data (demo).")
             return
         self._ai_request_card.hide()
-        self._plan_preview.setText(
-            "Plan preview: Grid MM, 12 grids, 0.35% step, budget 500 USDT.",
-        )
+        self._plan_preview_status.setText("Plan preview ready.")
         self._analysis_summary.setText(self._format_market_summary(include_ai_note=True))
         self._set_state(PairRunState.PLAN_READY)
         self._log_event("AI plan ready.")
+        self._rebuild_plan_preview(reason="built")
 
     def _is_plan_applied(self) -> bool:
         canonical_state = self._canonical_state(self._state)
@@ -354,6 +387,7 @@ class PairWorkspaceTab(QWidget):
             return
         self._user_touched.add(field_key)
         self._mark_field_state(field_key, "user")
+        self._rebuild_plan_preview(reason="strategy_edit")
 
     def _reset_strategy_to_ai(self) -> None:
         if not self._ai_values:
@@ -384,6 +418,7 @@ class PairWorkspaceTab(QWidget):
         self._reset_ai_button.setEnabled(True)
         self._set_state(PairRunState.APPLIED)
         self._log_event("[AI] Plan applied -> strategy populated")
+        self._rebuild_plan_preview(reason="built")
 
     def _confirm_start(self) -> None:
         self._set_state(PairRunState.WAIT_CONFIRM)
@@ -467,3 +502,96 @@ class PairWorkspaceTab(QWidget):
     def _log_event(self, message: str) -> None:
         self._logs_panel.append(message)
         self._logger.info("%s | %s", self.symbol, message)
+
+    def _rebuild_plan_preview(self, reason: str) -> None:
+        mid_price = self._prepared_mid_price or 100.0
+        budget = self._budget_input.value()
+        grid_count = self._grid_count_input.value()
+        range_low_pct = self._range_low_input.value()
+        range_high_pct = self._range_high_input.value()
+        if budget <= 0:
+            budget = 1000.0
+        if grid_count <= 0:
+            grid_count = 10
+        if range_low_pct <= 0:
+            range_low_pct = 1.0
+        if range_high_pct <= 0:
+            range_high_pct = 1.0
+        levels = self._build_demo_levels(
+            mid_price=mid_price,
+            grid_count=grid_count,
+            range_low_pct=range_low_pct,
+            range_high_pct=range_high_pct,
+            budget=budget,
+        )
+        self._plan_preview_table.setRowCount(len(levels))
+        for row, level in enumerate(levels):
+            for col, value in enumerate(
+                [level["side"], level["price"], level["qty"], level["pct_from_mid"]],
+            ):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                else:
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+                self._plan_preview_table.setItem(row, col, item)
+
+        buy_levels = [level for level in levels if level["side"] == "BUY"]
+        estimated_capital = sum(level["quote"] for level in buy_levels)
+        self._preview_capital_label.setText(f"Estimated capital usage: {estimated_capital:.2f} USDT")
+        self._preview_exposure_label.setText(f"Max exposure: {budget:.2f} USDT")
+        self._preview_levels_label.setText(f"Levels: {len(levels)}")
+
+        if reason == "built":
+            self._log_event(f"[PLAN] Preview built | levels={len(levels)} mid={mid_price:.2f}")
+        elif reason == "strategy_edit":
+            self._log_event("[PLAN] Preview updated from strategy edits")
+
+    def _build_demo_levels(
+        self,
+        mid_price: float,
+        grid_count: int,
+        range_low_pct: float,
+        range_high_pct: float,
+        budget: float,
+    ) -> list[dict[str, float | str]]:
+        low_price = mid_price * (1 - range_low_pct / 100)
+        high_price = mid_price * (1 + range_high_pct / 100)
+        buy_count = grid_count // 2
+        sell_count = grid_count - buy_count
+        per_level_quote = budget / grid_count
+        levels: list[dict[str, float | str]] = []
+
+        if buy_count:
+            buy_step = (mid_price - low_price) / (buy_count + 1)
+            for idx in range(buy_count):
+                price = low_price + buy_step * (idx + 1)
+                qty = per_level_quote / price
+                pct = (price - mid_price) / mid_price * 100
+                levels.append(
+                    {
+                        "side": "BUY",
+                        "price": f"{price:.4f}",
+                        "qty": f"{qty:.6f}",
+                        "pct_from_mid": f"{pct:.2f}%",
+                        "quote": per_level_quote,
+                    },
+                )
+
+        if sell_count:
+            sell_step = (high_price - mid_price) / (sell_count + 1)
+            for idx in range(sell_count):
+                price = mid_price + sell_step * (idx + 1)
+                qty = per_level_quote / price
+                pct = (price - mid_price) / mid_price * 100
+                levels.append(
+                    {
+                        "side": "SELL",
+                        "price": f"{price:.4f}",
+                        "qty": f"{qty:.6f}",
+                        "pct_from_mid": f"{pct:.2f}%",
+                        "quote": per_level_quote,
+                    },
+                )
+
+        return levels
