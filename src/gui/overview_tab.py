@@ -234,12 +234,19 @@ class OverviewTab(QWidget):
             self._logger.info("AI self-check skipped (missing OpenAI key).")
             return
         self._ai_status_label.setText("AI: CHECKING")
-        client = OpenAIClient(
-            api_key=self._app_state.openai_api_key,
-            model=self._app_state.openai_model,
-            timeout_s=25.0,
-            retries=1,
-        )
+        try:
+            client = OpenAIClient(
+                api_key=self._app_state.openai_api_key,
+                model=self._app_state.openai_model,
+                timeout_s=25.0,
+                retries=1,
+            )
+        except RuntimeError as exc:
+            self._app_state.ai_connected = False
+            self._app_state.ai_checked = True
+            self._logger.error("AI self-check failed: %s", exc)
+            self._set_ai_status()
+            return
         worker = _Worker(lambda: asyncio.run(client.self_check()))
         worker.signals.success.connect(self._handle_ai_self_check_success)
         worker.signals.error.connect(self._handle_ai_self_check_error)
