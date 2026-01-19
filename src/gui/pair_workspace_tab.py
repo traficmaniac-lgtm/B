@@ -28,9 +28,10 @@ from PySide6.QtWidgets import (
 
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
-from src.gui.models.pair_state import PairRunState
+from src.gui.models.pair_state import BotState, PairState
 from src.gui.widgets.pair_logs_panel import PairLogsPanel
 from src.gui.widgets.pair_topbar import PairTopBar
+from src.services.price_hub import PriceHub
 
 
 @dataclass
@@ -53,14 +54,22 @@ class MarketContext:
 
 
 class PairWorkspaceTab(QWidget):
-    def __init__(self, symbol: str, app_state: AppState, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        app_state: AppState,
+        price_hub: PriceHub | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.symbol = symbol
         self._app_state = app_state
+        self._price_hub = price_hub
         self._logger = get_logger(f"gui.pair_workspace.{symbol.lower()}")
 
-        self._state = PairRunState.IDLE
+        self._pair_state = PairState()
         self._data_ready = False
+        self._plan_applied = False
         self._market_context: MarketContext | None = None
         self._prepared_mid_price: float | None = None
         self._tick_timer = QTimer(self)
@@ -82,9 +91,13 @@ class PairWorkspaceTab(QWidget):
 
         self._connect_signals()
         self.update_controls_by_state()
+        if self._price_hub is not None:
+            self._price_hub.price_updated.connect(self._handle_price_update)
 
     def shutdown(self) -> None:
         self._tick_timer.stop()
+        if self._price_hub is not None:
+            self._price_hub.price_updated.disconnect(self._handle_price_update)
 
     def _connect_signals(self) -> None:
         self._topbar.prepare_button.clicked.connect(self._prepare_data)
@@ -294,18 +307,25 @@ class PairWorkspaceTab(QWidget):
         return "\n".join(lines)
 
     def _prepare_data(self) -> None:
-        self._set_state(PairRunState.PREPARING)
+        self._data_ready = False
+        self._plan_applied = False
+        self._set_state(BotState.PREPARING_DATA, reason="prepare_data")
         self._log_event("Prepare data requested.")
         self._analysis_summary.setText(self._preparing_summary())
-        QTimer.singleShot(700, self._finish_prepare)
+        delay_ms = random.randint(300, 800)
+        QTimer.singleShot(delay_ms, self._finish_prepare)
 
     def _finish_prepare(self) -> None:
         self._data_ready = True
         self._prepared_mid_price = round(random.uniform(95, 105), 2)
         self._market_context = self._build_market_context()
-        self._analysis_summary.setText(self._format_market_summary(include_ai_note=False))
+        period = self._topbar.period_combo.currentText()
+        quality = self._topbar.quality_combo.currentText()
+        self._analysis_summary.setText(
+            f"Prepared demo datapack ({self.symbol}, {period}, {quality})."
+        )
         self._ai_request_card.hide()
-        self._set_state(PairRunState.DATA_READY)
+        self._set_state(BotState.DATA_READY, reason="prepare_complete")
         self._log_event("Prepared data pack (demo).")
 
     def _analyze(self) -> None:
@@ -313,40 +333,23 @@ class PairWorkspaceTab(QWidget):
             QMessageBox.warning(self, "No data", "Prepare data before AI analysis.")
             self._log_event("AI analyze requested without data.")
             return
-        self._set_state(PairRunState.ANALYZING)
+        self._set_state(BotState.ANALYZING, reason="ai_analyze")
         self._log_event("AI analysis started.")
         self._analysis_summary.setText(self._analyzing_summary())
-        QTimer.singleShot(700, self._finish_analysis)
+        delay_ms = random.randint(500, 1200)
+        QTimer.singleShot(delay_ms, self._finish_analysis)
 
     def _finish_analysis(self) -> None:
-        period = self._topbar.period_combo.currentText()
-        quality = self._topbar.quality_combo.currentText()
-        if period != "24h" or quality != "Deep":
-            self._ai_request_card.show()
-            self._analysis_summary.setText(self._format_market_summary(include_ai_note=False))
-            self._plan_preview_status.setText("Awaiting additional data request resolution.")
-            self._plan_preview_table.setRowCount(0)
-            self._preview_capital_label.setText("Estimated capital usage: —")
-            self._preview_exposure_label.setText("Max exposure: —")
-            self._preview_levels_label.setText("Levels: 0")
-            self._set_state(PairRunState.NEED_MORE_DATA)
-            self._log_event("AI requested more data (demo).")
-            return
         self._ai_request_card.hide()
-        self._plan_preview_status.setText("Plan preview ready.")
         self._analysis_summary.setText(self._format_market_summary(include_ai_note=True))
-        self._set_state(PairRunState.PLAN_READY)
+        self._plan_preview_status.setText("AI analysis complete. Apply plan to populate strategy.")
+        self._set_state(BotState.PLAN_READY, reason="analysis_complete")
         self._log_event("AI plan ready.")
+        self._append_chat("AI", "Demo analysis complete. Click Apply Plan.")
         self._rebuild_plan_preview(reason="built")
 
     def _is_plan_applied(self) -> bool:
-        canonical_state = self._canonical_state(self._state)
-        return canonical_state in {
-            PairRunState.APPLIED,
-            PairRunState.RUNNING,
-            PairRunState.PAUSED,
-            PairRunState.STOPPED,
-        }
+        return self._plan_applied
 
     def _set_field_value(self, field_key: str, value: object, origin: str = "ai") -> None:
         field = self._strategy_fields[field_key]
@@ -416,40 +419,42 @@ class PairWorkspaceTab(QWidget):
         self._set_field_value("range_low_pct", demo_plan.range_low_pct, origin="ai")
         self._set_field_value("range_high_pct", demo_plan.range_high_pct, origin="ai")
         self._reset_ai_button.setEnabled(True)
-        self._set_state(PairRunState.APPLIED)
+        self._plan_applied = True
+        self._set_state(BotState.PLAN_READY, reason="apply_plan")
         self._log_event("[AI] Plan applied -> strategy populated")
         self._rebuild_plan_preview(reason="built")
 
     def _confirm_start(self) -> None:
-        self._set_state(PairRunState.WAIT_CONFIRM)
-        confirm = QMessageBox.question(
-            self,
-            "Confirm start",
-            f"Start {'dry-run ' if self._topbar.dry_run_toggle.isChecked() else ''}execution for {self.symbol}?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
-            self._set_state(PairRunState.APPLIED)
-            self._log_event("Run start canceled.")
+        if self._pair_state.state == BotState.PAUSED:
+            self._tick_timer.start()
+            self._set_state(BotState.RUNNING, reason="resume")
+            self._log_event("RUNNING (resume)")
             return
         self._tick_count = 0
         self._tick_timer.start()
-        self._set_state(PairRunState.RUNNING)
-        self._log_event("Execution started.")
+        self._set_state(BotState.RUNNING, reason="confirm_start")
+        if self._topbar.dry_run_toggle.isChecked():
+            self._log_event("RUNNING (dry-run)")
+        else:
+            self._log_event("RUNNING")
 
     def _toggle_pause(self) -> None:
-        if self._state == PairRunState.RUNNING:
+        if self._pair_state.state == BotState.RUNNING:
             self._tick_timer.stop()
-            self._set_state(PairRunState.PAUSED)
+            self._set_state(BotState.PAUSED, reason="pause")
             self._log_event("Execution paused.")
-        elif self._state == PairRunState.PAUSED:
+        elif self._pair_state.state == BotState.PAUSED:
             self._tick_timer.start()
-            self._set_state(PairRunState.RUNNING)
+            self._set_state(BotState.RUNNING, reason="resume")
             self._log_event("Execution resumed.")
 
     def _stop_run(self) -> None:
         self._tick_timer.stop()
-        self._set_state(PairRunState.STOPPED)
+        self._tick_count = 0
+        self._data_ready = False
+        self._plan_applied = False
+        self._analysis_summary.setText(self._idle_summary())
+        self._set_state(BotState.IDLE, reason="stop")
         self._log_event("Execution stopped.")
 
     def _log_tick(self) -> None:
@@ -467,37 +472,33 @@ class PairWorkspaceTab(QWidget):
     def _append_chat(self, sender: str, message: str) -> None:
         self._chat_history.appendPlainText(f"{sender}: {message}")
 
-    def _set_state(self, state: PairRunState) -> None:
-        self._state = state
-        canonical_state = self._canonical_state(state)
-        self._topbar.state_label.setText(f"State: {canonical_state.value}")
+    def _handle_price_update(self, symbol: str, price: float, source: str, age_ms: int) -> None:
+        if symbol != self.symbol:
+            return
+        self._topbar.price_label.setText(f"Price: {price:.6f} ({source}, {age_ms} ms)")
+
+    def _set_state(self, state: BotState, reason: str = "") -> None:
+        previous = self._pair_state.state
+        if previous == state:
+            return
+        self._pair_state.set_state(state, reason=reason)
+        self._topbar.state_label.setText(f"State: {self._pair_state.state.value}")
+        transition = f"state: {previous.value} -> {self._pair_state.state.value}"
+        if reason:
+            transition += f" (reason={reason})"
+        self._log_event(transition)
         self.update_controls_by_state()
 
-    def _canonical_state(self, state: PairRunState) -> PairRunState:
-        if state in {PairRunState.READY, PairRunState.NEED_MORE_DATA}:
-            return PairRunState.DATA_READY
-        if state == PairRunState.WAIT_CONFIRM:
-            return PairRunState.APPLIED
-        return state
-
     def update_controls_by_state(self) -> None:
-        canonical_state = self._canonical_state(self._state)
-        self._topbar.prepare_button.setEnabled(
-            canonical_state
-            in {
-                PairRunState.IDLE,
-                PairRunState.DATA_READY,
-                PairRunState.PLAN_READY,
-                PairRunState.APPLIED,
-                PairRunState.STOPPED,
-                PairRunState.ERROR,
-            }
+        state = self._pair_state.state
+        self._topbar.prepare_button.setEnabled(state in {BotState.IDLE, BotState.ERROR})
+        self._topbar.analyze_button.setEnabled(state == BotState.DATA_READY)
+        self._topbar.apply_button.setEnabled(state == BotState.PLAN_READY)
+        self._topbar.confirm_button.setEnabled(
+            (state == BotState.PLAN_READY and self._plan_applied) or state == BotState.PAUSED
         )
-        self._topbar.analyze_button.setEnabled(canonical_state == PairRunState.DATA_READY)
-        self._topbar.apply_button.setEnabled(canonical_state == PairRunState.PLAN_READY)
-        self._topbar.confirm_button.setEnabled(canonical_state == PairRunState.APPLIED)
-        self._topbar.pause_button.setEnabled(canonical_state == PairRunState.RUNNING)
-        self._topbar.stop_button.setEnabled(canonical_state in {PairRunState.RUNNING, PairRunState.PAUSED})
+        self._topbar.pause_button.setEnabled(state == BotState.RUNNING)
+        self._topbar.stop_button.setEnabled(state in {BotState.RUNNING, BotState.PAUSED})
 
     def _log_event(self, message: str) -> None:
         self._logs_panel.append(message)

@@ -24,7 +24,7 @@ def test_config_loads_defaults() -> None:
 def test_imports() -> None:
     from src.app.main import main
     from src.gui.main_window import MainWindow
-    from src.gui.models.pair_state import PairRunState
+    from src.gui.models.pair_state import BotState, PairState
     from src.gui.overview_tab import OverviewTab
     from src.gui.pair_workspace_tab import PairWorkspaceTab
 
@@ -32,7 +32,8 @@ def test_imports() -> None:
     assert MainWindow.__name__ == "MainWindow"
     assert OverviewTab.__name__ == "OverviewTab"
     assert PairWorkspaceTab.__name__ == "PairWorkspaceTab"
-    assert PairRunState.__name__ == "PairRunState"
+    assert BotState.__name__ == "BotState"
+    assert PairState.__name__ == "PairState"
 
 
 @pytest.mark.skipif(not PYSIDE_AVAILABLE, reason="PySide6 dependencies unavailable")

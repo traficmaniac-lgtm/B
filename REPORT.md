@@ -20,3 +20,10 @@
 - Merged dashboard/markets into an Overview tab with status cards and demo pair table.
 - Replaced settings tab with a modal Settings dialog, persisted to config.user.yaml.
 - Added Pair Workspace tabs with a state machine, pipeline controls, AI chat placeholder, and local logs.
+
+### Stage 3.0.1 - Bot workspace state machine + bot-only price updates
+- Implemented a strict bot workspace state machine with staged controls and transition logging.
+- Added demo data prep/analyze/apply flow and resume-ready confirm start in the bot UI.
+- Stopped Overview from streaming prices; live updates now run only for open bot tabs.
+- Added a price hub that registers/unregisters symbols on tab open/close.
+- Added PairState transition test coverage.

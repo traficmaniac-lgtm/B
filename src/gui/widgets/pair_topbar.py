@@ -20,6 +20,10 @@ class PairTopBar(QWidget):
         self.symbol_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.symbol_label)
 
+        self.price_label = QLabel("Price: --")
+        self.price_label.setStyleSheet("color: #4b5563;")
+        layout.addWidget(self.price_label)
+
         self.period_combo = QComboBox()
         self.period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
         self.period_combo.setCurrentText(default_period)

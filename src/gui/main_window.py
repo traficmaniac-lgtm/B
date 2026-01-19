@@ -21,6 +21,7 @@ from src.gui.overview_tab import OverviewTab
 from src.gui.pair_workspace_tab import PairWorkspaceTab
 from src.gui.settings_dialog import SettingsDialog
 from src.gui.widgets.log_dock import LogDock
+from src.services.price_hub import PriceHub
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +48,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         self._pair_tabs: dict[str, PairWorkspaceTab] = {}
+        self._price_hub = PriceHub(config=self._config, app_state=self._app_state, parent=self)
 
         self._log_dock = LogDock(self)
         self._log_dock.handler.setFormatter(
@@ -77,10 +79,11 @@ class MainWindow(QMainWindow):
         if symbol in self._pair_tabs:
             self._tabs.setCurrentWidget(self._pair_tabs[symbol])
             return
-        tab = PairWorkspaceTab(symbol=symbol, app_state=self._app_state)
+        tab = PairWorkspaceTab(symbol=symbol, app_state=self._app_state, price_hub=self._price_hub)
         self._pair_tabs[symbol] = tab
         index = self._tabs.addTab(tab, f"Bot: {symbol}")
         self._tabs.setCurrentIndex(index)
+        self._price_hub.register_symbol(symbol)
 
     def _build_status_left(self) -> QLabel:
         return QLabel("Ready")
@@ -126,10 +129,12 @@ class MainWindow(QMainWindow):
             symbol = widget.symbol
             widget.shutdown()
             self._pair_tabs.pop(symbol, None)
+            self._price_hub.unregister_symbol(symbol)
         self._tabs.removeTab(index)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
         self._overview_tab.shutdown()
         for tab in self._pair_tabs.values():
             tab.shutdown()
+        self._price_hub.shutdown()
         super().closeEvent(event)
