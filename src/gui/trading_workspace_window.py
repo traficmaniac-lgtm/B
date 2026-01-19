@@ -24,6 +24,7 @@ from src.ai.models import AiResponseEnvelope, fallback_do_not_trade
 from src.ai.openai_client import OpenAIClient
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
+from src.gui.models.pair_workspace_state import PairWorkspaceState
 from src.gui.pair_workspace_tab import PairWorkspaceTab
 
 
@@ -51,17 +52,20 @@ class TradingWorkspaceWindow(QMainWindow):
     def __init__(
         self,
         pair_workspace: PairWorkspaceTab,
+        pair_state: PairWorkspaceState,
         app_state: AppState,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._pair_workspace = pair_workspace
+        self._pair_state = pair_state
         self._app_state = app_state
         self._logger = get_logger(f"gui.trading_workspace.{pair_workspace.symbol.lower()}")
         self._thread_pool = QThreadPool.globalInstance()
         self._observer_in_flight = False
         self._last_ai_response: AiResponseEnvelope | None = None
         self._last_ai_raw: str | None = None
+        self._orders_source_logged = False
 
         self.setWindowTitle(f"Trading Workspace — {pair_workspace.symbol}")
         self.resize(1200, 820)
@@ -113,12 +117,25 @@ class TradingWorkspaceWindow(QMainWindow):
 
         orders_box = QGroupBox("Orders")
         orders_layout = QVBoxLayout()
+        self._orders_status = QLabel("No active plan/orders.")
+        orders_layout.addWidget(self._orders_status)
         self._orders_table = QTableWidget(0, 4)
         self._orders_table.setHorizontalHeaderLabels(["Side", "Price", "Qty", "% from mid"])
         self._orders_table.horizontalHeader().setStretchLastSection(True)
         self._orders_table.setEditTriggers(QTableWidget.NoEditTriggers)
         orders_layout.addWidget(self._orders_table)
         orders_box.setLayout(orders_layout)
+
+        plan_box = QGroupBox("Plan preview")
+        plan_layout = QVBoxLayout()
+        self._plan_status = QLabel("No active plan/orders.")
+        plan_layout.addWidget(self._plan_status)
+        self._plan_table = QTableWidget(0, 4)
+        self._plan_table.setHorizontalHeaderLabels(["Side", "Price", "Qty", "% from mid"])
+        self._plan_table.horizontalHeader().setStretchLastSection(True)
+        self._plan_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        plan_layout.addWidget(self._plan_table)
+        plan_box.setLayout(plan_layout)
 
         position_box = QGroupBox("Position / PnL")
         position_layout = QVBoxLayout()
@@ -136,6 +153,7 @@ class TradingWorkspaceWindow(QMainWindow):
 
         layout.addWidget(runtime_box)
         layout.addWidget(orders_box)
+        layout.addWidget(plan_box)
         layout.addWidget(position_box)
         layout.addWidget(risk_box)
         layout.addStretch()
@@ -206,7 +224,18 @@ class TradingWorkspaceWindow(QMainWindow):
             )
         else:
             self._runtime_datapack.setText("Datapack: -")
-        self._render_orders(snapshot["open_orders"])
+        if not self._orders_source_logged:
+            self._logger.info("orders_source=pair_state symbol=%s", self._pair_state.symbol)
+            self._orders_source_logged = True
+        plan_levels = list(self._pair_state.plan_levels)
+        open_orders = list(self._pair_state.open_orders)
+        if self._pair_state.plan_source == "demo":
+            if self._pair_state.demo_source_symbol != self._pair_state.symbol:
+                self._logger.info("Demo plan blocked for symbol=%s", self._pair_state.symbol)
+            plan_levels = []
+            open_orders = []
+        self._render_orders(open_orders)
+        self._render_plan_preview(plan_levels)
         self._position_label.setText(f"Position: {snapshot['position']['status']}")
         self._pnl_label.setText(f"PnL: {snapshot['position']['pnl']:.2f} USDT")
         risk = snapshot["risk"]
@@ -222,11 +251,27 @@ class TradingWorkspaceWindow(QMainWindow):
 
     def _render_orders(self, orders: list[dict[str, str]]) -> None:
         self._orders_table.setRowCount(len(orders))
+        if orders:
+            self._orders_status.setText("Active orders loaded.")
+        else:
+            self._orders_status.setText("No active plan/orders.")
         for row, order in enumerate(orders):
             for col, key in enumerate(("side", "price", "qty", "pct_from_mid")):
                 item = QTableWidgetItem(order.get(key, "--"))
                 item.setTextAlignment(Qt.AlignCenter)
                 self._orders_table.setItem(row, col, item)
+
+    def _render_plan_preview(self, plan_levels: list[dict[str, str]]) -> None:
+        self._plan_table.setRowCount(len(plan_levels))
+        if plan_levels:
+            self._plan_status.setText("Plan levels loaded.")
+        else:
+            self._plan_status.setText("No active plan/orders.")
+        for row, level in enumerate(plan_levels):
+            for col, key in enumerate(("side", "price", "qty", "pct_from_mid")):
+                item = QTableWidgetItem(level.get(key, "--"))
+                item.setTextAlignment(Qt.AlignCenter)
+                self._plan_table.setItem(row, col, item)
 
     def _update_observer_interval(self, interval_sec: int | None = None) -> None:
         if interval_sec is None:
