@@ -28,7 +28,7 @@ class MainWindow(QMainWindow):
 
         self._tabs = QTabWidget()
         self._tabs.addTab(DashboardTab(), "Dashboard")
-        self._tabs.addTab(MarketsTab(), "Markets")
+        self._tabs.addTab(MarketsTab(app_state), "Markets")
         self._tabs.addTab(BotTab(), "Bot")
         self._tabs.addTab(
             SettingsTab(

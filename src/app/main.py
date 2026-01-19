@@ -20,6 +20,12 @@ def _load_app_state(config_env: str, config_log_level: str, root_path: Path) -> 
         log_level=config_log_level,
         config_path=default_config_path,
         show_logs=True,
+        binance_api_key="",
+        binance_api_secret="",
+        openai_api_key="",
+        default_period="4h",
+        default_quality="Standard",
+        allow_ai_more_data=True,
     )
     user_config_path = root_path / "config.user.yaml"
     return AppState.load(user_config_path, defaults)
