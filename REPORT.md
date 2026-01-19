@@ -40,3 +40,8 @@
 - Added minute timeframes to period dropdowns and fallback warning when minute data is unavailable.
 - Introduced Trading Workspace with runtime panels, AI Observer, and user-approved action gating.
 - Added AI protocol fallback helper and tests for invalid JSON DO_NOT_TRADE handling.
+
+### Stage 4.0 - Trade Ready Mode GUI + AI mock flow
+- Replaced the Advanced AI placeholder with the Trade Ready Mode window and state machine.
+- Added market context, analysis controls, AI summary, trade variants, chat, and history zones.
+- Wired Overview double-click to pass last price into the Trade Ready Mode entry point.

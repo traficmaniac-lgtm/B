@@ -131,6 +131,12 @@ class _PairsTableModel(QAbstractTableModel):
             return self._pairs[row].symbol
         return None
 
+    def last_price_for_symbol(self, symbol: str) -> str | None:
+        price = self._price_data.get(symbol, ("--", "--", "--"))[0]
+        if price in {"--", ""}:
+            return None
+        return price
+
 
 class _PairsFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent: QObject | None = None) -> None:
@@ -170,7 +176,7 @@ class OverviewTab(QWidget):
         self,
         config: Config,
         app_state: AppState,
-        on_open_pair: Callable[[str], None],
+        on_open_pair: Callable[[str, str | None], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -346,7 +352,8 @@ class OverviewTab(QWidget):
         source_index = self._proxy_model.mapToSource(proxy_index)
         symbol = self._pairs_model.symbol_for_row(source_index.row())
         if symbol:
-            self._on_open_pair(symbol)
+            last_price = self._pairs_model.last_price_for_symbol(symbol)
+            self._on_open_pair(symbol, last_price)
 
     def _run_self_check(self) -> None:
         worker = _Worker(self._http_client.get_time)

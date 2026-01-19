@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from src.core.config import Config
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
+from src.gui.models.market_state import MarketState
 from src.gui.overview_tab import OverviewTab
 from src.gui.pair_mode_manager import PairModeManager
 from src.gui.pair_workspace_tab import PairWorkspaceTab
@@ -37,7 +38,12 @@ class MainWindow(QMainWindow):
 
         self._tabs = QTabWidget()
         self._tabs.setTabsClosable(True)
-        self._pair_mode_manager = PairModeManager(open_trading_workspace=self.open_pair_tab, parent=self)
+        self._market_state = MarketState(zero_fee_symbols=set(self._app_state.zero_fee_symbols))
+        self._pair_mode_manager = PairModeManager(
+            open_trading_workspace=self.open_pair_tab,
+            market_state=self._market_state,
+            parent=self,
+        )
         self._overview_tab = OverviewTab(
             self._config,
             app_state=self._app_state,
