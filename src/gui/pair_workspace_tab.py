@@ -552,11 +552,11 @@ class PairWorkspaceTab(QWidget):
         return symbol, self._app_state.default_quote
 
     def _extract_budget_value(self, message: str) -> float | None:
-        pattern = r\"(?:\\bbudget\\b|\\bбюджет\\b)\\s*([0-9]+(?:[\\.,][0-9]+)?)\"
+        pattern = r"(?:\bbudget\b|\bбюджет\b)\s*([0-9]+(?:[\.,][0-9]+)?)"
         match = re.search(pattern, message.lower())
         if not match:
             return None
-        raw = match.group(1).replace(\",\", \".\")
+        raw = match.group(1).replace(",", ".")
         try:
             return float(raw)
         except ValueError:
