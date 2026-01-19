@@ -36,6 +36,7 @@ from src.ai.models import (
     AiAnalysisResult,
     AiLevel,
     AiResponseEnvelope,
+    AiTradeOption,
     AiStrategyPatch,
 )
 from src.ai.openai_client import OpenAIClient
@@ -134,8 +135,12 @@ class PairWorkspaceTab(QWidget):
         self._last_ai_analysis: AiAnalysisResult | None = None
         self._last_datapack: dict[str, Any] | None = None
         self._pending_patch: AiStrategyPatch | None = None
+        self._last_strategy_patch: AiStrategyPatch | None = None
+        self._last_trade_options: list[AiTradeOption] = []
+        self._latest_ai_levels: list[AiLevel] = []
         self._ai_block_confirm = False
         self._trading_windows: list[QWidget] = []
+        self._runtime_started_at: datetime | None = None
 
         layout = QVBoxLayout()
         self._topbar = PairTopBar(
@@ -210,13 +215,43 @@ class PairWorkspaceTab(QWidget):
         self._analysis_summary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self._analysis_summary)
 
-        self._ai_request_card = QGroupBox("AI requested more data")
+        self._ai_request_card = QGroupBox("AI запросил больше данных")
         request_layout = QVBoxLayout()
-        self._ai_request_label = QLabel("Adjust period to 24h and quality to Deep to proceed.")
+        self._ai_request_label = QLabel("Для продолжения выберите период 24h и качество Deep.")
         request_layout.addWidget(self._ai_request_label)
         self._ai_request_card.setLayout(request_layout)
         self._ai_request_card.hide()
         layout.addWidget(self._ai_request_card)
+
+        self._trade_options_card = QGroupBox("ZERO_FEE варианты сделок")
+        trade_layout = QVBoxLayout()
+        self._trade_options_table = QTableWidget(0, 10)
+        self._trade_options_table.setHorizontalHeaderLabels(
+            [
+                "Название",
+                "Вход",
+                "Выход",
+                "TP %",
+                "Стоп %",
+                "Профит %",
+                "Профит USDT",
+                "ETA (мин)",
+                "Уверенность",
+                "Риск",
+            ]
+        )
+        self._trade_options_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._trade_options_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._trade_options_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._trade_options_table.verticalHeader().setVisible(False)
+        trade_layout.addWidget(self._trade_options_table)
+        self._apply_best_option_button = QPushButton("Применить лучший вариант")
+        self._apply_best_option_button.setEnabled(False)
+        self._apply_best_option_button.clicked.connect(self._apply_best_trade_option)
+        trade_layout.addWidget(self._apply_best_option_button)
+        self._trade_options_card.setLayout(trade_layout)
+        self._trade_options_card.hide()
+        layout.addWidget(self._trade_options_card)
 
         group.setLayout(layout)
         group.setMinimumHeight(180)
@@ -372,7 +407,7 @@ class PairWorkspaceTab(QWidget):
         form.addRow("Min change rebuild %", self._min_change_rebuild_input)
         form.addRow("Volatility mode", self._volatility_mode_input)
 
-        self._reset_ai_button = QPushButton("Reset to AI")
+        self._reset_ai_button = QPushButton("Сбросить к AI")
         self._reset_ai_button.setEnabled(False)
         self._reset_ai_button.clicked.connect(self._reset_strategy_to_ai)
 
@@ -482,7 +517,7 @@ class PairWorkspaceTab(QWidget):
         return group
 
     def _build_chat_panel(self) -> QWidget:
-        panel = QGroupBox("AI Chat")
+        panel = QGroupBox("AI чат")
         layout = QVBoxLayout()
         self._chat_history = QTextEdit()
         self._chat_history.setReadOnly(True)
@@ -491,7 +526,7 @@ class PairWorkspaceTab(QWidget):
 
         input_row = QHBoxLayout()
         self._chat_input = QLineEdit()
-        self._chat_input.setPlaceholderText("Ask AI to adjust strategy...")
+        self._chat_input.setPlaceholderText("Попросите AI скорректировать стратегию...")
         self._chat_send_button = QPushButton("Send")
         self._chat_apply_button = QPushButton("Apply Patch")
         self._chat_apply_button.setEnabled(False)
@@ -507,13 +542,13 @@ class PairWorkspaceTab(QWidget):
         return panel
 
     def _idle_summary(self) -> str:
-        return "No data prepared.\nClick “Prepare Data” to collect market data."
+        return "Данные не подготовлены.\nНажмите «Prepare Data», чтобы собрать рынок."
 
     def _preparing_summary(self) -> str:
-        return "Preparing market data…"
+        return "Подготовка рыночных данных…"
 
     def _analyzing_summary(self) -> str:
-        return "Market data ready.\nAI analysis in progress…"
+        return "Данные готовы.\nИдет анализ AI…"
 
     def _build_market_context(self) -> MarketContext:
         market_type = random.choice(["Range", "Trend", "Mixed"])
@@ -540,21 +575,20 @@ class PairWorkspaceTab(QWidget):
         ]
         if include_ai_note:
             ai_note = random.choice(["Grid suitable", "Grid risky", "Not recommended"])
-            lines.append(f"AI note: {ai_note}")
+            lines.append(f"AI заметка: {ai_note}")
         return "\n".join(lines)
 
     def _format_ai_summary(self, envelope: AiResponseEnvelope, analysis: AiAnalysisResult) -> str:
         lines = [
-            "AI analysis summary:",
-            f"Status: {envelope.status}",
+            "Сводка AI анализа:",
+            f"Статус: {analysis.status}",
         ]
-        if envelope.confidence is not None:
-            lines.append(f"Confidence: {envelope.confidence:.2f}")
-        if envelope.reason_codes:
-            lines.append(f"Reason codes: {', '.join(envelope.reason_codes)}")
-        lines.append(f"Strategy: {analysis.strategy.strategy_id}")
-        if analysis.summary_lines:
-            lines.extend(analysis.summary_lines[:3])
+        if analysis.confidence is not None:
+            lines.append(f"Уверенность: {analysis.confidence:.2f}")
+        if analysis.reason_codes:
+            lines.append(f"Причины: {', '.join(analysis.reason_codes)}")
+        if analysis.summary_ru:
+            lines.append(analysis.summary_ru)
         return "\n".join(lines)
 
     def _normalize_mode(self, mode: str) -> str:
@@ -582,6 +616,9 @@ class PairWorkspaceTab(QWidget):
             return symbol[:-4], "USDT"
         return symbol, self._app_state.default_quote
 
+    def _is_zero_fee_symbol(self) -> bool:
+        return self.symbol.upper() in {symbol.upper() for symbol in self._app_state.zero_fee_symbols}
+
     def _extract_budget_value(self, message: str) -> float | None:
         pattern = r"(?:\bbudget\b|\bбюджет\b)\s*([0-9]+(?:[\.,][0-9]+)?)"
         match = re.search(pattern, message.lower())
@@ -595,7 +632,10 @@ class PairWorkspaceTab(QWidget):
 
     def _collect_current_strategy(self) -> dict[str, Any]:
         levels: list[dict[str, Any]] = []
-        if self._last_ai_analysis and self._last_ai_analysis.strategy.levels:
+        source_levels = self._latest_ai_levels
+        if not source_levels and self._workspace_state.plan_levels:
+            source_levels = self._coerce_levels(self._workspace_state.plan_levels)
+        if source_levels:
             levels = [
                 {
                     "side": level.side,
@@ -603,7 +643,7 @@ class PairWorkspaceTab(QWidget):
                     "qty": level.qty,
                     "pct_from_mid": level.pct_from_mid,
                 }
-                for level in self._last_ai_analysis.strategy.levels
+                for level in source_levels
             ]
         return {
             "strategy_id": self._strategy_id_input.currentText(),
@@ -629,27 +669,54 @@ class PairWorkspaceTab(QWidget):
     def _render_ai_actions(self, actions: list[str]) -> None:
         if not actions:
             return
-        self._append_chat("AI", f"Actions: {', '.join(actions)}")
-        self._log_event(f"[AI] Actions: {', '.join(actions)}")
+        self._append_chat("AI", f"Рекомендации: {', '.join(actions)}")
+        self._log_event(f"[AI] Рекомендации: {', '.join(actions)}")
 
     def _split_rules(self, text: str) -> list[str]:
         if not text:
             return []
         return [item.strip() for item in text.split(",") if item.strip()]
 
-    def _render_preview_from_ai(self, analysis: AiAnalysisResult) -> None:
-        if analysis.strategy.levels:
-            self._render_plan_preview_levels(analysis.strategy.levels)
+    def _coerce_levels(self, raw_levels: list[Any]) -> list[AiLevel]:
+        levels: list[AiLevel] = []
+        for item in raw_levels:
+            if isinstance(item, AiLevel):
+                levels.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            try:
+                levels.append(
+                    AiLevel(
+                        side=str(item.get("side", "")),
+                        price=float(item.get("price", 0)),
+                        qty=float(item.get("qty", 0)),
+                        pct_from_mid=float(item.get("pct_from_mid", 0)),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return levels
+
+    def _render_preview_from_ai(self, patch: AiStrategyPatch | None) -> None:
+        levels = []
+        if patch is not None:
+            raw_levels = patch.parameters_patch.get("levels")
+            if isinstance(raw_levels, list):
+                levels = self._coerce_levels(raw_levels)
+        if levels:
+            self._render_plan_preview_levels(levels)
         else:
             self._rebuild_plan_preview(reason="built")
 
     def _render_plan_preview_levels(self, levels: list[AiLevel]) -> None:
         if not levels:
             self._plan_preview_table.setRowCount(0)
-            self._plan_preview_status.setText("No preview levels returned by AI.")
+            self._plan_preview_status.setText("AI не вернул уровни для предпросмотра.")
             self._update_workspace_plan([], source="none")
             return
-        self._plan_preview_status.setText("AI preview levels loaded.")
+        self._latest_ai_levels = list(levels)
+        self._plan_preview_status.setText("Предпросмотр уровней от AI загружен.")
         self._plan_preview_table.setRowCount(len(levels))
         plan_levels: list[dict[str, str]] = []
         for row, level in enumerate(levels):
@@ -681,6 +748,100 @@ class PairWorkspaceTab(QWidget):
         self._preview_levels_label.setText(f"Levels: {len(levels)}")
         self._update_workspace_plan(plan_levels, source="ai")
         self._log_event(f"[PLAN] AI preview loaded | levels={len(levels)}")
+
+    def _render_trade_options(self, options: list[AiTradeOption]) -> None:
+        if not self._is_zero_fee_symbol():
+            self._trade_options_card.hide()
+            self._apply_best_option_button.setEnabled(False)
+            self._trade_options_table.setRowCount(0)
+            return
+        if not options:
+            self._trade_options_card.show()
+            self._apply_best_option_button.setEnabled(False)
+            self._trade_options_table.setRowCount(0)
+            return
+        self._trade_options_card.show()
+        self._trade_options_table.setRowCount(len(options))
+        for row, option in enumerate(options):
+            row_values = [
+                option.name_ru,
+                f"{option.entry:.6f}",
+                f"{option.exit:.6f}",
+                f"{option.tp_pct:.2f}",
+                f"{option.stop_pct:.2f}",
+                f"{option.expected_profit_pct:.2f}",
+                f"{option.expected_profit_usdt:.2f}",
+                str(option.eta_min),
+                f"{option.confidence:.2f}" if option.confidence is not None else "-",
+                option.risk_note_ru or "-",
+            ]
+            for col, value in enumerate(row_values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignCenter)
+                self._trade_options_table.setItem(row, col, item)
+        self._apply_best_option_button.setEnabled(True)
+
+    def _build_patch_from_trade_option(self, option: AiTradeOption) -> AiStrategyPatch:
+        budget = self._budget_input.value()
+        mid_price = self._prepared_mid_price or option.entry
+        qty = 0.0
+        if option.entry > 0:
+            qty = budget / option.entry
+        levels = [
+            {
+                "side": "BUY",
+                "price": option.entry,
+                "qty": qty,
+                "pct_from_mid": (option.entry - mid_price) / mid_price * 100 if mid_price else 0.0,
+            },
+            {
+                "side": "SELL",
+                "price": option.exit,
+                "qty": qty,
+                "pct_from_mid": (option.exit - mid_price) / mid_price * 100 if mid_price else 0.0,
+            },
+        ]
+        parameters_patch = {
+            "strategy_id": "RANGE_MEAN_REVERSION",
+            "budget_usdt": budget,
+            "levels": levels,
+            "grid_step_pct": max(0.1, abs(option.tp_pct) / 2),
+            "range_low_pct": max(0.1, abs(option.stop_pct)),
+            "range_high_pct": max(0.1, abs(option.tp_pct)),
+            "bias": {"buy_pct": 50, "sell_pct": 50},
+            "order_size_mode": "equal",
+            "max_orders": max(2, self._max_orders_input.value()),
+            "max_exposure_pct": self._max_exposure_input.value(),
+            "hard_stop_pct": max(0.1, abs(option.stop_pct)),
+            "cooldown_minutes": self._cooldown_input.value(),
+            "soft_stop_rules": [],
+            "kill_switch_rules": [],
+            "recheck_interval_sec": self._recheck_interval_input.value(),
+            "ai_reanalyze_interval_sec": self._ai_reanalyze_interval_input.value(),
+            "min_change_to_rebuild_pct": self._min_change_rebuild_input.value(),
+            "volatility_mode": self._volatility_mode_input.currentText(),
+        }
+        return AiStrategyPatch(parameters_patch=parameters_patch)
+
+    def _apply_best_trade_option(self) -> None:
+        if not self._last_trade_options:
+            return
+        best = max(
+            self._last_trade_options,
+            key=lambda option: (option.expected_profit_pct, option.expected_profit_usdt),
+        )
+        patch = self._last_strategy_patch or self._build_patch_from_trade_option(best)
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            f"Применить лучший вариант сделки: {best.name_ru}?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._apply_strategy_patch(patch, origin="ai")
+        self._last_strategy_patch = patch
+        self._log_event(f"[AI] Applied best trade option: {best.name_ru}")
 
     def _update_workspace_plan(
         self,
@@ -746,64 +907,62 @@ class PairWorkspaceTab(QWidget):
         self._liquidity_stats = None
         self._logger.warning("Liquidity 24h unavailable: %s", message)
 
-    def _apply_strategy_patch(self, patch: AiStrategyPatch) -> None:
-        if self._last_ai_analysis is None:
-            return
+    def _apply_strategy_patch(self, patch: AiStrategyPatch, origin: str = "ai") -> None:
         updated = self._collect_current_strategy()
         for key, value in patch.parameters_patch.items():
             updated[key] = value
-        self._set_field_value("strategy_id", updated.get("strategy_id", self._strategy_id_input.currentText()))
-        self._set_field_value("budget", updated.get("budget_usdt", self._budget_input.value()))
-        self._set_field_value("grid_step_pct", updated.get("grid_step_pct", self._grid_step_input.value()))
-        self._set_field_value("range_low_pct", updated.get("range_low_pct", self._range_low_input.value()))
-        self._set_field_value("range_high_pct", updated.get("range_high_pct", self._range_high_input.value()))
+        self._last_strategy_patch = patch
+        self._set_field_value("strategy_id", updated.get("strategy_id", self._strategy_id_input.currentText()), origin)
+        self._set_field_value("budget", updated.get("budget_usdt", self._budget_input.value()), origin)
+        self._set_field_value("grid_step_pct", updated.get("grid_step_pct", self._grid_step_input.value()), origin)
+        self._set_field_value("range_low_pct", updated.get("range_low_pct", self._range_low_input.value()), origin)
+        self._set_field_value("range_high_pct", updated.get("range_high_pct", self._range_high_input.value()), origin)
         bias = updated.get("bias", {})
         if isinstance(bias, dict):
             if "buy_pct" in bias:
-                self._set_field_value("bias_buy_pct", bias.get("buy_pct", self._bias_buy_input.value()))
+                self._set_field_value("bias_buy_pct", bias.get("buy_pct", self._bias_buy_input.value()), origin)
             if "sell_pct" in bias:
-                self._set_field_value("bias_sell_pct", bias.get("sell_pct", self._bias_sell_input.value()))
-        self._set_field_value("order_size_mode", updated.get("order_size_mode", self._order_size_mode_input.currentText()))
-        self._set_field_value("max_orders", updated.get("max_orders", self._max_orders_input.value()))
+                self._set_field_value("bias_sell_pct", bias.get("sell_pct", self._bias_sell_input.value()), origin)
         self._set_field_value(
-            "max_exposure_pct", updated.get("max_exposure_pct", self._max_exposure_input.value())
+            "order_size_mode",
+            updated.get("order_size_mode", self._order_size_mode_input.currentText()),
+            origin,
         )
-        self._set_field_value("hard_stop_pct", updated.get("hard_stop_pct", self._hard_stop_input.value()))
-        self._set_field_value("cooldown_minutes", updated.get("cooldown_minutes", self._cooldown_input.value()))
-        if "soft_stop_rules" in updated:
-            self._set_field_value("soft_stop_rules", ", ".join(updated.get("soft_stop_rules", [])))
-        if "kill_switch_rules" in updated:
-            self._set_field_value("kill_switch_rules", ", ".join(updated.get("kill_switch_rules", [])))
+        self._set_field_value("max_orders", updated.get("max_orders", self._max_orders_input.value()), origin)
         self._set_field_value(
-            "recheck_interval_sec", updated.get("recheck_interval_sec", self._recheck_interval_input.value())
+            "max_exposure_pct",
+            updated.get("max_exposure_pct", self._max_exposure_input.value()),
+            origin,
+        )
+        self._set_field_value("hard_stop_pct", updated.get("hard_stop_pct", self._hard_stop_input.value()), origin)
+        self._set_field_value("cooldown_minutes", updated.get("cooldown_minutes", self._cooldown_input.value()), origin)
+        if "soft_stop_rules" in updated:
+            self._set_field_value("soft_stop_rules", ", ".join(updated.get("soft_stop_rules", [])), origin)
+        if "kill_switch_rules" in updated:
+            self._set_field_value("kill_switch_rules", ", ".join(updated.get("kill_switch_rules", [])), origin)
+        self._set_field_value(
+            "recheck_interval_sec",
+            updated.get("recheck_interval_sec", self._recheck_interval_input.value()),
+            origin,
         )
         self._set_field_value(
             "ai_reanalyze_interval_sec",
             updated.get("ai_reanalyze_interval_sec", self._ai_reanalyze_interval_input.value()),
+            origin,
         )
         self._set_field_value(
             "min_change_to_rebuild_pct",
             updated.get("min_change_to_rebuild_pct", self._min_change_rebuild_input.value()),
+            origin,
         )
         self._set_field_value(
-            "volatility_mode", updated.get("volatility_mode", self._volatility_mode_input.currentText())
+            "volatility_mode",
+            updated.get("volatility_mode", self._volatility_mode_input.currentText()),
+            origin,
         )
         if "levels" in updated and isinstance(updated["levels"], list):
-            self._last_ai_analysis.strategy.levels = [
-                AiLevel(
-                    side=str(level.get("side", "")),
-                    price=float(level.get("price", 0)),
-                    qty=float(level.get("qty", 0)),
-                    pct_from_mid=float(level.get("pct_from_mid", 0)),
-                )
-                for level in updated["levels"]
-                if isinstance(level, dict)
-            ]
-        if patch.recommended_actions:
-            action_text = "; ".join(action.detail for action in patch.recommended_actions)
-            if action_text:
-                self._log_event(f"[AI] Recommended actions: {action_text}")
-        self._render_preview_from_ai(self._last_ai_analysis)
+            self._latest_ai_levels = self._coerce_levels(updated["levels"])
+        self._render_preview_from_ai(patch)
         self._plan_applied = True
         self._sync_workspace_orders()
         self._log_event("[AI] Patch applied -> strategy updated")
@@ -813,6 +972,10 @@ class PairWorkspaceTab(QWidget):
         self._plan_applied = False
         self._ai_block_confirm = False
         self._update_workspace_plan([], source="none")
+        self._render_trade_options([])
+        self._last_ai_analysis = None
+        self._last_strategy_patch = None
+        self._last_trade_options = []
         self._prepared_period = None
         self._set_state(BotState.PREPARING_DATA, reason="prepare_data")
         self._log_event("Prepare data requested.")
@@ -853,11 +1016,11 @@ class PairWorkspaceTab(QWidget):
 
     def _analyze(self) -> None:
         if not self._data_ready:
-            QMessageBox.warning(self, "No data", "Prepare data before AI analysis.")
+            QMessageBox.warning(self, "Нет данных", "Сначала подготовьте данные для AI анализа.")
             self._log_event("AI analyze requested without data.")
             return
         if not self._app_state.openai_key_present:
-            QMessageBox.warning(self, "Missing OpenAI key", "Set the OpenAI API key in Settings.")
+            QMessageBox.warning(self, "Нет ключа OpenAI", "Укажите ключ OpenAI в Settings.")
             self._log_event("AI analyze skipped: missing OpenAI key.")
             return
         datapack = self._build_datapack()
@@ -883,49 +1046,70 @@ class PairWorkspaceTab(QWidget):
         if not isinstance(response, AiResponseEnvelope):
             self._handle_ai_analyze_error("AI response invalid or empty.")
             return
-        if response.status == "ERROR" or response.analysis_result is None:
-            self._handle_ai_analyze_error(response.message or "AI response invalid or empty.")
+        if response.analysis_result.status == "ERROR":
+            self._handle_ai_analyze_error(response.analysis_result.summary_ru or "AI response invalid or empty.")
             return
         self._ai_request_card.hide()
         self._last_ai_response = response
         self._last_ai_analysis = response.analysis_result
+        self._last_strategy_patch = response.strategy_patch
+        self._last_trade_options = list(response.trade_options)
         self._analysis_summary.setText(self._format_ai_summary(response, response.analysis_result))
-        self._set_summary_status(response.status)
-        self._plan_preview_status.setText("AI analysis complete. Apply plan to populate strategy.")
+        self._set_summary_status(response.analysis_result.status)
+        if self._is_zero_fee_symbol():
+            self._plan_preview_status.setText("AI анализ завершен. Проверьте варианты сделок ниже.")
+        else:
+            self._plan_preview_status.setText("AI анализ завершен. Нажмите Apply Plan для заполнения формы.")
         self._plan_applied = False
         self._pending_patch = None
         self._chat_apply_button.setEnabled(False)
+        suggested_strategy = None
+        if response.strategy_patch is not None:
+            suggested_strategy = response.strategy_patch.parameters_patch.get("strategy_id")
         self._ai_block_confirm = (
-            response.status in {"WARN", "DANGER"}
-            or response.analysis_result.strategy.strategy_id == "DO_NOT_TRADE"
+            response.analysis_result.status in {"WARN", "DANGER", "ERROR"}
+            or suggested_strategy == "DO_NOT_TRADE"
         )
+        self._render_trade_options(response.trade_options)
         if self._ai_block_confirm:
-            self._append_chat("AI", "AI signaled caution; trading is blocked until you re-run analysis.")
+            self._append_chat("AI", "AI отметил риски; подтверждение торговли заблокировано до повторного анализа.")
             self._log_event("[AI] Confirm Start blocked due to AI status.")
         self._set_state(BotState.PLAN_READY, reason="analysis_complete")
         self._log_event("AI analyze ok")
-        self._log_event(f"[AI] status={response.status} confidence={response.confidence}")
-        status_bits = [f"Status: {response.status}"]
-        if response.confidence is not None:
-            status_bits.append(f"confidence={response.confidence:.2f}")
-        if response.reason_codes:
-            status_bits.append(f"reasons={', '.join(response.reason_codes)}")
-        self._append_chat("AI", "Analysis complete. Click Apply Plan to populate strategy.")
+        self._log_event(
+            "[AI] status=%s confidence=%s",
+            response.analysis_result.status,
+            response.analysis_result.confidence,
+        )
+        status_bits = [f"Статус: {response.analysis_result.status}"]
+        if response.analysis_result.confidence is not None:
+            status_bits.append(f"уверенность={response.analysis_result.confidence:.2f}")
+        if response.analysis_result.reason_codes:
+            status_bits.append(f"причины={', '.join(response.analysis_result.reason_codes)}")
+        self._append_chat("AI", "Анализ завершен. Нажмите Apply Plan для заполнения формы.")
         self._append_chat("AI", " | ".join(status_bits))
-        if response.message:
-            self._append_chat("AI", response.message)
-        if response.analysis_result.actions:
-            action_details = [action.detail for action in response.analysis_result.actions if action.detail]
+        if response.analysis_result.summary_ru:
+            self._append_chat("AI", response.analysis_result.summary_ru)
+        if response.action_suggestions:
+            action_details = [
+                suggestion.note_ru or suggestion.type
+                for suggestion in response.action_suggestions
+                if suggestion.type
+            ]
             self._render_ai_actions(action_details)
-        self._render_preview_from_ai(response.analysis_result)
+        self._render_preview_from_ai(response.strategy_patch)
 
     def _handle_ai_analyze_error(self, message: str) -> None:
         self._log_event(f"AI analyze failed: {message}")
-        self._append_chat("AI", f"AI error: {message}")
-        self._analysis_summary.setText("AI analysis failed. Check logs for details.")
+        self._append_chat("AI", f"Ошибка AI: {message}")
+        self._analysis_summary.setText("AI анализ не удался. Проверьте логи.")
         self._set_summary_status("ERROR")
         self._ai_block_confirm = True
         self._pending_patch = None
+        self._last_ai_analysis = None
+        self._last_strategy_patch = None
+        self._last_trade_options = []
+        self._render_trade_options([])
         self._chat_apply_button.setEnabled(False)
         self._set_state(BotState.DATA_READY, reason="analysis_failed")
 
@@ -987,54 +1171,24 @@ class PairWorkspaceTab(QWidget):
         self._log_event("[UI] Reset strategy to AI values")
 
     def _apply_plan(self) -> None:
-        if self._last_ai_analysis is None:
-            QMessageBox.warning(self, "No AI plan", "Run AI Analyze before applying the plan.")
+        if self._last_strategy_patch is None:
+            QMessageBox.warning(self, "Нет плана AI", "Сначала запустите AI Analyze.")
             self._log_event("Apply plan skipped: missing AI response.")
             return
-        strategy = self._last_ai_analysis.strategy
-        self._ai_values = {}
-        self._user_touched.clear()
-        self._set_field_value("strategy_id", strategy.strategy_id, origin="ai")
-        self._set_field_value("budget", strategy.budget_usdt, origin="ai")
-        self._set_field_value("mode", "Grid", origin="ai")
-        self._set_field_value("grid_step_pct", strategy.grid_step_pct, origin="ai")
-        self._set_field_value("range_low_pct", strategy.range_low_pct, origin="ai")
-        self._set_field_value("range_high_pct", strategy.range_high_pct, origin="ai")
-        if strategy.levels:
-            self._set_field_value("grid_count", len(strategy.levels), origin="ai")
-        self._set_field_value("bias_buy_pct", strategy.bias.buy_pct, origin="ai")
-        self._set_field_value("bias_sell_pct", strategy.bias.sell_pct, origin="ai")
-        self._set_field_value("order_size_mode", strategy.order_size_mode, origin="ai")
-        self._set_field_value("max_orders", strategy.max_orders, origin="ai")
-        self._set_field_value("max_exposure_pct", strategy.max_exposure_pct, origin="ai")
-        self._set_field_value("hard_stop_pct", self._last_ai_analysis.risk.hard_stop_pct, origin="ai")
-        self._set_field_value("cooldown_minutes", self._last_ai_analysis.risk.cooldown_minutes, origin="ai")
-        self._set_field_value(
-            "soft_stop_rules", ", ".join(self._last_ai_analysis.risk.soft_stop_rules), origin="ai"
-        )
-        self._set_field_value(
-            "kill_switch_rules", ", ".join(self._last_ai_analysis.risk.kill_switch_rules), origin="ai"
-        )
-        self._set_field_value(
-            "recheck_interval_sec", self._last_ai_analysis.control.recheck_interval_sec, origin="ai"
-        )
-        self._set_field_value(
-            "ai_reanalyze_interval_sec", self._last_ai_analysis.control.ai_reanalyze_interval_sec, origin="ai"
-        )
-        self._set_field_value(
-            "min_change_to_rebuild_pct", self._last_ai_analysis.control.min_change_to_rebuild_pct, origin="ai"
-        )
-        self._set_field_value("volatility_mode", self._last_ai_analysis.risk.volatility_mode, origin="ai")
+        self._apply_strategy_patch(self._last_strategy_patch, origin="ai")
         self._reset_ai_button.setEnabled(True)
         self._plan_applied = True
         self._set_state(BotState.PLAN_READY, reason="apply_plan")
         self._sync_workspace_orders()
         self._log_event("[AI] Plan applied -> strategy populated")
-        self._render_preview_from_ai(self._last_ai_analysis)
 
     def _confirm_start(self) -> None:
         if self._ai_block_confirm:
-            QMessageBox.warning(self, "AI Block", "AI marked this plan as unsafe. Re-run analysis to proceed.")
+            QMessageBox.warning(
+                self,
+                "AI блокировка",
+                "AI отметил этот план как рискованный. Перезапустите анализ, чтобы продолжить.",
+            )
             self._log_event("Confirm start blocked by AI status.")
             return
         if self._pair_state.state == BotState.PAUSED:
@@ -1044,6 +1198,7 @@ class PairWorkspaceTab(QWidget):
             return
         self._tick_count = 0
         self._tick_timer.start()
+        self._runtime_started_at = datetime.now(timezone.utc)
         self._set_state(BotState.RUNNING, reason="confirm_start")
         if self._topbar.dry_run_toggle.isChecked():
             self._log_event("RUNNING (dry-run)")
@@ -1066,7 +1221,9 @@ class PairWorkspaceTab(QWidget):
         self._data_ready = False
         self._plan_applied = False
         self._ai_block_confirm = False
+        self._runtime_started_at = None
         self._update_workspace_plan([], source="none")
+        self._render_trade_options([])
         self._analysis_summary.setText(self._idle_summary())
         self._set_summary_status("OK")
         self._set_state(BotState.IDLE, reason="stop")
@@ -1084,16 +1241,16 @@ class PairWorkspaceTab(QWidget):
         if budget_value is not None:
             self._set_field_value("budget", budget_value, origin="user")
             self._mark_field_state("budget", "user")
-            self._append_chat("AI", f"Local intent applied: budget set to {budget_value:.2f} USDT.")
+        self._append_chat("AI", f"Локальное изменение: бюджет установлен на {budget_value:.2f} USDT.")
             self._log_event(f"[INTENT] budget -> {budget_value:.2f} USDT")
             self._chat_input.clear()
             return
         if not self._app_state.openai_key_present:
-            self._append_chat("AI", "Missing OpenAI key. Set it in Settings.")
+            self._append_chat("AI", "Не задан ключ OpenAI. Укажите его в Settings.")
             self._log_event("AI chat skipped: missing OpenAI key.")
             return
         if self._last_ai_analysis is None or self._last_datapack is None:
-            self._append_chat("AI", "Run AI Analyze before requesting adjustments.")
+            self._append_chat("AI", "Сначала запустите AI Analyze перед запросом изменений.")
             self._log_event("AI chat skipped: missing AI response.")
             return
         self._append_chat("User", message)
@@ -1126,31 +1283,46 @@ class PairWorkspaceTab(QWidget):
         if not isinstance(response, AiResponseEnvelope):
             self._handle_ai_chat_adjust_error("AI patch response invalid or empty.")
             return
-        if response.status == "ERROR" or response.strategy_patch is None:
-            self._handle_ai_chat_adjust_error(response.message or "AI patch response invalid or empty.")
+        if response.analysis_result.status == "ERROR" or response.strategy_patch is None:
+            self._handle_ai_chat_adjust_error(
+                response.analysis_result.summary_ru or "AI patch response invalid or empty."
+            )
             return
         self._pending_patch = response.strategy_patch
+        self._last_strategy_patch = response.strategy_patch
         self._chat_apply_button.setEnabled(True)
-        message = response.strategy_patch.message or response.message or "Patch ready to apply."
-        self._append_chat("AI", f"AI patch ready: {message}")
-        if response.strategy_patch.recommended_actions:
-            action_details = [action.detail for action in response.strategy_patch.recommended_actions if action.detail]
+        message = response.analysis_result.summary_ru or "Патч готов к применению."
+        self._append_chat("AI", f"Патч AI готов: {message}")
+        if response.action_suggestions:
+            action_details = [
+                suggestion.note_ru or suggestion.type
+                for suggestion in response.action_suggestions
+                if suggestion.type
+            ]
             self._render_ai_actions(action_details)
 
     def _handle_ai_chat_adjust_error(self, message: str) -> None:
-        self._append_chat("AI", f"AI adjust error: {message}")
+        self._append_chat("AI", f"Ошибка AI при изменении: {message}")
         self._log_event(f"AI chat adjust failed: {message}")
         self._pending_patch = None
         self._chat_apply_button.setEnabled(False)
 
     def _apply_pending_patch(self) -> None:
         if self._pending_patch is None:
-            self._append_chat("AI", "No patch available to apply.")
+            self._append_chat("AI", "Нет патча для применения.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            "Применить предложенный AI патч?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
             return
         self._apply_strategy_patch(self._pending_patch)
         self._pending_patch = None
         self._chat_apply_button.setEnabled(False)
-        self._append_chat("AI", "Patch applied to the strategy form.")
+        self._append_chat("AI", "Патч применен к форме стратегии.")
         self.update_controls_by_state()
 
     def _open_trading_workspace(self) -> None:
@@ -1165,17 +1337,31 @@ class PairWorkspaceTab(QWidget):
         window.show()
         self._trading_windows.append(window)
 
+    def apply_strategy_patch_from_observer(self, patch: AiStrategyPatch) -> None:
+        self._apply_strategy_patch(patch, origin="ai")
+        self._pending_patch = None
+        self._chat_apply_button.setEnabled(False)
+        self._log_event("[AI Observer] Patch applied from Trading Workspace")
+
     def get_trading_snapshot(self) -> dict[str, Any]:
-        analysis = self._last_ai_analysis
-        control = analysis.control if analysis else None
-        risk = analysis.risk if analysis else None
         datapack_summary = None
         if self._last_datapack:
             datapack_summary = {
                 "period": self._last_datapack.get("user_context", {}).get("selected_period"),
                 "quality": self._last_datapack.get("user_context", {}).get("quality"),
-                "last_price": self._last_datapack.get("market_snapshot", {}).get("last_price"),
+                "last_price": self._last_datapack.get("market", {}).get("last_price"),
             }
+        uptime_sec = None
+        if self._runtime_started_at:
+            uptime_sec = int((datetime.now(timezone.utc) - self._runtime_started_at).total_seconds())
+        position = {
+            "status": self._workspace_state.position_status,
+            "qty": self._workspace_state.position_qty,
+            "entry_price": self._workspace_state.entry_price,
+            "realized_pnl": self._workspace_state.realized_pnl,
+            "unrealized_pnl": self._workspace_state.unrealized_pnl,
+        }
+        pnl_total = self._workspace_state.realized_pnl + self._workspace_state.unrealized_pnl
         return {
             "symbol": self.symbol,
             "dry_run": self._topbar.dry_run_toggle.isChecked(),
@@ -1185,21 +1371,27 @@ class PairWorkspaceTab(QWidget):
             "open_orders": list(self._workspace_state.open_orders),
             "plan_levels": list(self._workspace_state.plan_levels),
             "plan_source": self._workspace_state.plan_source,
-            "position": {
-                "status": "FLAT",
-                "pnl": 0.0,
+            "position": position,
+            "pnl": {
+                "total": pnl_total,
+                "realized": self._workspace_state.realized_pnl,
+                "unrealized": self._workspace_state.unrealized_pnl,
             },
+            "recent_fills": list(self._workspace_state.recent_fills),
             "risk": {
-                "hard_stop_pct": risk.hard_stop_pct if risk else None,
-                "cooldown_minutes": risk.cooldown_minutes if risk else None,
-                "volatility_mode": risk.volatility_mode if risk else None,
+                "hard_stop_pct": self._hard_stop_input.value(),
+                "cooldown_minutes": self._cooldown_input.value(),
+                "volatility_mode": self._volatility_mode_input.currentText(),
             },
-            "recheck_interval_sec": control.recheck_interval_sec if control else 10,
-            "last_ai_analysis": analysis,
+            "recheck_interval_sec": self._recheck_interval_input.value(),
+            "runtime": {
+                "uptime_sec": uptime_sec,
+                "last_price_age_ms": self._latest_price_age_ms,
+            },
         }
 
     def build_monitor_datapack(self) -> dict[str, Any]:
-        return self._build_datapack()
+        return self._build_monitor_datapack()
 
     def _extract_preview_orders(self) -> list[dict[str, str]]:
         return list(self._workspace_state.open_orders)
@@ -1214,6 +1406,10 @@ class PairWorkspaceTab(QWidget):
         self._latest_price_source = source
         self._latest_price_age_ms = age_ms
         self._topbar.price_label.setText(f"Price: {price:.6f} ({source}, {age_ms} ms)")
+        if self._workspace_state.position_qty:
+            self._workspace_state.unrealized_pnl = (
+                (price - self._workspace_state.entry_price) * self._workspace_state.position_qty
+            )
 
     def _set_state(self, state: BotState, reason: str = "") -> None:
         previous = self._pair_state.state
@@ -1366,18 +1562,14 @@ class PairWorkspaceTab(QWidget):
         if now_price is not None:
             bid = now_price * (1 - spread_estimate / 200)
             ask = now_price * (1 + spread_estimate / 200)
-        candles_summary = []
+        ranges: dict[str, dict[str, float]] = {}
         base_vol = abs(volatility_proxy) if volatility_proxy is not None else 0.2
-        for candle_period, scale in (("1m", 0.3), ("5m", 0.5), ("1h", 0.8), ("4h", 1.2)):
-            candles_summary.append(
-                {
-                    "period": candle_period,
-                    "atr_pct": round(base_vol * scale + 0.2, 3),
-                    "stdev_pct": round(base_vol * scale + 0.1, 3),
-                    "momentum_pct": round(volatility_proxy * scale, 3),
-                }
-            )
-        liquidity_label = "unknown"
+        if now_price:
+            for range_period, scale in (("1m", 0.25), ("5m", 0.45), ("1h", 0.75), ("24h", 1.4)):
+                pct = round(base_vol * scale + 0.15, 3)
+                low = round(now_price * (1 - pct / 100), 6)
+                high = round(now_price * (1 + pct / 100), 6)
+                ranges[range_period] = {"low": low, "high": high, "pct": pct}
         quote_volume_24h = None
         base_volume_24h = None
         trade_count_24h = None
@@ -1385,42 +1577,95 @@ class PairWorkspaceTab(QWidget):
             quote_volume_24h = self._liquidity_stats.get("quote_volume")
             base_volume_24h = self._liquidity_stats.get("volume")
             trade_count_24h = self._liquidity_stats.get("trade_count")
+        liquidity_value: float | str = "unknown"
         if quote_volume_24h is not None:
-            liquidity_label = "OK"
-            if self._market_context and self._market_context.liquidity.lower() == "thin":
-                liquidity_label = "THIN"
+            liquidity_value = float(quote_volume_24h)
+        analysis_mode = "ZERO_FEE_CONVERT" if self._is_zero_fee_symbol() else "GRID_RANGE"
         return {
             "version": "v2.1.2",
-            "market_snapshot": {
-                "symbol": self.symbol,
+            "symbol": self.symbol,
+            "analysis_mode": analysis_mode,
+            "market": {
                 "last_price": now_price,
                 "bid": bid,
                 "ask": ask,
                 "spread_pct": spread_estimate,
+                "ranges": ranges,
+                "volatility_est": round(base_vol, 4),
+                "liquidity": liquidity_value,
                 "source_latency_ms": age_ms,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "candles_summary": candles_summary,
             },
-            "liquidity_summary": {
-                "base_volume_24h": base_volume_24h,
-                "quote_volume_24h": quote_volume_24h,
-                "trade_count_24h": trade_count_24h,
-                "liquidity_label": liquidity_label,
-            },
-            "exchange_constraints": {
+            "constraints": {
                 "tick_size": None,
                 "step_size": None,
+                "min_qty": None,
                 "min_notional": None,
+            },
+            "budget": {
+                "budget_usdt": self._budget_input.value(),
+                "mode": self._normalize_mode(self._mode_input.currentText()),
             },
             "user_context": {
                 "budget_usdt": self._budget_input.value(),
+                "mode": self._normalize_mode(self._mode_input.currentText()),
                 "dry_run": self._topbar.dry_run_toggle.isChecked(),
                 "selected_period": period,
                 "quality": quality,
+                "liquidity_summary": {
+                    "base_volume_24h": base_volume_24h,
+                    "quote_volume_24h": quote_volume_24h,
+                    "trade_count_24h": trade_count_24h,
+                },
             },
             "pair_context": {
                 "base_asset": base_asset,
                 "quote_asset": quote_asset,
                 "source": source,
             },
+        }
+
+    def _build_monitor_datapack(self) -> dict[str, Any]:
+        snapshot = self.get_trading_snapshot()
+        runtime = snapshot.get("runtime", {})
+        health = {
+            "ws_latency_ms": runtime.get("last_price_age_ms"),
+            "http_latency_ms": None,
+            "errors": self._workspace_state.error_count,
+        }
+        return {
+            "version": "v2.1.2",
+            "symbol": self.symbol,
+            "analysis_mode": "ZERO_FEE_CONVERT" if self._is_zero_fee_symbol() else "GRID_RANGE",
+            "runtime": {
+                "state": snapshot["state"],
+                "dry_run": snapshot["dry_run"],
+                "uptime_sec": runtime.get("uptime_sec"),
+                "last_reason": snapshot["last_reason"],
+            },
+            "open_orders": snapshot["open_orders"],
+            "position": snapshot["position"],
+            "pnl": snapshot["pnl"],
+            "recent_fills": snapshot["recent_fills"],
+            "strategy_state": {
+                "strategy_id": self._strategy_id_input.currentText(),
+                "budget_usdt": self._budget_input.value(),
+                "mode": self._normalize_mode(self._mode_input.currentText()),
+                "grid_step_pct": self._grid_step_input.value(),
+                "range_low_pct": self._range_low_input.value(),
+                "range_high_pct": self._range_high_input.value(),
+                "bias": {"buy_pct": self._bias_buy_input.value(), "sell_pct": self._bias_sell_input.value()},
+                "order_size_mode": self._order_size_mode_input.currentText(),
+                "max_orders": self._max_orders_input.value(),
+                "max_exposure_pct": self._max_exposure_input.value(),
+                "hard_stop_pct": self._hard_stop_input.value(),
+                "cooldown_minutes": self._cooldown_input.value(),
+                "recheck_interval_sec": self._recheck_interval_input.value(),
+                "ai_reanalyze_interval_sec": self._ai_reanalyze_interval_input.value(),
+                "min_change_to_rebuild_pct": self._min_change_rebuild_input.value(),
+                "volatility_mode": self._volatility_mode_input.currentText(),
+                "plan_applied": self._plan_applied,
+                "plan_levels": snapshot["plan_levels"],
+            },
+            "health": health,
         }

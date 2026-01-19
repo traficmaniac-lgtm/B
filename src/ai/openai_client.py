@@ -11,7 +11,7 @@ if importlib.util.find_spec("openai") is None:
 else:
     from openai import AsyncOpenAI
 
-from src.ai.models import AiResponseEnvelope, parse_ai_response
+from src.ai.models import AiResponseEnvelope, parse_ai_response_with_fallback
 from src.core.logging import get_logger
 
 
@@ -51,49 +51,61 @@ class OpenAIClient:
     async def analyze_pair(self, datapack: dict[str, Any]) -> AiResponseEnvelope:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         system_prompt = (
-            "You are a market analysis assistant.\n"
-            "Return ONLY valid JSON, no markdown, no extra prose.\n"
-            "You MUST return an object that matches this schema:\n"
+            "Ты аналитик рынка.\n"
+            "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
+            "Ответ должен быть на русском языке.\n"
+            "Строго следуй схеме:\n"
             "{\n"
-            '  "type": "analysis_result",\n'
-            '  "status": "OK|WARN|DANGER|ERROR",\n'
-            '  "confidence": 0.0,\n'
-            '  "reason_codes": ["..."],\n'
-            '  "message": "short message",\n'
             '  "analysis_result": {\n'
-            '    "summary_lines": ["..."],\n'
-            '    "strategy": {\n'
-            '      "strategy_id": "GRID_CLASSIC|GRID_BIASED_LONG|GRID_BIASED_SHORT|RANGE_MEAN_REVERSION|TREND_FOLLOW_GRID|DO_NOT_TRADE",\n'
+            '    "status": "OK|WARN|DANGER|ERROR",\n'
+            '    "confidence": 0.0,\n'
+            '    "reason_codes": ["..."],\n'
+            '    "summary_ru": "Короткое резюме"\n'
+            "  },\n"
+            '  "trade_options": [\n'
+            "    {\n"
+            '      "name_ru": "Вариант 1",\n'
+            '      "entry": 1.0,\n'
+            '      "exit": 1.01,\n'
+            '      "tp_pct": 0.2,\n'
+            '      "stop_pct": 0.1,\n'
+            '      "expected_profit_pct": 0.15,\n'
+            '      "expected_profit_usdt": 0.5,\n'
+            '      "eta_min": 15,\n'
+            '      "confidence": 0.55,\n'
+            '      "risk_note_ru": "Риск: ..." \n'
+            "    }\n"
+            "  ],\n"
+            '  "action_suggestions": [\n'
+            '    {"type": "SUGGEST_REBUILD", "note_ru": "Причина"}\n'
+            "  ],\n"
+            '  "strategy_patch": {\n'
+            '    "parameters_patch": {\n'
+            '      "strategy_id": "GRID_CLASSIC|RANGE_MEAN_REVERSION|TREND_FOLLOW_GRID|DO_NOT_TRADE",\n'
             '      "budget_usdt": 500,\n'
-            '      "levels": [\n'
-            '        {"side": "BUY", "price": 100.0, "qty": 0.5, "pct_from_mid": -1.0}\n'
-            "      ],\n"
+            '      "levels": [],\n'
             '      "grid_step_pct": 0.3,\n'
             '      "range_low_pct": 1.5,\n'
             '      "range_high_pct": 1.8,\n'
             '      "bias": {"buy_pct": 50, "sell_pct": 50},\n'
             '      "order_size_mode": "equal|martingale_light|liquidity_weighted",\n'
             '      "max_orders": 12,\n'
-            '      "max_exposure_pct": 35\n'
-            "    },\n"
-            '    "risk": {\n'
+            '      "max_exposure_pct": 35,\n'
             '      "hard_stop_pct": 8,\n'
             '      "cooldown_minutes": 15,\n'
-            '      "soft_stop_rules": ["..."],\n'
-            '      "kill_switch_rules": ["..."],\n'
-            '      "volatility_mode": "low|medium|high"\n'
-            "    },\n"
-            '    "control": {\n'
+            '      "soft_stop_rules": [],\n'
+            '      "kill_switch_rules": [],\n'
             '      "recheck_interval_sec": 60,\n'
             '      "ai_reanalyze_interval_sec": 300,\n'
-            '      "min_change_to_rebuild_pct": 0.3\n'
-            "    },\n"
-            '    "actions": [\n'
-            '      {"action": "note", "detail": "example", "severity": "info"}\n'
-            "    ]\n"
-            "  }\n"
+            '      "min_change_to_rebuild_pct": 0.3,\n'
+            '      "volatility_mode": "low|medium|high"\n'
+            "    }\n"
+            "  },\n"
+            '  "language": "ru"\n'
             "}\n"
-            "No trading, leverage, or order execution instructions."
+            "Если режим ZERO_FEE_CONVERT, верни 3-7 trade_options с ожидаемым профитом и ETA.\n"
+            "Если режим не ZERO_FEE_CONVERT, trade_options должен быть пустым.\n"
+            "Не давай инструкций по исполнению сделок."
         )
 
         async def _analyze() -> AiResponseEnvelope:
@@ -107,8 +119,8 @@ class OpenAIClient:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_response(content or "", expected_type="analysis_result")
-            if parsed.status != "ERROR":
+            parsed = parse_ai_response_with_fallback(content or "")
+            if parsed.analysis_result.status != "ERROR":
                 return parsed
             retry_messages = messages + [
                 {"role": "user", "content": "Your previous response was invalid JSON; output ONLY JSON."},
@@ -119,9 +131,7 @@ class OpenAIClient:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_response(content or "", expected_type="analysis_result")
-            if parsed.status == "ERROR":
-                raise RuntimeError(parsed.message or "Invalid AI JSON")
+            parsed = parse_ai_response_with_fallback(content or "")
             return parsed
 
         try:
@@ -133,47 +143,27 @@ class OpenAIClient:
     async def monitor_datapack(self, datapack: dict[str, Any]) -> tuple[AiResponseEnvelope, str]:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         system_prompt = (
-            "You are an AI observer monitoring a running strategy.\n"
-            "Return ONLY valid JSON, no markdown, no extra prose.\n"
-            "You MUST return an object that matches this schema:\n"
+            "Ты AI-наблюдатель за торговой стратегией.\n"
+            "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
+            "Ответ должен быть на русском языке.\n"
+            "Строго следуй схеме:\n"
             "{\n"
-            '  "type": "analysis_result",\n'
-            '  "status": "OK|WARN|DANGER|ERROR",\n'
-            '  "confidence": 0.0,\n'
-            '  "reason_codes": ["..."],\n'
-            '  "message": "short message",\n'
             '  "analysis_result": {\n'
-            '    "summary_lines": ["..."],\n'
-            '    "strategy": {\n'
-            '      "strategy_id": "GRID_CLASSIC|GRID_BIASED_LONG|GRID_BIASED_SHORT|RANGE_MEAN_REVERSION|TREND_FOLLOW_GRID|DO_NOT_TRADE",\n'
-            '      "budget_usdt": 500,\n'
-            '      "levels": [],\n'
-            '      "grid_step_pct": 0.3,\n'
-            '      "range_low_pct": 1.5,\n'
-            '      "range_high_pct": 1.8,\n'
-            '      "bias": {"buy_pct": 50, "sell_pct": 50},\n'
-            '      "order_size_mode": "equal|martingale_light|liquidity_weighted",\n'
-            '      "max_orders": 12,\n'
-            '      "max_exposure_pct": 35\n'
-            "    },\n"
-            '    "risk": {\n'
-            '      "hard_stop_pct": 8,\n'
-            '      "cooldown_minutes": 15,\n'
-            '      "soft_stop_rules": ["..."],\n'
-            '      "kill_switch_rules": ["..."],\n'
-            '      "volatility_mode": "low|medium|high"\n'
-            "    },\n"
-            '    "control": {\n'
-            '      "recheck_interval_sec": 10,\n'
-            '      "ai_reanalyze_interval_sec": 60,\n'
-            '      "min_change_to_rebuild_pct": 0.3\n'
-            "    },\n"
-            '    "actions": [\n'
-            '      {"action": "note", "detail": "example", "severity": "info"}\n'
-            "    ]\n"
-            "  }\n"
+            '    "status": "OK|WARN|DANGER|ERROR",\n'
+            '    "confidence": 0.0,\n'
+            '    "reason_codes": ["..."],\n'
+            '    "summary_ru": "Короткое резюме"\n'
+            "  },\n"
+            '  "trade_options": [],\n'
+            '  "action_suggestions": [\n'
+            '    {"type": "SUGGEST_PAUSE", "note_ru": "Причина"}\n'
+            "  ],\n"
+            '  "strategy_patch": {\n'
+            '    "parameters_patch": {}\n'
+            "  },\n"
+            '  "language": "ru"\n'
             "}\n"
-            "Do not execute trades; only suggest actions."
+            "Не исполняй сделки; только предлагай действия."
         )
 
         async def _monitor() -> tuple[AiResponseEnvelope, str]:
@@ -187,8 +177,8 @@ class OpenAIClient:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_response(content or "", expected_type="analysis_result")
-            if parsed.status != "ERROR":
+            parsed = parse_ai_response_with_fallback(content or "")
+            if parsed.analysis_result.status != "ERROR":
                 return parsed, content or ""
             retry_messages = messages + [
                 {"role": "user", "content": "Your previous response was invalid JSON; output ONLY JSON."},
@@ -199,9 +189,7 @@ class OpenAIClient:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_response(content or "", expected_type="analysis_result")
-            if parsed.status == "ERROR":
-                raise RuntimeError(parsed.message or "Invalid AI JSON")
+            parsed = parse_ai_response_with_fallback(content or "")
             return parsed, content or ""
 
         try:
@@ -219,15 +207,19 @@ class OpenAIClient:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         plan_payload = json.dumps(last_plan, ensure_ascii=False, indent=2)
         system_prompt = (
-            "You adjust a grid trading plan.\n"
-            "Return ONLY valid JSON, no markdown, no extra prose.\n"
-            "You MUST return an object that matches this schema:\n"
+            "Ты корректируешь параметры торговой стратегии.\n"
+            "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
+            "Ответ должен быть на русском языке.\n"
+            "Строго следуй схеме:\n"
             "{\n"
-            '  "type": "strategy_patch",\n'
-            '  "status": "OK|WARN|DANGER|ERROR",\n'
-            '  "confidence": 0.0,\n'
-            '  "reason_codes": ["..."],\n'
-            '  "message": "short message",\n'
+            '  "analysis_result": {\n'
+            '    "status": "OK|WARN|DANGER|ERROR",\n'
+            '    "confidence": 0.0,\n'
+            '    "reason_codes": ["..."],\n'
+            '    "summary_ru": "Короткое резюме"\n'
+            "  },\n"
+            '  "trade_options": [],\n'
+            '  "action_suggestions": [],\n'
             '  "strategy_patch": {\n'
             '    "parameters_patch": {\n'
             '      "budget_usdt": 500,\n'
@@ -247,15 +239,11 @@ class OpenAIClient:
             '      "ai_reanalyze_interval_sec": 300,\n'
             '      "min_change_to_rebuild_pct": 0.3,\n'
             '      "volatility_mode": "low|medium|high"\n'
-            "    },\n"
-            '    "recommended_actions": [\n'
-            '      {"action": "note", "detail": "example", "severity": "info"}\n'
-            "    ],\n"
-            '    "message": "Short explanation"\n'
-            "  }\n"
+            "    }\n"
+            "  },\n"
+            '  "language": "ru"\n'
             "}\n"
-            "Only include fields you want to change inside parameters_patch. "
-            "Do not include any extra text outside JSON."
+            "Заполняй только те поля, которые нужно изменить. Не добавляй лишний текст."
         )
 
         async def _adjust() -> AiResponseEnvelope:
@@ -278,8 +266,8 @@ class OpenAIClient:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_response(content or "", expected_type="strategy_patch")
-            if parsed.status != "ERROR":
+            parsed = parse_ai_response_with_fallback(content or "")
+            if parsed.analysis_result.status != "ERROR":
                 return parsed
             retry_messages = messages + [
                 {"role": "user", "content": "Your previous response was invalid JSON; output ONLY JSON."},
@@ -290,9 +278,7 @@ class OpenAIClient:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_response(content or "", expected_type="strategy_patch")
-            if parsed.status == "ERROR":
-                raise RuntimeError(parsed.message or "Invalid AI JSON")
+            parsed = parse_ai_response_with_fallback(content or "")
             return parsed
 
         try:

@@ -9,8 +9,6 @@ from src.core.logging import get_logger
 
 _LOGGER = get_logger("ai.models")
 
-
-AI_RESPONSE_TYPES = {"analysis_result", "strategy_patch"}
 AI_STATUS_VALUES = {"OK", "WARN", "DANGER", "ERROR"}
 
 
@@ -23,73 +21,45 @@ class AiLevel:
 
 
 @dataclass
-class AiBias:
-    buy_pct: float
-    sell_pct: float
-
-
-@dataclass
-class AiStrategy:
-    strategy_id: str
-    budget_usdt: float
-    levels: list[AiLevel]
-    grid_step_pct: float
-    range_low_pct: float
-    range_high_pct: float
-    bias: AiBias
-    order_size_mode: str
-    max_orders: int
-    max_exposure_pct: float
-
-
-@dataclass
-class AiRisk:
-    hard_stop_pct: float
-    cooldown_minutes: int
-    soft_stop_rules: list[str]
-    kill_switch_rules: list[str]
-    volatility_mode: str
-
-
-@dataclass
-class AiControl:
-    recheck_interval_sec: int
-    ai_reanalyze_interval_sec: int
-    min_change_to_rebuild_pct: float
-
-
-@dataclass
-class AiAction:
-    action: str
-    detail: str
-    severity: str | None = None
-
-
-@dataclass
 class AiAnalysisResult:
-    summary_lines: list[str]
-    strategy: AiStrategy
-    risk: AiRisk
-    control: AiControl
-    actions: list[AiAction]
+    status: str
+    confidence: float | None
+    reason_codes: list[str]
+    summary_ru: str
+
+
+@dataclass
+class AiTradeOption:
+    name_ru: str
+    entry: float
+    exit: float
+    tp_pct: float
+    stop_pct: float
+    expected_profit_pct: float
+    expected_profit_usdt: float
+    eta_min: int
+    confidence: float | None
+    risk_note_ru: str | None
+
+
+@dataclass
+class AiActionSuggestion:
+    type: str
+    note_ru: str | None
 
 
 @dataclass
 class AiStrategyPatch:
     parameters_patch: dict[str, Any]
-    recommended_actions: list[AiAction]
-    message: str | None = None
 
 
 @dataclass
 class AiResponseEnvelope:
-    type: str
-    status: str
-    confidence: float | None
-    reason_codes: list[str]
-    message: str | None
-    analysis_result: AiAnalysisResult | None = None
-    strategy_patch: AiStrategyPatch | None = None
+    analysis_result: AiAnalysisResult
+    trade_options: list[AiTradeOption]
+    action_suggestions: list[AiActionSuggestion]
+    strategy_patch: AiStrategyPatch | None
+    language: str | None
 
 
 def safe_json_loads(text: str) -> Any | None:
@@ -100,203 +70,105 @@ def safe_json_loads(text: str) -> Any | None:
         return None
 
 
-def parse_ai_response(text: str, expected_type: str | None = None) -> AiResponseEnvelope:
+def parse_ai_response(text: str) -> AiResponseEnvelope:
     if not text:
-        return _error_envelope("Invalid AI JSON", expected_type or "analysis_result")
+        return _error_envelope("Invalid AI JSON")
     payload = safe_json_loads(text.strip())
     if not isinstance(payload, dict):
-        return _error_envelope("Invalid AI JSON", expected_type or "analysis_result")
-    envelope = _build_envelope(payload)
-    if expected_type and envelope.type != expected_type:
-        return _error_envelope("Invalid AI JSON", expected_type)
-    return envelope
+        return _error_envelope("Invalid AI JSON")
+    return _build_envelope(payload)
 
 
-def parse_ai_response_with_fallback(text: str, expected_type: str | None = None) -> AiResponseEnvelope:
-    envelope = parse_ai_response(text, expected_type=expected_type)
-    if envelope.status != "ERROR":
+def parse_ai_response_with_fallback(text: str) -> AiResponseEnvelope:
+    envelope = parse_ai_response(text)
+    if envelope.analysis_result.status != "ERROR":
         return envelope
-    return fallback_do_not_trade(envelope.message or "Invalid AI JSON")
+    return fallback_do_not_trade(envelope.analysis_result.summary_ru)
 
 
 def _build_envelope(payload: dict[str, Any]) -> AiResponseEnvelope:
-    response_type = payload.get("type")
-    if response_type not in AI_RESPONSE_TYPES:
-        return _error_envelope("Invalid AI JSON", response_type)
-    status = payload.get("status")
+    analysis_payload = payload.get("analysis_result")
+    if not isinstance(analysis_payload, dict):
+        return _error_envelope("Invalid AI JSON")
+    status = str(analysis_payload.get("status", "ERROR")).upper()
     if status not in AI_STATUS_VALUES:
         status = "ERROR"
-    confidence = _to_float(payload.get("confidence"))
-    reason_codes = _parse_string_list(payload.get("reason_codes"))
-    message = payload.get("message")
-    analysis_result: AiAnalysisResult | None = None
-    strategy_patch: AiStrategyPatch | None = None
-    if response_type == "analysis_result":
-        analysis_result = _parse_analysis_result(payload.get("analysis_result"))
-        if analysis_result is None:
-            return _error_envelope("Invalid AI JSON", response_type)
-    if response_type == "strategy_patch":
-        strategy_patch = _parse_strategy_patch(payload.get("strategy_patch"))
-        if strategy_patch is None:
-            return _error_envelope("Invalid AI JSON", response_type)
-    return AiResponseEnvelope(
-        type=response_type,
+    analysis = AiAnalysisResult(
         status=status,
-        confidence=confidence,
-        reason_codes=reason_codes,
-        message=str(message) if message is not None else None,
-        analysis_result=analysis_result,
+        confidence=_to_float(analysis_payload.get("confidence")),
+        reason_codes=_parse_string_list(analysis_payload.get("reason_codes")),
+        summary_ru=str(analysis_payload.get("summary_ru") or ""),
+    )
+    trade_options = _parse_trade_options(payload.get("trade_options"))
+    action_suggestions = _parse_action_suggestions(payload.get("action_suggestions"))
+    strategy_patch = _parse_strategy_patch(payload.get("strategy_patch"))
+    language = payload.get("language")
+    return AiResponseEnvelope(
+        analysis_result=analysis,
+        trade_options=trade_options,
+        action_suggestions=action_suggestions,
         strategy_patch=strategy_patch,
+        language=str(language) if language is not None else None,
     )
 
 
-def _parse_analysis_result(payload: Any) -> AiAnalysisResult | None:
-    if not isinstance(payload, dict):
-        return None
-    strategy_payload = payload.get("strategy")
-    risk_payload = payload.get("risk")
-    control_payload = payload.get("control")
-    if not isinstance(strategy_payload, dict) or not isinstance(risk_payload, dict) or not isinstance(control_payload, dict):
-        return None
-    strategy = _parse_strategy(strategy_payload)
-    risk = _parse_risk(risk_payload)
-    control = _parse_control(control_payload)
-    if strategy is None or risk is None or control is None:
-        return None
-    summary_lines = _parse_string_list(payload.get("summary_lines"))
-    actions = _parse_actions(payload.get("actions"))
-    return AiAnalysisResult(
-        summary_lines=summary_lines,
-        strategy=strategy,
-        risk=risk,
-        control=control,
-        actions=actions,
-    )
-
-
-def _parse_strategy(payload: dict[str, Any]) -> AiStrategy | None:
-    required = (
-        "strategy_id",
-        "budget_usdt",
-        "levels",
-        "grid_step_pct",
-        "range_low_pct",
-        "range_high_pct",
-        "bias",
-        "order_size_mode",
-        "max_orders",
-        "max_exposure_pct",
-    )
-    if not all(key in payload for key in required):
-        return None
-    bias_payload = payload.get("bias")
-    if not isinstance(bias_payload, dict):
-        return None
-    bias = AiBias(
-        buy_pct=float(bias_payload.get("buy_pct")),
-        sell_pct=float(bias_payload.get("sell_pct")),
-    )
-    levels = _parse_levels(payload.get("levels"))
-    return AiStrategy(
-        strategy_id=str(payload.get("strategy_id")),
-        budget_usdt=float(payload.get("budget_usdt")),
-        levels=levels,
-        grid_step_pct=float(payload.get("grid_step_pct")),
-        range_low_pct=float(payload.get("range_low_pct")),
-        range_high_pct=float(payload.get("range_high_pct")),
-        bias=bias,
-        order_size_mode=str(payload.get("order_size_mode")),
-        max_orders=int(float(payload.get("max_orders"))),
-        max_exposure_pct=float(payload.get("max_exposure_pct")),
-    )
-
-
-def _parse_risk(payload: dict[str, Any]) -> AiRisk | None:
-    required = (
-        "hard_stop_pct",
-        "cooldown_minutes",
-        "soft_stop_rules",
-        "kill_switch_rules",
-        "volatility_mode",
-    )
-    if not all(key in payload for key in required):
-        return None
-    return AiRisk(
-        hard_stop_pct=float(payload.get("hard_stop_pct")),
-        cooldown_minutes=int(float(payload.get("cooldown_minutes"))),
-        soft_stop_rules=_parse_string_list(payload.get("soft_stop_rules")),
-        kill_switch_rules=_parse_string_list(payload.get("kill_switch_rules")),
-        volatility_mode=str(payload.get("volatility_mode")),
-    )
-
-
-def _parse_control(payload: dict[str, Any]) -> AiControl | None:
-    required = ("recheck_interval_sec", "ai_reanalyze_interval_sec", "min_change_to_rebuild_pct")
-    if not all(key in payload for key in required):
-        return None
-    return AiControl(
-        recheck_interval_sec=int(float(payload.get("recheck_interval_sec"))),
-        ai_reanalyze_interval_sec=int(float(payload.get("ai_reanalyze_interval_sec"))),
-        min_change_to_rebuild_pct=float(payload.get("min_change_to_rebuild_pct")),
-    )
-
-
-def _parse_strategy_patch(payload: Any) -> AiStrategyPatch | None:
-    if not isinstance(payload, dict):
-        return None
-    parameters_patch = payload.get("parameters_patch")
-    if not isinstance(parameters_patch, dict):
-        return None
-    recommended_actions = _parse_actions(payload.get("recommended_actions"))
-    message = payload.get("message")
-    return AiStrategyPatch(
-        parameters_patch=parameters_patch,
-        recommended_actions=recommended_actions,
-        message=str(message) if message is not None else None,
-    )
-
-
-def _parse_levels(payload: Any) -> list[AiLevel]:
+def _parse_trade_options(payload: Any) -> list[AiTradeOption]:
     if not isinstance(payload, list):
         return []
-    levels: list[AiLevel] = []
+    options: list[AiTradeOption] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
         try:
-            levels.append(
-                AiLevel(
-                    side=str(item.get("side", "")),
-                    price=float(item.get("price", 0)),
-                    qty=float(item.get("qty", 0)),
-                    pct_from_mid=float(item.get("pct_from_mid", 0)),
+            options.append(
+                AiTradeOption(
+                    name_ru=str(item.get("name_ru", "")),
+                    entry=float(item.get("entry", 0)),
+                    exit=float(item.get("exit", 0)),
+                    tp_pct=float(item.get("tp_pct", 0)),
+                    stop_pct=float(item.get("stop_pct", 0)),
+                    expected_profit_pct=float(item.get("expected_profit_pct", 0)),
+                    expected_profit_usdt=float(item.get("expected_profit_usdt", 0)),
+                    eta_min=int(float(item.get("eta_min", 0))),
+                    confidence=_to_float(item.get("confidence")),
+                    risk_note_ru=str(item.get("risk_note_ru")) if item.get("risk_note_ru") is not None else None,
                 )
             )
         except (TypeError, ValueError):
             continue
-    return levels
+    return options
 
 
-def _parse_actions(payload: Any) -> list[AiAction]:
+def _parse_action_suggestions(payload: Any) -> list[AiActionSuggestion]:
     if not isinstance(payload, list):
         return []
-    actions: list[AiAction] = []
+    suggestions: list[AiActionSuggestion] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
-        action = item.get("action")
-        detail = item.get("detail")
-        severity = item.get("severity")
-        if action is None or detail is None:
+        action_type = item.get("type") or item.get("action")
+        note = item.get("note_ru") or item.get("detail_ru") or item.get("detail")
+        if not action_type:
             continue
-        actions.append(
-            AiAction(
-                action=str(action),
-                detail=str(detail),
-                severity=str(severity) if severity is not None else None,
+        suggestions.append(
+            AiActionSuggestion(
+                type=str(action_type),
+                note_ru=str(note) if note is not None else None,
             )
         )
-    return actions
+    return suggestions
+
+
+def _parse_strategy_patch(payload: Any) -> AiStrategyPatch | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "parameters_patch" in payload and isinstance(payload.get("parameters_patch"), dict):
+        parameters_patch = payload.get("parameters_patch", {})
+    else:
+        parameters_patch = payload
+    return AiStrategyPatch(parameters_patch=parameters_patch)
 
 
 def _parse_string_list(payload: Any) -> list[str]:
@@ -314,55 +186,33 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-def _error_envelope(message: str, response_type: str) -> AiResponseEnvelope:
-    return AiResponseEnvelope(
-        type=response_type,
+def _error_envelope(message: str) -> AiResponseEnvelope:
+    analysis = AiAnalysisResult(
         status="ERROR",
         confidence=None,
         reason_codes=["INVALID_JSON"],
-        message=message,
-        analysis_result=None,
+        summary_ru=message,
+    )
+    return AiResponseEnvelope(
+        analysis_result=analysis,
+        trade_options=[],
+        action_suggestions=[],
         strategy_patch=None,
+        language="ru",
     )
 
 
 def fallback_do_not_trade(message: str) -> AiResponseEnvelope:
-    strategy = AiStrategy(
-        strategy_id="DO_NOT_TRADE",
-        budget_usdt=0.0,
-        levels=[],
-        grid_step_pct=0.0,
-        range_low_pct=0.0,
-        range_high_pct=0.0,
-        bias=AiBias(buy_pct=0.0, sell_pct=0.0),
-        order_size_mode="equal",
-        max_orders=0,
-        max_exposure_pct=0.0,
-    )
-    risk = AiRisk(
-        hard_stop_pct=0.0,
-        cooldown_minutes=0,
-        soft_stop_rules=[],
-        kill_switch_rules=[],
-        volatility_mode="low",
-    )
-    control = AiControl(
-        recheck_interval_sec=30,
-        ai_reanalyze_interval_sec=300,
-        min_change_to_rebuild_pct=0.0,
-    )
     analysis = AiAnalysisResult(
-        summary_lines=[message],
-        strategy=strategy,
-        risk=risk,
-        control=control,
-        actions=[AiAction(action="note", detail=message, severity="warn")],
-    )
-    return AiResponseEnvelope(
-        type="analysis_result",
         status="ERROR",
         confidence=None,
         reason_codes=["INVALID_JSON"],
-        message=message,
+        summary_ru=message,
+    )
+    return AiResponseEnvelope(
         analysis_result=analysis,
+        trade_options=[],
+        action_suggestions=[],
+        strategy_patch=None,
+        language="ru",
     )

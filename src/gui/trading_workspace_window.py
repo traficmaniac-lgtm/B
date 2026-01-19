@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
@@ -141,9 +140,22 @@ class TradingWorkspaceWindow(QMainWindow):
         position_layout = QVBoxLayout()
         self._position_label = QLabel("Position: -")
         self._pnl_label = QLabel("PnL: -")
+        self._pnl_detail_label = QLabel("PnL detail: -")
         position_layout.addWidget(self._position_label)
         position_layout.addWidget(self._pnl_label)
+        position_layout.addWidget(self._pnl_detail_label)
         position_box.setLayout(position_layout)
+
+        history_box = QGroupBox("History / Fills")
+        history_layout = QVBoxLayout()
+        self._history_status = QLabel("No history yet.")
+        history_layout.addWidget(self._history_status)
+        self._history_table = QTableWidget(0, 5)
+        self._history_table.setHorizontalHeaderLabels(["Time", "Side", "Price", "Qty", "PnL"])
+        self._history_table.horizontalHeader().setStretchLastSection(True)
+        self._history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        history_layout.addWidget(self._history_table)
+        history_box.setLayout(history_layout)
 
         risk_box = QGroupBox("Risk")
         risk_layout = QVBoxLayout()
@@ -155,6 +167,7 @@ class TradingWorkspaceWindow(QMainWindow):
         layout.addWidget(orders_box)
         layout.addWidget(plan_box)
         layout.addWidget(position_box)
+        layout.addWidget(history_box)
         layout.addWidget(risk_box)
         layout.addStretch()
         panel.setLayout(layout)
@@ -236,8 +249,16 @@ class TradingWorkspaceWindow(QMainWindow):
             open_orders = []
         self._render_orders(open_orders)
         self._render_plan_preview(plan_levels)
-        self._position_label.setText(f"Position: {snapshot['position']['status']}")
-        self._pnl_label.setText(f"PnL: {snapshot['position']['pnl']:.2f} USDT")
+        position = snapshot["position"]
+        pnl = snapshot["pnl"]
+        self._position_label.setText(
+            f"Position: {position['status']} | Qty: {position['qty']:.6f} @ {position['entry_price']:.6f}"
+        )
+        self._pnl_label.setText(f"PnL: {pnl['total']:.2f} USDT")
+        self._pnl_detail_label.setText(
+            f"PnL detail: realized {pnl['realized']:.2f} | unrealized {pnl['unrealized']:.2f}"
+        )
+        self._render_history(snapshot["recent_fills"])
         risk = snapshot["risk"]
         risk_text = "Risk: -"
         if risk["hard_stop_pct"] is not None:
@@ -248,6 +269,18 @@ class TradingWorkspaceWindow(QMainWindow):
             )
         self._risk_label.setText(risk_text)
         self._update_observer_interval(snapshot["recheck_interval_sec"])
+
+    def _render_history(self, fills: list[dict[str, str]]) -> None:
+        self._history_table.setRowCount(len(fills))
+        if fills:
+            self._history_status.setText("History loaded.")
+        else:
+            self._history_status.setText("No history yet.")
+        for row, fill in enumerate(fills):
+            for col, key in enumerate(("time", "side", "price", "qty", "pnl")):
+                item = QTableWidgetItem(str(fill.get(key, "--")))
+                item.setTextAlignment(Qt.AlignCenter)
+                self._history_table.setItem(row, col, item)
 
     def _render_orders(self, orders: list[dict[str, str]]) -> None:
         self._orders_table.setRowCount(len(orders))
@@ -311,17 +344,20 @@ class TradingWorkspaceWindow(QMainWindow):
             return
         self._last_ai_response = envelope
         self._last_ai_raw = raw
-        summary = {
-            "status": envelope.status,
-            "confidence": envelope.confidence,
-            "reason_codes": envelope.reason_codes,
-            "message": envelope.message,
-        }
-        self._observer_summary.setPlainText(json.dumps(summary, ensure_ascii=False, indent=2))
+        analysis = envelope.analysis_result
+        summary_lines = [f"Статус: {analysis.status}"]
+        if analysis.confidence is not None:
+            summary_lines.append(f"Уверенность: {analysis.confidence:.2f}")
+        if analysis.reason_codes:
+            summary_lines.append(f"Причины: {', '.join(analysis.reason_codes)}")
+        if analysis.summary_ru:
+            summary_lines.append(f"Сводка: {analysis.summary_ru}")
+        summary_text = "\n".join(summary_lines)
+        self._observer_summary.setPlainText(summary_text)
         self._observer_raw.setPlainText(raw or "Empty response.")
         self._observer_last.setText("Last check: OK")
-        self._observer_status.setText(f"Observer: {envelope.status}")
-        self._logger.info("AI observer summary: %s", summary)
+        self._observer_status.setText(f"Observer: {analysis.status}")
+        self._logger.info("AI observer summary: %s", summary_text)
         if raw:
             self._logger.info("AI observer raw: %s", raw)
         self._set_action_buttons(envelope)
@@ -331,7 +367,7 @@ class TradingWorkspaceWindow(QMainWindow):
         fallback = fallback_do_not_trade(message)
         self._last_ai_response = fallback
         self._last_ai_raw = None
-        self._observer_summary.setPlainText(json.dumps({"status": "ERROR", "message": message}, indent=2))
+        self._observer_summary.setPlainText(f"Статус: ERROR\nСводка: {message}")
         self._observer_raw.setPlainText("No valid JSON response.")
         self._observer_last.setText("Last check: ERROR")
         self._observer_status.setText("Observer: ERROR")
@@ -339,25 +375,42 @@ class TradingWorkspaceWindow(QMainWindow):
         self._set_action_buttons(fallback)
 
     def _set_action_buttons(self, envelope: AiResponseEnvelope) -> None:
-        has_actions = False
-        if envelope.analysis_result and envelope.analysis_result.actions:
-            has_actions = True
-        self._approve_pause.setEnabled(has_actions)
-        self._approve_rebuild.setEnabled(has_actions)
-        self._approve_cancel.setEnabled(has_actions)
-        self._approve_close.setEnabled(has_actions)
-        self._apply_patch.setEnabled(envelope.strategy_patch is not None)
+        action_types = {suggestion.type for suggestion in envelope.action_suggestions}
+        self._approve_pause.setEnabled("SUGGEST_PAUSE" in action_types)
+        self._approve_rebuild.setEnabled("SUGGEST_REBUILD" in action_types)
+        self._approve_cancel.setEnabled(
+            "SUGGEST_CANCEL_STALE" in action_types or "SUGGEST_CANCEL_ORDERS" in action_types
+        )
+        self._approve_close.setEnabled("SUGGEST_CLOSE_POSITION" in action_types)
+        self._apply_patch.setEnabled(
+            envelope.strategy_patch is not None and "SUGGEST_APPLY_PATCH" in action_types
+        )
 
     def _confirm_action(self, action: str) -> None:
         if self._last_ai_response is None:
             return
         reply = QMessageBox.question(
             self,
-            "Confirm action",
-            f"Approve AI suggested action: {action}?",
+            "Подтверждение",
+            f"Подтвердить действие AI: {action}?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
         self._logger.info("USER_APPROVED: %s", action)
         self._observer_summary.appendPlainText(f"USER_APPROVED: {action}")
+        self._execute_action(action)
+
+    def _execute_action(self, action: str) -> None:
+        snapshot = self._pair_workspace.get_trading_snapshot()
+        dry_run = snapshot.get("dry_run", True)
+        if action == "APPLY_PATCH" and self._last_ai_response and self._last_ai_response.strategy_patch:
+            if dry_run:
+                self._observer_summary.appendPlainText("DRY_RUN: patch application simulated.")
+                self._logger.info("DRY_RUN: apply_patch")
+                return
+            self._pair_workspace.apply_strategy_patch_from_observer(self._last_ai_response.strategy_patch)
+            self._observer_summary.appendPlainText("Patch applied to strategy.")
+            return
+        self._observer_summary.appendPlainText(f"DRY_RUN: action {action} simulated.")
+        self._logger.info("DRY_RUN: action=%s", action)
