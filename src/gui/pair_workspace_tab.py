@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, QSignalBlocker, Qt, QThreadPool, QTimer, Signal
@@ -19,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QSpinBox,
+    QScrollArea,
     QPushButton,
     QPlainTextEdit,
     QSplitter,
@@ -29,7 +32,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ai.models import AiPatchResponse, AiPlan, AiResponse
+from src.ai.models import (
+    AiAnalysisResult,
+    AiLevel,
+    AiResponseEnvelope,
+    AiStrategyPatch,
+)
 from src.ai.openai_client import OpenAIClient
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
@@ -97,8 +105,11 @@ class PairWorkspaceTab(QWidget):
         self._latest_price: float | None = None
         self._latest_price_source: str | None = None
         self._latest_price_age_ms: int | None = None
-        self._last_ai_response: AiResponse | None = None
+        self._last_ai_response: AiResponseEnvelope | None = None
+        self._last_ai_analysis: AiAnalysisResult | None = None
         self._last_datapack: dict[str, Any] | None = None
+        self._pending_patch: AiStrategyPatch | None = None
+        self._ai_block_confirm = False
 
         layout = QVBoxLayout()
         self._topbar = PairTopBar(
@@ -130,32 +141,29 @@ class PairWorkspaceTab(QWidget):
         self._topbar.pause_button.clicked.connect(self._toggle_pause)
         self._topbar.stop_button.clicked.connect(self._stop_run)
         self._chat_send_button.clicked.connect(self._send_chat)
+        self._chat_apply_button.clicked.connect(self._apply_pending_patch)
 
     def _build_body(self) -> QSplitter:
         splitter = QSplitter(Qt.Horizontal)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(self._build_analysis_panel())
+        left_layout.addWidget(self._build_strategy_panel())
+        left_layout.addWidget(self._build_plan_panel())
+        left_layout.addWidget(self._build_logs_panel())
+        left_layout.addStretch()
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_panel.setLayout(left_layout)
 
-        left_splitter = QSplitter(Qt.Vertical)
-        left_splitter.addWidget(self._build_analysis_panel())
-        left_splitter.addWidget(self._build_strategy_panel())
-        left_splitter.addWidget(self._build_plan_panel())
-        left_splitter.addWidget(self._build_logs_panel())
-        left_splitter.setStretchFactor(0, 1)
-        left_splitter.setStretchFactor(1, 1)
-        left_splitter.setStretchFactor(2, 2)
-        left_splitter.setStretchFactor(3, 2)
-
-        main_panel = QWidget()
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(left_splitter)
-        main_layout.addStretch()
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_panel.setLayout(main_layout)
-        main_panel.setMinimumWidth(560)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumWidth(560)
+        scroll_area.setWidget(left_panel)
 
         chat_panel = self._build_chat_panel()
-        chat_panel.setMinimumWidth(340)
+        chat_panel.setMinimumWidth(360)
 
-        splitter.addWidget(main_panel)
+        splitter.addWidget(scroll_area)
         splitter.addWidget(chat_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
@@ -167,7 +175,7 @@ class PairWorkspaceTab(QWidget):
         self._analysis_summary = QTextEdit()
         self._analysis_summary.setReadOnly(True)
         self._analysis_summary.setText(self._idle_summary())
-        self._analysis_summary.setMinimumHeight(100)
+        self._analysis_summary.setMinimumHeight(140)
         self._analysis_summary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self._analysis_summary)
 
@@ -180,6 +188,7 @@ class PairWorkspaceTab(QWidget):
         layout.addWidget(self._ai_request_card)
 
         group.setLayout(layout)
+        group.setMinimumHeight(180)
         group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return group
 
@@ -189,50 +198,148 @@ class PairWorkspaceTab(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
+        self._strategy_id_input = QComboBox()
+        self._strategy_id_input.addItems(
+            [
+                "GRID_CLASSIC",
+                "GRID_BIASED_LONG",
+                "GRID_BIASED_SHORT",
+                "RANGE_MEAN_REVERSION",
+                "TREND_FOLLOW_GRID",
+                "DO_NOT_TRADE",
+            ]
+        )
+        self._strategy_id_input.setMinimumWidth(180)
+
         self._budget_input = QDoubleSpinBox()
         self._budget_input.setRange(10.0, 1_000_000.0)
         self._budget_input.setDecimals(2)
-        self._budget_input.setMinimumWidth(160)
+        self._budget_input.setMinimumWidth(180)
 
         self._mode_input = QComboBox()
         self._mode_input.addItems(["Grid", "Adaptive Grid", "Manual"])
-        self._mode_input.setMinimumWidth(160)
+        self._mode_input.setMinimumWidth(180)
 
         self._grid_count_input = QSpinBox()
         self._grid_count_input.setRange(3, 60)
-        self._grid_count_input.setMinimumWidth(160)
+        self._grid_count_input.setMinimumWidth(180)
 
         self._grid_step_input = QDoubleSpinBox()
         self._grid_step_input.setRange(0.1, 10.0)
         self._grid_step_input.setDecimals(2)
-        self._grid_step_input.setMinimumWidth(160)
+        self._grid_step_input.setMinimumWidth(180)
 
         self._range_low_input = QDoubleSpinBox()
         self._range_low_input.setRange(0.5, 20.0)
         self._range_low_input.setDecimals(2)
-        self._range_low_input.setMinimumWidth(160)
+        self._range_low_input.setMinimumWidth(180)
 
         self._range_high_input = QDoubleSpinBox()
         self._range_high_input.setRange(0.5, 20.0)
         self._range_high_input.setDecimals(2)
-        self._range_high_input.setMinimumWidth(160)
+        self._range_high_input.setMinimumWidth(180)
+
+        self._bias_buy_input = QDoubleSpinBox()
+        self._bias_buy_input.setRange(0, 100)
+        self._bias_buy_input.setDecimals(1)
+        self._bias_buy_input.setMinimumWidth(180)
+
+        self._bias_sell_input = QDoubleSpinBox()
+        self._bias_sell_input.setRange(0, 100)
+        self._bias_sell_input.setDecimals(1)
+        self._bias_sell_input.setMinimumWidth(180)
+
+        self._order_size_mode_input = QComboBox()
+        self._order_size_mode_input.addItems(["equal", "martingale_light", "liquidity_weighted"])
+        self._order_size_mode_input.setMinimumWidth(180)
+
+        self._max_orders_input = QSpinBox()
+        self._max_orders_input.setRange(1, 200)
+        self._max_orders_input.setMinimumWidth(180)
+
+        self._max_exposure_input = QDoubleSpinBox()
+        self._max_exposure_input.setRange(1, 100)
+        self._max_exposure_input.setDecimals(1)
+        self._max_exposure_input.setMinimumWidth(180)
+
+        self._hard_stop_input = QDoubleSpinBox()
+        self._hard_stop_input.setRange(0.1, 50.0)
+        self._hard_stop_input.setDecimals(2)
+        self._hard_stop_input.setMinimumWidth(180)
+
+        self._cooldown_input = QSpinBox()
+        self._cooldown_input.setRange(1, 240)
+        self._cooldown_input.setMinimumWidth(180)
+
+        self._soft_stop_input = QLineEdit()
+        self._soft_stop_input.setMinimumWidth(180)
+        self._soft_stop_input.setPlaceholderText("comma separated")
+
+        self._kill_switch_input = QLineEdit()
+        self._kill_switch_input.setMinimumWidth(180)
+        self._kill_switch_input.setPlaceholderText("comma separated")
+
+        self._recheck_interval_input = QSpinBox()
+        self._recheck_interval_input.setRange(10, 3600)
+        self._recheck_interval_input.setMinimumWidth(180)
+
+        self._ai_reanalyze_interval_input = QSpinBox()
+        self._ai_reanalyze_interval_input.setRange(30, 7200)
+        self._ai_reanalyze_interval_input.setMinimumWidth(180)
+
+        self._min_change_rebuild_input = QDoubleSpinBox()
+        self._min_change_rebuild_input.setRange(0.05, 10.0)
+        self._min_change_rebuild_input.setDecimals(2)
+        self._min_change_rebuild_input.setMinimumWidth(180)
+
+        self._volatility_mode_input = QComboBox()
+        self._volatility_mode_input.addItems(["low", "medium", "high"])
+        self._volatility_mode_input.setMinimumWidth(180)
 
         for widget in (
+            self._strategy_id_input,
             self._budget_input,
             self._mode_input,
             self._grid_count_input,
             self._grid_step_input,
             self._range_low_input,
             self._range_high_input,
+            self._bias_buy_input,
+            self._bias_sell_input,
+            self._order_size_mode_input,
+            self._max_orders_input,
+            self._max_exposure_input,
+            self._hard_stop_input,
+            self._cooldown_input,
+            self._soft_stop_input,
+            self._kill_switch_input,
+            self._recheck_interval_input,
+            self._ai_reanalyze_interval_input,
+            self._min_change_rebuild_input,
+            self._volatility_mode_input,
         ):
             widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        form.addRow("Strategy ID", self._strategy_id_input)
         form.addRow("Budget (USDT)", self._budget_input)
         form.addRow("Mode", self._mode_input)
         form.addRow("Grid count", self._grid_count_input)
         form.addRow("Grid step %", self._grid_step_input)
         form.addRow("Range low %", self._range_low_input)
         form.addRow("Range high %", self._range_high_input)
+        form.addRow("Bias buy %", self._bias_buy_input)
+        form.addRow("Bias sell %", self._bias_sell_input)
+        form.addRow("Order size mode", self._order_size_mode_input)
+        form.addRow("Max orders", self._max_orders_input)
+        form.addRow("Max exposure %", self._max_exposure_input)
+        form.addRow("Hard stop %", self._hard_stop_input)
+        form.addRow("Cooldown (min)", self._cooldown_input)
+        form.addRow("Soft stop rules", self._soft_stop_input)
+        form.addRow("Kill switch rules", self._kill_switch_input)
+        form.addRow("Recheck interval (s)", self._recheck_interval_input)
+        form.addRow("AI reanalyze (s)", self._ai_reanalyze_interval_input)
+        form.addRow("Min change rebuild %", self._min_change_rebuild_input)
+        form.addRow("Volatility mode", self._volatility_mode_input)
 
         self._reset_ai_button = QPushButton("Reset to AI")
         self._reset_ai_button.setEnabled(False)
@@ -249,20 +356,52 @@ class PairWorkspaceTab(QWidget):
         group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
 
         self._strategy_fields = {
+            "strategy_id": self._strategy_id_input,
             "budget": self._budget_input,
             "mode": self._mode_input,
             "grid_count": self._grid_count_input,
             "grid_step_pct": self._grid_step_input,
             "range_low_pct": self._range_low_input,
             "range_high_pct": self._range_high_input,
+            "bias_buy_pct": self._bias_buy_input,
+            "bias_sell_pct": self._bias_sell_input,
+            "order_size_mode": self._order_size_mode_input,
+            "max_orders": self._max_orders_input,
+            "max_exposure_pct": self._max_exposure_input,
+            "hard_stop_pct": self._hard_stop_input,
+            "cooldown_minutes": self._cooldown_input,
+            "soft_stop_rules": self._soft_stop_input,
+            "kill_switch_rules": self._kill_switch_input,
+            "recheck_interval_sec": self._recheck_interval_input,
+            "ai_reanalyze_interval_sec": self._ai_reanalyze_interval_input,
+            "min_change_to_rebuild_pct": self._min_change_rebuild_input,
+            "volatility_mode": self._volatility_mode_input,
         }
 
+        self._strategy_id_input.currentTextChanged.connect(lambda _: self._on_field_changed("strategy_id"))
         self._budget_input.valueChanged.connect(lambda _: self._on_field_changed("budget"))
         self._mode_input.currentTextChanged.connect(lambda _: self._on_field_changed("mode"))
         self._grid_count_input.valueChanged.connect(lambda _: self._on_field_changed("grid_count"))
         self._grid_step_input.valueChanged.connect(lambda _: self._on_field_changed("grid_step_pct"))
         self._range_low_input.valueChanged.connect(lambda _: self._on_field_changed("range_low_pct"))
         self._range_high_input.valueChanged.connect(lambda _: self._on_field_changed("range_high_pct"))
+        self._bias_buy_input.valueChanged.connect(lambda _: self._on_field_changed("bias_buy_pct"))
+        self._bias_sell_input.valueChanged.connect(lambda _: self._on_field_changed("bias_sell_pct"))
+        self._order_size_mode_input.currentTextChanged.connect(lambda _: self._on_field_changed("order_size_mode"))
+        self._max_orders_input.valueChanged.connect(lambda _: self._on_field_changed("max_orders"))
+        self._max_exposure_input.valueChanged.connect(lambda _: self._on_field_changed("max_exposure_pct"))
+        self._hard_stop_input.valueChanged.connect(lambda _: self._on_field_changed("hard_stop_pct"))
+        self._cooldown_input.valueChanged.connect(lambda _: self._on_field_changed("cooldown_minutes"))
+        self._soft_stop_input.textChanged.connect(lambda _: self._on_field_changed("soft_stop_rules"))
+        self._kill_switch_input.textChanged.connect(lambda _: self._on_field_changed("kill_switch_rules"))
+        self._recheck_interval_input.valueChanged.connect(lambda _: self._on_field_changed("recheck_interval_sec"))
+        self._ai_reanalyze_interval_input.valueChanged.connect(
+            lambda _: self._on_field_changed("ai_reanalyze_interval_sec")
+        )
+        self._min_change_rebuild_input.valueChanged.connect(
+            lambda _: self._on_field_changed("min_change_to_rebuild_pct")
+        )
+        self._volatility_mode_input.currentTextChanged.connect(lambda _: self._on_field_changed("volatility_mode"))
 
         return group
 
@@ -297,6 +436,7 @@ class PairWorkspaceTab(QWidget):
         metrics_layout.addWidget(self._preview_levels_label)
         layout.addLayout(metrics_layout)
         group.setLayout(layout)
+        group.setMinimumHeight(240)
         group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return group
 
@@ -306,6 +446,7 @@ class PairWorkspaceTab(QWidget):
         self._logs_panel = PairLogsPanel()
         layout.addWidget(self._logs_panel)
         group.setLayout(layout)
+        group.setMinimumHeight(220)
         group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return group
 
@@ -321,10 +462,13 @@ class PairWorkspaceTab(QWidget):
         self._chat_input = QLineEdit()
         self._chat_input.setPlaceholderText("Ask AI to adjust strategy...")
         self._chat_send_button = QPushButton("Send")
+        self._chat_apply_button = QPushButton("Apply Patch")
+        self._chat_apply_button.setEnabled(False)
         self._chat_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._chat_send_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         input_row.addWidget(self._chat_input)
         input_row.addWidget(self._chat_send_button)
+        input_row.addWidget(self._chat_apply_button)
 
         layout.addLayout(input_row)
         panel.setLayout(layout)
@@ -368,16 +512,18 @@ class PairWorkspaceTab(QWidget):
             lines.append(f"AI note: {ai_note}")
         return "\n".join(lines)
 
-    def _format_ai_summary(self, response: AiResponse) -> str:
+    def _format_ai_summary(self, envelope: AiResponseEnvelope, analysis: AiAnalysisResult) -> str:
         lines = [
             "AI analysis summary:",
-            f"Market type: {response.summary.market_type}",
-            f"Volatility: {response.summary.volatility}",
-            f"Liquidity: {response.summary.liquidity}",
-            f"Spread: {response.summary.spread}",
+            f"Status: {envelope.status}",
         ]
-        if response.summary.advice:
-            lines.append(f"Advice: {response.summary.advice}")
+        if envelope.confidence is not None:
+            lines.append(f"Confidence: {envelope.confidence:.2f}")
+        if envelope.reason_codes:
+            lines.append(f"Reason codes: {', '.join(envelope.reason_codes)}")
+        lines.append(f"Strategy: {analysis.strategy.strategy_id}")
+        if analysis.summary_lines:
+            lines.extend(analysis.summary_lines[:3])
         return "\n".join(lines)
 
     def _normalize_mode(self, mode: str) -> str:
@@ -388,6 +534,15 @@ class PairWorkspaceTab(QWidget):
             return "Manual"
         return "Grid"
 
+    def _set_summary_status(self, status: str) -> None:
+        if status in {"WARN"}:
+            self._analysis_summary.setStyleSheet("background-color: rgba(217, 164, 65, 0.15);")
+            return
+        if status in {"DANGER", "ERROR"}:
+            self._analysis_summary.setStyleSheet("background-color: rgba(217, 65, 65, 0.18);")
+            return
+        self._analysis_summary.setStyleSheet("")
+
     def _split_symbol(self, symbol: str) -> tuple[str, str]:
         if "/" in symbol:
             base, quote = symbol.split("/", maxsplit=1)
@@ -396,31 +551,68 @@ class PairWorkspaceTab(QWidget):
             return symbol[:-4], "USDT"
         return symbol, self._app_state.default_quote
 
-    def _plan_to_dict(self, plan: AiPlan) -> dict[str, Any]:
+    def _extract_budget_value(self, message: str) -> float | None:
+        pattern = r\"(?:\\bbudget\\b|\\bбюджет\\b)\\s*([0-9]+(?:[\\.,][0-9]+)?)\"
+        match = re.search(pattern, message.lower())
+        if not match:
+            return None
+        raw = match.group(1).replace(\",\", \".\")
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def _collect_current_strategy(self) -> dict[str, Any]:
+        levels: list[dict[str, Any]] = []
+        if self._last_ai_analysis and self._last_ai_analysis.strategy.levels:
+            levels = [
+                {
+                    "side": level.side,
+                    "price": level.price,
+                    "qty": level.qty,
+                    "pct_from_mid": level.pct_from_mid,
+                }
+                for level in self._last_ai_analysis.strategy.levels
+            ]
         return {
-            "mode": plan.mode,
-            "grid_count": plan.grid_count,
-            "grid_step_pct": plan.grid_step_pct,
-            "range_low_pct": plan.range_low_pct,
-            "range_high_pct": plan.range_high_pct,
-            "budget_usdt": plan.budget_usdt,
+            "strategy_id": self._strategy_id_input.currentText(),
+            "budget_usdt": self._budget_input.value(),
+            "levels": levels,
+            "grid_step_pct": self._grid_step_input.value(),
+            "range_low_pct": self._range_low_input.value(),
+            "range_high_pct": self._range_high_input.value(),
+            "bias": {"buy_pct": self._bias_buy_input.value(), "sell_pct": self._bias_sell_input.value()},
+            "order_size_mode": self._order_size_mode_input.currentText(),
+            "max_orders": self._max_orders_input.value(),
+            "max_exposure_pct": self._max_exposure_input.value(),
+            "hard_stop_pct": self._hard_stop_input.value(),
+            "cooldown_minutes": self._cooldown_input.value(),
+            "soft_stop_rules": self._split_rules(self._soft_stop_input.text()),
+            "kill_switch_rules": self._split_rules(self._kill_switch_input.text()),
+            "recheck_interval_sec": self._recheck_interval_input.value(),
+            "ai_reanalyze_interval_sec": self._ai_reanalyze_interval_input.value(),
+            "min_change_to_rebuild_pct": self._min_change_rebuild_input.value(),
+            "volatility_mode": self._volatility_mode_input.currentText(),
         }
 
-    def _render_ai_questions(self, questions: list[str], tool_requests: list[str]) -> None:
-        if questions:
-            self._append_chat("AI", f"Questions: {', '.join(questions)}")
-            self._log_event(f"[AI] Questions: {', '.join(questions)}")
-        if tool_requests:
-            self._append_chat("AI", f"Tool requests: {', '.join(tool_requests)}")
-            self._log_event(f"[AI] Tool requests: {', '.join(tool_requests)}")
+    def _render_ai_actions(self, actions: list[str]) -> None:
+        if not actions:
+            return
+        self._append_chat("AI", f"Actions: {', '.join(actions)}")
+        self._log_event(f"[AI] Actions: {', '.join(actions)}")
 
-    def _render_preview_from_ai(self, response: AiResponse) -> None:
-        if response.preview_levels:
-            self._render_plan_preview_levels(response.preview_levels)
+    def _split_rules(self, text: str) -> list[str]:
+        if not text:
+            return []
+        return [item.strip() for item in text.split(",") if item.strip()]
+
+    def _render_preview_from_ai(self, analysis: AiAnalysisResult) -> None:
+        if analysis.strategy.levels:
+            self._render_plan_preview_levels(analysis.strategy.levels)
         else:
             self._rebuild_plan_preview(reason="built")
 
-    def _render_plan_preview_levels(self, levels: list[Any]) -> None:
+    def _render_plan_preview_levels(self, levels: list[AiLevel]) -> None:
         if not levels:
             self._plan_preview_table.setRowCount(0)
             self._plan_preview_status.setText("No preview levels returned by AI.")
@@ -449,41 +641,75 @@ class PairWorkspaceTab(QWidget):
         self._preview_levels_label.setText(f"Levels: {len(levels)}")
         self._log_event(f"[PLAN] AI preview loaded | levels={len(levels)}")
 
-    def _apply_ai_patch(self, patch: AiPatchResponse) -> None:
-        if self._last_ai_response is None:
+    def _apply_strategy_patch(self, patch: AiStrategyPatch) -> None:
+        if self._last_ai_analysis is None:
             return
-        plan = self._last_ai_response.plan
-        updated = {
-            "mode": plan.mode,
-            "grid_count": plan.grid_count,
-            "grid_step_pct": plan.grid_step_pct,
-            "range_low_pct": plan.range_low_pct,
-            "range_high_pct": plan.range_high_pct,
-            "budget_usdt": plan.budget_usdt,
-        }
-        for key, value in patch.patch.items():
-            if key in updated:
-                updated[key] = value
-        self._last_ai_response.plan = AiPlan(
-            mode=str(updated["mode"]),
-            grid_count=int(float(updated["grid_count"])),
-            grid_step_pct=float(updated["grid_step_pct"]),
-            range_low_pct=float(updated["range_low_pct"]),
-            range_high_pct=float(updated["range_high_pct"]),
-            budget_usdt=float(updated["budget_usdt"]),
+        updated = self._collect_current_strategy()
+        for key, value in patch.parameters_patch.items():
+            updated[key] = value
+        self._set_field_value("strategy_id", updated.get("strategy_id", self._strategy_id_input.currentText()))
+        self._set_field_value("budget", updated.get("budget_usdt", self._budget_input.value()))
+        self._set_field_value("grid_step_pct", updated.get("grid_step_pct", self._grid_step_input.value()))
+        self._set_field_value("range_low_pct", updated.get("range_low_pct", self._range_low_input.value()))
+        self._set_field_value("range_high_pct", updated.get("range_high_pct", self._range_high_input.value()))
+        bias = updated.get("bias", {})
+        if isinstance(bias, dict):
+            if "buy_pct" in bias:
+                self._set_field_value("bias_buy_pct", bias.get("buy_pct", self._bias_buy_input.value()))
+            if "sell_pct" in bias:
+                self._set_field_value("bias_sell_pct", bias.get("sell_pct", self._bias_sell_input.value()))
+        self._set_field_value("order_size_mode", updated.get("order_size_mode", self._order_size_mode_input.currentText()))
+        self._set_field_value("max_orders", updated.get("max_orders", self._max_orders_input.value()))
+        self._set_field_value(
+            "max_exposure_pct", updated.get("max_exposure_pct", self._max_exposure_input.value())
         )
-        if patch.preview_levels:
-            self._last_ai_response.preview_levels = patch.preview_levels
-        else:
-            self._last_ai_response.preview_levels = []
-        self._apply_plan()
+        self._set_field_value("hard_stop_pct", updated.get("hard_stop_pct", self._hard_stop_input.value()))
+        self._set_field_value("cooldown_minutes", updated.get("cooldown_minutes", self._cooldown_input.value()))
+        if "soft_stop_rules" in updated:
+            self._set_field_value("soft_stop_rules", ", ".join(updated.get("soft_stop_rules", [])))
+        if "kill_switch_rules" in updated:
+            self._set_field_value("kill_switch_rules", ", ".join(updated.get("kill_switch_rules", [])))
+        self._set_field_value(
+            "recheck_interval_sec", updated.get("recheck_interval_sec", self._recheck_interval_input.value())
+        )
+        self._set_field_value(
+            "ai_reanalyze_interval_sec",
+            updated.get("ai_reanalyze_interval_sec", self._ai_reanalyze_interval_input.value()),
+        )
+        self._set_field_value(
+            "min_change_to_rebuild_pct",
+            updated.get("min_change_to_rebuild_pct", self._min_change_rebuild_input.value()),
+        )
+        self._set_field_value(
+            "volatility_mode", updated.get("volatility_mode", self._volatility_mode_input.currentText())
+        )
+        if "levels" in updated and isinstance(updated["levels"], list):
+            self._last_ai_analysis.strategy.levels = [
+                AiLevel(
+                    side=str(level.get("side", "")),
+                    price=float(level.get("price", 0)),
+                    qty=float(level.get("qty", 0)),
+                    pct_from_mid=float(level.get("pct_from_mid", 0)),
+                )
+                for level in updated["levels"]
+                if isinstance(level, dict)
+            ]
+        if patch.recommended_actions:
+            action_text = "; ".join(action.detail for action in patch.recommended_actions)
+            if action_text:
+                self._log_event(f"[AI] Recommended actions: {action_text}")
+        self._render_preview_from_ai(self._last_ai_analysis)
+        self._plan_applied = True
+        self._log_event("[AI] Patch applied -> strategy updated")
 
     def _prepare_data(self) -> None:
         self._data_ready = False
         self._plan_applied = False
+        self._ai_block_confirm = False
         self._set_state(BotState.PREPARING_DATA, reason="prepare_data")
         self._log_event("Prepare data requested.")
         self._analysis_summary.setText(self._preparing_summary())
+        self._set_summary_status("OK")
         delay_ms = random.randint(300, 800)
         QTimer.singleShot(delay_ms, self._finish_prepare)
 
@@ -496,6 +722,7 @@ class PairWorkspaceTab(QWidget):
         self._analysis_summary.setText(
             f"Prepared demo datapack ({self.symbol}, {period}, {quality})."
         )
+        self._set_summary_status("OK")
         self._ai_request_card.hide()
         self._set_state(BotState.DATA_READY, reason="prepare_complete")
         self._log_event("Prepared data pack (demo).")
@@ -519,7 +746,7 @@ class PairWorkspaceTab(QWidget):
         worker.signals.error.connect(self._handle_ai_analyze_error)
         self._thread_pool.start(worker)
 
-    def _run_ai_analyze(self, datapack: dict[str, Any]) -> AiResponse:
+    def _run_ai_analyze(self, datapack: dict[str, Any]) -> AiResponseEnvelope:
         client = OpenAIClient(
             api_key=self._app_state.openai_api_key,
             model=self._app_state.openai_model,
@@ -529,25 +756,53 @@ class PairWorkspaceTab(QWidget):
         return asyncio.run(client.analyze_pair(datapack))
 
     def _handle_ai_analyze_success(self, response: object) -> None:
-        if not isinstance(response, AiResponse):
+        if not isinstance(response, AiResponseEnvelope):
             self._handle_ai_analyze_error("AI response invalid or empty.")
+            return
+        if response.status == "ERROR" or response.analysis_result is None:
+            self._handle_ai_analyze_error(response.message or "AI response invalid or empty.")
             return
         self._ai_request_card.hide()
         self._last_ai_response = response
-        self._analysis_summary.setText(self._format_ai_summary(response))
+        self._last_ai_analysis = response.analysis_result
+        self._analysis_summary.setText(self._format_ai_summary(response, response.analysis_result))
+        self._set_summary_status(response.status)
         self._plan_preview_status.setText("AI analysis complete. Apply plan to populate strategy.")
+        self._plan_applied = False
+        self._pending_patch = None
+        self._chat_apply_button.setEnabled(False)
+        self._ai_block_confirm = (
+            response.status in {"WARN", "DANGER"}
+            or response.analysis_result.strategy.strategy_id == "DO_NOT_TRADE"
+        )
+        if self._ai_block_confirm:
+            self._append_chat("AI", "AI signaled caution; trading is blocked until you re-run analysis.")
+            self._log_event("[AI] Confirm Start blocked due to AI status.")
         self._set_state(BotState.PLAN_READY, reason="analysis_complete")
         self._log_event("AI analyze ok")
+        self._log_event(f"[AI] status={response.status} confidence={response.confidence}")
+        status_bits = [f"Status: {response.status}"]
+        if response.confidence is not None:
+            status_bits.append(f"confidence={response.confidence:.2f}")
+        if response.reason_codes:
+            status_bits.append(f"reasons={', '.join(response.reason_codes)}")
         self._append_chat("AI", "Analysis complete. Click Apply Plan to populate strategy.")
-        if response.risk_notes:
-            self._append_chat("AI", f"Risks: {', '.join(response.risk_notes)}")
-        self._render_ai_questions(response.questions, response.tool_requests)
-        self._render_preview_from_ai(response)
+        self._append_chat("AI", " | ".join(status_bits))
+        if response.message:
+            self._append_chat("AI", response.message)
+        if response.analysis_result.actions:
+            action_details = [action.detail for action in response.analysis_result.actions if action.detail]
+            self._render_ai_actions(action_details)
+        self._render_preview_from_ai(response.analysis_result)
 
     def _handle_ai_analyze_error(self, message: str) -> None:
         self._log_event(f"AI analyze failed: {message}")
         self._append_chat("AI", f"AI error: {message}")
         self._analysis_summary.setText("AI analysis failed. Check logs for details.")
+        self._set_summary_status("ERROR")
+        self._ai_block_confirm = True
+        self._pending_patch = None
+        self._chat_apply_button.setEnabled(False)
         self._set_state(BotState.DATA_READY, reason="analysis_failed")
 
     def _is_plan_applied(self) -> bool:
@@ -567,7 +822,10 @@ class PairWorkspaceTab(QWidget):
         if origin == "ai":
             self._ai_values[field_key] = value
             self._user_touched.discard(field_key)
+            field.setProperty("autoFilled", True)
             self._mark_field_state(field_key, "ai")
+        else:
+            field.setProperty("autoFilled", False)
 
     def _mark_field_state(self, field_key: str, state: str = "neutral") -> None:
         field = self._strategy_fields[field_key]
@@ -591,6 +849,7 @@ class PairWorkspaceTab(QWidget):
         if not self._is_plan_applied() or not self._ai_values:
             return
         self._user_touched.add(field_key)
+        self._strategy_fields[field_key].setProperty("autoFilled", False)
         self._mark_field_state(field_key, "user")
         self._rebuild_plan_preview(reason="strategy_edit")
 
@@ -604,26 +863,55 @@ class PairWorkspaceTab(QWidget):
         self._log_event("[UI] Reset strategy to AI values")
 
     def _apply_plan(self) -> None:
-        if self._last_ai_response is None:
+        if self._last_ai_analysis is None:
             QMessageBox.warning(self, "No AI plan", "Run AI Analyze before applying the plan.")
             self._log_event("Apply plan skipped: missing AI response.")
             return
-        demo_plan = self._last_ai_response.plan
+        strategy = self._last_ai_analysis.strategy
         self._ai_values = {}
         self._user_touched.clear()
-        self._set_field_value("budget", demo_plan.budget_usdt, origin="ai")
-        self._set_field_value("mode", self._normalize_mode(demo_plan.mode), origin="ai")
-        self._set_field_value("grid_count", demo_plan.grid_count, origin="ai")
-        self._set_field_value("grid_step_pct", demo_plan.grid_step_pct, origin="ai")
-        self._set_field_value("range_low_pct", demo_plan.range_low_pct, origin="ai")
-        self._set_field_value("range_high_pct", demo_plan.range_high_pct, origin="ai")
+        self._set_field_value("strategy_id", strategy.strategy_id, origin="ai")
+        self._set_field_value("budget", strategy.budget_usdt, origin="ai")
+        self._set_field_value("mode", "Grid", origin="ai")
+        self._set_field_value("grid_step_pct", strategy.grid_step_pct, origin="ai")
+        self._set_field_value("range_low_pct", strategy.range_low_pct, origin="ai")
+        self._set_field_value("range_high_pct", strategy.range_high_pct, origin="ai")
+        if strategy.levels:
+            self._set_field_value("grid_count", len(strategy.levels), origin="ai")
+        self._set_field_value("bias_buy_pct", strategy.bias.buy_pct, origin="ai")
+        self._set_field_value("bias_sell_pct", strategy.bias.sell_pct, origin="ai")
+        self._set_field_value("order_size_mode", strategy.order_size_mode, origin="ai")
+        self._set_field_value("max_orders", strategy.max_orders, origin="ai")
+        self._set_field_value("max_exposure_pct", strategy.max_exposure_pct, origin="ai")
+        self._set_field_value("hard_stop_pct", self._last_ai_analysis.risk.hard_stop_pct, origin="ai")
+        self._set_field_value("cooldown_minutes", self._last_ai_analysis.risk.cooldown_minutes, origin="ai")
+        self._set_field_value(
+            "soft_stop_rules", ", ".join(self._last_ai_analysis.risk.soft_stop_rules), origin="ai"
+        )
+        self._set_field_value(
+            "kill_switch_rules", ", ".join(self._last_ai_analysis.risk.kill_switch_rules), origin="ai"
+        )
+        self._set_field_value(
+            "recheck_interval_sec", self._last_ai_analysis.control.recheck_interval_sec, origin="ai"
+        )
+        self._set_field_value(
+            "ai_reanalyze_interval_sec", self._last_ai_analysis.control.ai_reanalyze_interval_sec, origin="ai"
+        )
+        self._set_field_value(
+            "min_change_to_rebuild_pct", self._last_ai_analysis.control.min_change_to_rebuild_pct, origin="ai"
+        )
+        self._set_field_value("volatility_mode", self._last_ai_analysis.risk.volatility_mode, origin="ai")
         self._reset_ai_button.setEnabled(True)
         self._plan_applied = True
         self._set_state(BotState.PLAN_READY, reason="apply_plan")
         self._log_event("[AI] Plan applied -> strategy populated")
-        self._render_preview_from_ai(self._last_ai_response)
+        self._render_preview_from_ai(self._last_ai_analysis)
 
     def _confirm_start(self) -> None:
+        if self._ai_block_confirm:
+            QMessageBox.warning(self, "AI Block", "AI marked this plan as unsafe. Re-run analysis to proceed.")
+            self._log_event("Confirm start blocked by AI status.")
+            return
         if self._pair_state.state == BotState.PAUSED:
             self._tick_timer.start()
             self._set_state(BotState.RUNNING, reason="resume")
@@ -652,7 +940,9 @@ class PairWorkspaceTab(QWidget):
         self._tick_count = 0
         self._data_ready = False
         self._plan_applied = False
+        self._ai_block_confirm = False
         self._analysis_summary.setText(self._idle_summary())
+        self._set_summary_status("OK")
         self._set_state(BotState.IDLE, reason="stop")
         self._log_event("Execution stopped.")
 
@@ -664,23 +954,33 @@ class PairWorkspaceTab(QWidget):
         message = self._chat_input.text().strip()
         if not message:
             return
+        budget_value = self._extract_budget_value(message)
+        if budget_value is not None:
+            self._set_field_value("budget", budget_value, origin="user")
+            self._mark_field_state("budget", "user")
+            self._append_chat("AI", f"Local intent applied: budget set to {budget_value:.2f} USDT.")
+            self._log_event(f"[INTENT] budget -> {budget_value:.2f} USDT")
+            self._chat_input.clear()
+            return
         if not self._app_state.openai_key_present:
             self._append_chat("AI", "Missing OpenAI key. Set it in Settings.")
             self._log_event("AI chat skipped: missing OpenAI key.")
             return
-        if self._last_ai_response is None or self._last_datapack is None:
+        if self._last_ai_analysis is None or self._last_datapack is None:
             self._append_chat("AI", "Run AI Analyze before requesting adjustments.")
             self._log_event("AI chat skipped: missing AI response.")
             return
         self._append_chat("User", message)
         self._chat_input.clear()
+        self._pending_patch = None
+        self._chat_apply_button.setEnabled(False)
         worker = _AiWorker(lambda: self._run_ai_chat_adjust(message))
         worker.signals.success.connect(self._handle_ai_chat_adjust_success)
         worker.signals.error.connect(self._handle_ai_chat_adjust_error)
         self._thread_pool.start(worker)
 
-    def _run_ai_chat_adjust(self, message: str) -> AiPatchResponse:
-        if self._last_datapack is None or self._last_ai_response is None:
+    def _run_ai_chat_adjust(self, message: str) -> AiResponseEnvelope:
+        if self._last_datapack is None or self._last_ai_analysis is None:
             raise RuntimeError("No AI plan to adjust")
         client = OpenAIClient(
             api_key=self._app_state.openai_api_key,
@@ -691,26 +991,41 @@ class PairWorkspaceTab(QWidget):
         return asyncio.run(
             client.chat_adjust(
                 datapack=self._last_datapack,
-                last_plan=self._plan_to_dict(self._last_ai_response.plan),
+                last_plan=self._collect_current_strategy(),
                 user_message=message,
             )
         )
 
     def _handle_ai_chat_adjust_success(self, response: object) -> None:
-        if not isinstance(response, AiPatchResponse):
+        if not isinstance(response, AiResponseEnvelope):
             self._handle_ai_chat_adjust_error("AI patch response invalid or empty.")
             return
-        if self._last_ai_response is None:
-            self._handle_ai_chat_adjust_error("No AI plan available.")
+        if response.status == "ERROR" or response.strategy_patch is None:
+            self._handle_ai_chat_adjust_error(response.message or "AI patch response invalid or empty.")
             return
-        self._apply_ai_patch(response)
-        message = response.message or "Plan updated."
-        self._append_chat("AI", f"AI updated plan: {message}")
-        self._render_ai_questions(response.questions, response.tool_requests)
+        self._pending_patch = response.strategy_patch
+        self._chat_apply_button.setEnabled(True)
+        message = response.strategy_patch.message or response.message or "Patch ready to apply."
+        self._append_chat("AI", f"AI patch ready: {message}")
+        if response.strategy_patch.recommended_actions:
+            action_details = [action.detail for action in response.strategy_patch.recommended_actions if action.detail]
+            self._render_ai_actions(action_details)
 
     def _handle_ai_chat_adjust_error(self, message: str) -> None:
         self._append_chat("AI", f"AI adjust error: {message}")
         self._log_event(f"AI chat adjust failed: {message}")
+        self._pending_patch = None
+        self._chat_apply_button.setEnabled(False)
+
+    def _apply_pending_patch(self) -> None:
+        if self._pending_patch is None:
+            self._append_chat("AI", "No patch available to apply.")
+            return
+        self._apply_strategy_patch(self._pending_patch)
+        self._pending_patch = None
+        self._chat_apply_button.setEnabled(False)
+        self._append_chat("AI", "Patch applied to the strategy form.")
+        self.update_controls_by_state()
 
     def _append_chat(self, sender: str, message: str) -> None:
         self._chat_history.append(f"{sender}: {message}")
@@ -742,7 +1057,8 @@ class PairWorkspaceTab(QWidget):
         self._topbar.analyze_button.setEnabled(state == BotState.DATA_READY and ai_ready)
         self._topbar.apply_button.setEnabled(state == BotState.PLAN_READY)
         self._topbar.confirm_button.setEnabled(
-            (state == BotState.PLAN_READY and self._plan_applied) or state == BotState.PAUSED
+            ((state == BotState.PLAN_READY and self._plan_applied and not self._ai_block_confirm))
+            or state == BotState.PAUSED
         )
         self._topbar.pause_button.setEnabled(state == BotState.RUNNING)
         self._topbar.stop_button.setEnabled(state in {BotState.RUNNING, BotState.PAUSED})
@@ -851,43 +1167,63 @@ class PairWorkspaceTab(QWidget):
         source = self._latest_price_source or "None"
         age_ms = self._latest_price_age_ms
         base_asset, quote_asset = self._split_symbol(self.symbol)
-        spread_estimate = self._market_context.spread if self._market_context else None
-        volatility_proxy = None
+        spread_estimate = self._market_context.spread if self._market_context else 0.2
+        volatility_proxy = 0.0
         if self._prepared_mid_price and now_price:
             try:
                 volatility_proxy = (now_price - self._prepared_mid_price) / self._prepared_mid_price * 100
             except ZeroDivisionError:
-                volatility_proxy = None
-        strategy_inputs = {
-            "budget": self._budget_input.value(),
-            "mode": self._mode_input.currentText(),
-            "grid_count": self._grid_count_input.value(),
-            "grid_step_pct": self._grid_step_input.value(),
-            "range_low_pct": self._range_low_input.value(),
-            "range_high_pct": self._range_high_input.value(),
-        }
+                volatility_proxy = 0.0
+        bid = None
+        ask = None
+        if now_price is not None:
+            bid = now_price * (1 - spread_estimate / 200)
+            ask = now_price * (1 + spread_estimate / 200)
+        candles_summary = []
+        base_vol = abs(volatility_proxy) if volatility_proxy is not None else 0.2
+        for candle_period, scale in (("1m", 0.3), ("5m", 0.5), ("1h", 0.8), ("4h", 1.2)):
+            candles_summary.append(
+                {
+                    "period": candle_period,
+                    "atr_pct": round(base_vol * scale + 0.2, 3),
+                    "stdev_pct": round(base_vol * scale + 0.1, 3),
+                    "momentum_pct": round(volatility_proxy * scale, 3),
+                }
+            )
+        liquidity_label = "OK"
+        if self._market_context and self._market_context.liquidity.lower() == "thin":
+            liquidity_label = "THIN"
         return {
-            "version": "v2",
-            "symbol": self.symbol,
-            "base_asset": base_asset,
-            "quote_asset": quote_asset,
-            "period": period,
-            "quality": quality,
-            "current_price": {
-                "value": now_price,
-                "source": source,
-                "age_ms": age_ms,
+            "version": "v2.1.2",
+            "market_snapshot": {
+                "symbol": self.symbol,
+                "last_price": now_price,
+                "bid": bid,
+                "ask": ask,
+                "spread_pct": spread_estimate,
+                "source_latency_ms": age_ms,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "candles_summary": candles_summary,
             },
-            "spread_estimate_pct": spread_estimate,
-            "volatility_proxy_pct": volatility_proxy,
-            "exchange_limits": {
-                "tickSize": None,
-                "stepSize": None,
-                "minNotional": None,
+            "liquidity_summary": {
+                "quote_volume_24h": 0,
+                "trade_count_24h": 0,
+                "liquidity_label": liquidity_label,
             },
-            "user_inputs": strategy_inputs,
-            "app_settings": {
+            "exchange_constraints": {
+                "tick_size": None,
+                "step_size": None,
+                "min_notional": None,
+            },
+            "user_context": {
+                "budget_usdt": self._budget_input.value(),
                 "dry_run": self._topbar.dry_run_toggle.isChecked(),
-                "allow_request_more_data": self._app_state.allow_ai_more_data,
+                "selected_period": period,
+                "quality": quality,
+            },
+            "pair_context": {
+                "base_asset": base_asset,
+                "quote_asset": quote_asset,
+                "source": source,
             },
         }
