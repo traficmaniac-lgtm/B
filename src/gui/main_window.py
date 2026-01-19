@@ -35,7 +35,7 @@ class MainWindow(QMainWindow):
 
         self._tabs = QTabWidget()
         self._tabs.setTabsClosable(True)
-        self._overview_tab = OverviewTab(on_open_pair=self.open_pair_tab)
+        self._overview_tab = OverviewTab(self._config, on_open_pair=self.open_pair_tab)
         self._tabs.addTab(self._overview_tab, "Overview")
         self._tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
         self._tabs.tabBar().setTabButton(0, QTabBar.LeftSide, None)
