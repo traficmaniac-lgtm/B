@@ -26,6 +26,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.core.logging import get_logger
+from src.gui.trading_runtime_window import TradingRuntimeWindow
+
 
 class TradeReadyState(str, Enum):
     IDLE = "IDLE"
@@ -61,6 +64,9 @@ class TradeReadyModeWindow(QMainWindow):
         self._analysis_timer: QTimer | None = None
         self._latest_ai_report: dict[str, Any] | None = None
         self._variants: list[TradeVariant] = []
+        self._selected_variant: TradeVariant | None = None
+        self._runtime_windows: list[TradingRuntimeWindow] = []
+        self._logger = get_logger(f"gui.trade_ready.{symbol.lower()}")
 
         self.setWindowTitle(f"Trade Ready Mode — {symbol}")
         self.resize(1280, 860)
@@ -241,6 +247,10 @@ class TradeReadyModeWindow(QMainWindow):
         self._strategy_type = QComboBox()
         self._strategy_type.addItems(["Grid", "Convert", "Range", "Auto"])
 
+        self._runtime_mode = QComboBox()
+        self._runtime_mode.addItems(["DRY-RUN", "LIVE"])
+        self._runtime_mode.setCurrentText("DRY-RUN")
+
         self._budget_input = QDoubleSpinBox()
         self._budget_input.setRange(10.0, 1_000_000.0)
         self._budget_input.setDecimals(2)
@@ -266,13 +276,20 @@ class TradeReadyModeWindow(QMainWindow):
         self._risk_limit_input.setSuffix(" x")
 
         form.addRow(QLabel("Strategy type"), self._strategy_type)
+        form.addRow(QLabel("Runtime mode"), self._runtime_mode)
         form.addRow(QLabel("Budget"), self._budget_input)
         form.addRow(QLabel("Grid step"), self._grid_step_input)
         form.addRow(QLabel("Range low / high"), self._range_low_input)
         form.addRow(QLabel(""), self._range_high_input)
         form.addRow(QLabel("Risk limit"), self._risk_limit_input)
 
-        group.setLayout(form)
+        self._open_runtime_button = QPushButton("Перейти к торговле (Runtime)")
+        self._open_runtime_button.clicked.connect(self._open_runtime_window)
+
+        group_layout = QVBoxLayout()
+        group_layout.addLayout(form)
+        group_layout.addWidget(self._open_runtime_button)
+        group.setLayout(group_layout)
         group.setEnabled(False)
         self._strategy_group = group
         return group
@@ -363,6 +380,7 @@ class TradeReadyModeWindow(QMainWindow):
         self._analyze_button.setEnabled(not is_analyzing)
         self._chat_send.setEnabled(not is_analyzing)
         self._update_variant_buttons_enabled(state == TradeReadyState.REPORT_READY)
+        self._open_runtime_button.setEnabled(state == TradeReadyState.PLAN_READY)
         if state == TradeReadyState.IDLE:
             self._strategy_group.setEnabled(False)
 
@@ -528,6 +546,7 @@ class TradeReadyModeWindow(QMainWindow):
     def _accept_variant(self, variant: TradeVariant) -> None:
         if self._state != TradeReadyState.REPORT_READY:
             return
+        self._selected_variant = variant
         self._fill_strategy_form(variant.strategy)
         self._apply_state(TradeReadyState.PLAN_READY)
         self._log_event(f"Вариант принят: {variant.title}.")
@@ -548,6 +567,38 @@ class TradeReadyModeWindow(QMainWindow):
         self._range_low_input.setValue(float(strategy.get("range_low_pct", 0.0)))
         self._range_high_input.setValue(float(strategy.get("range_high_pct", 0.0)))
         self._risk_limit_input.setValue(float(strategy.get("risk_limit", 1.0)))
+
+    def _open_runtime_window(self) -> None:
+        if self._state != TradeReadyState.PLAN_READY:
+            return
+        snapshot = self._build_strategy_snapshot()
+        mode = self._runtime_mode.currentText()
+        runtime = TradingRuntimeWindow(
+            symbol=self._symbol,
+            exchange=self._exchange,
+            strategy_snapshot=snapshot,
+            mode=mode,
+            trade_ready_window=self,
+            parent=self.parentWidget(),
+        )
+        runtime.show()
+        self._runtime_windows.append(runtime)
+        self._log_event("Открыто окно Trading Runtime.")
+        self._logger.info("Opened Trading Runtime window", extra={"symbol": self._symbol})
+
+    def _build_strategy_snapshot(self) -> dict[str, Any]:
+        range_low = self._range_low_input.value()
+        range_high = self._range_high_input.value()
+        range_text = f"{range_low:.2f}% / {range_high:.2f}%"
+        strategy_id = self._selected_variant.title if self._selected_variant else "AUTO-STRATEGY"
+        return {
+            "strategy_id": strategy_id,
+            "strategy_type": self._strategy_type.currentText(),
+            "budget": self._budget_input.value(),
+            "grid_step": f"{self._grid_step_input.value():.2f}%",
+            "range": range_text,
+            "risk_limit": f"{self._risk_limit_input.value():.2f}x",
+        }
 
     def _send_chat_message(self) -> None:
         message = self._chat_input.text().strip()

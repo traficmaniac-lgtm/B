@@ -45,3 +45,8 @@
 - Replaced the Advanced AI placeholder with the Trade Ready Mode window and state machine.
 - Added market context, analysis controls, AI summary, trade variants, chat, and history zones.
 - Wired Overview double-click to pass last price into the Trade Ready Mode entry point.
+
+### Stage 4.0.1 - Trading Runtime window scaffolding
+- Added Trading Runtime Window with header controls, split layout, and runtime state machine.
+- Implemented mock orders, position snapshot, AI observer, recommendations, runtime chat, and tabs.
+- Wired Trade Ready Mode to open the runtime window with a strategy snapshot and mode selection.
