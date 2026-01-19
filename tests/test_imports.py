@@ -20,6 +20,13 @@ def test_config_loads_defaults() -> None:
     assert config.prices.refresh_interval_ms > 0
 
 
+def test_openai_client_import() -> None:
+    pytest.importorskip("openai")
+    from src.ai.openai_client import OpenAIClient
+
+    assert OpenAIClient.__name__ == "OpenAIClient"
+
+
 @pytest.mark.skipif(not PYSIDE_AVAILABLE, reason="PySide6 dependencies unavailable")
 def test_imports() -> None:
     from src.app.main import main

@@ -25,6 +25,7 @@ def _load_app_state(config: Config, root_path: Path) -> AppState:
         binance_api_key="",
         binance_api_secret="",
         openai_api_key="",
+        openai_model="gpt-4o-mini",
         default_period="4h",
         default_quality="Standard",
         allow_ai_more_data=True,
@@ -32,6 +33,8 @@ def _load_app_state(config: Config, root_path: Path) -> AppState:
         price_refresh_ms=price_refresh_ms,
         default_quote="USDT",
         pnl_period="24h",
+        ai_connected=False,
+        ai_checked=False,
     )
     user_config_path = root_path / "config.user.yaml"
     app_state = AppState.load(user_config_path, defaults)

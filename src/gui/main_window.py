@@ -104,6 +104,7 @@ class MainWindow(QMainWindow):
         root_logger.setLevel(app_state.log_level)
         self.statusBar().showMessage("Settings saved", 3000)
         self._status_right_label.setText(f"env: {app_state.env.lower()} | core: loaded")
+        self._overview_tab.refresh_ai_status()
 
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("File")

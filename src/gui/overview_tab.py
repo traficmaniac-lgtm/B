@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 from time import perf_counter
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ai.openai_client import OpenAIClient
 from src.binance.http_client import BinanceHttpClient
 from src.binance.ws_client import BinanceWsClient
 from src.core.config import Config
@@ -125,6 +127,7 @@ class OverviewTab(QWidget):
         layout.addWidget(self._selected_label)
 
         self.setLayout(layout)
+        self._set_ai_status()
 
     def _build_status_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -153,7 +156,8 @@ class OverviewTab(QWidget):
 
         ai_box = QGroupBox("AI")
         ai_layout = QVBoxLayout()
-        ai_layout.addWidget(QLabel("AI: NOT CONNECTED"))
+        self._ai_status_label = QLabel("AI: NOT CONNECTED")
+        ai_layout.addWidget(self._ai_status_label)
         ai_box.setLayout(ai_layout)
 
         balance_box = QGroupBox("Balance / PnL")
@@ -220,6 +224,26 @@ class OverviewTab(QWidget):
         worker.signals.success.connect(self._handle_self_check_success)
         worker.signals.error.connect(self._handle_self_check_error)
         self._thread_pool.start(worker)
+        self._run_ai_self_check()
+
+    def _run_ai_self_check(self) -> None:
+        if not self._app_state.openai_key_present:
+            self._app_state.ai_connected = False
+            self._app_state.ai_checked = False
+            self._set_ai_status()
+            self._logger.info("AI self-check skipped (missing OpenAI key).")
+            return
+        self._ai_status_label.setText("AI: CHECKING")
+        client = OpenAIClient(
+            api_key=self._app_state.openai_api_key,
+            model=self._app_state.openai_model,
+            timeout_s=25.0,
+            retries=1,
+        )
+        worker = _Worker(lambda: asyncio.run(client.self_check()))
+        worker.signals.success.connect(self._handle_ai_self_check_success)
+        worker.signals.error.connect(self._handle_ai_self_check_error)
+        self._thread_pool.start(worker)
 
     def _handle_self_check_success(self, result: object, latency_ms: int) -> None:
         if isinstance(result, dict) and "serverTime" in result:
@@ -231,6 +255,29 @@ class OverviewTab(QWidget):
     def _handle_self_check_error(self, message: str) -> None:
         self._logger.error("self-check failed: %s", message)
         self._set_binance_status_error(message)
+
+    def _handle_ai_self_check_success(self, result: object, latency_ms: int) -> None:
+        if not isinstance(result, tuple) or len(result) != 2:
+            self._logger.error("Unexpected AI self-check response: %s", result)
+            self._app_state.ai_connected = False
+            self._app_state.ai_checked = True
+            self._set_ai_status()
+            return
+        ok, message = result
+        self._app_state.ai_checked = True
+        if ok:
+            self._app_state.ai_connected = True
+            self._logger.info("AI self-check ok (%sms): %s", latency_ms, message)
+        else:
+            self._app_state.ai_connected = False
+            self._logger.error("AI self-check failed: %s", message)
+        self._set_ai_status()
+
+    def _handle_ai_self_check_error(self, message: str) -> None:
+        self._app_state.ai_connected = False
+        self._app_state.ai_checked = True
+        self._logger.error("AI self-check failed: %s", message)
+        self._set_ai_status()
 
     def _handle_load_pairs(self) -> None:
         self._set_pairs_buttons_enabled(False)
@@ -383,3 +430,18 @@ class OverviewTab(QWidget):
         if len(summary) > max_len:
             return summary[: max_len - 3] + "..."
         return summary
+
+    def refresh_ai_status(self) -> None:
+        self._set_ai_status()
+
+    def _set_ai_status(self) -> None:
+        if not self._app_state.openai_key_present:
+            self._ai_status_label.setText("AI: NOT CONNECTED")
+            return
+        if self._app_state.ai_connected:
+            self._ai_status_label.setText("AI: CONNECTED")
+            return
+        if self._app_state.ai_checked:
+            self._ai_status_label.setText("AI: ERROR")
+            return
+        self._ai_status_label.setText("AI: NOT CONNECTED")
