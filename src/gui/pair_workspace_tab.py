@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 from PySide6.QtCore import QTimer
@@ -33,6 +34,15 @@ class DemoPlan:
     range_band: str
 
 
+@dataclass
+class MarketContext:
+    market_type: str
+    volatility: str
+    liquidity: str
+    spread: float
+    spread_status: str
+
+
 class PairWorkspaceTab(QWidget):
     def __init__(self, symbol: str, app_state: AppState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -42,6 +52,7 @@ class PairWorkspaceTab(QWidget):
 
         self._state = PairRunState.IDLE
         self._data_ready = False
+        self._market_context: MarketContext | None = None
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._log_tick)
@@ -94,7 +105,8 @@ class PairWorkspaceTab(QWidget):
     def _build_analysis_panel(self) -> QWidget:
         group = QGroupBox("Analysis summary")
         layout = QVBoxLayout()
-        self._analysis_summary = QLabel("No data prepared yet.")
+        self._analysis_summary = QLabel(self._idle_summary())
+        self._analysis_summary.setWordWrap(True)
         layout.addWidget(self._analysis_summary)
 
         self._ai_request_card = QGroupBox("AI requested more data")
@@ -163,18 +175,53 @@ class PairWorkspaceTab(QWidget):
         panel.setLayout(layout)
         return panel
 
+    def _idle_summary(self) -> str:
+        return "No data prepared.\nClick “Prepare Data” to collect market data."
+
+    def _preparing_summary(self) -> str:
+        return "Preparing market data…"
+
+    def _analyzing_summary(self) -> str:
+        return "Market data ready.\nAI analysis in progress…"
+
+    def _build_market_context(self) -> MarketContext:
+        market_type = random.choice(["Range", "Trend", "Mixed"])
+        volatility = random.choice(["Low", "Medium", "High"])
+        liquidity = random.choice(["OK", "Thin"])
+        spread = round(random.uniform(0.05, 0.45), 2)
+        spread_status = "OK" if spread <= 0.2 else "Warning"
+        return MarketContext(
+            market_type=market_type,
+            volatility=volatility,
+            liquidity=liquidity,
+            spread=spread,
+            spread_status=spread_status,
+        )
+
+    def _format_market_summary(self, include_ai_note: bool) -> str:
+        context = self._market_context or self._build_market_context()
+        self._market_context = context
+        lines = [
+            f"Market type: {context.market_type}",
+            f"Volatility: {context.volatility}",
+            f"Liquidity: {context.liquidity}",
+            f"Spread: {context.spread:.2f}% ({context.spread_status})",
+        ]
+        if include_ai_note:
+            ai_note = random.choice(["Grid suitable", "Grid risky", "Not recommended"])
+            lines.append(f"AI note: {ai_note}")
+        return "\n".join(lines)
+
     def _prepare_data(self) -> None:
         self._set_state(PairRunState.PREPARING)
         self._log_event("Prepare data requested.")
+        self._analysis_summary.setText(self._preparing_summary())
         QTimer.singleShot(700, self._finish_prepare)
 
     def _finish_prepare(self) -> None:
         self._data_ready = True
-        period = self._topbar.period_combo.currentText()
-        quality = self._topbar.quality_combo.currentText()
-        self._analysis_summary.setText(
-            f"Data prepared for {self.symbol}: period={period}, quality={quality}.",
-        )
+        self._market_context = self._build_market_context()
+        self._analysis_summary.setText(self._format_market_summary(include_ai_note=False))
         self._ai_request_card.hide()
         self._set_state(PairRunState.DATA_READY)
         self._log_event("Prepared data pack (demo).")
@@ -186,6 +233,7 @@ class PairWorkspaceTab(QWidget):
             return
         self._set_state(PairRunState.ANALYZING)
         self._log_event("AI analysis started.")
+        self._analysis_summary.setText(self._analyzing_summary())
         QTimer.singleShot(700, self._finish_analysis)
 
     def _finish_analysis(self) -> None:
@@ -193,9 +241,7 @@ class PairWorkspaceTab(QWidget):
         quality = self._topbar.quality_combo.currentText()
         if period != "24h" or quality != "Deep":
             self._ai_request_card.show()
-            self._analysis_summary.setText(
-                "AI requested more data to proceed with a deeper plan.",
-            )
+            self._analysis_summary.setText(self._format_market_summary(include_ai_note=False))
             self._plan_preview.setText("Awaiting additional data request resolution.")
             self._set_state(PairRunState.NEED_MORE_DATA)
             self._log_event("AI requested more data (demo).")
@@ -204,7 +250,7 @@ class PairWorkspaceTab(QWidget):
         self._plan_preview.setText(
             "Plan preview: Grid MM, 12 grids, 0.35% step, budget 500 USDT.",
         )
-        self._analysis_summary.setText("AI analysis complete. Plan ready to apply.")
+        self._analysis_summary.setText(self._format_market_summary(include_ai_note=True))
         self._set_state(PairRunState.PLAN_READY)
         self._log_event("AI plan ready.")
 
