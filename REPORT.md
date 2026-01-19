@@ -27,3 +27,10 @@
 - Stopped Overview from streaming prices; live updates now run only for open bot tabs.
 - Added a price hub that registers/unregisters symbols on tab open/close.
 - Added PairState transition test coverage.
+
+### Stage 2.1.2 - AI protocol JSON + datapack expansion + UI patch flow
+- Added strict AI protocol dataclasses, response envelope parsing, and invalid JSON guards with single retry.
+- Expanded the analysis datapack with market snapshot, liquidity summary, constraints, and user context.
+- Updated Pair Workspace to parse analysis_result/strategy_patch, block unsafe starts, and support Apply Patch.
+- Added local quick-intent parsing for budget updates in AI chat.
+- Refreshed AI_PROTOCOL.md with new schemas and examples plus parser tests.

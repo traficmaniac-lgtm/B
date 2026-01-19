@@ -23,8 +23,12 @@ def test_config_loads_defaults() -> None:
 def test_openai_client_import() -> None:
     pytest.importorskip("openai")
     from src.ai.openai_client import OpenAIClient
+    from src.ai.models import AiAnalysisResult, AiResponseEnvelope, AiStrategyPatch
 
     assert OpenAIClient.__name__ == "OpenAIClient"
+    assert AiAnalysisResult.__name__ == "AiAnalysisResult"
+    assert AiResponseEnvelope.__name__ == "AiResponseEnvelope"
+    assert AiStrategyPatch.__name__ == "AiStrategyPatch"
 
 
 @pytest.mark.skipif(not PYSIDE_AVAILABLE, reason="PySide6 dependencies unavailable")

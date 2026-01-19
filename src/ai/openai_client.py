@@ -11,7 +11,7 @@ if importlib.util.find_spec("openai") is None:
 else:
     from openai import AsyncOpenAI
 
-from src.ai.models import AiPatchResponse, AiResponse, parse_ai_json, parse_ai_patch_json
+from src.ai.models import AiResponseEnvelope, parse_ai_response
 from src.core.logging import get_logger
 
 
@@ -48,51 +48,80 @@ class OpenAIClient:
 
         return True, f"OpenAI self-check ok: {reply.strip()}"
 
-    async def analyze_pair(self, datapack: dict[str, Any]) -> AiResponse:
+    async def analyze_pair(self, datapack: dict[str, Any]) -> AiResponseEnvelope:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         system_prompt = (
-            "You are a market analysis assistant. Return ONLY a JSON object that follows this schema:\n"
+            "You are a market analysis assistant.\n"
+            "Return ONLY valid JSON, no markdown, no extra prose.\n"
+            "You MUST return an object that matches this schema:\n"
             "{\n"
-            '  "summary": {\n'
-            '    "market_type": "range|trend|mixed",\n'
-            '    "volatility": "low|medium|high",\n'
-            '    "liquidity": "ok|thin",\n'
-            '    "spread": "<string or percent>",\n'
-            '    "advice": "<short advice>"\n'
-            "  },\n"
-            '  "plan": {\n'
-            '    "mode": "grid|adaptive|manual",\n'
-            '    "grid_count": 12,\n'
-            '    "grid_step_pct": 0.3,\n'
-            '    "range_low_pct": 1.5,\n'
-            '    "range_high_pct": 1.8,\n'
-            '    "budget_usdt": 500\n'
-            "  },\n"
-            '  "preview_levels": {\n'
-            '    "levels": [\n'
-            '      {"side": "BUY", "price": 100.0, "qty": 0.5, "pct_from_mid": -1.0}\n'
+            '  "type": "analysis_result",\n'
+            '  "status": "OK|WARN|DANGER|ERROR",\n'
+            '  "confidence": 0.0,\n'
+            '  "reason_codes": ["..."],\n'
+            '  "message": "short message",\n'
+            '  "analysis_result": {\n'
+            '    "summary_lines": ["..."],\n'
+            '    "strategy": {\n'
+            '      "strategy_id": "GRID_CLASSIC|GRID_BIASED_LONG|GRID_BIASED_SHORT|RANGE_MEAN_REVERSION|TREND_FOLLOW_GRID|DO_NOT_TRADE",\n'
+            '      "budget_usdt": 500,\n'
+            '      "levels": [\n'
+            '        {"side": "BUY", "price": 100.0, "qty": 0.5, "pct_from_mid": -1.0}\n'
+            "      ],\n"
+            '      "grid_step_pct": 0.3,\n'
+            '      "range_low_pct": 1.5,\n'
+            '      "range_high_pct": 1.8,\n'
+            '      "bias": {"buy_pct": 50, "sell_pct": 50},\n'
+            '      "order_size_mode": "equal|martingale_light|liquidity_weighted",\n'
+            '      "max_orders": 12,\n'
+            '      "max_exposure_pct": 35\n'
+            "    },\n"
+            '    "risk": {\n'
+            '      "hard_stop_pct": 8,\n'
+            '      "cooldown_minutes": 15,\n'
+            '      "soft_stop_rules": ["..."],\n'
+            '      "kill_switch_rules": ["..."],\n'
+            '      "volatility_mode": "low|medium|high"\n'
+            "    },\n"
+            '    "control": {\n'
+            '      "recheck_interval_sec": 60,\n'
+            '      "ai_reanalyze_interval_sec": 300,\n'
+            '      "min_change_to_rebuild_pct": 0.3\n'
+            "    },\n"
+            '    "actions": [\n'
+            '      {"action": "note", "detail": "example", "severity": "info"}\n'
             "    ]\n"
-            "  },\n"
-            '  "risk_notes": ["..."],\n'
-            '  "questions": ["..."],\n'
-            '  "tool_requests": ["..."]\n'
+            "  }\n"
             "}\n"
             "No trading, leverage, or order execution instructions."
         )
 
-        async def _analyze() -> AiResponse:
+        async def _analyze() -> AiResponseEnvelope:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Analyze this datapack:\n{payload}"},
+            ]
             response = await self._chat_completion(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Analyze this datapack:\n{payload}"},
-                ],
+                messages=messages,
                 max_tokens=520,
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_json(content or "")
-            if parsed is None:
-                raise RuntimeError("Failed to parse AI JSON response")
+            parsed = parse_ai_response(content or "", expected_type="analysis_result")
+            if parsed.status != "ERROR":
+                return parsed
+            retry_messages = messages + [
+                {"role": "user", "content": "Your previous response was invalid JSON; output ONLY JSON."},
+            ]
+            response = await self._chat_completion(
+                messages=retry_messages,
+                max_tokens=520,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else None
+            parsed = parse_ai_response(content or "", expected_type="analysis_result")
+            if parsed.status == "ERROR":
+                raise RuntimeError(parsed.message or "Invalid AI JSON")
             return parsed
 
         try:
@@ -106,55 +135,84 @@ class OpenAIClient:
         datapack: dict[str, Any],
         last_plan: dict[str, Any],
         user_message: str,
-    ) -> AiPatchResponse:
+    ) -> AiResponseEnvelope:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         plan_payload = json.dumps(last_plan, ensure_ascii=False, indent=2)
         system_prompt = (
-            "You adjust a grid trading plan. Return ONLY a JSON object with this schema:\n"
+            "You adjust a grid trading plan.\n"
+            "Return ONLY valid JSON, no markdown, no extra prose.\n"
+            "You MUST return an object that matches this schema:\n"
             "{\n"
-            '  "patch": {\n'
-            '    "mode": "grid|adaptive|manual",\n'
-            '    "grid_count": 12,\n'
-            '    "grid_step_pct": 0.3,\n'
-            '    "range_low_pct": 1.5,\n'
-            '    "range_high_pct": 1.8,\n'
-            '    "budget_usdt": 500\n'
-            "  },\n"
-            '  "preview_levels": {\n'
-            '    "levels": [\n'
-            '      {"side": "BUY", "price": 100.0, "qty": 0.5, "pct_from_mid": -1.0}\n'
-            "    ]\n"
-            "  },\n"
-            '  "message": "Short explanation",\n'
-            '  "questions": ["..."],\n'
-            '  "tool_requests": ["..."]\n'
+            '  "type": "strategy_patch",\n'
+            '  "status": "OK|WARN|DANGER|ERROR",\n'
+            '  "confidence": 0.0,\n'
+            '  "reason_codes": ["..."],\n'
+            '  "message": "short message",\n'
+            '  "strategy_patch": {\n'
+            '    "parameters_patch": {\n'
+            '      "budget_usdt": 500,\n'
+            '      "levels": [],\n'
+            '      "grid_step_pct": 0.3,\n'
+            '      "range_low_pct": 1.5,\n'
+            '      "range_high_pct": 1.8,\n'
+            '      "bias": {"buy_pct": 50, "sell_pct": 50},\n'
+            '      "order_size_mode": "equal|martingale_light|liquidity_weighted",\n'
+            '      "max_orders": 12,\n'
+            '      "max_exposure_pct": 35,\n'
+            '      "hard_stop_pct": 8,\n'
+            '      "cooldown_minutes": 15,\n'
+            '      "soft_stop_rules": [],\n'
+            '      "kill_switch_rules": [],\n'
+            '      "recheck_interval_sec": 60,\n'
+            '      "ai_reanalyze_interval_sec": 300,\n'
+            '      "min_change_to_rebuild_pct": 0.3,\n'
+            '      "volatility_mode": "low|medium|high"\n'
+            "    },\n"
+            '    "recommended_actions": [\n'
+            '      {"action": "note", "detail": "example", "severity": "info"}\n'
+            "    ],\n"
+            '    "message": "Short explanation"\n'
+            "  }\n"
             "}\n"
-            "Only include the fields you want to change inside patch. "
+            "Only include fields you want to change inside parameters_patch. "
             "Do not include any extra text outside JSON."
         )
 
-        async def _adjust() -> AiPatchResponse:
+        async def _adjust() -> AiResponseEnvelope:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Last datapack:\n"
+                        f"{payload}\n\n"
+                        "Last plan:\n"
+                        f"{plan_payload}\n\n"
+                        f"User message: {user_message}"
+                    ),
+                },
+            ]
             response = await self._chat_completion(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Last datapack:\n"
-                            f"{payload}\n\n"
-                            "Last plan:\n"
-                            f"{plan_payload}\n\n"
-                            f"User message: {user_message}"
-                        ),
-                    },
-                ],
+                messages=messages,
                 max_tokens=420,
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else None
-            parsed = parse_ai_patch_json(content or "")
-            if parsed is None:
-                raise RuntimeError("Failed to parse AI patch response")
+            parsed = parse_ai_response(content or "", expected_type="strategy_patch")
+            if parsed.status != "ERROR":
+                return parsed
+            retry_messages = messages + [
+                {"role": "user", "content": "Your previous response was invalid JSON; output ONLY JSON."},
+            ]
+            response = await self._chat_completion(
+                messages=retry_messages,
+                max_tokens=420,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else None
+            parsed = parse_ai_response(content or "", expected_type="strategy_patch")
+            if parsed.status == "ERROR":
+                raise RuntimeError(parsed.message or "Invalid AI JSON")
             return parsed
 
         try:
