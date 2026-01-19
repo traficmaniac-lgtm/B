@@ -50,3 +50,8 @@
 - Added Trading Runtime Window with header controls, split layout, and runtime state machine.
 - Implemented mock orders, position snapshot, AI observer, recommendations, runtime chat, and tabs.
 - Wired Trade Ready Mode to open the runtime window with a strategy snapshot and mode selection.
+
+### Stage 4.1 - Runtime Engine (dry-run)
+- Added runtime module with price feed polling, virtual order book, strategy executor, and runtime state machine.
+- Wired Trading Runtime Window to the runtime engine with live orders, PnL, exposure, and observer updates.
+- Extended strategy snapshots for numeric parameters and refreshed AI observer recommendations using live metrics.
