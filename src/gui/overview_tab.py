@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterable
 from time import perf_counter
 from typing import Callable
@@ -16,22 +15,17 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
-    QDialog,
-    QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QSplitter,
     QTableView,
     QVBoxLayout,
     QWidget,
 )
-
-from src.ai.openai_client import OpenAIClient
 from src.binance.account_client import BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
@@ -133,12 +127,6 @@ class _PairsTableModel(QAbstractTableModel):
             return self._pairs[row].symbol
         return None
 
-    def last_price_for_symbol(self, symbol: str) -> str | None:
-        price = self._price_data.get(symbol, ("--", "--", "--"))[0]
-        if price in {"--", ""}:
-            return None
-        return price
-
 
 class _PairsFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent: QObject | None = None) -> None:
@@ -178,7 +166,7 @@ class OverviewTab(QWidget):
         self,
         config: Config,
         app_state: AppState,
-        on_open_pair: Callable[[str, str | None], None],
+        on_open_pair: Callable[[str], None],
         price_feed_manager: PriceFeedManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -212,18 +200,19 @@ class OverviewTab(QWidget):
         self._proxy_model.setSourceModel(self._pairs_model)
         self._account_client: BinanceAccountClient | None = None
         self._account_balances: list[dict[str, object]] = []
-        self._account_balances_display: list[str] = []
         self._account_last_error: str | None = None
         self._account_timer = QTimer(self)
         self._account_timer.setInterval(10_000)
         self._account_timer.timeout.connect(self._refresh_account_balances)
-        self._open_orders_timer = QTimer(self)
-        self._open_orders_timer.setInterval(1500)
-        self._open_orders_timer.timeout.connect(self._refresh_open_orders)
 
         layout = QVBoxLayout()
-        layout.addLayout(self._build_status_row())
-        layout.addLayout(self._build_filters())
+
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(6)
+        top_layout.addLayout(self._build_status_row())
+        top_layout.addLayout(self._build_filters())
 
         counts_row = QHBoxLayout()
         self._shown_label = QLabel("Shown 0 / Total 0")
@@ -232,7 +221,7 @@ class OverviewTab(QWidget):
         counts_row.addWidget(self._shown_label)
         counts_row.addStretch()
         counts_row.addWidget(self._filter_status_label)
-        layout.addLayout(counts_row)
+        top_layout.addLayout(counts_row)
 
         self._table = QTableView()
         self._table.setModel(self._proxy_model)
@@ -241,90 +230,67 @@ class OverviewTab(QWidget):
         self._table.setEditTriggers(QTableView.NoEditTriggers)
         self._table.doubleClicked.connect(self._handle_double_click)
         self._table.selectionModel().selectionChanged.connect(self._update_selected_pair)
-        layout.addWidget(self._table)
+        self._table.setSortingEnabled(True)
 
-        self._selected_label = QLabel("Selected pair: -")
-        layout.addWidget(self._selected_label)
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(top_widget)
+        splitter.addWidget(self._table)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(splitter)
 
         self.setLayout(layout)
-        self._set_ai_status()
         self.refresh_account_status()
 
     def _build_status_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        row.addLayout(self._build_status_cards())
+        row.addLayout(self._build_status_badges())
+        row.addStretch()
 
-        self._self_check_button = QPushButton("Run Self-check")
+        self._self_check_button = QPushButton("Self-check")
         self._self_check_button.clicked.connect(self._run_self_check)
-        row.addWidget(self._self_check_button, alignment=Qt.AlignTop)
+        row.addWidget(self._self_check_button, alignment=Qt.AlignRight)
         return row
 
-    def _build_status_cards(self) -> QGridLayout:
-        grid = QGridLayout()
+    def _build_status_badges(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._status_badges: dict[str, QLabel] = {}
+        for name in ["Config", "Binance", "WS", "Account", "Cache"]:
+            badge = QLabel()
+            badge.setStyleSheet(
+                "QLabel {"
+                "border: 1px solid #e5e7eb;"
+                "border-radius: 10px;"
+                "padding: 2px 8px;"
+                "font-size: 11px;"
+                "}"
+            )
+            row.addWidget(badge)
+            self._status_badges[name] = badge
+        self._set_status_badge("Config", "✔", "OK", "#16a34a")
+        self._set_status_badge("Binance", "✖", "LOST", "#dc2626")
+        self._set_status_badge("WS", "✖", "LOST", "#dc2626")
+        self._set_status_badge("Account", "✖", "LOST", "#dc2626")
+        self._set_status_badge("Cache", "●", "DEGRADED", "#6b7280")
+        return row
 
-        config_box = QGroupBox("Config")
-        config_layout = QVBoxLayout()
-        config_layout.addWidget(QLabel("Config loaded: YES"))
-        config_box.setLayout(config_layout)
-
-        binance_box = QGroupBox("Binance")
-        binance_layout = QVBoxLayout()
-        self._binance_status_label = QLabel("Binance: NOT CONNECTED")
-        self._ws_status_label = QLabel("WS: NOT CONNECTED")
-        binance_layout.addWidget(self._binance_status_label)
-        binance_layout.addWidget(self._ws_status_label)
-        binance_box.setLayout(binance_layout)
-
-        ai_box = QGroupBox("AI")
-        ai_layout = QVBoxLayout()
-        self._ai_status_label = QLabel("AI: NOT CONNECTED")
-        ai_layout.addWidget(self._ai_status_label)
-        ai_box.setLayout(ai_layout)
-
-        balance_box = QGroupBox("Balance / PnL")
-        balance_layout = QVBoxLayout()
-        self._balance_label = QLabel("Balance (USDT): Not connected")
-        self._pnl_period_combo = QComboBox()
-        self._pnl_period_combo.addItems(["1h", "4h", "24h", "7d"])
-        self._pnl_period_combo.setCurrentText(self._app_state.pnl_period)
-        self._pnl_period_combo.currentTextChanged.connect(self._handle_pnl_period_change)
-        self._pnl_label = QLabel("PnL: --")
-        balance_layout.addWidget(self._balance_label)
-        balance_layout.addWidget(QLabel("PnL period"))
-        balance_layout.addWidget(self._pnl_period_combo)
-        balance_layout.addWidget(self._pnl_label)
-        balance_box.setLayout(balance_layout)
-
-        account_box = QGroupBox("Account (read-only)")
-        account_layout = QVBoxLayout()
-        self._account_status_label = QLabel("Account: ключи не заданы")
-        self._account_balances_label = QLabel("Balances: —")
-        self._account_balances_label.setWordWrap(True)
-        self._account_show_all_btn = QPushButton("Показать все")
-        self._account_show_all_btn.clicked.connect(self._show_all_balances)
-        self._account_show_all_btn.setEnabled(False)
-        self._open_orders_label = QLabel("Open orders: —")
-        self._open_orders_model = QStandardItemModel(0, 7, self)
-        self._open_orders_model.setHorizontalHeaderLabels(
-            ["ID", "Side", "Price", "OrigQty", "ExecQty", "Status", "Time"]
+    def _set_status_badge(self, name: str, icon: str, text: str, color: str) -> None:
+        badge = self._status_badges.get(name)
+        if not badge:
+            return
+        badge.setText(f"{icon} {name} {text}")
+        badge.setStyleSheet(
+            "QLabel {"
+            "border: 1px solid #e5e7eb;"
+            "border-radius: 10px;"
+            "padding: 2px 8px;"
+            "font-size: 11px;"
+            f"color: {color};"
+            "}"
         )
-        self._open_orders_table = QTableView()
-        self._open_orders_table.setModel(self._open_orders_model)
-        self._open_orders_table.horizontalHeader().setStretchLastSection(True)
-        self._open_orders_table.setEditTriggers(QTableView.NoEditTriggers)
-        account_layout.addWidget(self._account_status_label)
-        account_layout.addWidget(self._account_balances_label)
-        account_layout.addWidget(self._account_show_all_btn)
-        account_layout.addWidget(self._open_orders_label)
-        account_layout.addWidget(self._open_orders_table)
-        account_box.setLayout(account_layout)
-
-        grid.addWidget(config_box, 0, 0)
-        grid.addWidget(binance_box, 0, 1)
-        grid.addWidget(ai_box, 0, 2)
-        grid.addWidget(balance_box, 0, 3)
-        grid.addWidget(account_box, 0, 4)
-        return grid
 
     def _build_filters(self) -> QHBoxLayout:
         layout = QHBoxLayout()
@@ -342,8 +308,6 @@ class OverviewTab(QWidget):
         self._load_button.clicked.connect(self._handle_load_pairs)
         self._refresh_button = QPushButton("Force refresh from exchange")
         self._refresh_button.clicked.connect(self._handle_refresh_pairs)
-        self._cache_status_label = QLabel("Cache: -")
-        self._cache_status_label.setStyleSheet("color: #6b7280;")
 
         layout.addWidget(QLabel("Search"))
         layout.addWidget(self._search_input)
@@ -351,14 +315,12 @@ class OverviewTab(QWidget):
         layout.addWidget(self._quote_combo)
         layout.addWidget(self._load_button)
         layout.addWidget(self._refresh_button)
-        layout.addWidget(self._cache_status_label)
         layout.addStretch()
         return layout
 
     def _update_selected_pair(self) -> None:
         selected = self._table.selectionModel().selectedRows()
         if not selected:
-            self._selected_label.setText("Selected pair: -")
             self._stop_selected_symbol_stream()
             return
         proxy_index = selected[0]
@@ -366,7 +328,6 @@ class OverviewTab(QWidget):
         symbol = self._pairs_model.symbol_for_row(source_index.row())
         if not symbol:
             return
-        self._selected_label.setText(f"Selected pair: {symbol}")
         self._start_selected_symbol_stream(symbol)
 
     def _handle_double_click(self, _: QModelIndex) -> None:
@@ -377,42 +338,14 @@ class OverviewTab(QWidget):
         source_index = self._proxy_model.mapToSource(proxy_index)
         symbol = self._pairs_model.symbol_for_row(source_index.row())
         if symbol:
-            last_price = self._pairs_model.last_price_for_symbol(symbol)
-            self._on_open_pair(symbol, last_price)
+            self._on_open_pair(symbol)
 
     def _run_self_check(self) -> None:
         worker = _Worker(self._http_client.get_time)
         worker.signals.success.connect(self._handle_self_check_success)
         worker.signals.error.connect(self._handle_self_check_error)
         self._thread_pool.start(worker)
-        self._run_ai_self_check()
         self._refresh_account_balances()
-
-    def _run_ai_self_check(self) -> None:
-        if not self._app_state.openai_key_present:
-            self._app_state.ai_connected = False
-            self._app_state.ai_checked = False
-            self._set_ai_status()
-            self._logger.info("AI self-check skipped (missing OpenAI key).")
-            return
-        self._ai_status_label.setText("AI: CHECKING")
-        try:
-            client = OpenAIClient(
-                api_key=self._app_state.openai_api_key,
-                model=self._app_state.openai_model,
-                timeout_s=25.0,
-                retries=1,
-            )
-        except RuntimeError as exc:
-            self._app_state.ai_connected = False
-            self._app_state.ai_checked = True
-            self._logger.error("AI self-check failed: %s", exc)
-            self._set_ai_status()
-            return
-        worker = _Worker(lambda: asyncio.run(client.self_check()))
-        worker.signals.success.connect(self._handle_ai_self_check_success)
-        worker.signals.error.connect(self._handle_ai_self_check_error)
-        self._thread_pool.start(worker)
 
     def _handle_self_check_success(self, result: object, latency_ms: int) -> None:
         if isinstance(result, dict) and "serverTime" in result:
@@ -430,13 +363,8 @@ class OverviewTab(QWidget):
         api_secret = self._app_state.binance_api_secret.strip()
         if not api_key or not api_secret:
             self._account_client = None
-            self._account_status_label.setText("Account: ключи не заданы")
-            self._account_balances_label.setText("Balances: —")
-            self._account_show_all_btn.setEnabled(False)
-            self._open_orders_label.setText("Open orders: —")
-            self._open_orders_model.removeRows(0, self._open_orders_model.rowCount())
             self._account_timer.stop()
-            self._open_orders_timer.stop()
+            self._set_status_badge("Account", "✖", "LOST", "#dc2626")
             return
         self._account_client = BinanceAccountClient(
             base_url=self._config.binance.base_url,
@@ -448,10 +376,8 @@ class OverviewTab(QWidget):
             backoff_base_s=self._config.http.backoff_base_s,
             backoff_max_s=self._config.http.backoff_max_s,
         )
-        self._account_status_label.setText("Account: CHECKING")
+        self._set_status_badge("Account", "●", "DEGRADED", "#6b7280")
         self._account_timer.start()
-        if self._selected_symbol:
-            self._open_orders_timer.start()
         self._refresh_account_balances()
 
     def _refresh_account_balances(self) -> None:
@@ -482,146 +408,25 @@ class OverviewTab(QWidget):
             total = free + locked
             parsed.append({"asset": asset, "free": free, "locked": locked, "total": total})
         self._account_balances = parsed
-        display = self._select_top_balances(parsed)
-        self._account_balances_display = display
-        self._account_status_label.setText("Account: CONNECTED")
-        self._account_show_all_btn.setEnabled(bool(parsed))
-        self._account_balances_label.setText("Balances: " + ", ".join(display) if display else "Balances: —")
+        self._set_status_badge("Account", "✔", "OK", "#16a34a")
         self._account_last_error = None
 
     def _handle_account_error(self, message: str) -> None:
         summary = self._summarize_error(message)
         self._logger.error("Account read-only error: %s", summary)
         self._account_last_error = summary
-        self._account_status_label.setText(f"Account: ERROR ({summary})")
+        self._set_status_badge("Account", "⚠", "DEGRADED", "#f59e0b")
 
-    def _select_top_balances(self, balances: list[dict[str, object]]) -> list[str]:
-        priority_assets = ["USDT", "USDC", "FDUSD", "EURI", "EUR", "BTC"]
-        by_asset = {item["asset"]: item for item in balances if item.get("asset")}
-        selected: list[dict[str, object]] = []
-        for asset in priority_assets:
-            item = by_asset.get(asset)
-            if item and float(item.get("total", 0)) > 0:
-                selected.append(item)
-        if len(selected) < 6:
-            remaining = [
-                item for item in balances if item.get("asset") not in {s["asset"] for s in selected}
-            ]
-            remaining.sort(key=lambda x: float(x.get("total", 0)), reverse=True)
-            selected.extend(remaining[: 6 - len(selected)])
-        return [f"{item['asset']}: {item['total']:.4f}" for item in selected]
 
-    def _show_all_balances(self) -> None:
-        if not self._account_balances:
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Все балансы (spot)")
-        layout = QVBoxLayout()
-        table = QTableView(dialog)
-        model = QStandardItemModel(0, 4, dialog)
-        model.setHorizontalHeaderLabels(["Asset", "Free", "Locked", "Total"])
-        for item in self._account_balances:
-            asset = str(item.get("asset", ""))
-            free = float(item.get("free", 0))
-            locked = float(item.get("locked", 0))
-            total = float(item.get("total", 0))
-            row = [
-                QStandardItem(asset),
-                QStandardItem(f"{free:.6f}"),
-                QStandardItem(f"{locked:.6f}"),
-                QStandardItem(f"{total:.6f}"),
-            ]
-            model.appendRow(row)
-        table.setModel(model)
-        table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(table)
-        dialog.setLayout(layout)
-        dialog.resize(520, 420)
-        dialog.exec()
-
-    def _refresh_open_orders(self) -> None:
-        if not self._account_client or not self._selected_symbol:
-            return
-        worker = _Worker(lambda: self._account_client.get_open_orders(self._selected_symbol))
-        worker.signals.success.connect(self._handle_open_orders)
-        worker.signals.error.connect(self._handle_open_orders_error)
-        self._thread_pool.start(worker)
-
-    def _handle_open_orders(self, result: object, _: int) -> None:
-        if not isinstance(result, list):
-            self._handle_open_orders_error("Unexpected open orders response")
-            return
-        self._open_orders_model.removeRows(0, self._open_orders_model.rowCount())
-        for order in result:
-            if not isinstance(order, dict):
-                continue
-            order_id = str(order.get("orderId", ""))
-            side = str(order.get("side", ""))
-            price = str(order.get("price", ""))
-            orig_qty = str(order.get("origQty", ""))
-            exec_qty = str(order.get("executedQty", ""))
-            status = str(order.get("status", ""))
-            time_raw = order.get("time")
-            time_str = self._format_time(time_raw)
-            row = [
-                QStandardItem(order_id),
-                QStandardItem(side),
-                QStandardItem(price),
-                QStandardItem(orig_qty),
-                QStandardItem(exec_qty),
-                QStandardItem(status),
-                QStandardItem(time_str),
-            ]
-            self._open_orders_model.appendRow(row)
-        self._open_orders_label.setText(f"Open orders: {len(result)}")
-
-    def _handle_open_orders_error(self, message: str) -> None:
-        summary = self._summarize_error(message)
-        self._logger.warning("Open orders error: %s", summary)
-        self._open_orders_label.setText(f"Open orders: ERROR ({summary})")
-
-    @staticmethod
-    def _format_time(value: object) -> str:
-        if not isinstance(value, int):
-            return "—"
-        try:
-            from datetime import datetime, timezone
-
-            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%H:%M:%S")
-        except Exception:
-            return "—"
-
-    def _handle_ai_self_check_success(self, result: object, latency_ms: int) -> None:
-        if not isinstance(result, tuple) or len(result) != 2:
-            self._logger.error("Unexpected AI self-check response: %s", result)
-            self._app_state.ai_connected = False
-            self._app_state.ai_checked = True
-            self._set_ai_status()
-            return
-        ok, message = result
-        self._app_state.ai_checked = True
-        if ok:
-            self._app_state.ai_connected = True
-            self._logger.info("AI self-check ok (%sms): %s", latency_ms, message)
-        else:
-            self._app_state.ai_connected = False
-            self._logger.error("AI self-check failed: %s", message)
-        self._set_ai_status()
-
-    def _handle_ai_self_check_error(self, message: str) -> None:
-        self._app_state.ai_connected = False
-        self._app_state.ai_checked = True
-        self._logger.error("AI self-check failed: %s", message)
-        self._set_ai_status()
 
     def _handle_load_pairs(self) -> None:
         self._set_pairs_buttons_enabled(False)
         self._pairs_model.set_pairs([])
         self._all_pairs = []
         self._cache_partial = False
-        self._cache_status_label.setText("Cache: -")
         self._logger.info("Loading pairs...")
-        self._binance_status_label.setText("Binance: LOADING")
+        self._set_status_badge("Binance", "●", "DEGRADED", "#6b7280")
+        self._set_status_badge("Cache", "●", "DEGRADED", "#6b7280")
         worker = _Worker(self._markets_service.load_pairs_cached_all)
         worker.signals.success.connect(self._handle_pairs_loaded_cached)
         worker.signals.error.connect(self._handle_pairs_error)
@@ -632,9 +437,9 @@ class OverviewTab(QWidget):
         self._pairs_model.set_pairs([])
         self._all_pairs = []
         self._cache_partial = False
-        self._cache_status_label.setText("Cache: Refreshing...")
         self._logger.info("Refreshing pairs...")
-        self._binance_status_label.setText("Binance: REFRESHING")
+        self._set_status_badge("Binance", "●", "DEGRADED", "#6b7280")
+        self._set_status_badge("Cache", "●", "DEGRADED", "#6b7280")
         worker = _Worker(self._markets_service.refresh_pairs_all)
         worker.signals.success.connect(self._handle_pairs_loaded_http)
         worker.signals.error.connect(self._handle_pairs_error)
@@ -666,20 +471,18 @@ class OverviewTab(QWidget):
         self._apply_filters()
         self._set_pairs_buttons_enabled(True)
         self._logger.info("Loaded %s pairs from %s.", len(pair_list), source)
-        self._binance_status_label.setText(f"Binance: CONNECTED ({len(pair_list)} pairs, {source})")
         if source == "CACHE" and self._cache_partial:
-            self._cache_status_label.setText("Cache: PARTIAL (force refresh recommended)")
-            self._cache_status_label.setStyleSheet("color: #f59e0b;")
+            self._set_status_badge("Cache", "⚠", "DEGRADED", "#f59e0b")
         elif source == "CACHE":
-            self._cache_status_label.setText("Cache: OK")
-            self._cache_status_label.setStyleSheet("color: #16a34a;")
+            self._set_status_badge("Cache", "✔", "OK", "#16a34a")
         else:
-            self._cache_status_label.setText("Cache: Fresh from exchange")
-            self._cache_status_label.setStyleSheet("color: #16a34a;")
+            self._set_status_badge("Cache", "✔", "OK", "#16a34a")
+        self._set_binance_status_connected()
 
     def _handle_pairs_error(self, message: str) -> None:
         self._logger.error("Failed to load pairs: %s", message)
         self._set_binance_status_error(message)
+        self._set_status_badge("Cache", "✖", "LOST", "#dc2626")
         self._set_pairs_buttons_enabled(True)
 
     def _apply_filters(self) -> None:
@@ -703,7 +506,6 @@ class OverviewTab(QWidget):
         if filtered_symbols:
             self._table.selectRow(0)
         else:
-            self._selected_label.setText("Selected pair: -")
             self._stop_selected_symbol_stream()
 
     def _refresh_prices(self) -> None:
@@ -739,13 +541,10 @@ class OverviewTab(QWidget):
         self._price_manager.start()
         if not self._price_timer.isActive():
             self._price_timer.start()
-        if self._account_client:
-            self._open_orders_timer.start()
 
     def _stop_selected_symbol_stream(self) -> None:
         if not self._selected_symbol:
             self._price_timer.stop()
-            self._open_orders_timer.stop()
             return
         symbol = self._selected_symbol
         self._price_manager.unsubscribe(symbol, self._handle_price_update)
@@ -754,48 +553,41 @@ class OverviewTab(QWidget):
         self._selected_symbol = None
         self._latest_price_update = None
         self._price_timer.stop()
-        self._open_orders_timer.stop()
 
     def _set_pairs_buttons_enabled(self, enabled: bool) -> None:
         self._load_button.setEnabled(enabled)
         self._refresh_button.setEnabled(enabled)
 
     def _set_binance_status_connected(self) -> None:
-        self._binance_status_label.setText("Binance: CONNECTED")
+        self._set_status_badge("Binance", "✔", "OK", "#16a34a")
 
     def _set_binance_status_error(self, message: str) -> None:
         summary = self._summarize_error(message)
-        self._binance_status_label.setText(f"Binance: ERROR ({summary})")
+        self._set_status_badge("Binance", "✖", "LOST", "#dc2626")
+        self._logger.warning("Binance status error: %s", summary)
 
     def _emit_ws_status(self, status: str, message: str | None) -> None:
         self._ws_status_signals.status.emit(status, message or status)
 
     def _handle_ws_status(self, status: str, message: str) -> None:
-        label = status.replace("WS_", "")
         if status == WS_CONNECTED:
-            self._ws_status_label.setText(f"WS: {label}")
-            self._ws_status_label.setStyleSheet("color: #16a34a;")
+            self._set_status_badge("WS", "✔", "OK", "#16a34a")
             return
         if status == WS_DEGRADED:
-            self._ws_status_label.setText(f"WS: {label}")
-            self._ws_status_label.setStyleSheet("color: #f59e0b;")
+            self._set_status_badge("WS", "⚠", "DEGRADED", "#f59e0b")
             return
         if status == WS_LOST:
-            self._ws_status_label.setText(f"WS: {label}")
-            self._ws_status_label.setStyleSheet("color: #dc2626;")
+            self._set_status_badge("WS", "✖", "LOST", "#dc2626")
             return
         if status == "ERROR":
             summary = self._summarize_error(message)
-            self._ws_status_label.setText(f"WS: ERROR ({summary})")
+            self._set_status_badge("WS", "✖", "LOST", "#dc2626")
+            self._logger.warning("WS status error: %s", summary)
 
     def _handle_quote_change(self, quote: str) -> None:
         self._app_state.default_quote = quote
         self._persist_app_state()
         self._apply_filters()
-
-    def _handle_pnl_period_change(self, period: str) -> None:
-        self._app_state.pnl_period = period
-        self._persist_app_state()
 
     def _handle_search_text(self, _: str) -> None:
         self._apply_filters()
@@ -811,7 +603,6 @@ class OverviewTab(QWidget):
     def shutdown(self) -> None:
         self._price_timer.stop()
         self._account_timer.stop()
-        self._open_orders_timer.stop()
         self._stop_selected_symbol_stream()
 
     @staticmethod
@@ -820,18 +611,3 @@ class OverviewTab(QWidget):
         if len(summary) > max_len:
             return summary[: max_len - 3] + "..."
         return summary
-
-    def refresh_ai_status(self) -> None:
-        self._set_ai_status()
-
-    def _set_ai_status(self) -> None:
-        if not self._app_state.openai_key_present:
-            self._ai_status_label.setText("AI: NOT CONNECTED")
-            return
-        if self._app_state.ai_connected:
-            self._ai_status_label.setText("AI: CONNECTED")
-            return
-        if self._app_state.ai_checked:
-            self._ai_status_label.setText("AI: ERROR")
-            return
-        self._ai_status_label.setText("AI: NOT CONNECTED")

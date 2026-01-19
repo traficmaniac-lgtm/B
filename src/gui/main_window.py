@@ -9,22 +9,17 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QStatusBar,
-    QTabBar,
-    QTabWidget,
     QToolBar,
 )
 
 from src.core.config import Config
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
-from src.gui.models.market_state import MarketState
+from src.gui.lite_grid_window import LiteGridWindow
 from src.gui.overview_tab import OverviewTab
-from src.gui.pair_mode_manager import PairModeManager
-from src.gui.pair_workspace_tab import PairWorkspaceTab
 from src.gui.settings_dialog import SettingsDialog
 from src.gui.widgets.log_dock import LogDock
 from src.services.price_feed_manager import PriceFeedManager
-from src.services.price_hub import PriceHub
 
 
 class MainWindow(QMainWindow):
@@ -37,35 +32,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BBOT — Desktop Terminal")
         self.resize(1200, 800)
 
-        self._tabs = QTabWidget()
-        self._tabs.setTabsClosable(True)
-        self._market_state = MarketState(zero_fee_symbols=set(self._app_state.zero_fee_symbols))
         self._price_feed_manager = PriceFeedManager.get_instance(self._config)
-        self._pair_mode_manager = PairModeManager(
-            open_trading_workspace=self.open_pair_tab,
-            market_state=self._market_state,
-            price_feed_manager=self._price_feed_manager,
-            parent=self,
-        )
         self._overview_tab = OverviewTab(
             self._config,
             app_state=self._app_state,
-            on_open_pair=self._pair_mode_manager.open_pair_dialog,
+            on_open_pair=self.open_lite_grid_window,
             price_feed_manager=self._price_feed_manager,
         )
-        self._tabs.addTab(self._overview_tab, "Overview")
-        self._tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
-        self._tabs.tabBar().setTabButton(0, QTabBar.LeftSide, None)
-        self._tabs.tabCloseRequested.connect(self._close_tab)
-        self.setCentralWidget(self._tabs)
-
-        self._pair_tabs: dict[str, PairWorkspaceTab] = {}
-        self._price_hub = PriceHub(
-            config=self._config,
-            app_state=self._app_state,
-            price_feed_manager=self._price_feed_manager,
-            parent=self,
-        )
+        self.setCentralWidget(self._overview_tab)
+        self._lite_grid_windows: list[LiteGridWindow] = []
 
         self._log_dock = LogDock(self)
         self._log_dock.handler.setFormatter(
@@ -92,15 +67,11 @@ class MainWindow(QMainWindow):
     def show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
-    def open_pair_tab(self, symbol: str) -> None:
-        if symbol in self._pair_tabs:
-            self._tabs.setCurrentWidget(self._pair_tabs[symbol])
-            return
-        tab = PairWorkspaceTab(symbol=symbol, app_state=self._app_state, price_hub=self._price_hub)
-        self._pair_tabs[symbol] = tab
-        index = self._tabs.addTab(tab, f"Bot: {symbol}")
-        self._tabs.setCurrentIndex(index)
-        self._price_hub.register_symbol(symbol)
+    def open_lite_grid_window(self, symbol: str) -> None:
+        window = LiteGridWindow(symbol=symbol, price_feed_manager=self._price_feed_manager, parent=self)
+        window.show()
+        self._lite_grid_windows.append(window)
+        window.destroyed.connect(lambda _: self._remove_lite_window(window))
 
     def _build_status_left(self) -> QLabel:
         return QLabel("Ready")
@@ -121,7 +92,6 @@ class MainWindow(QMainWindow):
         root_logger.setLevel(app_state.log_level)
         self.statusBar().showMessage("Settings saved", 3000)
         self._status_right_label.setText(f"env: {app_state.env.lower()} | core: loaded")
-        self._overview_tab.refresh_ai_status()
         self._overview_tab.refresh_account_status()
 
     def _build_menu(self) -> None:
@@ -140,21 +110,13 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self._app_state, on_save=self._handle_settings_save, parent=self)
         dialog.exec()
 
-    def _close_tab(self, index: int) -> None:
-        if index == 0:
-            return
-        widget = self._tabs.widget(index)
-        if isinstance(widget, PairWorkspaceTab):
-            symbol = widget.symbol
-            widget.shutdown()
-            self._pair_tabs.pop(symbol, None)
-            self._price_hub.unregister_symbol(symbol)
-        self._tabs.removeTab(index)
+    def _remove_lite_window(self, window: LiteGridWindow) -> None:
+        if window in self._lite_grid_windows:
+            self._lite_grid_windows.remove(window)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
         self._overview_tab.shutdown()
-        for tab in self._pair_tabs.values():
-            tab.shutdown()
-        self._price_hub.shutdown()
+        for window in list(self._lite_grid_windows):
+            window.close()
         self._price_feed_manager.shutdown()
         super().closeEvent(event)
