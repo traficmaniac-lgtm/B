@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QSpinBox,
@@ -125,6 +126,9 @@ class LiteGridWindow(QMainWindow):
         self._last_price: float | None = None
         self._account_can_trade = False
         self._symbol_tradeable = False
+        self._trade_disabled_reason = ""
+        self._last_trade_disabled_reason = ""
+        self._suppress_dry_run_event = False
         self._exchange_rules: dict[str, float | None] = {}
         self._trade_fees: tuple[float | None, float | None] = (None, None)
         self._quote_asset, self._base_asset = self._infer_assets_from_symbol(self._symbol)
@@ -134,10 +138,10 @@ class LiteGridWindow(QMainWindow):
         self._fees_in_flight = False
 
         self._balances_timer = QTimer(self)
-        self._balances_timer.setInterval(8_000)
+        self._balances_timer.setInterval(10_000)
         self._balances_timer.timeout.connect(self._refresh_balances)
         self._orders_timer = QTimer(self)
-        self._orders_timer.setInterval(2_500)
+        self._orders_timer.setInterval(3_000)
         self._orders_timer.timeout.connect(self._refresh_open_orders)
 
         self.setWindowTitle(tr("window_title", symbol=self._symbol))
@@ -153,7 +157,7 @@ class LiteGridWindow(QMainWindow):
         outer_layout.addWidget(self._build_logs())
 
         self.setCentralWidget(central)
-        self._handle_dry_run_toggle(self._dry_run_toggle.isChecked())
+        self._apply_trade_status_label()
 
         self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
@@ -166,6 +170,7 @@ class LiteGridWindow(QMainWindow):
             self._refresh_balances()
             self._refresh_open_orders()
         else:
+            self._trade_disabled_reason = "no keys"
             self._apply_trading_permissions()
         self._append_log("Lite Grid Terminal opened.", kind="INFO")
 
@@ -235,11 +240,14 @@ class LiteGridWindow(QMainWindow):
 
         self._engine_state_label = QLabel(f"{tr('engine')}: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
+        self._trade_status_label = QLabel(tr("trade_status_disabled"))
+        self._trade_status_label.setStyleSheet("color: #dc2626; font-size: 11px; font-weight: 600;")
 
         row_bottom.addWidget(self._feed_indicator)
         row_bottom.addWidget(self._age_label)
         row_bottom.addWidget(self._latency_label)
         row_bottom.addStretch()
+        row_bottom.addWidget(self._trade_status_label)
         row_bottom.addWidget(self._engine_state_label)
 
         wrapper.addLayout(row_top)
@@ -594,7 +602,7 @@ class LiteGridWindow(QMainWindow):
             tr(
                 "runtime_account_line",
                 quote=f"{quote_total:.2f}",
-                base=f"{base_total:.4f}",
+                base=f"{base_total:.8f}",
                 equity=f"{equity:.2f}",
             )
         )
@@ -631,8 +639,33 @@ class LiteGridWindow(QMainWindow):
         self._update_setting("stop_loss_enabled", enabled)
 
     def _handle_dry_run_toggle(self, checked: bool) -> None:
+        if self._suppress_dry_run_event:
+            return
+        if not checked and not self._can_trade():
+            self._suppress_dry_run_event = True
+            self._dry_run_toggle.setChecked(True)
+            self._suppress_dry_run_event = False
+            return
+        if not checked:
+            confirm = QMessageBox.question(
+                self,
+                tr("trade_confirm_title"),
+                tr("trade_confirm_message"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                self._suppress_dry_run_event = True
+                self._dry_run_toggle.setChecked(True)
+                self._suppress_dry_run_event = False
+                return
         state = "enabled" if checked else "disabled"
         self._append_log(f"Dry-run {state}.", kind="INFO")
+        self._append_log(
+            f"Trade enabled state changed: live={str(not checked).lower()}.",
+            kind="INFO",
+        )
+        self._apply_trade_status_label()
 
     def _handle_start(self) -> None:
         self._append_log(f"Start pressed (dry-run={self._dry_run_toggle.isChecked()}).", kind="ORDERS")
@@ -674,6 +707,7 @@ class LiteGridWindow(QMainWindow):
 
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested.", kind="INFO")
+        self._refresh_balances()
         self._refresh_open_orders()
 
     def _change_state(self, new_state: str) -> None:
@@ -742,16 +776,37 @@ class LiteGridWindow(QMainWindow):
                 balances[asset] = (free, locked)
         self._balances = balances
         can_trade = result.get("canTrade")
-        self._account_can_trade = bool(can_trade) if can_trade is not None else False
+        permissions = result.get("permissions")
+        self._account_can_trade = True
+        if can_trade is not None:
+            self._account_can_trade = bool(can_trade)
+        if isinstance(permissions, list) and permissions:
+            self._account_can_trade = self._account_can_trade and "SPOT" in permissions
+            if "SPOT" not in permissions:
+                self._trade_disabled_reason = "no permissions"
+        elif isinstance(permissions, list) and not permissions:
+            self._account_can_trade = False
+            self._trade_disabled_reason = "no permissions"
+        if not self._account_can_trade and not self._trade_disabled_reason:
+            self._trade_disabled_reason = "canTrade=false"
+        if self._account_can_trade:
+            self._trade_disabled_reason = ""
         self._apply_trade_fees_from_account(result)
         self._apply_trading_permissions()
         self._update_runtime_balances()
-        self._append_log(f"Balances updated ({latency_ms}ms).", kind="INFO")
+        quote_total = self._asset_total(self._quote_asset)
+        base_total = self._asset_total(self._base_asset)
+        self._append_log(
+            f"balances updated: {self._quote_asset}={quote_total:.2f}, "
+            f"{self._base_asset}={base_total:.8f}",
+            kind="INFO",
+        )
         self._refresh_trade_fees()
 
     def _handle_account_error(self, message: str) -> None:
         self._balances_in_flight = False
         self._account_can_trade = False
+        self._trade_disabled_reason = self._infer_trade_error_reason(message)
         self._append_log(f"Balances update error: {message}", kind="ERROR")
         self._apply_trading_permissions()
 
@@ -772,13 +827,15 @@ class LiteGridWindow(QMainWindow):
         self._open_orders = [item for item in result if isinstance(item, dict)]
         self._render_open_orders()
         self._append_log(
-            f"Open orders updated ({len(self._open_orders)}) in {latency_ms}ms.",
+            f"open orders updated (n={len(self._open_orders)}).",
             kind="INFO",
         )
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
+        self._trade_disabled_reason = self._infer_trade_error_reason(message)
         self._append_log(f"Open orders update error: {message}", kind="ERROR")
+        self._apply_trading_permissions()
 
     def _refresh_exchange_rules(self) -> None:
         if self._rules_in_flight:
@@ -806,6 +863,8 @@ class LiteGridWindow(QMainWindow):
         tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
         step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
         min_notional = self._extract_filter_value(filters, "MIN_NOTIONAL", "minNotional")
+        if min_notional is None:
+            min_notional = self._extract_filter_value(filters, "NOTIONAL", "minNotional")
         self._exchange_rules = {
             "tick": tick_size,
             "step": step_size,
@@ -815,7 +874,10 @@ class LiteGridWindow(QMainWindow):
         self._update_rules_label()
         self._update_grid_preview()
         self._update_runtime_balances()
-        self._append_log(f"Exchange rules loaded ({latency_ms}ms).", kind="INFO")
+        self._append_log(
+            f"Exchange rules loaded ({latency_ms}ms). base={self._base_asset}, quote={self._quote_asset}",
+            kind="INFO",
+        )
 
     def _handle_exchange_error(self, message: str) -> None:
         self._rules_in_flight = False
@@ -863,14 +925,70 @@ class LiteGridWindow(QMainWindow):
         self._update_rules_label()
 
     def _apply_trading_permissions(self) -> None:
-        can_trade = self._account_can_trade and self._symbol_tradeable
+        can_trade = self._can_trade()
         if not can_trade:
+            if not self._trade_disabled_reason:
+                self._trade_disabled_reason = "read-only"
+            if self._trade_disabled_reason != self._last_trade_disabled_reason:
+                self._append_log(
+                    f"cannot trade: reason={self._trade_disabled_reason}",
+                    kind="WARN",
+                )
+                self._last_trade_disabled_reason = self._trade_disabled_reason
+            self._suppress_dry_run_event = True
             self._dry_run_toggle.setChecked(True)
+            self._suppress_dry_run_event = False
             self._dry_run_toggle.setEnabled(False)
-            self._dry_run_toggle.setToolTip(tr("dry_run_forced_tooltip"))
+            self._dry_run_toggle.setToolTip(tr("trade_disabled_tooltip"))
         else:
+            self._trade_disabled_reason = ""
+            self._last_trade_disabled_reason = ""
             self._dry_run_toggle.setEnabled(True)
             self._dry_run_toggle.setToolTip("")
+        self._apply_trade_status_label()
+        self._update_grid_preview()
+
+    def _apply_trade_status_label(self) -> None:
+        if not self._can_trade():
+            self._trade_status_label.setText(tr("trade_status_disabled"))
+            self._trade_status_label.setStyleSheet(
+                "color: #dc2626; font-size: 11px; font-weight: 600;"
+            )
+            self._set_cancel_buttons_enabled(True)
+        elif self._dry_run_toggle.isChecked():
+            self._trade_status_label.setText(tr("trade_status_dry_run"))
+            self._trade_status_label.setStyleSheet(
+                "color: #6b7280; font-size: 11px; font-weight: 600;"
+            )
+            self._set_cancel_buttons_enabled(True)
+        else:
+            self._trade_status_label.setText(tr("trade_status_live"))
+            self._trade_status_label.setStyleSheet(
+                "color: #16a34a; font-size: 11px; font-weight: 600;"
+            )
+            self._set_cancel_buttons_enabled(False)
+
+    def _set_cancel_buttons_enabled(self, enabled: bool) -> None:
+        if hasattr(self, "_cancel_selected_button"):
+            self._cancel_selected_button.setEnabled(enabled)
+        if hasattr(self, "_cancel_all_button"):
+            self._cancel_all_button.setEnabled(enabled)
+
+    def _can_trade(self) -> bool:
+        if not self._account_client:
+            return False
+        if not self._symbol_tradeable:
+            return False
+        return self._account_can_trade
+
+    @staticmethod
+    def _infer_trade_error_reason(message: str) -> str:
+        message_lower = message.lower()
+        if "401" in message_lower or "unauthorized" in message_lower:
+            return "invalid keys"
+        if "403" in message_lower or "forbidden" in message_lower:
+            return "no permissions"
+        return "read-only"
 
     def _update_rules_label(self) -> None:
         tick = self._exchange_rules.get("tick")
@@ -906,7 +1024,18 @@ class LiteGridWindow(QMainWindow):
 
     def _order_id_for_row(self, row: int) -> str:
         item = self._orders_table.item(row, 0)
-        return item.text() if item and item.text() else "—"
+        if item:
+            data = item.data(Qt.UserRole)
+            if data:
+                return str(data)
+            if item.text():
+                return item.text()
+        side_item = self._orders_table.item(row, 1)
+        if side_item:
+            data = side_item.data(Qt.UserRole)
+            if data:
+                return str(data)
+        return "—"
 
     def _render_open_orders(self) -> None:
         self._orders_table.setRowCount(len(self._open_orders))
@@ -919,8 +1048,8 @@ class LiteGridWindow(QMainWindow):
             filled_raw = order.get("executedQty", "—")
             time_ms = order.get("time")
             age_text = self._format_age(time_ms, now_ms)
-            self._set_order_cell(row, 0, order_id, align=Qt.AlignLeft)
-            self._set_order_cell(row, 1, side, align=Qt.AlignLeft)
+            self._set_order_cell(row, 0, "", align=Qt.AlignLeft, user_role=order_id)
+            self._set_order_cell(row, 1, side, align=Qt.AlignLeft, user_role=order_id)
             self._set_order_cell(row, 2, str(price_raw), align=Qt.AlignRight)
             self._set_order_cell(row, 3, str(qty_raw), align=Qt.AlignRight)
             self._set_order_cell(row, 4, str(filled_raw), align=Qt.AlignRight)
@@ -928,9 +1057,18 @@ class LiteGridWindow(QMainWindow):
             self._set_order_row_tooltip(row)
         self._refresh_orders_metrics()
 
-    def _set_order_cell(self, row: int, column: int, text: str, align: Qt.AlignmentFlag) -> None:
+    def _set_order_cell(
+        self,
+        row: int,
+        column: int,
+        text: str,
+        align: Qt.AlignmentFlag,
+        user_role: str | None = None,
+    ) -> None:
         item = QTableWidgetItem(text)
         item.setTextAlignment(int(align | Qt.AlignVCenter))
+        if user_role is not None:
+            item.setData(Qt.UserRole, user_role)
         self._orders_table.setItem(row, column, item)
 
     def _remove_orders_by_side(self, side: str) -> int:
@@ -1034,9 +1172,8 @@ class LiteGridWindow(QMainWindow):
             return
         menu = QMenu(self)
         cancel_action = menu.addAction(tr("context_cancel"))
-        cancel_buy_action = menu.addAction(tr("context_cancel_buy"))
-        cancel_sell_action = menu.addAction(tr("context_cancel_sell"))
-        copy_action = menu.addAction(tr("context_copy_price"))
+        cancel_action.setEnabled(self._dry_run_toggle.isChecked())
+        copy_action = menu.addAction(tr("context_copy_id"))
         show_action = menu.addAction(tr("context_show_logs"))
         action = menu.exec(self._orders_table.viewport().mapToGlobal(position))
         if action == cancel_action:
@@ -1047,19 +1184,10 @@ class LiteGridWindow(QMainWindow):
             self._orders_table.removeRow(row)
             self._append_log(f"Cancel selected: {order_id}", kind="ORDERS")
             self._refresh_orders_metrics()
-        if action in (cancel_buy_action, cancel_sell_action):
-            if not self._dry_run_toggle.isChecked():
-                self._append_log("Cancel side: not implemented.", kind="ORDERS")
-                return
-            side = "BUY" if action == cancel_buy_action else "SELL"
-            removed = self._remove_orders_by_side(side)
-            self._append_log(f"Cancel side {side}: {removed}", kind="ORDERS")
-            self._refresh_orders_metrics()
         if action == copy_action:
-            price_item = self._orders_table.item(row, 2)
-            price_text = price_item.text() if price_item else "—"
-            QApplication.clipboard().setText(price_text)
-            self._append_log(f"Copy price: {price_text}", kind="ORDERS")
+            order_id = self._order_id_for_row(row)
+            QApplication.clipboard().setText(order_id)
+            self._append_log(f"Copy id: {order_id}", kind="ORDERS")
         if action == show_action:
             details = self._format_order_details(row)
             self._append_log(f"Order context: {details}", kind="ORDERS")
@@ -1078,7 +1206,10 @@ class LiteGridWindow(QMainWindow):
             header = self._orders_table.horizontalHeaderItem(column)
             header_text = header.text() if header else str(column)
             item = self._orders_table.item(row, column)
-            values.append(f"{header_text}={item.text() if item else '—'}")
+            if header_text.upper() == "ID":
+                values.append(f"{header_text}={self._order_id_for_row(row)}")
+            else:
+                values.append(f"{header_text}={item.text() if item else '—'}")
         return "; ".join(values)
 
     def _append_log(self, message: str, kind: str = "INFO") -> None:
