@@ -55,8 +55,8 @@ class TradingRuntimeWindow(QMainWindow):
         exchange: str,
         strategy_snapshot: dict[str, Any],
         mode: str,
+        price_feed_manager: PriceFeedManager | None = None,
         trade_ready_window: QWidget | None = None,
-        price_feed_manager: PriceFeedManager,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
