@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
@@ -8,6 +9,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -64,6 +66,10 @@ class BotTab(QWidget):
     def _build_strategy_fields(self) -> QWidget:
         group = QGroupBox("Strategy Settings")
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
 
         self._budget_input = QLineEdit()
         self._mode_input = QLineEdit()
@@ -71,12 +77,24 @@ class BotTab(QWidget):
         self._grid_step_input = QLineEdit()
         self._range_input = QLineEdit()
 
+        fields = [
+            self._budget_input,
+            self._mode_input,
+            self._grid_count_input,
+            self._grid_step_input,
+            self._range_input,
+        ]
+        for field in fields:
+            field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            field.setMinimumHeight(28)
+
         form.addRow("Budget (USDT)", self._budget_input)
         form.addRow("Mode", self._mode_input)
         form.addRow("Grid count", self._grid_count_input)
         form.addRow("Grid step %", self._grid_step_input)
         form.addRow("Range low/high %", self._range_input)
 
+        group.setMinimumHeight(180)
         group.setLayout(form)
         return group
 
