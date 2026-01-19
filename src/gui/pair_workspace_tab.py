@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSignalBlocker, QTimer
 from PySide6.QtWidgets import (
+    QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QSpinBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -27,11 +31,12 @@ from src.gui.widgets.pair_topbar import PairTopBar
 
 @dataclass
 class DemoPlan:
-    budget: str
+    budget: float
     mode: str
-    grid_count: str
-    grid_step: str
-    range_band: str
+    grid_count: int
+    grid_step_pct: float
+    range_low_pct: float
+    range_high_pct: float
 
 
 @dataclass
@@ -57,6 +62,8 @@ class PairWorkspaceTab(QWidget):
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._log_tick)
         self._tick_count = 0
+        self._ai_values: dict[str, Any] = {}
+        self._user_touched: set[str] = set()
 
         layout = QVBoxLayout()
         self._topbar = PairTopBar(
@@ -124,19 +131,64 @@ class PairWorkspaceTab(QWidget):
         group = QGroupBox("Strategy form")
         form = QFormLayout()
 
-        self._budget_input = QLineEdit()
-        self._mode_input = QLineEdit()
-        self._grid_count_input = QLineEdit()
-        self._grid_step_input = QLineEdit()
-        self._range_input = QLineEdit()
+        self._budget_input = QDoubleSpinBox()
+        self._budget_input.setRange(10.0, 1_000_000.0)
+        self._budget_input.setDecimals(2)
+
+        self._mode_input = QComboBox()
+        self._mode_input.addItems(["Grid", "Adaptive Grid", "Manual"])
+
+        self._grid_count_input = QSpinBox()
+        self._grid_count_input.setRange(3, 60)
+
+        self._grid_step_input = QDoubleSpinBox()
+        self._grid_step_input.setRange(0.1, 10.0)
+        self._grid_step_input.setDecimals(2)
+
+        self._range_low_input = QDoubleSpinBox()
+        self._range_low_input.setRange(0.5, 20.0)
+        self._range_low_input.setDecimals(2)
+
+        self._range_high_input = QDoubleSpinBox()
+        self._range_high_input.setRange(0.5, 20.0)
+        self._range_high_input.setDecimals(2)
 
         form.addRow("Budget (USDT)", self._budget_input)
         form.addRow("Mode", self._mode_input)
         form.addRow("Grid count", self._grid_count_input)
         form.addRow("Grid step %", self._grid_step_input)
-        form.addRow("Range low/high %", self._range_input)
+        form.addRow("Range low %", self._range_low_input)
+        form.addRow("Range high %", self._range_high_input)
 
-        group.setLayout(form)
+        self._reset_ai_button = QPushButton("Reset to AI")
+        self._reset_ai_button.setEnabled(False)
+        self._reset_ai_button.clicked.connect(self._reset_strategy_to_ai)
+
+        header_layout = QHBoxLayout()
+        header_layout.addStretch()
+        header_layout.addWidget(self._reset_ai_button)
+
+        layout = QVBoxLayout()
+        layout.addLayout(header_layout)
+        layout.addLayout(form)
+        group.setLayout(layout)
+
+        self._strategy_fields = {
+            "budget": self._budget_input,
+            "mode": self._mode_input,
+            "grid_count": self._grid_count_input,
+            "grid_step_pct": self._grid_step_input,
+            "range_low_pct": self._range_low_input,
+            "range_high_pct": self._range_high_input,
+        }
+
+        self._budget_input.valueChanged.connect(lambda _: self._on_field_changed("budget"))
+        self._mode_input.currentTextChanged.connect(lambda _: self._on_field_changed("mode"))
+        self._grid_count_input.valueChanged.connect(lambda _: self._on_field_changed("grid_count"))
+        self._grid_step_input.valueChanged.connect(lambda _: self._on_field_changed("grid_step_pct"))
+        self._range_low_input.valueChanged.connect(lambda _: self._on_field_changed("range_low_pct"))
+        self._range_high_input.valueChanged.connect(lambda _: self._on_field_changed("range_high_pct"))
+
         return group
 
     def _build_plan_panel(self) -> QWidget:
@@ -254,21 +306,84 @@ class PairWorkspaceTab(QWidget):
         self._set_state(PairRunState.PLAN_READY)
         self._log_event("AI plan ready.")
 
+    def _is_plan_applied(self) -> bool:
+        canonical_state = self._canonical_state(self._state)
+        return canonical_state in {
+            PairRunState.APPLIED,
+            PairRunState.RUNNING,
+            PairRunState.PAUSED,
+            PairRunState.STOPPED,
+        }
+
+    def _set_field_value(self, field_key: str, value: object, origin: str = "ai") -> None:
+        field = self._strategy_fields[field_key]
+        with QSignalBlocker(field):
+            if isinstance(field, QDoubleSpinBox):
+                field.setValue(float(value))
+            elif isinstance(field, QSpinBox):
+                field.setValue(int(value))
+            elif isinstance(field, QComboBox):
+                field.setCurrentText(str(value))
+            elif isinstance(field, QLineEdit):
+                field.setText(str(value))
+        if origin == "ai":
+            self._ai_values[field_key] = value
+            self._user_touched.discard(field_key)
+            self._mark_field_state(field_key, "ai")
+
+    def _mark_field_state(self, field_key: str, state: str = "neutral") -> None:
+        field = self._strategy_fields[field_key]
+        if state == "ai":
+            field.setStyleSheet(
+                "border: 1px solid #7f5ad9;"
+                "border-radius: 4px;"
+                "background-color: rgba(127, 90, 217, 0.12);"
+            )
+            return
+        if state == "user":
+            field.setStyleSheet(
+                "border: 1px solid #d9a441;"
+                "border-radius: 4px;"
+                "background-color: rgba(217, 164, 65, 0.12);"
+            )
+            return
+        field.setStyleSheet("")
+
+    def _on_field_changed(self, field_key: str) -> None:
+        if not self._is_plan_applied() or not self._ai_values:
+            return
+        self._user_touched.add(field_key)
+        self._mark_field_state(field_key, "user")
+
+    def _reset_strategy_to_ai(self) -> None:
+        if not self._ai_values:
+            return
+        for field_key, value in self._ai_values.items():
+            self._set_field_value(field_key, value, origin="ai")
+        self._user_touched.clear()
+        self._reset_ai_button.setEnabled(True)
+        self._log_event("[UI] Reset strategy to AI values")
+
     def _apply_plan(self) -> None:
         demo_plan = DemoPlan(
-            budget="500",
-            mode="Market Making",
-            grid_count="12",
-            grid_step="0.35",
-            range_band="-1.5 / 1.8",
+            budget=500.0,
+            mode="Grid",
+            grid_count=12,
+            grid_step_pct=0.35,
+            range_low_pct=1.5,
+            range_high_pct=1.8,
         )
-        self._budget_input.setText(demo_plan.budget)
-        self._mode_input.setText(demo_plan.mode)
-        self._grid_count_input.setText(demo_plan.grid_count)
-        self._grid_step_input.setText(demo_plan.grid_step)
-        self._range_input.setText(demo_plan.range_band)
+        self._ai_values = {}
+        self._user_touched.clear()
+        self._set_field_value("budget", demo_plan.budget, origin="ai")
+        self._set_field_value("mode", demo_plan.mode, origin="ai")
+        self._set_field_value("grid_count", demo_plan.grid_count, origin="ai")
+        self._set_field_value("grid_step_pct", demo_plan.grid_step_pct, origin="ai")
+        self._set_field_value("range_low_pct", demo_plan.range_low_pct, origin="ai")
+        self._set_field_value("range_high_pct", demo_plan.range_high_pct, origin="ai")
+        self._reset_ai_button.setEnabled(True)
         self._set_state(PairRunState.APPLIED)
-        self._log_event("Applied plan to strategy form.")
+        self._log_event("[AI] Plan applied -> strategy populated")
 
     def _confirm_start(self) -> None:
         self._set_state(PairRunState.WAIT_CONFIRM)
