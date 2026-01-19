@@ -43,3 +43,15 @@ def test_strategy_form_widgets() -> None:
     assert isinstance(tab._range_high_input, QDoubleSpinBox)
     assert tab._reset_ai_button.text() == "Reset to AI"
     assert tab._strategy_fields["budget"] is tab._budget_input
+
+
+@pytest.mark.skipif(not PYSIDE_AVAILABLE, reason="PySide6 dependencies unavailable")
+def test_plan_preview_table_populates() -> None:
+    from src.gui.models.app_state import AppState
+    from src.gui.pair_workspace_tab import PairWorkspaceTab
+
+    app = QApplication.instance() or QApplication([])
+    app_state = AppState(env="TEST", log_level="INFO", config_path="config.yml")
+    tab = PairWorkspaceTab(symbol="ETHUSDT", app_state=app_state)
+    tab._rebuild_plan_preview(reason="built")
+    assert tab._plan_preview_table.rowCount() > 0
