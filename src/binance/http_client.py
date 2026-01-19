@@ -27,6 +27,10 @@ class BinanceHttpClient:
     def get_exchange_info(self) -> dict[str, Any]:
         return self._request_json("/api/v3/exchangeInfo")
 
+    def get_exchange_info_symbol(self, symbol: str) -> dict[str, Any]:
+        symbol_clean = symbol.strip().upper()
+        return self._request_json(f"/api/v3/exchangeInfo?symbol={symbol_clean}")
+
     def get_ticker_price(self, symbol: str | None = None) -> dict[str, str] | str:
         if symbol:
             data = self._request_json(f"/api/v3/ticker/price?symbol={symbol}")

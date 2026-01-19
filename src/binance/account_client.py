@@ -46,6 +46,13 @@ class BinanceAccountClient:
             raise ValueError("Unexpected open orders response format")
         return [item for item in payload if isinstance(item, dict)]
 
+    def get_trade_fees(self, symbol: str) -> list[dict[str, Any]]:
+        params = {"symbol": symbol}
+        payload = self._request_signed("/sapi/v1/asset/tradeFee", params=params)
+        if not isinstance(payload, list):
+            raise ValueError("Unexpected trade fee response format")
+        return [item for item in payload if isinstance(item, dict)]
+
     def _request_signed(self, path: str, params: dict[str, Any] | None = None) -> Any:
         if not self._api_key or not self._api_secret:
             raise RuntimeError("Binance API key/secret not configured")
