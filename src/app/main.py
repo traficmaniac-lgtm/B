@@ -7,17 +7,19 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from src.core.config import load_config
+from src.core.config import Config, load_config
 from src.core.logging import configure_logging, get_logger
 from src.gui.main_window import MainWindow
 from src.gui.models.app_state import AppState
 
 
-def _load_app_state(config_env: str, config_log_level: str, root_path: Path) -> AppState:
-    default_config_path = str(root_path / "config.json")
+def _load_app_state(config: Config, root_path: Path) -> AppState:
+    default_config_path = str((root_path / "config.json").resolve())
+    price_ttl_ms = getattr(config.prices, "ttl_ms", 2500)
+    price_refresh_ms = getattr(config.prices, "refresh_interval_ms", 500)
     defaults = AppState(
-        env=config_env,
-        log_level=config_log_level,
+        env=config.app.env,
+        log_level=config.app.log_level,
         config_path=default_config_path,
         show_logs=True,
         binance_api_key="",
@@ -26,13 +28,16 @@ def _load_app_state(config_env: str, config_log_level: str, root_path: Path) -> 
         default_period="4h",
         default_quality="Standard",
         allow_ai_more_data=True,
-        price_ttl_ms=config.prices.ttl_ms,
-        price_refresh_ms=config.prices.refresh_interval_ms,
+        price_ttl_ms=price_ttl_ms,
+        price_refresh_ms=price_refresh_ms,
         default_quote="USDT",
         pnl_period="24h",
     )
     user_config_path = root_path / "config.user.yaml"
-    return AppState.load(user_config_path, defaults)
+    app_state = AppState.load(user_config_path, defaults)
+    if not user_config_path.exists():
+        app_state.save(user_config_path)
+    return app_state
 
 
 def _configure_exception_hook(logger: logging.LoggerAdapter) -> None:
@@ -47,12 +52,12 @@ def _configure_exception_hook(logger: logging.LoggerAdapter) -> None:
 
 
 def main() -> int:
-    config = load_config()
+    root_path = Path(__file__).resolve().parents[2]
+    config = load_config(root_path / "config.json")
     configure_logging(config.app.log_level)
     logger = get_logger("app")
 
-    root_path = Path(__file__).resolve().parents[2]
-    app_state = _load_app_state(config.app.env, config.app.log_level, root_path)
+    app_state = _load_app_state(config, root_path)
     logging.getLogger().setLevel(app_state.log_level)
 
     app = QApplication(sys.argv)
