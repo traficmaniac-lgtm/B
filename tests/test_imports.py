@@ -1,11 +1,17 @@
+import pytest
+
+pytest.importorskip("PySide6")
+
 from src.app.main import main
 from src.gui.main_window import MainWindow
-from src.gui.pair_workspace_window import PairWorkspaceWindow
-from src.services.ai_provider import AIProvider
+from src.gui.models.pair_state import PairRunState
+from src.gui.overview_tab import OverviewTab
+from src.gui.pair_workspace_tab import PairWorkspaceTab
 
 
 def test_imports() -> None:
     assert callable(main)
     assert MainWindow.__name__ == "MainWindow"
-    assert PairWorkspaceWindow.__name__ == "PairWorkspaceWindow"
-    assert AIProvider.__name__ == "AIProvider"
+    assert OverviewTab.__name__ == "OverviewTab"
+    assert PairWorkspaceTab.__name__ == "PairWorkspaceTab"
+    assert PairRunState.__name__ == "PairRunState"

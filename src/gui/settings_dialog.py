@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from src.core.logging import get_logger
+from src.gui.models.app_state import AppState
+
+
+class SettingsDialog(QDialog):
+    def __init__(
+        self,
+        app_state: AppState,
+        on_save: Callable[[AppState], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._logger = get_logger("gui.settings")
+        self._app_state = app_state
+        self._on_save = on_save
+
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+
+        layout = QVBoxLayout()
+        layout.addLayout(self._build_form())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._handle_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+    def _build_form(self) -> QFormLayout:
+        form = QFormLayout()
+
+        self._binance_key_input = QLineEdit(self._app_state.binance_api_key)
+        self._binance_key_input.setEchoMode(QLineEdit.Password)
+
+        self._binance_secret_input = QLineEdit(self._app_state.binance_api_secret)
+        self._binance_secret_input.setEchoMode(QLineEdit.Password)
+
+        self._openai_key_input = QLineEdit(self._app_state.openai_api_key)
+        self._openai_key_input.setEchoMode(QLineEdit.Password)
+
+        self._default_period_combo = QComboBox()
+        self._default_period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
+        self._default_period_combo.setCurrentText(self._app_state.default_period)
+
+        self._default_quality_combo = QComboBox()
+        self._default_quality_combo.addItems(["Standard", "Deep"])
+        self._default_quality_combo.setCurrentText(self._app_state.default_quality)
+
+        self._allow_ai_more_data = QCheckBox("Allow AI to request more data")
+        self._allow_ai_more_data.setChecked(self._app_state.allow_ai_more_data)
+
+        form.addRow(QLabel("Binance API key"), self._binance_key_input)
+        form.addRow(QLabel("Binance API secret"), self._binance_secret_input)
+        form.addRow(QLabel("OpenAI API key"), self._openai_key_input)
+        form.addRow(QLabel("Default period"), self._default_period_combo)
+        form.addRow(QLabel("Default quality"), self._default_quality_combo)
+        form.addRow(self._allow_ai_more_data)
+        return form
+
+    def _handle_save(self) -> None:
+        self._app_state.binance_api_key = self._binance_key_input.text().strip()
+        self._app_state.binance_api_secret = self._binance_secret_input.text().strip()
+        self._app_state.openai_api_key = self._openai_key_input.text().strip()
+        self._app_state.default_period = self._default_period_combo.currentText()
+        self._app_state.default_quality = self._default_quality_combo.currentText()
+        self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
+        self._on_save(self._app_state)
+        config_path = self._app_state.user_config_path or Path("config.user.yaml")
+        self._logger.info("[SETTINGS] saved to %s", config_path.as_posix())
+        self.accept()

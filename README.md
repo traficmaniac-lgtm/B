@@ -14,9 +14,13 @@ python -m pip install -r requirements.txt
 python -m src.app.main
 ```
 
+### Settings
+
+Open Settings from the toolbar or File → Settings menu. Changes are saved to `config.user.yaml`.
+
 ### Pair Workspace
 
-Double click any row in the Markets tab to open a Pair Workspace window for that symbol.
+Double click any row in the Overview tab to open a Pair Workspace bot tab for that symbol.
 
 ## Run tests
 
