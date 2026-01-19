@@ -45,9 +45,7 @@ TEXT = {
     "cancel_all": "Отменить все",
     "refresh": "Обновить",
     "context_cancel": "Отменить",
-    "context_cancel_buy": "Отменить все BUY",
-    "context_cancel_sell": "Отменить все SELL",
-    "context_copy_price": "Копировать цену",
+    "context_copy_id": "Копировать ID",
     "context_show_logs": "Показать в логах",
     "trades_summary": "Closed {closed} | Win {win} | Avg {avg} | Realized {realized} | Fees {fees}",
     "logs": "Logs",
@@ -57,7 +55,12 @@ TEXT = {
     "grid_preview": "Grid: {levels} lvls | step {step}% | range ±{range}% | est orders: {orders} | min order: {min_order} {quote_ccy}",
     "ws_degraded_tooltip": "Нет обновлений > X сек, fallback на HTTP",
     "rules_line": "Rules: {rules}",
-    "dry_run_forced_tooltip": "read-only keys",
+    "trade_disabled_tooltip": "Trade disabled: read-only / no permissions / invalid keys",
+    "trade_status_disabled": "TRADE: DISABLED",
+    "trade_status_dry_run": "TRADE: DRY-RUN",
+    "trade_status_live": "TRADE: LIVE",
+    "trade_confirm_title": "Enable LIVE trading?",
+    "trade_confirm_message": "Enable LIVE trading? This will allow real orders.",
 }
 
 
