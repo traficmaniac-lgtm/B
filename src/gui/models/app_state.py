@@ -19,6 +19,10 @@ class AppState:
     default_period: str = "4h"
     default_quality: str = "Standard"
     allow_ai_more_data: bool = True
+    price_ttl_ms: int = 2500
+    price_refresh_ms: int = 500
+    default_quote: str = "USDT"
+    pnl_period: str = "24h"
     user_config_path: Path | None = None
 
     @classmethod
@@ -38,6 +42,10 @@ class AppState:
         default_period = str(data.get("default_period", defaults.default_period))
         default_quality = str(data.get("default_quality", defaults.default_quality))
         allow_ai_more_data = bool(data.get("allow_ai_more_data", defaults.allow_ai_more_data))
+        price_ttl_ms = int(data.get("price_ttl_ms", defaults.price_ttl_ms))
+        price_refresh_ms = int(data.get("price_refresh_ms", defaults.price_refresh_ms))
+        default_quote = str(data.get("default_quote", defaults.default_quote)).upper()
+        pnl_period = str(data.get("pnl_period", defaults.pnl_period))
         return cls(
             env=env,
             log_level=log_level,
@@ -49,6 +57,10 @@ class AppState:
             default_period=default_period,
             default_quality=default_quality,
             allow_ai_more_data=allow_ai_more_data,
+            price_ttl_ms=price_ttl_ms,
+            price_refresh_ms=price_refresh_ms,
+            default_quote=default_quote,
+            pnl_period=pnl_period,
             user_config_path=path,
         )
 
@@ -64,6 +76,10 @@ class AppState:
             "default_period": self.default_period,
             "default_quality": self.default_quality,
             "allow_ai_more_data": self.allow_ai_more_data,
+            "price_ttl_ms": self.price_ttl_ms,
+            "price_refresh_ms": self.price_refresh_ms,
+            "default_quote": self.default_quote,
+            "pnl_period": self.pnl_period,
         }
 
     def save(self, path: Path) -> None:

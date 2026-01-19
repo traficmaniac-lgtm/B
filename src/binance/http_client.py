@@ -27,7 +27,16 @@ class BinanceHttpClient:
     def get_exchange_info(self) -> dict[str, Any]:
         return self._request_json("/api/v3/exchangeInfo")
 
-    def get_ticker_prices(self) -> dict[str, str]:
+    def get_ticker_price(self, symbol: str | None = None) -> dict[str, str] | str:
+        if symbol:
+            data = self._request_json(f"/api/v3/ticker/price?symbol={symbol}")
+            if not isinstance(data, dict) or "price" not in data:
+                raise ValueError("Unexpected ticker response format")
+            price = data.get("price")
+            if not isinstance(price, str):
+                raise ValueError("Unexpected ticker response format")
+            return price
+
         data = self._request_json("/api/v3/ticker/price")
         if not isinstance(data, list):
             raise ValueError("Unexpected ticker response format")
@@ -35,10 +44,16 @@ class BinanceHttpClient:
         for item in data:
             if not isinstance(item, dict):
                 continue
-            symbol = item.get("symbol")
-            price = item.get("price")
-            if isinstance(symbol, str) and isinstance(price, str):
-                prices[symbol] = price
+            item_symbol = item.get("symbol")
+            item_price = item.get("price")
+            if isinstance(item_symbol, str) and isinstance(item_price, str):
+                prices[item_symbol] = item_price
+        return prices
+
+    def get_ticker_prices(self) -> dict[str, str]:
+        prices = self.get_ticker_price()
+        if not isinstance(prices, dict):
+            raise ValueError("Unexpected ticker response format")
         return prices
 
     def get_time(self) -> dict[str, Any]:

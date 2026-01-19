@@ -17,7 +17,10 @@ class StubClient:
                     "baseAsset": "BTC",
                     "quoteAsset": "USDT",
                     "status": "TRADING",
-                    "filters": [],
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                    ],
                 },
                 {
                     "symbol": "ETHBUSD",
@@ -53,3 +56,5 @@ def test_load_pairs_filters_quote_status_and_blacklist() -> None:
     assert client.called is True
     assert all(isinstance(pair, Pair) for pair in pairs)
     assert [pair.symbol for pair in pairs] == ["BTCUSDT"]
+    assert pairs[0].tick_size == "0.01"
+    assert pairs[0].step_size == "0.001"

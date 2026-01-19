@@ -21,10 +21,13 @@ from PySide6.QtWidgets import (
 )
 
 from src.binance.http_client import BinanceHttpClient
+from src.binance.ws_client import BinanceWsClient
 from src.core.config import Config
 from src.core.logging import get_logger
 from src.core.models import Pair
+from src.gui.models.app_state import AppState
 from src.services.markets_service import MarketsService
+from src.services.price_service import PriceService
 
 
 class _WorkerSignals(QObject):
@@ -49,6 +52,10 @@ class _Worker(QRunnable):
         self.signals.success.emit(result, latency_ms)
 
 
+class _WsStatusSignals(QObject):
+    status = Signal(str, str)
+
+
 @dataclass(frozen=True)
 class _TableColumns:
     symbol: int = 0
@@ -61,11 +68,13 @@ class OverviewTab(QWidget):
     def __init__(
         self,
         config: Config,
+        app_state: AppState,
         on_open_pair: Callable[[str], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
+        self._app_state = app_state
         self._logger = get_logger("gui.overview")
         self._on_open_pair = on_open_pair
         self._http_client = BinanceHttpClient(
@@ -76,12 +85,27 @@ class OverviewTab(QWidget):
             backoff_max_s=config.http.backoff_max_s,
         )
         self._markets_service = MarketsService(self._http_client)
+        self._ws_status_signals = _WsStatusSignals()
+        self._ws_status_signals.status.connect(self._handle_ws_status)
+        self._ws_client = BinanceWsClient(
+            ws_url=config.binance.ws_url,
+            on_tick=self._handle_ws_tick,
+            on_status=self._emit_ws_status,
+        )
+        self._price_service = PriceService(
+            http_client=self._http_client,
+            ws_client=self._ws_client,
+            ttl_ms=self._app_state.price_ttl_ms,
+            refresh_interval_ms=self._app_state.price_refresh_ms,
+            fallback_enabled=config.prices.fallback_enabled,
+        )
         self._thread_pool = QThreadPool.globalInstance()
         self._price_timer = QTimer(self)
-        self._price_timer.setInterval(self._config.prices.ttl_ms)
+        self._price_timer.setInterval(self._app_state.price_refresh_ms)
         self._price_timer.timeout.connect(self._refresh_prices)
         self._price_update_in_flight = False
         self._symbol_rows: dict[str, int] = {}
+        self._symbols_order: list[str] = []
         self._table_columns = _TableColumns()
 
         layout = QVBoxLayout()
@@ -122,7 +146,9 @@ class OverviewTab(QWidget):
         binance_box = QGroupBox("Binance")
         binance_layout = QVBoxLayout()
         self._binance_status_label = QLabel("Binance: NOT CONNECTED")
+        self._ws_status_label = QLabel("WS: NOT CONNECTED")
         binance_layout.addWidget(self._binance_status_label)
+        binance_layout.addWidget(self._ws_status_label)
         binance_box.setLayout(binance_layout)
 
         ai_box = QGroupBox("AI")
@@ -130,9 +156,24 @@ class OverviewTab(QWidget):
         ai_layout.addWidget(QLabel("AI: NOT CONNECTED"))
         ai_box.setLayout(ai_layout)
 
+        balance_box = QGroupBox("Balance / PnL")
+        balance_layout = QVBoxLayout()
+        self._balance_label = QLabel("Balance (USDT): Not connected")
+        self._pnl_period_combo = QComboBox()
+        self._pnl_period_combo.addItems(["1h", "4h", "24h", "7d"])
+        self._pnl_period_combo.setCurrentText(self._app_state.pnl_period)
+        self._pnl_period_combo.currentTextChanged.connect(self._handle_pnl_period_change)
+        self._pnl_label = QLabel("PnL: --")
+        balance_layout.addWidget(self._balance_label)
+        balance_layout.addWidget(QLabel("PnL period"))
+        balance_layout.addWidget(self._pnl_period_combo)
+        balance_layout.addWidget(self._pnl_label)
+        balance_box.setLayout(balance_layout)
+
         grid.addWidget(config_box, 0, 0)
         grid.addWidget(binance_box, 0, 1)
         grid.addWidget(ai_box, 0, 2)
+        grid.addWidget(balance_box, 0, 3)
         return grid
 
     def _build_filters(self) -> QHBoxLayout:
@@ -143,6 +184,8 @@ class OverviewTab(QWidget):
 
         self._quote_combo = QComboBox()
         self._quote_combo.addItems(["USDT", "USDC", "FDUSD", "EUR"])
+        self._quote_combo.setCurrentText(self._app_state.default_quote)
+        self._quote_combo.currentTextChanged.connect(self._handle_quote_change)
 
         self._load_button = QPushButton("Load Pairs")
         self._load_button.clicked.connect(self._handle_load_pairs)
@@ -189,8 +232,11 @@ class OverviewTab(QWidget):
     def _handle_load_pairs(self) -> None:
         self._load_button.setEnabled(False)
         self._symbol_rows.clear()
+        self._symbols_order.clear()
         self._table.setRowCount(0)
         quote = self._quote_combo.currentText().strip()
+        self._logger.info("Loading pairs...")
+        self._binance_status_label.setText("Binance: LOADING")
         worker = _Worker(lambda: self._markets_service.load_pairs(quote))
         worker.signals.success.connect(self._handle_pairs_loaded)
         worker.signals.error.connect(self._handle_pairs_error)
@@ -205,6 +251,8 @@ class OverviewTab(QWidget):
         pair_list = [pair for pair in pairs if isinstance(pair, Pair)]
         self._populate_table(pair_list)
         self._load_button.setEnabled(True)
+        self._price_service.set_symbols([pair.symbol for pair in pair_list])
+        self._price_service.start()
         self._refresh_prices()
         if not self._price_timer.isActive():
             self._price_timer.start()
@@ -218,6 +266,7 @@ class OverviewTab(QWidget):
         self._table.setRowCount(len(pairs))
         for row_index, pair in enumerate(pairs):
             self._symbol_rows[pair.symbol] = row_index
+            self._symbols_order.append(pair.symbol)
             self._set_table_item(row_index, self._table_columns.symbol, pair.symbol)
             self._set_table_item(row_index, self._table_columns.price, "--")
             self._set_table_item(row_index, self._table_columns.source, "--")
@@ -232,29 +281,19 @@ class OverviewTab(QWidget):
         if self._price_update_in_flight or not self._symbol_rows:
             return
         self._price_update_in_flight = True
-        worker = _Worker(self._http_client.get_ticker_prices)
-        worker.signals.success.connect(self._handle_prices_loaded)
-        worker.signals.error.connect(self._handle_prices_error)
-        self._thread_pool.start(worker)
-
-    def _handle_prices_loaded(self, prices: object, latency_ms: int) -> None:
-        self._price_update_in_flight = False
-        if not isinstance(prices, dict):
-            self._logger.error("Unexpected prices payload: %s", prices)
-            return
-        self._set_binance_status_connected()
-        for symbol, row_index in self._symbol_rows.items():
-            price = prices.get(symbol)
+        symbols_to_update = self._symbols_order[:200]
+        snapshot = self._price_service.snapshot(symbols_to_update)
+        for symbol in symbols_to_update:
+            price = snapshot.get(symbol)
             if price is None:
                 continue
-            self._set_table_item(row_index, self._table_columns.price, str(price))
-            self._set_table_item(row_index, self._table_columns.source, "HTTP")
-            self._set_table_item(row_index, self._table_columns.updated_ms, str(latency_ms))
-
-    def _handle_prices_error(self, message: str) -> None:
+            row_index = self._symbol_rows.get(symbol)
+            if row_index is None:
+                continue
+            self._set_table_item(row_index, self._table_columns.price, f"{price.price:.8f}")
+            self._set_table_item(row_index, self._table_columns.source, price.source)
+            self._set_table_item(row_index, self._table_columns.updated_ms, str(price.age_ms))
         self._price_update_in_flight = False
-        self._logger.error("Failed to refresh prices: %s", message)
-        self._set_binance_status_error(message)
 
     def _set_table_item(self, row: int, column: int, value: str) -> None:
         item = self._table.item(row, column)
@@ -270,6 +309,43 @@ class OverviewTab(QWidget):
     def _set_binance_status_error(self, message: str) -> None:
         summary = self._summarize_error(message)
         self._binance_status_label.setText(f"Binance: ERROR ({summary})")
+
+    def _handle_ws_tick(self, symbol: str, price: float, timestamp_ms: int) -> None:
+        self._price_service.on_ws_tick(symbol, price, timestamp_ms)
+
+    def _emit_ws_status(self, status: str, message: str | None) -> None:
+        self._ws_status_signals.status.emit(status, message or status)
+
+    def _handle_ws_status(self, status: str, message: str) -> None:
+        if status == "CONNECTED":
+            self._ws_status_label.setText("WS: CONNECTED")
+            return
+        if status == "RECONNECTING":
+            self._ws_status_label.setText("WS: RECONNECTING")
+            return
+        if status == "ERROR":
+            summary = self._summarize_error(message)
+            self._ws_status_label.setText(f"WS: ERROR ({summary})")
+
+    def _handle_quote_change(self, quote: str) -> None:
+        self._app_state.default_quote = quote
+        self._persist_app_state()
+
+    def _handle_pnl_period_change(self, period: str) -> None:
+        self._app_state.pnl_period = period
+        self._persist_app_state()
+
+    def _persist_app_state(self) -> None:
+        if self._app_state.user_config_path is None:
+            return
+        try:
+            self._app_state.save(self._app_state.user_config_path)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Failed to persist UI state: %s", exc)
+
+    def shutdown(self) -> None:
+        self._price_timer.stop()
+        self._price_service.stop()
 
     @staticmethod
     def _summarize_error(message: str, max_len: int = 80) -> str:
