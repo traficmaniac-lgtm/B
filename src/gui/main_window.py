@@ -68,7 +68,12 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, title, message)
 
     def open_lite_grid_window(self, symbol: str) -> None:
-        window = LiteGridWindow(symbol=symbol, price_feed_manager=self._price_feed_manager, parent=self)
+        window = LiteGridWindow(
+            symbol=symbol,
+            config=self._config,
+            price_feed_manager=self._price_feed_manager,
+            parent=self,
+        )
         window.show()
         self._lite_grid_windows.append(window)
         window.destroyed.connect(lambda _: self._remove_lite_window(window))

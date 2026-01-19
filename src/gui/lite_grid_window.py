@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from time import perf_counter, time
+from typing import Any, Callable
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,19 +18,44 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
-    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QSpinBox,
     QSplitter,
     QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from src.binance.account_client import BinanceAccountClient
+from src.binance.http_client import BinanceHttpClient
+from src.core.config import Config
 from src.core.logging import get_logger
 from src.gui.i18n import TEXT, tr
 from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
+
+
+class _WorkerSignals(QObject):
+    success = Signal(object, int)
+    error = Signal(str)
+
+
+class _Worker(QRunnable):
+    def __init__(self, fn: Callable[[], object]) -> None:
+        super().__init__()
+        self.signals = _WorkerSignals()
+        self._fn = fn
+
+    def run(self) -> None:
+        start = perf_counter()
+        try:
+            result = self._fn()
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+            return
+        latency_ms = int((perf_counter() - start) * 1000)
+        self.signals.success.emit(result, latency_ms)
 
 
 @dataclass
@@ -57,11 +83,13 @@ class LiteGridWindow(QMainWindow):
     def __init__(
         self,
         symbol: str,
+        config: Config,
         price_feed_manager: PriceFeedManager,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._logger = get_logger("gui.lite_grid")
+        self._config = config
         self._symbol = symbol.strip().upper()
         self._price_feed_manager = price_feed_manager
         self._signals = _LiteGridSignals()
@@ -72,14 +100,53 @@ class LiteGridWindow(QMainWindow):
         self._ws_status = ""
         self._settings_state = GridSettingsState()
         self._log_entries: list[tuple[str, str]] = []
+        self._thread_pool = QThreadPool.globalInstance()
+        self._account_client: BinanceAccountClient | None = None
+        self._http_client = BinanceHttpClient(
+            base_url=self._config.binance.base_url,
+            timeout_s=self._config.http.timeout_s,
+            retries=self._config.http.retries,
+            backoff_base_s=self._config.http.backoff_base_s,
+            backoff_max_s=self._config.http.backoff_max_s,
+        )
+        if self._config.binance.api_key and self._config.binance.api_secret:
+            self._account_client = BinanceAccountClient(
+                base_url=self._config.binance.base_url,
+                api_key=self._config.binance.api_key,
+                api_secret=self._config.binance.api_secret,
+                recv_window=self._config.binance.recv_window,
+                timeout_s=self._config.http.timeout_s,
+                retries=self._config.http.retries,
+                backoff_base_s=self._config.http.backoff_base_s,
+                backoff_max_s=self._config.http.backoff_max_s,
+            )
+        self._balances: dict[str, tuple[float, float]] = {}
+        self._open_orders: list[dict[str, Any]] = []
+        self._last_price: float | None = None
+        self._account_can_trade = False
+        self._symbol_tradeable = False
+        self._exchange_rules: dict[str, float | None] = {}
+        self._trade_fees: tuple[float | None, float | None] = (None, None)
+        self._quote_asset, self._base_asset = self._infer_assets_from_symbol(self._symbol)
+        self._balances_in_flight = False
+        self._orders_in_flight = False
+        self._rules_in_flight = False
+        self._fees_in_flight = False
+
+        self._balances_timer = QTimer(self)
+        self._balances_timer.setInterval(8_000)
+        self._balances_timer.timeout.connect(self._refresh_balances)
+        self._orders_timer = QTimer(self)
+        self._orders_timer.setInterval(2_500)
+        self._orders_timer.timeout.connect(self._refresh_open_orders)
 
         self.setWindowTitle(tr("window_title", symbol=self._symbol))
         self.resize(1050, 720)
 
         central = QWidget(self)
         outer_layout = QVBoxLayout(central)
-        outer_layout.setContentsMargins(12, 12, 12, 12)
-        outer_layout.setSpacing(10)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(8)
 
         outer_layout.addLayout(self._build_header())
         outer_layout.addWidget(self._build_body())
@@ -92,6 +159,14 @@ class LiteGridWindow(QMainWindow):
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
         self._price_feed_manager.start()
+        self._refresh_exchange_rules()
+        if self._account_client:
+            self._balances_timer.start()
+            self._orders_timer.start()
+            self._refresh_balances()
+            self._refresh_open_orders()
+        else:
+            self._apply_trading_permissions()
         self._append_log("Lite Grid Terminal opened.", kind="INFO")
 
     @property
@@ -103,7 +178,7 @@ class LiteGridWindow(QMainWindow):
         wrapper.setSpacing(4)
 
         row_top = QHBoxLayout()
-        row_top.setSpacing(10)
+        row_top.setSpacing(8)
         row_bottom = QHBoxLayout()
         row_bottom.setSpacing(8)
 
@@ -124,16 +199,21 @@ class LiteGridWindow(QMainWindow):
         self._dry_run_toggle.setCheckable(True)
         self._dry_run_toggle.setChecked(True)
         self._dry_run_toggle.toggled.connect(self._handle_dry_run_toggle)
+        badge_base = (
+            "padding: 3px 8px; border-radius: 10px; border: 1px solid #d1d5db; "
+            "font-weight: 600; min-height: 20px;"
+        )
         self._dry_run_toggle.setStyleSheet(
             "QPushButton {"
-            "padding: 4px 8px; border-radius: 10px; border: 1px solid #d1d5db;"
-            "background: #f3f4f6; font-weight: 600;}"
+            f"{badge_base}"
+            "background: #f3f4f6;}"
             "QPushButton:checked {background: #16a34a; color: white; border-color: #16a34a;}"
+            "QPushButton:disabled {background: #e5e7eb; color: #9ca3af;}"
         )
 
         self._state_badge = QLabel(f"{tr('state')}: {self._state}")
         self._state_badge.setStyleSheet(
-            "padding: 4px 8px; border-radius: 10px; background: #1f2937; color: white; font-weight: 600;"
+            f"{badge_base} background: #111827; color: white;"
         )
 
         row_top.addWidget(self._symbol_label)
@@ -154,7 +234,7 @@ class LiteGridWindow(QMainWindow):
         self._latency_label.setStyleSheet("color: #6b7280; font-size: 11px;")
 
         self._engine_state_label = QLabel(f"{tr('engine')}: {self._engine_state}")
-        self._engine_state_label.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
+        self._apply_engine_state_style(self._engine_state)
 
         row_bottom.addWidget(self._feed_indicator)
         row_bottom.addWidget(self._age_label)
@@ -179,26 +259,43 @@ class LiteGridWindow(QMainWindow):
 
     def _build_market_panel(self) -> QWidget:
         group = QGroupBox(tr("market"))
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
         layout = QVBoxLayout(group)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
 
         self._market_price = QLabel(f"{tr('price')}: —")
         self._market_spread = QLabel(f"{tr('spread')}: —")
         self._market_volatility = QLabel(f"{tr('volatility')}: —")
         self._market_fee = QLabel(f"{tr('fee')}: —")
+        self._rules_label = QLabel(tr("rules_line", rules="—"))
+
+        self._set_market_label_state(self._market_price, active=False)
+        self._set_market_label_state(self._market_spread, active=False)
+        self._set_market_label_state(self._market_volatility, active=False)
+        self._set_market_label_state(self._market_fee, active=False)
+        self._rules_label.setStyleSheet("color: #6b7280; font-size: 10px;")
 
         layout.addWidget(self._market_price)
         layout.addWidget(self._market_spread)
         layout.addWidget(self._market_volatility)
         layout.addWidget(self._market_fee)
+        layout.addWidget(self._rules_label)
         layout.addStretch()
         return group
 
     def _build_grid_panel(self) -> QWidget:
         group = QGroupBox(tr("grid_settings"))
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
         layout = QVBoxLayout(group)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
+        form.setVerticalSpacing(4)
 
         self._budget_input = QDoubleSpinBox()
         self._budget_input.setRange(10.0, 1_000_000.0)
@@ -316,8 +413,12 @@ class LiteGridWindow(QMainWindow):
 
     def _build_runtime_panel(self) -> QWidget:
         group = QGroupBox(tr("runtime"))
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
         layout = QVBoxLayout(group)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
 
         fixed_font = QFont()
         fixed_font.setStyleHint(QFont.Monospace)
@@ -325,47 +426,38 @@ class LiteGridWindow(QMainWindow):
 
         self._balance_quote_label = QLabel(
             tr(
-                "balance_quote_base",
+                "runtime_account_line",
                 quote="0.00",
-                quote_ccy="USDT",
                 base="0.0000",
-                base_ccy=self._symbol,
+                equity="0.00",
             )
         )
         self._balance_quote_label.setFont(fixed_font)
-        self._balance_equity_label = QLabel(
-            tr("equity_line", equity="0.00", free="0.00", locked="0.00")
+        self._balance_bot_label = QLabel(
+            tr("runtime_bot_line", used="0.00", free="0.00", locked="0.00")
         )
-        self._balance_equity_label.setFont(fixed_font)
+        self._balance_bot_label.setFont(fixed_font)
 
-        self._budget_line = QLabel(tr("bot_budget_line", budget="0.00", used="0.00", free="0.00"))
-        self._budget_line.setFont(fixed_font)
-        self._budget_progress = QProgressBar()
-        self._budget_progress.setRange(0, 100)
-        self._budget_progress.setValue(0)
-        self._budget_progress.setTextVisible(False)
-        self._budget_progress.setFixedHeight(7)
-
-        self._pnl_label = QLabel(tr("pnl_line", unreal="0.00", real="0.00", total="0.00"))
+        self._pnl_label = QLabel(tr("pnl_line", unreal="0.00", real="0.00", total="+0.00"))
         self._pnl_label.setFont(fixed_font)
+        self._pnl_label.setTextFormat(Qt.RichText)
 
         self._orders_count_label = QLabel(tr("orders_count", count="0"))
         self._orders_count_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self._orders_count_label.setFont(fixed_font)
 
         layout.addWidget(self._balance_quote_label)
-        layout.addWidget(self._balance_equity_label)
-        layout.addWidget(self._budget_line)
-        layout.addWidget(self._budget_progress)
+        layout.addWidget(self._balance_bot_label)
         layout.addWidget(self._pnl_label)
-        layout.addSpacing(6)
         layout.addWidget(self._orders_count_label)
 
-        self._orders_table = QTableWidget(0, 7, self)
+        self._orders_table = QTableWidget(0, 6, self)
         self._orders_table.setHorizontalHeaderLabels(TEXT["orders_columns"])
         self._orders_table.setColumnHidden(0, True)
         self._orders_table.horizontalHeader().setStretchLastSection(True)
         self._orders_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._orders_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._orders_table.verticalHeader().setDefaultSectionSize(22)
         self._orders_table.setMinimumHeight(160)
         self._orders_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._orders_table.customContextMenuRequested.connect(self._show_order_context_menu)
@@ -376,6 +468,8 @@ class LiteGridWindow(QMainWindow):
         self._cancel_selected_button = QPushButton(tr("cancel_selected"))
         self._cancel_all_button = QPushButton(tr("cancel_all"))
         self._refresh_button = QPushButton(tr("refresh"))
+        for button in (self._cancel_selected_button, self._cancel_all_button, self._refresh_button):
+            button.setFixedHeight(28)
 
         self._cancel_selected_button.clicked.connect(self._handle_cancel_selected)
         self._cancel_all_button.clicked.connect(self._handle_cancel_all)
@@ -396,6 +490,9 @@ class LiteGridWindow(QMainWindow):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
+        fixed_font = QFont()
+        fixed_font.setStyleHint(QFont.Monospace)
+        fixed_font.setFixedPitch(True)
         self._trades_summary_label = QLabel(
             tr(
                 "trades_summary",
@@ -407,6 +504,7 @@ class LiteGridWindow(QMainWindow):
             )
         )
         self._trades_summary_label.setStyleSheet("font-weight: 600;")
+        self._trades_summary_label.setFont(fixed_font)
 
         filter_row = QHBoxLayout()
         filter_label = QLabel(tr("logs"))
@@ -437,11 +535,15 @@ class LiteGridWindow(QMainWindow):
 
     def _apply_price_update(self, update: PriceUpdate) -> None:
         if update.last_price is not None:
+            self._last_price = update.last_price
             self._last_price_label.setText(tr("last_price", price=f"{update.last_price:.8f}"))
             self._market_price.setText(f"{tr('price')}: {update.last_price:.8f}")
+            self._set_market_label_state(self._market_price, active=True)
         else:
+            self._last_price = None
             self._last_price_label.setText(tr("last_price", price="—"))
             self._market_price.setText(f"{tr('price')}: —")
+            self._set_market_label_state(self._market_price, active=False)
 
         latency = f"{update.latency_ms}ms" if update.latency_ms is not None else "—"
         age = f"{update.price_age_ms}ms" if update.price_age_ms is not None else "—"
@@ -453,10 +555,14 @@ class LiteGridWindow(QMainWindow):
         micro = update.microstructure
         if micro.spread_pct is not None:
             self._market_spread.setText(f"{tr('spread')}: {micro.spread_pct:.4f}%")
+            self._set_market_label_state(self._market_spread, active=True)
         elif micro.spread_abs is not None:
             self._market_spread.setText(f"{tr('spread')}: {micro.spread_abs:.8f}")
+            self._set_market_label_state(self._market_spread, active=True)
         else:
             self._market_spread.setText(f"{tr('spread')}: —")
+            self._set_market_label_state(self._market_spread, active=False)
+        self._update_runtime_balances()
 
     def _apply_status_update(self, status: str, _: str) -> None:
         if status == WS_CONNECTED:
@@ -472,6 +578,44 @@ class LiteGridWindow(QMainWindow):
             self._ws_status = ""
             self._feed_indicator.setToolTip("")
         self._feed_indicator.setText(f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK —")
+
+    @staticmethod
+    def _set_market_label_state(label: QLabel, active: bool) -> None:
+        if active:
+            label.setStyleSheet("color: #111827; font-size: 11px;")
+        else:
+            label.setStyleSheet("color: #9ca3af; font-size: 10px;")
+
+    def _update_runtime_balances(self) -> None:
+        quote_total = self._asset_total(self._quote_asset)
+        base_total = self._asset_total(self._base_asset)
+        equity = quote_total + (base_total * self._last_price if self._last_price else 0.0)
+        self._balance_quote_label.setText(
+            tr(
+                "runtime_account_line",
+                quote=f"{quote_total:.2f}",
+                base=f"{base_total:.4f}",
+                equity=f"{equity:.2f}",
+            )
+        )
+        used = self._open_orders_value()
+        locked = used
+        free = max(quote_total - used, 0.0)
+        self._balance_bot_label.setText(
+            tr(
+                "runtime_bot_line",
+                used=f"{used:.2f}",
+                free=f"{free:.2f}",
+                locked=f"{locked:.2f}",
+            )
+        )
+
+    def _asset_total(self, asset: str) -> float:
+        free, locked = self._balances.get(asset, (0.0, 0.0))
+        return free + locked
+
+    def _open_orders_value(self) -> float:
+        return sum(self._extract_order_value(row) for row in range(self._orders_table.rowCount()))
 
     def _handle_range_mode_change(self, value: str) -> None:
         self._update_setting("range_mode", value)
@@ -529,13 +673,15 @@ class LiteGridWindow(QMainWindow):
         self._refresh_orders_metrics()
 
     def _handle_refresh(self) -> None:
-        self._append_log("Manual refresh requested (not implemented).", kind="INFO")
+        self._append_log("Manual refresh requested.", kind="INFO")
+        self._refresh_open_orders()
 
     def _change_state(self, new_state: str) -> None:
         self._state = new_state
         self._state_badge.setText(f"{tr('state')}: {self._state}")
         self._engine_state = self._engine_state_from_status(new_state)
         self._engine_state_label.setText(f"{tr('engine')}: {self._engine_state}")
+        self._apply_engine_state_style(self._engine_state)
 
     def _update_setting(self, key: str, value: Any) -> None:
         if hasattr(self._settings_state, key):
@@ -568,9 +714,247 @@ class LiteGridWindow(QMainWindow):
         self._append_log("Settings reset to defaults.", kind="INFO")
         self._update_grid_preview()
 
+    def _refresh_balances(self) -> None:
+        if not self._account_client or self._balances_in_flight:
+            return
+        self._balances_in_flight = True
+        worker = _Worker(self._account_client.get_account_info)
+        worker.signals.success.connect(self._handle_account_info)
+        worker.signals.error.connect(self._handle_account_error)
+        self._thread_pool.start(worker)
+
+    def _handle_account_info(self, result: object, latency_ms: int) -> None:
+        self._balances_in_flight = False
+        if not isinstance(result, dict):
+            self._handle_account_error("Unexpected account response")
+            return
+        balances_raw = result.get("balances", [])
+        balances: dict[str, tuple[float, float]] = {}
+        if isinstance(balances_raw, list):
+            for entry in balances_raw:
+                if not isinstance(entry, dict):
+                    continue
+                asset = str(entry.get("asset", "")).upper()
+                if not asset:
+                    continue
+                free = self._coerce_float(str(entry.get("free", ""))) or 0.0
+                locked = self._coerce_float(str(entry.get("locked", ""))) or 0.0
+                balances[asset] = (free, locked)
+        self._balances = balances
+        can_trade = result.get("canTrade")
+        self._account_can_trade = bool(can_trade) if can_trade is not None else False
+        self._apply_trade_fees_from_account(result)
+        self._apply_trading_permissions()
+        self._update_runtime_balances()
+        self._append_log(f"Balances updated ({latency_ms}ms).", kind="INFO")
+        self._refresh_trade_fees()
+
+    def _handle_account_error(self, message: str) -> None:
+        self._balances_in_flight = False
+        self._account_can_trade = False
+        self._append_log(f"Balances update error: {message}", kind="ERROR")
+        self._apply_trading_permissions()
+
+    def _refresh_open_orders(self) -> None:
+        if not self._account_client or self._orders_in_flight:
+            return
+        self._orders_in_flight = True
+        worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol))
+        worker.signals.success.connect(self._handle_open_orders)
+        worker.signals.error.connect(self._handle_open_orders_error)
+        self._thread_pool.start(worker)
+
+    def _handle_open_orders(self, result: object, latency_ms: int) -> None:
+        self._orders_in_flight = False
+        if not isinstance(result, list):
+            self._handle_open_orders_error("Unexpected open orders response")
+            return
+        self._open_orders = [item for item in result if isinstance(item, dict)]
+        self._render_open_orders()
+        self._append_log(
+            f"Open orders updated ({len(self._open_orders)}) in {latency_ms}ms.",
+            kind="INFO",
+        )
+
+    def _handle_open_orders_error(self, message: str) -> None:
+        self._orders_in_flight = False
+        self._append_log(f"Open orders update error: {message}", kind="ERROR")
+
+    def _refresh_exchange_rules(self) -> None:
+        if self._rules_in_flight:
+            return
+        self._rules_in_flight = True
+        worker = _Worker(lambda: self._http_client.get_exchange_info_symbol(self._symbol))
+        worker.signals.success.connect(self._handle_exchange_info)
+        worker.signals.error.connect(self._handle_exchange_error)
+        self._thread_pool.start(worker)
+
+    def _handle_exchange_info(self, result: object, latency_ms: int) -> None:
+        self._rules_in_flight = False
+        if not isinstance(result, dict):
+            self._handle_exchange_error("Unexpected exchange info response")
+            return
+        symbols = result.get("symbols", []) if isinstance(result.get("symbols"), list) else []
+        info = symbols[0] if symbols else {}
+        if not isinstance(info, dict):
+            self._handle_exchange_error("Unexpected exchange info payload")
+            return
+        self._base_asset = str(info.get("baseAsset", self._base_asset)).upper()
+        self._quote_asset = str(info.get("quoteAsset", self._quote_asset)).upper()
+        self._symbol_tradeable = str(info.get("status", "")).upper() == "TRADING"
+        filters = info.get("filters", [])
+        tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
+        step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
+        min_notional = self._extract_filter_value(filters, "MIN_NOTIONAL", "minNotional")
+        self._exchange_rules = {
+            "tick": tick_size,
+            "step": step_size,
+            "min_notional": min_notional,
+        }
+        self._apply_trading_permissions()
+        self._update_rules_label()
+        self._update_grid_preview()
+        self._update_runtime_balances()
+        self._append_log(f"Exchange rules loaded ({latency_ms}ms).", kind="INFO")
+
+    def _handle_exchange_error(self, message: str) -> None:
+        self._rules_in_flight = False
+        self._symbol_tradeable = False
+        self._append_log(f"Exchange rules error: {message}", kind="ERROR")
+        self._update_rules_label()
+
+    def _refresh_trade_fees(self) -> None:
+        if not self._account_client or self._fees_in_flight:
+            return
+        self._fees_in_flight = True
+        worker = _Worker(lambda: self._account_client.get_trade_fees(self._symbol))
+        worker.signals.success.connect(self._handle_trade_fees)
+        worker.signals.error.connect(self._handle_trade_fees_error)
+        self._thread_pool.start(worker)
+
+    def _handle_trade_fees(self, result: object, latency_ms: int) -> None:
+        self._fees_in_flight = False
+        if not isinstance(result, list):
+            self._handle_trade_fees_error("Unexpected trade fee response")
+            return
+        entry = result[0] if result else {}
+        if isinstance(entry, dict):
+            maker = self._coerce_float(str(entry.get("makerCommission", "")))
+            taker = self._coerce_float(str(entry.get("takerCommission", "")))
+            self._trade_fees = (maker, taker)
+        self._update_rules_label()
+        self._append_log(f"Trade fees loaded ({latency_ms}ms).", kind="INFO")
+
+    def _handle_trade_fees_error(self, message: str) -> None:
+        self._fees_in_flight = False
+        self._append_log(f"Trade fees error: {message}", kind="ERROR")
+        self._update_rules_label()
+
+    def _apply_trade_fees_from_account(self, account: dict[str, Any]) -> None:
+        maker_raw = account.get("makerCommission")
+        taker_raw = account.get("takerCommission")
+        if maker_raw is None or taker_raw is None:
+            return
+        maker = self._coerce_float(str(maker_raw))
+        taker = self._coerce_float(str(taker_raw))
+        if maker is None or taker is None:
+            return
+        self._trade_fees = (maker / 10_000, taker / 10_000)
+        self._update_rules_label()
+
+    def _apply_trading_permissions(self) -> None:
+        can_trade = self._account_can_trade and self._symbol_tradeable
+        if not can_trade:
+            self._dry_run_toggle.setChecked(True)
+            self._dry_run_toggle.setEnabled(False)
+            self._dry_run_toggle.setToolTip(tr("dry_run_forced_tooltip"))
+        else:
+            self._dry_run_toggle.setEnabled(True)
+            self._dry_run_toggle.setToolTip("")
+
+    def _update_rules_label(self) -> None:
+        tick = self._exchange_rules.get("tick")
+        step = self._exchange_rules.get("step")
+        min_notional = self._exchange_rules.get("min_notional")
+        maker, taker = self._trade_fees
+        has_rules = any(value is not None for value in (tick, step, min_notional, maker, taker))
+        if not has_rules:
+            self._rules_label.setText(tr("rules_line", rules="—"))
+            self._market_fee.setText(f"{tr('fee')}: —")
+            self._set_market_label_state(self._market_fee, active=False)
+            return
+        tick_text = f"{tick:.8f}" if tick is not None else "—"
+        step_text = f"{step:.8f}" if step is not None else "—"
+        min_text = f"{min_notional:.4f}" if min_notional is not None else "—"
+        maker_text = f"{(maker or 0.0) * 100:.2f}%" if maker is not None else "—"
+        taker_text = f"{(taker or 0.0) * 100:.2f}%" if taker is not None else "—"
+        rules = f"tick {tick_text} | step {step_text} | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
+        self._rules_label.setText(tr("rules_line", rules=rules))
+        self._market_fee.setText(f"{tr('fee')}: {maker_text}/{taker_text}")
+        self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
+
+    @staticmethod
+    def _extract_filter_value(filters: object, filter_type: str, key: str) -> float | None:
+        if not isinstance(filters, list):
+            return None
+        for entry in filters:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("filterType") == filter_type:
+                return LiteGridWindow._coerce_float(str(entry.get(key, "")))
+        return None
+
     def _order_id_for_row(self, row: int) -> str:
         item = self._orders_table.item(row, 0)
         return item.text() if item and item.text() else "—"
+
+    def _render_open_orders(self) -> None:
+        self._orders_table.setRowCount(len(self._open_orders))
+        now_ms = int(time() * 1000)
+        for row, order in enumerate(self._open_orders):
+            order_id = str(order.get("orderId", "—"))
+            side = str(order.get("side", "—"))
+            price_raw = order.get("price", "—")
+            qty_raw = order.get("origQty", "—")
+            filled_raw = order.get("executedQty", "—")
+            time_ms = order.get("time")
+            age_text = self._format_age(time_ms, now_ms)
+            self._set_order_cell(row, 0, order_id, align=Qt.AlignLeft)
+            self._set_order_cell(row, 1, side, align=Qt.AlignLeft)
+            self._set_order_cell(row, 2, str(price_raw), align=Qt.AlignRight)
+            self._set_order_cell(row, 3, str(qty_raw), align=Qt.AlignRight)
+            self._set_order_cell(row, 4, str(filled_raw), align=Qt.AlignRight)
+            self._set_order_cell(row, 5, age_text, align=Qt.AlignRight)
+            self._set_order_row_tooltip(row)
+        self._refresh_orders_metrics()
+
+    def _set_order_cell(self, row: int, column: int, text: str, align: Qt.AlignmentFlag) -> None:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(int(align | Qt.AlignVCenter))
+        self._orders_table.setItem(row, column, item)
+
+    def _remove_orders_by_side(self, side: str) -> int:
+        removed = 0
+        for row in reversed(range(self._orders_table.rowCount())):
+            side_item = self._orders_table.item(row, 1)
+            side_text = side_item.text().upper() if side_item else ""
+            if side_text == side.upper():
+                self._orders_table.removeRow(row)
+                removed += 1
+        return removed
+
+    def _format_age(self, time_ms: object, now_ms: int) -> str:
+        if not isinstance(time_ms, (int, float)):
+            return "—"
+        age_ms = max(now_ms - int(time_ms), 0)
+        seconds = age_ms // 1000
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
 
     def _extract_order_value(self, row: int) -> float:
         price_item = self._orders_table.item(row, 2)
@@ -592,28 +976,8 @@ class LiteGridWindow(QMainWindow):
             return None
 
     def _refresh_orders_metrics(self) -> None:
-        budget = float(self._budget_input.value())
-        locked = sum(self._extract_order_value(row) for row in range(self._orders_table.rowCount()))
-        used = locked
-        free = max(budget - used, 0.0)
         self._orders_count_label.setText(tr("orders_count", count=str(self._orders_table.rowCount())))
-        self._budget_line.setText(
-            tr("bot_budget_line", budget=f"{budget:.2f}", used=f"{used:.2f}", free=f"{free:.2f}")
-        )
-        usage_pct = int((used / budget) * 100) if budget > 0 else 0
-        self._budget_progress.setValue(min(max(usage_pct, 0), 100))
-        self._balance_quote_label.setText(
-            tr(
-                "balance_quote_base",
-                quote=f"{budget:.2f}",
-                quote_ccy="USDT",
-                base="0.0000",
-                base_ccy=self._symbol,
-            )
-        )
-        self._balance_equity_label.setText(
-            tr("equity_line", equity=f"{budget:.2f}", free=f"{free:.2f}", locked=f"{locked:.2f}")
-        )
+        self._update_runtime_balances()
         for row in range(self._orders_table.rowCount()):
             self._set_order_row_tooltip(row)
 
@@ -627,6 +991,20 @@ class LiteGridWindow(QMainWindow):
             label.setStyleSheet("color: #dc2626;")
         else:
             label.setStyleSheet("color: #6b7280;")
+
+    def _apply_engine_state_style(self, state: str) -> None:
+        color_map = {
+            "WAITING": "#6b7280",
+            "PLACING_GRID": "#2563eb",
+            "WAITING_FILLS": "#d97706",
+            "REBALANCING": "#7c3aed",
+            "PAUSED_BY_RISK": "#f97316",
+            "ERROR": "#dc2626",
+        }
+        color = color_map.get(state, "#6b7280")
+        self._engine_state_label.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: 600;"
+        )
 
     def _update_pnl(self, unrealized: float | None, realized: float | None) -> None:
         if unrealized is None:
@@ -645,7 +1023,7 @@ class LiteGridWindow(QMainWindow):
             total_text = "—"
             self._apply_pnl_style(self._pnl_label, None)
         else:
-            total_text = f"{total:.2f}"
+            total_text = f"{total:+.2f}"
             self._apply_pnl_style(self._pnl_label, total)
 
         self._pnl_label.setText(tr("pnl_line", unreal=unreal_text, real=real_text, total=total_text))
@@ -656,8 +1034,10 @@ class LiteGridWindow(QMainWindow):
             return
         menu = QMenu(self)
         cancel_action = menu.addAction(tr("context_cancel"))
-        copy_action = menu.addAction(tr("context_copy_id"))
-        show_action = menu.addAction(tr("context_show_details"))
+        cancel_buy_action = menu.addAction(tr("context_cancel_buy"))
+        cancel_sell_action = menu.addAction(tr("context_cancel_sell"))
+        copy_action = menu.addAction(tr("context_copy_price"))
+        show_action = menu.addAction(tr("context_show_logs"))
         action = menu.exec(self._orders_table.viewport().mapToGlobal(position))
         if action == cancel_action:
             if not self._dry_run_toggle.isChecked():
@@ -667,10 +1047,19 @@ class LiteGridWindow(QMainWindow):
             self._orders_table.removeRow(row)
             self._append_log(f"Cancel selected: {order_id}", kind="ORDERS")
             self._refresh_orders_metrics()
+        if action in (cancel_buy_action, cancel_sell_action):
+            if not self._dry_run_toggle.isChecked():
+                self._append_log("Cancel side: not implemented.", kind="ORDERS")
+                return
+            side = "BUY" if action == cancel_buy_action else "SELL"
+            removed = self._remove_orders_by_side(side)
+            self._append_log(f"Cancel side {side}: {removed}", kind="ORDERS")
+            self._refresh_orders_metrics()
         if action == copy_action:
-            order_id = self._order_id_for_row(row)
-            QApplication.clipboard().setText(order_id)
-            self._append_log(f"Copy ID: {order_id}", kind="ORDERS")
+            price_item = self._orders_table.item(row, 2)
+            price_text = price_item.text() if price_item else "—"
+            QApplication.clipboard().setText(price_text)
+            self._append_log(f"Copy price: {price_text}", kind="ORDERS")
         if action == show_action:
             details = self._format_order_details(row)
             self._append_log(f"Order context: {details}", kind="ORDERS")
@@ -728,6 +1117,9 @@ class LiteGridWindow(QMainWindow):
             "IDLE": "WAITING",
             "RUNNING": "PLACING_GRID",
             "PAUSED": "WAITING_FILLS",
+            "REBALANCING": "REBALANCING",
+            "PAUSED_BY_RISK": "PAUSED_BY_RISK",
+            "ERROR": "ERROR",
         }
         return mapping.get(state, state)
 
@@ -747,11 +1139,22 @@ class LiteGridWindow(QMainWindow):
                 range=f"{range_pct:.2f}",
                 orders=str(levels),
                 min_order=f"{min_order:.2f}",
-                quote_ccy="USDT",
+                quote_ccy=self._quote_asset,
             )
         )
 
+    @staticmethod
+    def _infer_assets_from_symbol(symbol: str) -> tuple[str, str]:
+        candidates = ["USDT", "USDC", "BUSD", "BTC", "ETH", "BNB"]
+        for quote in candidates:
+            if symbol.endswith(quote):
+                base = symbol[: -len(quote)]
+                return quote, base or symbol
+        return "USDT", symbol
+
     def closeEvent(self, event: object) -> None:  # noqa: N802
+        self._balances_timer.stop()
+        self._orders_timer.stop()
         self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
         self._price_feed_manager.unregister_symbol(self._symbol)
