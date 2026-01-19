@@ -1,4 +1,4 @@
-# BBOT Desktop Terminal (Stage 1.2)
+# BBOT Desktop Terminal (Stage 2.0.1)
 
 ## Setup
 
@@ -13,6 +13,13 @@ python -m pip install -r requirements.txt
 ```powershell
 python -m src.app.main
 ```
+
+## Overview (real Binance pairs)
+
+1. Open the **Overview** tab.
+2. Pick the desired Quote (e.g., USDT).
+3. Click **Load Pairs** to fetch real Binance Spot symbols.
+4. Prices will refresh automatically via HTTP every ~2 seconds.
 
 ### Settings
 
