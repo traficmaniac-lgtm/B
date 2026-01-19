@@ -73,7 +73,9 @@ class SettingsTab(QWidget):
         self._openai_key_hint = QLabel(self._key_present_label(self._app_state.openai_api_key))
 
         self._default_period_combo = QComboBox()
-        self._default_period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
+        self._default_period_combo.addItems(
+            ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "12h", "24h", "1d", "7d"]
+        )
         self._default_period_combo.setCurrentText(self._app_state.default_period)
 
         self._default_quality_combo = QComboBox()

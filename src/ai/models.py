@@ -112,6 +112,13 @@ def parse_ai_response(text: str, expected_type: str | None = None) -> AiResponse
     return envelope
 
 
+def parse_ai_response_with_fallback(text: str, expected_type: str | None = None) -> AiResponseEnvelope:
+    envelope = parse_ai_response(text, expected_type=expected_type)
+    if envelope.status != "ERROR":
+        return envelope
+    return fallback_do_not_trade(envelope.message or "Invalid AI JSON")
+
+
 def _build_envelope(payload: dict[str, Any]) -> AiResponseEnvelope:
     response_type = payload.get("type")
     if response_type not in AI_RESPONSE_TYPES:
@@ -312,8 +319,50 @@ def _error_envelope(message: str, response_type: str) -> AiResponseEnvelope:
         type=response_type,
         status="ERROR",
         confidence=None,
-        reason_codes=[],
+        reason_codes=["INVALID_JSON"],
         message=message,
         analysis_result=None,
         strategy_patch=None,
+    )
+
+
+def fallback_do_not_trade(message: str) -> AiResponseEnvelope:
+    strategy = AiStrategy(
+        strategy_id="DO_NOT_TRADE",
+        budget_usdt=0.0,
+        levels=[],
+        grid_step_pct=0.0,
+        range_low_pct=0.0,
+        range_high_pct=0.0,
+        bias=AiBias(buy_pct=0.0, sell_pct=0.0),
+        order_size_mode="equal",
+        max_orders=0,
+        max_exposure_pct=0.0,
+    )
+    risk = AiRisk(
+        hard_stop_pct=0.0,
+        cooldown_minutes=0,
+        soft_stop_rules=[],
+        kill_switch_rules=[],
+        volatility_mode="low",
+    )
+    control = AiControl(
+        recheck_interval_sec=30,
+        ai_reanalyze_interval_sec=300,
+        min_change_to_rebuild_pct=0.0,
+    )
+    analysis = AiAnalysisResult(
+        summary_lines=[message],
+        strategy=strategy,
+        risk=risk,
+        control=control,
+        actions=[AiAction(action="note", detail=message, severity="warn")],
+    )
+    return AiResponseEnvelope(
+        type="analysis_result",
+        status="ERROR",
+        confidence=None,
+        reason_codes=["INVALID_JSON"],
+        message=message,
+        analysis_result=analysis,
     )

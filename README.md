@@ -18,8 +18,10 @@ python -m src.app.main
 
 1. Open the **Overview** tab.
 2. Pick the desired Quote (e.g., USDT).
-3. Click **Load Pairs** to fetch real Binance Spot symbols.
-4. Prices are shown without live streaming (use Bot tabs for live ticks).
+3. Click **Load Pairs** to fetch real Binance Spot symbols (cache is used if fresh).
+4. Use the search input + quote filter to narrow the list (Shown/Total counter updates).
+5. Click **Force refresh from exchange** if the cache is partial or stale.
+6. Prices are updated only for the selected row; live streaming still happens in Bot tabs.
 
 Overview prices are now static by design.
 Overview acts as a catalog of symbols, not a live ticker.
@@ -43,6 +45,11 @@ Open Settings from the toolbar or File → Settings menu. Changes are saved to `
 ### Pair Workspace
 
 Double click any row in the Overview tab to open a Pair Workspace bot tab for that symbol.
+
+### Trading Workspace
+
+Use the **Trading** button in the Pair Workspace to open the Trading Workspace window with runtime status,
+orders, risk summary, and the AI Observer panel. AI suggestions never execute automatically.
 
 ## Run tests
 

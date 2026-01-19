@@ -34,3 +34,9 @@
 - Updated Pair Workspace to parse analysis_result/strategy_patch, block unsafe starts, and support Apply Patch.
 - Added local quick-intent parsing for budget updates in AI chat.
 - Refreshed AI_PROTOCOL.md with new schemas and examples plus parser tests.
+
+### Stage 3.1 - Overview filtering + Trading Workspace + minute periods
+- Switched Overview to a proxy-filtered model with search + quote filtering, shown/total counter, and cache status.
+- Added minute timeframes to period dropdowns and fallback warning when minute data is unavailable.
+- Introduced Trading Workspace with runtime panels, AI Observer, and user-approved action gating.
+- Added AI protocol fallback helper and tests for invalid JSON DO_NOT_TRADE handling.

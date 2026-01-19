@@ -62,12 +62,18 @@ def apply_patch(plan: StrategyPlan, patch: StrategyPatch) -> StrategyPlan:
     )
 
 
-def _period_to_hours(period: str) -> int:
+def _period_to_hours(period: str) -> float:
     mapping = {
+        "1m": 1 / 60,
+        "3m": 3 / 60,
+        "5m": 5 / 60,
+        "15m": 15 / 60,
+        "30m": 30 / 60,
         "1h": 1,
         "4h": 4,
         "12h": 12,
         "24h": 24,
+        "1d": 24,
         "7d": 168,
     }
     return mapping.get(period, 4)

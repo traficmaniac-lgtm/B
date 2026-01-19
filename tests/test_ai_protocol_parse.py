@@ -1,4 +1,4 @@
-from src.ai.models import parse_ai_response
+from src.ai.models import parse_ai_response, parse_ai_response_with_fallback
 
 
 def test_parse_ai_analysis_result_valid() -> None:
@@ -50,6 +50,13 @@ def test_parse_ai_analysis_result_valid() -> None:
 def test_parse_ai_invalid_json_returns_error() -> None:
     envelope = parse_ai_response("{not_json}", expected_type="analysis_result")
     assert envelope.status == "ERROR"
+
+
+def test_parse_ai_invalid_json_falls_back_to_do_not_trade() -> None:
+    envelope = parse_ai_response_with_fallback("{not_json}", expected_type="analysis_result")
+    assert envelope.status == "ERROR"
+    assert envelope.analysis_result is not None
+    assert envelope.analysis_result.strategy.strategy_id == "DO_NOT_TRADE"
 
 
 def json_dumps(payload: dict) -> str:
