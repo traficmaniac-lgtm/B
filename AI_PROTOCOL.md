@@ -4,6 +4,7 @@
 - AI must never place trades, open positions, or execute orders.
 - AI only analyzes, suggests, and provides patches to the local strategy form.
 - AI must return **ONLY valid JSON** (no markdown, no extra prose).
+- All AI responses must be **in Russian** and include `"language": "ru"`.
 
 ## Analysis DataPack (v2.1.2)
 
@@ -12,131 +13,147 @@ The GUI sends a compact datapack with market snapshot and user context. No large
 ```json
 {
   "version": "v2.1.2",
-  "market_snapshot": {
-    "symbol": "BTCUSDT",
-    "last_price": 65000.12,
-    "bid": 64990.5,
-    "ask": 65009.7,
-    "spread_pct": 0.03,
-    "source_latency_ms": 850,
-    "timestamp_utc": "2024-05-18T12:00:00+00:00",
-    "candles_summary": [
-      {"period": "1m", "atr_pct": 0.4, "stdev_pct": 0.3, "momentum_pct": 0.1},
-      {"period": "5m", "atr_pct": 0.6, "stdev_pct": 0.5, "momentum_pct": 0.2},
-      {"period": "1h", "atr_pct": 1.1, "stdev_pct": 0.9, "momentum_pct": 0.5},
-      {"period": "4h", "atr_pct": 1.6, "stdev_pct": 1.2, "momentum_pct": 0.9}
-    ]
+  "symbol": "USDTUSDC",
+  "analysis_mode": "ZERO_FEE_CONVERT",
+  "market": {
+    "last_price": 1.0002,
+    "bid": 1.0001,
+    "ask": 1.0003,
+    "spread_pct": 0.02,
+    "ranges": {
+      "1m": {"low": 0.9999, "high": 1.0004, "pct": 0.15},
+      "5m": {"low": 0.9997, "high": 1.0006, "pct": 0.25},
+      "1h": {"low": 0.9992, "high": 1.0010, "pct": 0.40},
+      "24h": {"low": 0.9985, "high": 1.0016, "pct": 0.60}
+    },
+    "volatility_est": 0.25,
+    "liquidity": 153200000,
+    "source_latency_ms": 420,
+    "timestamp_utc": "2024-05-18T12:00:00+00:00"
   },
-  "liquidity_summary": {
-    "quote_volume_24h": 0,
-    "trade_count_24h": 0,
-    "liquidity_label": "OK"
-  },
-  "exchange_constraints": {
+  "constraints": {
     "tick_size": null,
     "step_size": null,
+    "min_qty": null,
     "min_notional": null
+  },
+  "budget": {
+    "budget_usdt": 500,
+    "mode": "Grid"
   },
   "user_context": {
     "budget_usdt": 500,
+    "mode": "Grid",
     "dry_run": true,
     "selected_period": "4h",
-    "quality": "Standard"
+    "quality": "Standard",
+    "liquidity_summary": {
+      "base_volume_24h": 0,
+      "quote_volume_24h": 0,
+      "trade_count_24h": 0
+    }
   },
   "pair_context": {
-    "base_asset": "BTC",
-    "quote_asset": "USDT",
+    "base_asset": "USDT",
+    "quote_asset": "USDC",
     "source": "ws"
   }
 }
 ```
 
-## Response Envelope
-
-Every AI response must be wrapped in an envelope:
+## Monitor DataPack (Trading Workspace)
 
 ```json
 {
-  "type": "analysis_result | strategy_patch",
-  "status": "OK | WARN | DANGER | ERROR",
-  "confidence": 0.0,
-  "reason_codes": ["..."],
-  "message": "short message",
-  "analysis_result": {"...": "..."},
-  "strategy_patch": {"...": "..."}
-}
-```
-
-## analysis_result schema
-
-```json
-{
-  "type": "analysis_result",
-  "status": "OK",
-  "confidence": 0.74,
-  "reason_codes": ["RANGE", "LOW_SPREAD"],
-  "message": "Range-bound conditions",
-  "analysis_result": {
-    "summary_lines": [
-      "Range-bound market",
-      "Volatility moderate",
-      "Spread stable"
-    ],
-    "strategy": {
-      "strategy_id": "GRID_CLASSIC",
-      "budget_usdt": 500,
-      "levels": [
-        {"side": "BUY", "price": 64200, "qty": 0.01, "pct_from_mid": -1.2},
-        {"side": "SELL", "price": 65800, "qty": 0.01, "pct_from_mid": 1.2}
-      ],
-      "grid_step_pct": 0.3,
-      "range_low_pct": 1.5,
-      "range_high_pct": 1.8,
-      "bias": {"buy_pct": 50, "sell_pct": 50},
-      "order_size_mode": "equal",
-      "max_orders": 12,
-      "max_exposure_pct": 35
-    },
-    "risk": {
-      "hard_stop_pct": 8,
-      "cooldown_minutes": 15,
-      "soft_stop_rules": ["cooldown if spread widens"],
-      "kill_switch_rules": ["halt on drawdown"],
-      "volatility_mode": "medium"
-    },
-    "control": {
-      "recheck_interval_sec": 60,
-      "ai_reanalyze_interval_sec": 300,
-      "min_change_to_rebuild_pct": 0.3
-    },
-    "actions": [
-      {"action": "note", "detail": "Watch for breakout", "severity": "info"}
-    ]
+  "version": "v2.1.2",
+  "symbol": "USDTUSDC",
+  "analysis_mode": "ZERO_FEE_CONVERT",
+  "runtime": {
+    "state": "RUNNING",
+    "dry_run": true,
+    "uptime_sec": 120,
+    "last_reason": "confirm_start"
+  },
+  "open_orders": [],
+  "position": {
+    "status": "FLAT",
+    "qty": 0,
+    "entry_price": 0,
+    "realized_pnl": 0,
+    "unrealized_pnl": 0
+  },
+  "pnl": {
+    "total": 0,
+    "realized": 0,
+    "unrealized": 0
+  },
+  "recent_fills": [],
+  "strategy_state": {
+    "strategy_id": "GRID_CLASSIC",
+    "budget_usdt": 500,
+    "mode": "Grid",
+    "grid_step_pct": 0.3,
+    "range_low_pct": 1.5,
+    "range_high_pct": 1.8,
+    "bias": {"buy_pct": 50, "sell_pct": 50},
+    "order_size_mode": "equal",
+    "max_orders": 12,
+    "max_exposure_pct": 35,
+    "hard_stop_pct": 8,
+    "cooldown_minutes": 15,
+    "recheck_interval_sec": 60,
+    "ai_reanalyze_interval_sec": 300,
+    "min_change_to_rebuild_pct": 0.3,
+    "volatility_mode": "medium",
+    "plan_applied": true,
+    "plan_levels": []
+  },
+  "health": {
+    "ws_latency_ms": 420,
+    "http_latency_ms": null,
+    "errors": 0
   }
 }
 ```
 
-## strategy_patch schema
+## Response Envelope (strict)
+
+Every AI response must be a JSON object with the following schema:
 
 ```json
 {
-  "type": "strategy_patch",
-  "status": "OK",
-  "confidence": 0.62,
-  "reason_codes": ["USER_REQUEST"],
-  "message": "Conservative tweak",
+  "analysis_result": {
+    "status": "OK | WARN | DANGER | ERROR",
+    "confidence": 0.0,
+    "reason_codes": ["..."],
+    "summary_ru": "Короткое резюме на русском"
+  },
+  "trade_options": [
+    {
+      "name_ru": "Вариант 1",
+      "entry": 1.0001,
+      "exit": 1.0004,
+      "tp_pct": 0.2,
+      "stop_pct": 0.1,
+      "expected_profit_pct": 0.15,
+      "expected_profit_usdt": 0.45,
+      "eta_min": 20,
+      "confidence": 0.6,
+      "risk_note_ru": "Риск: низкая ликвидность"
+    }
+  ],
+  "action_suggestions": [
+    {"type": "SUGGEST_REBUILD", "note_ru": "Обновить уровни из-за роста спрэда"}
+  ],
   "strategy_patch": {
     "parameters_patch": {
       "budget_usdt": 400,
       "grid_step_pct": 0.4,
-      "max_exposure_pct": 25,
-      "hard_stop_pct": 6,
+      "range_low_pct": 1.2,
+      "range_high_pct": 1.6,
       "volatility_mode": "low"
-    },
-    "recommended_actions": [
-      {"action": "note", "detail": "Keep orders smaller", "severity": "info"}
-    ],
-    "message": "Adjusted risk lower."
-  }
+    }
+  },
+  "language": "ru"
 }
 ```

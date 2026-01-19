@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ class AppState:
     price_refresh_ms: int = 500
     default_quote: str = "USDT"
     pnl_period: str = "24h"
+    zero_fee_symbols: list[str] = field(default_factory=lambda: ["USDTUSDC", "EURIUSDT"])
     ai_connected: bool = False
     ai_checked: bool = False
     user_config_path: Path | None = None
@@ -50,6 +51,7 @@ class AppState:
         price_refresh_ms = int(data.get("price_refresh_ms", defaults.price_refresh_ms))
         default_quote = str(data.get("default_quote", defaults.default_quote)).upper()
         pnl_period = str(data.get("pnl_period", defaults.pnl_period))
+        zero_fee_symbols = _parse_symbol_list(data.get("zero_fee_symbols", defaults.zero_fee_symbols))
         return cls(
             env=env,
             log_level=log_level,
@@ -66,6 +68,7 @@ class AppState:
             price_refresh_ms=price_refresh_ms,
             default_quote=default_quote,
             pnl_period=pnl_period,
+            zero_fee_symbols=zero_fee_symbols,
             user_config_path=path,
         )
 
@@ -86,6 +89,7 @@ class AppState:
             "price_refresh_ms": self.price_refresh_ms,
             "default_quote": self.default_quote,
             "pnl_period": self.pnl_period,
+            "zero_fee_symbols": list(self.zero_fee_symbols),
         }
 
     def save(self, path: Path) -> None:
@@ -95,3 +99,12 @@ class AppState:
     @property
     def openai_key_present(self) -> bool:
         return bool(self.openai_api_key.strip())
+
+
+def _parse_symbol_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip().upper() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        parts = [item.strip().upper() for item in value.replace("\n", ",").split(",")]
+        return [item for item in parts if item]
+    return []

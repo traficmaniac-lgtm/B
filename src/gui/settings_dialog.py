@@ -86,6 +86,9 @@ class SettingsDialog(QDialog):
         self._allow_ai_more_data = QCheckBox("Allow AI to request more data")
         self._allow_ai_more_data.setChecked(self._app_state.allow_ai_more_data)
 
+        self._zero_fee_symbols_input = QLineEdit(", ".join(self._app_state.zero_fee_symbols))
+        self._zero_fee_symbols_input.setPlaceholderText("USDTUSDC, EURIUSDT")
+
         form.addRow(QLabel("Binance API key"), self._binance_key_input)
         form.addRow(QLabel("Binance API secret"), self._binance_secret_input)
         form.addRow(QLabel("OpenAI API key"), self._openai_key_input)
@@ -95,6 +98,7 @@ class SettingsDialog(QDialog):
         form.addRow(QLabel("Price TTL (ms)"), self._price_ttl_input)
         form.addRow(QLabel("Price refresh (ms)"), self._price_refresh_input)
         form.addRow(QLabel("Default quote"), self._default_quote_combo)
+        form.addRow(QLabel("Zero-fee symbols"), self._zero_fee_symbols_input)
         form.addRow(self._allow_ai_more_data)
         return form
 
@@ -111,6 +115,11 @@ class SettingsDialog(QDialog):
         self._app_state.price_refresh_ms = self._price_refresh_input.value()
         self._app_state.default_quote = self._default_quote_combo.currentText()
         self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
+        self._app_state.zero_fee_symbols = [
+            item.strip().upper()
+            for item in self._zero_fee_symbols_input.text().replace("\n", ",").split(",")
+            if item.strip()
+        ]
         if (
             previous_openai_key != self._app_state.openai_api_key
             or previous_model != self._app_state.openai_model
