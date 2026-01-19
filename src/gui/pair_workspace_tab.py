@@ -58,7 +58,7 @@ class PairWorkspaceTab(QWidget):
         self.setLayout(layout)
 
         self._connect_signals()
-        self._sync_buttons()
+        self.update_controls_by_state()
 
     def shutdown(self) -> None:
         self._tick_timer.stop()
@@ -176,7 +176,7 @@ class PairWorkspaceTab(QWidget):
             f"Data prepared for {self.symbol}: period={period}, quality={quality}.",
         )
         self._ai_request_card.hide()
-        self._set_state(PairRunState.READY)
+        self._set_state(PairRunState.DATA_READY)
         self._log_event("Prepared data pack (demo).")
 
     def _analyze(self) -> None:
@@ -273,17 +273,35 @@ class PairWorkspaceTab(QWidget):
 
     def _set_state(self, state: PairRunState) -> None:
         self._state = state
-        self._topbar.state_label.setText(f"State: {state.value}")
-        self._sync_buttons()
+        canonical_state = self._canonical_state(state)
+        self._topbar.state_label.setText(f"State: {canonical_state.value}")
+        self.update_controls_by_state()
 
-    def _sync_buttons(self) -> None:
-        self._topbar.prepare_button.setEnabled(self._state in {PairRunState.IDLE, PairRunState.READY, PairRunState.STOPPED})
-        self._topbar.analyze_button.setEnabled(self._state in {PairRunState.READY, PairRunState.NEED_MORE_DATA})
-        self._topbar.apply_button.setEnabled(self._state == PairRunState.PLAN_READY)
-        self._topbar.confirm_button.setEnabled(self._state in {PairRunState.APPLIED})
-        self._topbar.pause_button.setEnabled(self._state in {PairRunState.RUNNING, PairRunState.PAUSED})
-        self._topbar.stop_button.setEnabled(self._state in {PairRunState.RUNNING, PairRunState.PAUSED})
-        self._topbar.pause_button.setText("Resume" if self._state == PairRunState.PAUSED else "Pause")
+    def _canonical_state(self, state: PairRunState) -> PairRunState:
+        if state in {PairRunState.READY, PairRunState.NEED_MORE_DATA}:
+            return PairRunState.DATA_READY
+        if state == PairRunState.WAIT_CONFIRM:
+            return PairRunState.APPLIED
+        return state
+
+    def update_controls_by_state(self) -> None:
+        canonical_state = self._canonical_state(self._state)
+        self._topbar.prepare_button.setEnabled(
+            canonical_state
+            in {
+                PairRunState.IDLE,
+                PairRunState.DATA_READY,
+                PairRunState.PLAN_READY,
+                PairRunState.APPLIED,
+                PairRunState.STOPPED,
+                PairRunState.ERROR,
+            }
+        )
+        self._topbar.analyze_button.setEnabled(canonical_state == PairRunState.DATA_READY)
+        self._topbar.apply_button.setEnabled(canonical_state == PairRunState.PLAN_READY)
+        self._topbar.confirm_button.setEnabled(canonical_state == PairRunState.APPLIED)
+        self._topbar.pause_button.setEnabled(canonical_state == PairRunState.RUNNING)
+        self._topbar.stop_button.setEnabled(canonical_state in {PairRunState.RUNNING, PairRunState.PAUSED})
 
     def _log_event(self, message: str) -> None:
         self._logs_panel.append(message)

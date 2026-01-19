@@ -6,7 +6,8 @@ from enum import Enum
 class PairRunState(str, Enum):
     IDLE = "IDLE"
     PREPARING = "PREPARING"
-    READY = "READY"
+    DATA_READY = "DATA_READY"
+    READY = "DATA_READY"
     ANALYZING = "ANALYZING"
     NEED_MORE_DATA = "NEED_MORE_DATA"
     PLAN_READY = "PLAN_READY"
