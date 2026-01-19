@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QPlainTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QPlainTextEdit, QSizePolicy, QVBoxLayout, QWidget
 
 
 class PairLogsPanel(QWidget):
@@ -8,6 +8,7 @@ class PairLogsPanel(QWidget):
         super().__init__(parent)
         self._text = QPlainTextEdit()
         self._text.setReadOnly(True)
+        self._text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         layout = QVBoxLayout()
         layout.addWidget(self._text)

@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QSizePolicy,
     QSpinBox,
-    QPlainTextEdit,
     QPushButton,
+    QPlainTextEdit,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -87,6 +89,8 @@ class PairWorkspaceTab(QWidget):
         )
         layout.addWidget(self._topbar)
         layout.addWidget(self._build_body())
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 1)
         self.setLayout(layout)
 
         self._connect_signals()
@@ -109,17 +113,27 @@ class PairWorkspaceTab(QWidget):
         self._chat_send_button.clicked.connect(self._send_chat)
 
     def _build_body(self) -> QSplitter:
-        splitter = QSplitter()
+        splitter = QSplitter(Qt.Horizontal)
+
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.addWidget(self._build_analysis_panel())
+        left_splitter.addWidget(self._build_strategy_panel())
+        left_splitter.addWidget(self._build_plan_panel())
+        left_splitter.addWidget(self._build_logs_panel())
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 1)
+        left_splitter.setStretchFactor(2, 2)
+        left_splitter.setStretchFactor(3, 2)
 
         main_panel = QWidget()
         main_layout = QVBoxLayout()
-        main_layout.addWidget(self._build_analysis_panel())
-        main_layout.addWidget(self._build_strategy_panel())
-        main_layout.addWidget(self._build_plan_panel())
-        main_layout.addWidget(self._build_logs_panel())
+        main_layout.addWidget(left_splitter)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_panel.setLayout(main_layout)
+        main_panel.setMinimumWidth(560)
 
         chat_panel = self._build_chat_panel()
+        chat_panel.setMinimumWidth(340)
 
         splitter.addWidget(main_panel)
         splitter.addWidget(chat_panel)
@@ -130,8 +144,11 @@ class PairWorkspaceTab(QWidget):
     def _build_analysis_panel(self) -> QWidget:
         group = QGroupBox("Analysis summary")
         layout = QVBoxLayout()
-        self._analysis_summary = QLabel(self._idle_summary())
-        self._analysis_summary.setWordWrap(True)
+        self._analysis_summary = QTextEdit()
+        self._analysis_summary.setReadOnly(True)
+        self._analysis_summary.setText(self._idle_summary())
+        self._analysis_summary.setMinimumHeight(100)
+        self._analysis_summary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self._analysis_summary)
 
         self._ai_request_card = QGroupBox("AI requested more data")
@@ -143,6 +160,7 @@ class PairWorkspaceTab(QWidget):
         layout.addWidget(self._ai_request_card)
 
         group.setLayout(layout)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return group
 
     def _build_strategy_panel(self) -> QWidget:
@@ -171,6 +189,16 @@ class PairWorkspaceTab(QWidget):
         self._range_high_input.setRange(0.5, 20.0)
         self._range_high_input.setDecimals(2)
 
+        for widget in (
+            self._budget_input,
+            self._mode_input,
+            self._grid_count_input,
+            self._grid_step_input,
+            self._range_low_input,
+            self._range_high_input,
+        ):
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         form.addRow("Budget (USDT)", self._budget_input)
         form.addRow("Mode", self._mode_input)
         form.addRow("Grid count", self._grid_count_input)
@@ -190,6 +218,7 @@ class PairWorkspaceTab(QWidget):
         layout.addLayout(header_layout)
         layout.addLayout(form)
         group.setLayout(layout)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
 
         self._strategy_fields = {
             "budget": self._budget_input,
@@ -227,7 +256,7 @@ class PairWorkspaceTab(QWidget):
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self._plan_preview_table.setFixedHeight(260)
+        self._plan_preview_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self._plan_preview_table)
 
         metrics_layout = QHBoxLayout()
@@ -240,6 +269,7 @@ class PairWorkspaceTab(QWidget):
         metrics_layout.addWidget(self._preview_levels_label)
         layout.addLayout(metrics_layout)
         group.setLayout(layout)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return group
 
     def _build_logs_panel(self) -> QWidget:
@@ -248,25 +278,29 @@ class PairWorkspaceTab(QWidget):
         self._logs_panel = PairLogsPanel()
         layout.addWidget(self._logs_panel)
         group.setLayout(layout)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return group
 
     def _build_chat_panel(self) -> QWidget:
-        panel = QWidget()
+        panel = QGroupBox("AI Chat")
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("AI Chat"))
-        self._chat_history = QPlainTextEdit()
+        self._chat_history = QTextEdit()
         self._chat_history.setReadOnly(True)
+        self._chat_history.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self._chat_history)
 
         input_row = QHBoxLayout()
         self._chat_input = QLineEdit()
         self._chat_input.setPlaceholderText("Ask AI to adjust strategy...")
         self._chat_send_button = QPushButton("Send")
+        self._chat_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._chat_send_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         input_row.addWidget(self._chat_input)
         input_row.addWidget(self._chat_send_button)
 
         layout.addLayout(input_row)
         panel.setLayout(layout)
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         return panel
 
     def _idle_summary(self) -> str:
@@ -470,7 +504,7 @@ class PairWorkspaceTab(QWidget):
         self._append_chat("AI", "Not implemented yet.")
 
     def _append_chat(self, sender: str, message: str) -> None:
-        self._chat_history.appendPlainText(f"{sender}: {message}")
+        self._chat_history.append(f"{sender}: {message}")
 
     def _handle_price_update(self, symbol: str, price: float, source: str, age_ms: int) -> None:
         if symbol != self.symbol:
