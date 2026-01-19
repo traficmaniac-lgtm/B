@@ -189,12 +189,15 @@ class OverviewTab(QWidget):
 
         self._load_button = QPushButton("Load Pairs")
         self._load_button.clicked.connect(self._handle_load_pairs)
+        self._refresh_button = QPushButton("Refresh")
+        self._refresh_button.clicked.connect(self._handle_refresh_pairs)
 
         layout.addWidget(QLabel("Search"))
         layout.addWidget(self._search_input)
         layout.addWidget(QLabel("Quote"))
         layout.addWidget(self._quote_combo)
         layout.addWidget(self._load_button)
+        layout.addWidget(self._refresh_button)
         layout.addStretch()
         return layout
 
@@ -230,37 +233,64 @@ class OverviewTab(QWidget):
         self._set_binance_status_error(message)
 
     def _handle_load_pairs(self) -> None:
-        self._load_button.setEnabled(False)
+        self._set_pairs_buttons_enabled(False)
         self._symbol_rows.clear()
         self._symbols_order.clear()
         self._table.setRowCount(0)
         quote = self._quote_combo.currentText().strip()
         self._logger.info("Loading pairs...")
         self._binance_status_label.setText("Binance: LOADING")
-        worker = _Worker(lambda: self._markets_service.load_pairs(quote))
-        worker.signals.success.connect(self._handle_pairs_loaded)
+        worker = _Worker(lambda: self._markets_service.load_pairs_cached(quote))
+        worker.signals.success.connect(self._handle_pairs_loaded_cached)
         worker.signals.error.connect(self._handle_pairs_error)
         self._thread_pool.start(worker)
 
-    def _handle_pairs_loaded(self, pairs: object, _: int) -> None:
+    def _handle_refresh_pairs(self) -> None:
+        self._set_pairs_buttons_enabled(False)
+        self._symbol_rows.clear()
+        self._symbols_order.clear()
+        self._table.setRowCount(0)
+        quote = self._quote_combo.currentText().strip()
+        self._logger.info("Refreshing pairs...")
+        self._binance_status_label.setText("Binance: REFRESHING")
+        worker = _Worker(lambda: self._markets_service.refresh_pairs(quote))
+        worker.signals.success.connect(self._handle_pairs_loaded_http)
+        worker.signals.error.connect(self._handle_pairs_error)
+        self._thread_pool.start(worker)
+
+    def _handle_pairs_loaded_cached(self, payload: object, _: int) -> None:
+        if not isinstance(payload, tuple) or len(payload) != 2:
+            self._logger.error("Unexpected cached pairs response: %s", payload)
+            self._set_pairs_buttons_enabled(True)
+            return
+        pairs, from_cache = payload
+        source = "CACHE" if from_cache else "HTTP"
+        self._handle_pairs_loaded(pairs, source)
+
+    def _handle_pairs_loaded_http(self, pairs: object, _: int) -> None:
+        self._handle_pairs_loaded(pairs, "HTTP")
+
+    def _handle_pairs_loaded(self, pairs: object, source: str) -> None:
         self._set_binance_status_connected()
         if not isinstance(pairs, Iterable):
             self._logger.error("Unexpected pairs response: %s", pairs)
-            self._load_button.setEnabled(True)
+            self._set_pairs_buttons_enabled(True)
             return
         pair_list = [pair for pair in pairs if isinstance(pair, Pair)]
         self._populate_table(pair_list)
-        self._load_button.setEnabled(True)
+        self._set_pairs_buttons_enabled(True)
         self._price_service.set_symbols([pair.symbol for pair in pair_list])
         self._price_service.start()
         self._refresh_prices()
         if not self._price_timer.isActive():
             self._price_timer.start()
+        self._logger.info("Loaded %s pairs from %s.", len(pair_list), source)
+        self._binance_status_label.setText(f"Binance: CONNECTED ({len(pair_list)} pairs, {source})")
 
     def _handle_pairs_error(self, message: str) -> None:
         self._logger.error("Failed to load pairs: %s", message)
         self._set_binance_status_error(message)
-        self._load_button.setEnabled(True)
+        self._set_pairs_buttons_enabled(True)
 
     def _populate_table(self, pairs: list[Pair]) -> None:
         self._table.setRowCount(len(pairs))
@@ -302,6 +332,10 @@ class OverviewTab(QWidget):
             item.setTextAlignment(Qt.AlignCenter)
             self._table.setItem(row, column, item)
         item.setText(value)
+
+    def _set_pairs_buttons_enabled(self, enabled: bool) -> None:
+        self._load_button.setEnabled(enabled)
+        self._refresh_button.setEnabled(enabled)
 
     def _set_binance_status_connected(self) -> None:
         self._binance_status_label.setText("Binance: CONNECTED")
