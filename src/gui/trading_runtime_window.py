@@ -481,7 +481,7 @@ class TradingRuntimeWindow(QMainWindow):
         if any(rec.rec_type == "PAUSE_TRADING" for rec in recommendations):
             badge_style = "padding: 4px 10px; border-radius: 10px; background: #fecaca; color: #991b1b;"
             badge_text = "DANGER"
-        elif any(rec.rec_type in {\"ADJUST_PARAMS\", \"REBUILD_GRID\"} for rec in recommendations):
+        elif any(rec.rec_type in {"ADJUST_PARAMS", "REBUILD_GRID"} for rec in recommendations):
             badge_style = "padding: 4px 10px; border-radius: 10px; background: #fde68a; color: #92400e;"
             badge_text = "WARNING"
         self._observer_badge.setStyleSheet(badge_style)
