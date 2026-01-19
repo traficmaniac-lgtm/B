@@ -56,6 +56,12 @@ class BinanceHttpClient:
             raise ValueError("Unexpected ticker response format")
         return prices
 
+    def get_ticker_24h(self, symbol: str) -> dict[str, Any]:
+        data = self._request_json(f"/api/v3/ticker/24hr?symbol={symbol}")
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected 24h ticker response format")
+        return data
+
     def get_time(self) -> dict[str, Any]:
         return self._request_json("/api/v3/time")
 

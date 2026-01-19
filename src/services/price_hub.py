@@ -78,3 +78,6 @@ class PriceHub(QObject):
     def _handle_ws_status(self, status: str, message: str | None) -> None:
         if status == "ERROR":
             self._logger.warning("WS status error: %s", message or status)
+
+    def fetch_ticker_24h(self, symbol: str) -> dict[str, object]:
+        return self._http_client.get_ticker_24h(symbol)

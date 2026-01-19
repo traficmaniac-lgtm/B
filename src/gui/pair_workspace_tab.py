@@ -42,6 +42,7 @@ from src.ai.openai_client import OpenAIClient
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
 from src.gui.models.pair_state import BotState, PairState
+from src.gui.models.pair_workspace_state import PairWorkspaceState
 from src.gui.widgets.pair_logs_panel import PairLogsPanel
 from src.gui.widgets.pair_topbar import PairTopBar
 from src.services.price_hub import PriceHub
@@ -76,6 +77,26 @@ class _AiWorker(QRunnable):
         self.signals.success.emit(result)
 
 
+class _LiquidityWorkerSignals(QObject):
+    success = Signal(object)
+    error = Signal(str)
+
+
+class _LiquidityWorker(QRunnable):
+    def __init__(self, fn: Callable[[], object]) -> None:
+        super().__init__()
+        self.signals = _LiquidityWorkerSignals()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+        except Exception as exc:  # noqa: BLE001
+            self.signals.error.emit(str(exc))
+            return
+        self.signals.success.emit(result)
+
+
 class PairWorkspaceTab(QWidget):
     def __init__(
         self,
@@ -91,6 +112,7 @@ class PairWorkspaceTab(QWidget):
         self._logger = get_logger(f"gui.pair_workspace.{symbol.lower()}")
 
         self._pair_state = PairState()
+        self._workspace_state = PairWorkspaceState(symbol=symbol)
         self._data_ready = False
         self._plan_applied = False
         self._market_context: MarketContext | None = None
@@ -106,6 +128,8 @@ class PairWorkspaceTab(QWidget):
         self._latest_price: float | None = None
         self._latest_price_source: str | None = None
         self._latest_price_age_ms: int | None = None
+        self._liquidity_stats: dict[str, float | int | None] | None = None
+        self._liquidity_in_flight = False
         self._last_ai_response: AiResponseEnvelope | None = None
         self._last_ai_analysis: AiAnalysisResult | None = None
         self._last_datapack: dict[str, Any] | None = None
@@ -134,6 +158,10 @@ class PairWorkspaceTab(QWidget):
         self._tick_timer.stop()
         if self._price_hub is not None:
             self._price_hub.price_updated.disconnect(self._handle_price_update)
+
+    @property
+    def workspace_state(self) -> PairWorkspaceState:
+        return self._workspace_state
 
     def _connect_signals(self) -> None:
         self._topbar.prepare_button.clicked.connect(self._prepare_data)
@@ -619,17 +647,26 @@ class PairWorkspaceTab(QWidget):
         if not levels:
             self._plan_preview_table.setRowCount(0)
             self._plan_preview_status.setText("No preview levels returned by AI.")
+            self._update_workspace_plan([], source="none")
             return
         self._plan_preview_status.setText("AI preview levels loaded.")
         self._plan_preview_table.setRowCount(len(levels))
+        plan_levels: list[dict[str, str]] = []
         for row, level in enumerate(levels):
             side = getattr(level, "side", "")
             price = getattr(level, "price", 0.0)
             qty = getattr(level, "qty", 0.0)
             pct = getattr(level, "pct_from_mid", 0.0)
-            for col, value in enumerate(
-                [side, f"{price:.6f}", f"{qty:.6f}", f"{pct:.2f}%"],
-            ):
+            row_values = [side, f"{price:.6f}", f"{qty:.6f}", f"{pct:.2f}%"]
+            plan_levels.append(
+                {
+                    "side": str(side),
+                    "price": row_values[1],
+                    "qty": row_values[2],
+                    "pct_from_mid": row_values[3],
+                }
+            )
+            for col, value in enumerate(row_values):
                 item = QTableWidgetItem(value)
                 if col == 0:
                     item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
@@ -642,7 +679,72 @@ class PairWorkspaceTab(QWidget):
         self._preview_capital_label.setText(f"Estimated capital usage: {estimated_capital:.2f} USDT")
         self._preview_exposure_label.setText(f"Max exposure: {budget:.2f} USDT")
         self._preview_levels_label.setText(f"Levels: {len(levels)}")
+        self._update_workspace_plan(plan_levels, source="ai")
         self._log_event(f"[PLAN] AI preview loaded | levels={len(levels)}")
+
+    def _update_workspace_plan(
+        self,
+        plan_levels: list[dict[str, str]],
+        source: str,
+        demo_source_symbol: str | None = None,
+    ) -> None:
+        self._workspace_state.plan_levels = list(plan_levels)
+        self._workspace_state.plan_source = source
+        self._workspace_state.demo_source_symbol = demo_source_symbol
+        self._sync_workspace_orders()
+
+    def _sync_workspace_orders(self) -> None:
+        if self._plan_applied and self._workspace_state.plan_levels and self._workspace_state.plan_source != "demo":
+            self._workspace_state.open_orders = list(self._workspace_state.plan_levels)
+        else:
+            self._workspace_state.open_orders = []
+
+    def _request_liquidity_stats(self) -> None:
+        if self._price_hub is None or self._liquidity_in_flight:
+            return
+        self._liquidity_in_flight = True
+
+        def _run() -> object:
+            return self._price_hub.fetch_ticker_24h(self.symbol)
+
+        worker = _LiquidityWorker(_run)
+        worker.signals.success.connect(self._handle_liquidity_success)
+        worker.signals.error.connect(self._handle_liquidity_error)
+        self._thread_pool.start(worker)
+
+    def _handle_liquidity_success(self, payload: object) -> None:
+        self._liquidity_in_flight = False
+        if not isinstance(payload, dict):
+            self._handle_liquidity_error("Liquidity response invalid.")
+            return
+        volume = payload.get("volume")
+        quote_volume = payload.get("quoteVolume")
+        trade_count = payload.get("count")
+        try:
+            volume_value = float(volume) if volume is not None else None
+        except (TypeError, ValueError):
+            volume_value = None
+        try:
+            quote_value = float(quote_volume) if quote_volume is not None else None
+        except (TypeError, ValueError):
+            quote_value = None
+        try:
+            trade_value = int(trade_count) if trade_count is not None else None
+        except (TypeError, ValueError):
+            trade_value = None
+        if volume_value is None and quote_value is None:
+            self._liquidity_stats = None
+            return
+        self._liquidity_stats = {
+            "volume": volume_value,
+            "quote_volume": quote_value,
+            "trade_count": trade_value,
+        }
+
+    def _handle_liquidity_error(self, message: str) -> None:
+        self._liquidity_in_flight = False
+        self._liquidity_stats = None
+        self._logger.warning("Liquidity 24h unavailable: %s", message)
 
     def _apply_strategy_patch(self, patch: AiStrategyPatch) -> None:
         if self._last_ai_analysis is None:
@@ -703,12 +805,14 @@ class PairWorkspaceTab(QWidget):
                 self._log_event(f"[AI] Recommended actions: {action_text}")
         self._render_preview_from_ai(self._last_ai_analysis)
         self._plan_applied = True
+        self._sync_workspace_orders()
         self._log_event("[AI] Patch applied -> strategy updated")
 
     def _prepare_data(self) -> None:
         self._data_ready = False
         self._plan_applied = False
         self._ai_block_confirm = False
+        self._update_workspace_plan([], source="none")
         self._prepared_period = None
         self._set_state(BotState.PREPARING_DATA, reason="prepare_data")
         self._log_event("Prepare data requested.")
@@ -738,6 +842,7 @@ class PairWorkspaceTab(QWidget):
         self._ai_request_card.hide()
         self._set_state(BotState.DATA_READY, reason="prepare_complete")
         self._log_event("Prepared data pack (demo).")
+        self._request_liquidity_stats()
 
     def _resolve_period(self) -> tuple[str, bool]:
         period = self._topbar.period_combo.currentText()
@@ -923,6 +1028,7 @@ class PairWorkspaceTab(QWidget):
         self._reset_ai_button.setEnabled(True)
         self._plan_applied = True
         self._set_state(BotState.PLAN_READY, reason="apply_plan")
+        self._sync_workspace_orders()
         self._log_event("[AI] Plan applied -> strategy populated")
         self._render_preview_from_ai(self._last_ai_analysis)
 
@@ -960,6 +1066,7 @@ class PairWorkspaceTab(QWidget):
         self._data_ready = False
         self._plan_applied = False
         self._ai_block_confirm = False
+        self._update_workspace_plan([], source="none")
         self._analysis_summary.setText(self._idle_summary())
         self._set_summary_status("OK")
         self._set_state(BotState.IDLE, reason="stop")
@@ -1049,7 +1156,12 @@ class PairWorkspaceTab(QWidget):
     def _open_trading_workspace(self) -> None:
         from src.gui.trading_workspace_window import TradingWorkspaceWindow
 
-        window = TradingWorkspaceWindow(pair_workspace=self, app_state=self._app_state, parent=self)
+        window = TradingWorkspaceWindow(
+            pair_workspace=self,
+            pair_state=self._workspace_state,
+            app_state=self._app_state,
+            parent=self,
+        )
         window.show()
         self._trading_windows.append(window)
 
@@ -1070,7 +1182,9 @@ class PairWorkspaceTab(QWidget):
             "state": self._pair_state.state.value,
             "last_reason": self._pair_state.last_reason,
             "datapack_summary": datapack_summary,
-            "open_orders": self._extract_preview_orders(),
+            "open_orders": list(self._workspace_state.open_orders),
+            "plan_levels": list(self._workspace_state.plan_levels),
+            "plan_source": self._workspace_state.plan_source,
             "position": {
                 "status": "FLAT",
                 "pnl": 0.0,
@@ -1088,23 +1202,7 @@ class PairWorkspaceTab(QWidget):
         return self._build_datapack()
 
     def _extract_preview_orders(self) -> list[dict[str, str]]:
-        orders: list[dict[str, str]] = []
-        for row in range(self._plan_preview_table.rowCount()):
-            side_item = self._plan_preview_table.item(row, 0)
-            price_item = self._plan_preview_table.item(row, 1)
-            qty_item = self._plan_preview_table.item(row, 2)
-            pct_item = self._plan_preview_table.item(row, 3)
-            if side_item is None or price_item is None or qty_item is None or pct_item is None:
-                continue
-            orders.append(
-                {
-                    "side": side_item.text(),
-                    "price": price_item.text(),
-                    "qty": qty_item.text(),
-                    "pct_from_mid": pct_item.text(),
-                }
-            )
-        return orders
+        return list(self._workspace_state.open_orders)
 
     def _append_chat(self, sender: str, message: str) -> None:
         self._chat_history.append(f"{sender}: {message}")
@@ -1189,6 +1287,16 @@ class PairWorkspaceTab(QWidget):
             self._log_event(f"[PLAN] Preview built | levels={len(levels)} mid={mid_price:.2f}")
         elif reason == "strategy_edit":
             self._log_event("[PLAN] Preview updated from strategy edits")
+        demo_levels = [
+            {
+                "side": str(level["side"]),
+                "price": str(level["price"]),
+                "qty": str(level["qty"]),
+                "pct_from_mid": str(level["pct_from_mid"]),
+            }
+            for level in levels
+        ]
+        self._update_workspace_plan(demo_levels, source="demo", demo_source_symbol=self.symbol)
 
     def _build_demo_levels(
         self,
@@ -1269,9 +1377,18 @@ class PairWorkspaceTab(QWidget):
                     "momentum_pct": round(volatility_proxy * scale, 3),
                 }
             )
-        liquidity_label = "OK"
-        if self._market_context and self._market_context.liquidity.lower() == "thin":
-            liquidity_label = "THIN"
+        liquidity_label = "unknown"
+        quote_volume_24h = None
+        base_volume_24h = None
+        trade_count_24h = None
+        if self._liquidity_stats:
+            quote_volume_24h = self._liquidity_stats.get("quote_volume")
+            base_volume_24h = self._liquidity_stats.get("volume")
+            trade_count_24h = self._liquidity_stats.get("trade_count")
+        if quote_volume_24h is not None:
+            liquidity_label = "OK"
+            if self._market_context and self._market_context.liquidity.lower() == "thin":
+                liquidity_label = "THIN"
         return {
             "version": "v2.1.2",
             "market_snapshot": {
@@ -1285,8 +1402,9 @@ class PairWorkspaceTab(QWidget):
                 "candles_summary": candles_summary,
             },
             "liquidity_summary": {
-                "quote_volume_24h": 0,
-                "trade_count_24h": 0,
+                "base_volume_24h": base_volume_24h,
+                "quote_volume_24h": quote_volume_24h,
+                "trade_count_24h": trade_count_24h,
                 "liquidity_label": liquidity_label,
             },
             "exchange_constraints": {
