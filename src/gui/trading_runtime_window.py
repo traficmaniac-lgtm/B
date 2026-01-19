@@ -44,7 +44,7 @@ class RuntimeRecommendation:
 
 
 class _PriceFeedSignals(QObject):
-    price_tick = Signal(float, int, int)
+    price_tick = Signal(float, int, object)
     ws_status = Signal(str, str)
 
 
@@ -504,7 +504,7 @@ class TradingRuntimeWindow(QMainWindow):
     def _handle_ws_status(self, status: str, details: str) -> None:
         self._price_signals.ws_status.emit(status, details)
 
-    def _update_price_display(self, price: float, latency_ms: int, exchange_ts: int) -> None:
+    def _update_price_display(self, price: float, latency_ms: int, exchange_ts: object) -> None:
         self._price_label.setText(f"Price: {price:.6f}")
         self._latency_label.setText(f"Latency: {latency_ms} ms")
 
