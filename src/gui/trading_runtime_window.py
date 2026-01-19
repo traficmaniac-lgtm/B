@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from datetime import datetime, timezone
+from queue import Queue
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -27,12 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.logging import get_logger
-
-
-class RuntimeState(str, Enum):
-    STOPPED = "STOPPED"
-    RUNNING = "RUNNING"
-    PAUSED = "PAUSED"
+from src.runtime.engine import PnLSnapshot, RuntimeEngine
+from src.runtime.runtime_state import RuntimeState
 
 
 @dataclass(frozen=True)
@@ -60,9 +58,11 @@ class TradingRuntimeWindow(QMainWindow):
         self._strategy_snapshot = strategy_snapshot
         self._mode = mode
         self._trade_ready_window = trade_ready_window
-        self._state = RuntimeState.STOPPED
+        self._state = RuntimeState.IDLE
         self._uptime_seconds = 0
         self._logger = get_logger(f"gui.trading_runtime.{symbol.lower()}")
+        self._engine = RuntimeEngine(symbol=symbol, strategy_snapshot=strategy_snapshot)
+        self._event_queue: Queue[tuple[str, Any]] = Queue()
 
         self.setWindowTitle(f"Trading Runtime — {symbol}")
         self.resize(1380, 900)
@@ -79,8 +79,26 @@ class TradingRuntimeWindow(QMainWindow):
         self._uptime_timer.timeout.connect(self._tick_uptime)
         self._uptime_timer.start()
 
-        self._apply_state(RuntimeState.STOPPED)
-        self._seed_mock_data()
+        self._event_timer = QTimer(self)
+        self._event_timer.setInterval(200)
+        self._event_timer.timeout.connect(self._process_event_queue)
+        self._event_timer.start()
+
+        self._orders_refresh_timer = QTimer(self)
+        self._orders_refresh_timer.setInterval(1000)
+        self._orders_refresh_timer.timeout.connect(self._refresh_orders_table)
+        self._orders_refresh_timer.start()
+
+        self._observer_timer = QTimer(self)
+        self._observer_timer.timeout.connect(self._run_observer_cycle)
+        self._update_observer_interval(self._observer_interval.currentText())
+
+        self._engine.subscribe("order_created", lambda order: self._event_queue.put(("order_created", order)))
+        self._engine.subscribe("order_filled", lambda order: self._event_queue.put(("order_filled", order)))
+        self._engine.subscribe("pnl_updated", lambda pnl: self._event_queue.put(("pnl_updated", pnl)))
+        self._engine.subscribe("state_changed", lambda state: self._event_queue.put(("state_changed", state)))
+
+        self._apply_state(self._engine.get_state())
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -224,7 +242,7 @@ class TradingRuntimeWindow(QMainWindow):
         header_row.addWidget(QLabel("Observer interval"))
         self._observer_interval = QComboBox()
         self._observer_interval.addItems(["10s", "30s", "1m", "5m"])
-        self._observer_interval.currentTextChanged.connect(self._log_interval_change)
+        self._observer_interval.currentTextChanged.connect(self._update_observer_interval)
         header_row.addWidget(self._observer_interval)
         header_row.addStretch()
         layout.addLayout(header_row)
@@ -295,6 +313,7 @@ class TradingRuntimeWindow(QMainWindow):
     def _apply_state(self, state: RuntimeState) -> None:
         self._state = state
         palette = {
+            RuntimeState.IDLE: ("#e2e8f0", "#1e293b"),
             RuntimeState.STOPPED: ("#e5e7eb", "#111827"),
             RuntimeState.RUNNING: ("#bbf7d0", "#166534"),
             RuntimeState.PAUSED: ("#fde68a", "#92400e"),
@@ -305,10 +324,10 @@ class TradingRuntimeWindow(QMainWindow):
             f"padding: 4px 10px; border-radius: 10px; background: {bg}; color: {fg};"
         )
 
-        self._start_button.setEnabled(state in {RuntimeState.STOPPED, RuntimeState.PAUSED})
+        self._start_button.setEnabled(state in {RuntimeState.IDLE, RuntimeState.STOPPED, RuntimeState.PAUSED})
         self._pause_button.setEnabled(state == RuntimeState.RUNNING)
         self._stop_button.setEnabled(state in {RuntimeState.RUNNING, RuntimeState.PAUSED})
-        self._emergency_button.setEnabled(state != RuntimeState.STOPPED)
+        self._emergency_button.setEnabled(state not in {RuntimeState.IDLE, RuntimeState.STOPPED})
 
     def _confirm_start(self) -> None:
         if self._state == RuntimeState.RUNNING:
@@ -316,35 +335,31 @@ class TradingRuntimeWindow(QMainWindow):
         message = "Запустить торговый runtime? Это демонстрационный режим."
         if QMessageBox.question(self, "Подтвердите запуск", message) != QMessageBox.Yes:
             return
-        self._apply_state(RuntimeState.RUNNING)
+        self._engine.start()
         self._log_event("Runtime запущен.")
         self._logger.info("Runtime started", extra={"symbol": self._symbol})
 
     def _pause_runtime(self) -> None:
         if self._state != RuntimeState.RUNNING:
             return
-        self._apply_state(RuntimeState.PAUSED)
+        self._engine.pause()
         self._log_event("Runtime поставлен на паузу.")
         self._logger.info("Runtime paused", extra={"symbol": self._symbol})
 
     def _stop_runtime(self) -> None:
-        if self._state == RuntimeState.STOPPED:
+        if self._state in {RuntimeState.IDLE, RuntimeState.STOPPED}:
             return
-        self._apply_state(RuntimeState.STOPPED)
-        self._uptime_seconds = 0
-        self._update_uptime_label()
+        self._engine.stop()
         self._log_event("Runtime остановлен.")
         self._logger.info("Runtime stopped", extra={"symbol": self._symbol})
 
     def _confirm_emergency_stop(self) -> None:
-        if self._state == RuntimeState.STOPPED:
+        if self._state in {RuntimeState.IDLE, RuntimeState.STOPPED}:
             return
         message = "Выполнить EMERGENCY STOP? Это немедленно остановит runtime."
         if QMessageBox.warning(self, "Emergency Stop", message, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        self._apply_state(RuntimeState.STOPPED)
-        self._uptime_seconds = 0
-        self._update_uptime_label()
+        self._engine.stop(cancel_orders=True)
         self._log_event("EMERGENCY STOP выполнен.")
         self._logger.warning("Emergency stop", extra={"symbol": self._symbol})
 
@@ -368,34 +383,101 @@ class TradingRuntimeWindow(QMainWindow):
         self._audit_trail.addItem(message)
         self._audit_trail.scrollToBottom()
 
-    def _seed_mock_data(self) -> None:
-        mock_orders = [
-            ("#10231", "BUY", "29125.4", "0.120", "OPEN", "12s"),
-            ("#10232", "SELL", "29210.0", "0.080", "OPEN", "8s"),
-        ]
-        self._orders_table.setRowCount(len(mock_orders))
-        for row, order in enumerate(mock_orders):
-            for col, value in enumerate(order):
-                self._orders_table.setItem(row, col, QTableWidgetItem(value))
-        self._orders_hint.setVisible(len(mock_orders) == 0)
+    def _process_event_queue(self) -> None:
+        while not self._event_queue.empty():
+            event, payload = self._event_queue.get_nowait()
+            if event == "state_changed":
+                self._handle_state_changed(payload)
+            elif event == "order_created":
+                self._refresh_orders_table()
+                self._log_event(f"Order created: {payload.id}")
+            elif event == "order_filled":
+                self._refresh_orders_table()
+                self._log_event(f"Order filled: {payload.id}")
+            elif event == "pnl_updated":
+                self._update_pnl(payload)
 
-        recommendations = [
-            RuntimeRecommendation(
-                rec_type="ADJUST_PARAMS",
-                reason="Повышена волатильность, рекомендовано увеличить шаг сетки.",
-                confidence=0.68,
-                expected_effect="Снизит частоту входов и уменьшит риск.",
-                can_apply_patch=True,
-            ),
-            RuntimeRecommendation(
-                rec_type="PAUSE_TRADING",
-                reason="Обнаружены новости с повышенной неопределённостью.",
-                confidence=0.54,
-                expected_effect="Защитит капитал до стабилизации.",
-                can_apply_patch=False,
-            ),
-        ]
+    def _handle_state_changed(self, state: RuntimeState) -> None:
+        self._apply_state(state)
+        if state in {RuntimeState.IDLE, RuntimeState.STOPPED}:
+            self._uptime_seconds = 0
+            self._update_uptime_label()
+        if state == RuntimeState.PAUSED:
+            self._log_event("Runtime paused by engine.")
+        elif state == RuntimeState.RUNNING:
+            self._log_event("Runtime running.")
+
+    def _refresh_orders_table(self) -> None:
+        orders = self._engine.get_orders()
+        self._orders_table.setRowCount(len(orders))
+        now = datetime.now(timezone.utc)
+        for row, order in enumerate(orders):
+            age_seconds = int((now - order.created_at).total_seconds())
+            values = [
+                order.id,
+                order.side.value,
+                f"{order.price:.4f}",
+                f"{order.qty:.4f}",
+                order.status.value,
+                f"{age_seconds}s",
+            ]
+            for col, value in enumerate(values):
+                self._orders_table.setItem(row, col, QTableWidgetItem(value))
+        self._orders_hint.setVisible(len(orders) == 0)
+
+    def _update_pnl(self, pnl: PnLSnapshot) -> None:
+        total = pnl.realized + pnl.unrealized
+        self._session_pnl.setText(f"Session PnL: {total:.2f}")
+        position_label = "FLAT"
+        if pnl.position_qty > 0:
+            position_label = f"LONG (+{pnl.position_qty:.4f})"
+        elif pnl.position_qty < 0:
+            position_label = f"SHORT ({pnl.position_qty:.4f})"
+        self._position_label.setText(position_label)
+        self._avg_price_label.setText(f"{pnl.avg_price:.4f}" if pnl.position_qty else "—")
+        self._unrealized_label.setText(f"{pnl.unrealized:.2f}")
+        self._realized_label.setText(f"{pnl.realized:.2f}")
+        self._exposure_label.setText(f"{pnl.exposure:.2f}")
+
+    def _run_observer_cycle(self) -> None:
+        if self._state == RuntimeState.IDLE:
+            return
+        snapshot = self._engine.get_observer_snapshot()
+        recommendations_raw = self._engine.get_recommendations()
+        recommendations = [RuntimeRecommendation(**rec) for rec in recommendations_raw]
         self._render_recommendations(recommendations)
+        now = datetime.now(timezone.utc)
+        self._observer_last.setText(f"Last check: {now.strftime('%H:%M:%S')} UTC")
+
+        badge_style = "padding: 4px 10px; border-radius: 10px; background: #bbf7d0; color: #166534;"
+        badge_text = "SAFE"
+        if any(rec.rec_type == "PAUSE_TRADING" for rec in recommendations):
+            badge_style = "padding: 4px 10px; border-radius: 10px; background: #fecaca; color: #991b1b;"
+            badge_text = "ALERT"
+        elif any(rec.rec_type == "ADJUST_PARAMS" for rec in recommendations):
+            badge_style = "padding: 4px 10px; border-radius: 10px; background: #fde68a; color: #92400e;"
+            badge_text = "WATCH"
+        self._observer_badge.setStyleSheet(badge_style)
+        self._observer_badge.setText(badge_text)
+
+        self._observer_summary.setText(recommendations[0].reason if recommendations else "—")
+        payload = {"snapshot": snapshot, "recommendations": recommendations_raw}
+        self._raw_ai_json.setPlainText(self._format_json(payload))
+
+    def _update_observer_interval(self, value: str) -> None:
+        mapping = {"10s": 10_000, "30s": 30_000, "1m": 60_000, "5m": 300_000}
+        interval = mapping.get(value, 30_000)
+        self._observer_timer.setInterval(interval)
+        self._observer_timer.start()
+        self._log_event(f"Observer interval set to {value}.")
+
+    def _format_json(self, payload: dict[str, Any]) -> str:
+        try:
+            import json
+
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(payload)
 
     def _render_recommendations(self, recommendations: list[RuntimeRecommendation]) -> None:
         while self._recommendations_container.count():
@@ -470,12 +552,13 @@ class TradingRuntimeWindow(QMainWindow):
             return "Могу снизить риск, увеличив шаг и сузив диапазон. Подтвердите, если нужно."
         return "Принято. Готов дать рекомендации после следующей проверки."
 
-    def _log_interval_change(self, value: str) -> None:
-        self._log_event(f"Observer interval set to {value}.")
-
     def _return_to_trade_ready(self) -> None:
         if not self._trade_ready_window:
             return
         self._trade_ready_window.raise_()
         self._trade_ready_window.activateWindow()
         self._log_event("Фокус возвращён на Trade Ready.")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
+        self._engine.stop(cancel_orders=True)
+        super().closeEvent(event)
