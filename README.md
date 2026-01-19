@@ -1,4 +1,4 @@
-# BBOT Desktop Terminal (Stage 2.0.1)
+# BBOT Desktop Terminal (Stage 3.0.1)
 
 ## Setup
 
@@ -19,7 +19,13 @@ python -m src.app.main
 1. Open the **Overview** tab.
 2. Pick the desired Quote (e.g., USDT).
 3. Click **Load Pairs** to fetch real Binance Spot symbols.
-4. Prices will refresh automatically via HTTP every ~2 seconds.
+4. Prices are shown without live streaming (use Bot tabs for live ticks).
+
+Overview prices are now static by design.
+Overview acts as a catalog of symbols, not a live ticker.
+Live price streaming is enabled only inside open Bot tabs.
+Open a Bot tab to receive ticks and see the current price there.
+Closing the Bot tab stops live price updates for that symbol.
 
 ### Settings
 

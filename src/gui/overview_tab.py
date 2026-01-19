@@ -279,11 +279,7 @@ class OverviewTab(QWidget):
         pair_list = [pair for pair in pairs if isinstance(pair, Pair)]
         self._populate_table(pair_list)
         self._set_pairs_buttons_enabled(True)
-        self._price_service.set_symbols([pair.symbol for pair in pair_list])
-        self._price_service.start()
-        self._refresh_prices()
-        if not self._price_timer.isActive():
-            self._price_timer.start()
+        self._price_service.set_symbols([])
         self._logger.info("Loaded %s pairs from %s.", len(pair_list), source)
         self._binance_status_label.setText(f"Binance: CONNECTED ({len(pair_list)} pairs, {source})")
 
