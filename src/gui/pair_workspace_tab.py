@@ -1241,7 +1241,10 @@ class PairWorkspaceTab(QWidget):
         if budget_value is not None:
             self._set_field_value("budget", budget_value, origin="user")
             self._mark_field_state("budget", "user")
-        self._append_chat("AI", f"Локальное изменение: бюджет установлен на {budget_value:.2f} USDT.")
+            self._append_chat(
+                "AI",
+                f"Локальное изменение: бюджет установлен на {budget_value:.2f} USDT.",
+            )
             self._log_event(f"[INTENT] budget -> {budget_value:.2f} USDT")
             self._chat_input.clear()
             return
