@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QPlainTextEdit,
     QSpinBox,
@@ -106,10 +107,20 @@ class LiteGridWindow(QMainWindow):
         self._dry_run_toggle.setChecked(True)
         self._dry_run_toggle.toggled.connect(self._handle_dry_run_toggle)
 
+        self._start_button = QPushButton("Start")
+        self._pause_button = QPushButton("Pause")
+        self._stop_button = QPushButton("Stop")
+        self._start_button.clicked.connect(self._handle_start)
+        self._pause_button.clicked.connect(self._handle_pause)
+        self._stop_button.clicked.connect(self._handle_stop)
+
         layout.addWidget(self._symbol_label)
         layout.addWidget(self._last_price_label)
         layout.addWidget(self._source_label)
         layout.addStretch()
+        layout.addWidget(self._start_button)
+        layout.addWidget(self._pause_button)
+        layout.addWidget(self._stop_button)
         layout.addWidget(self._dry_run_toggle)
         layout.addWidget(self._state_label)
         return layout
@@ -263,11 +274,25 @@ class LiteGridWindow(QMainWindow):
 
         self._balance_label = QLabel("Balance (quote/base): —")
         self._orders_label = QLabel("Open orders: —")
-        self._pnl_label = QLabel("PnL: unrealized — / realized —")
+        self._budget_label = QLabel("Bot budget: —")
+        self._used_label = QLabel("Used in orders: —")
+        self._free_label = QLabel("Free in bot: —")
+        self._locked_label = QLabel("Locked in orders: —")
+        self._max_exposure_label = QLabel("Max exposure: —")
+        self._pnl_unrealized_label = QLabel("Unrealized: —")
+        self._pnl_realized_label = QLabel("Realized: —")
+        self._pnl_total_label = QLabel("Total: —")
 
         layout.addWidget(self._balance_label)
         layout.addWidget(self._orders_label)
-        layout.addWidget(self._pnl_label)
+        layout.addWidget(self._budget_label)
+        layout.addWidget(self._used_label)
+        layout.addWidget(self._free_label)
+        layout.addWidget(self._locked_label)
+        layout.addWidget(self._max_exposure_label)
+        layout.addWidget(self._pnl_unrealized_label)
+        layout.addWidget(self._pnl_realized_label)
+        layout.addWidget(self._pnl_total_label)
 
         self._orders_table = QTableWidget(0, 5, self)
         self._orders_table.setHorizontalHeaderLabels(["ID", "Side", "Price", "Qty", "Status"])
@@ -275,29 +300,29 @@ class LiteGridWindow(QMainWindow):
         self._orders_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._orders_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._orders_table.setMinimumHeight(160)
+        self._orders_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._orders_table.customContextMenuRequested.connect(self._show_order_context_menu)
 
         layout.addWidget(self._orders_table)
 
         buttons = QHBoxLayout()
-        self._start_button = QPushButton("Start")
-        self._pause_button = QPushButton("Pause")
-        self._stop_button = QPushButton("Stop")
-        self._cancel_button = QPushButton("Cancel all orders")
+        self._cancel_selected_button = QPushButton("Cancel selected")
+        self._cancel_all_button = QPushButton("Cancel all")
         self._refresh_button = QPushButton("Refresh")
 
-        self._start_button.clicked.connect(lambda: self._change_state("RUNNING"))
-        self._pause_button.clicked.connect(lambda: self._change_state("PAUSED"))
-        self._stop_button.clicked.connect(lambda: self._change_state("IDLE"))
-        self._cancel_button.clicked.connect(self._handle_cancel_orders)
+        self._cancel_selected_button.clicked.connect(self._handle_cancel_selected)
+        self._cancel_all_button.clicked.connect(self._handle_cancel_all)
         self._refresh_button.clicked.connect(self._handle_refresh)
 
-        buttons.addWidget(self._start_button)
-        buttons.addWidget(self._pause_button)
-        buttons.addWidget(self._stop_button)
-        buttons.addStretch()
-        buttons.addWidget(self._cancel_button)
+        buttons.addWidget(self._cancel_selected_button)
+        buttons.addWidget(self._cancel_all_button)
         buttons.addWidget(self._refresh_button)
         layout.addLayout(buttons)
+
+        self._apply_pnl_style(self._pnl_unrealized_label, None)
+        self._apply_pnl_style(self._pnl_realized_label, None)
+        self._apply_pnl_style(self._pnl_total_label, None)
+        self._refresh_orders_metrics()
         return group
 
     def _build_logs(self) -> QFrame:
@@ -306,12 +331,27 @@ class LiteGridWindow(QMainWindow):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
+        trades_label = QLabel("Trades summary")
+        trades_label.setStyleSheet("font-weight: 600;")
+        trades_row = QHBoxLayout()
+        self._trades_closed_label = QLabel("Closed: 0")
+        self._trades_profitable_label = QLabel("Profitable: 0")
+        self._trades_win_rate_label = QLabel("Win rate: —")
+        self._trades_avg_profit_label = QLabel("Avg profit: —")
+        trades_row.addWidget(self._trades_closed_label)
+        trades_row.addWidget(self._trades_profitable_label)
+        trades_row.addWidget(self._trades_win_rate_label)
+        trades_row.addWidget(self._trades_avg_profit_label)
+        trades_row.addStretch()
+
         label = QLabel("Logs")
         label.setStyleSheet("font-weight: 600;")
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(200)
         self._log_view.setFixedHeight(140)
+        layout.addWidget(trades_label)
+        layout.addLayout(trades_row)
         layout.addWidget(label)
         layout.addWidget(self._log_view)
         return frame
@@ -373,12 +413,46 @@ class LiteGridWindow(QMainWindow):
         self._update_setting("stop_loss_enabled", enabled)
 
     def _handle_dry_run_toggle(self, checked: bool) -> None:
-        self._cancel_button.setEnabled(not checked)
         state = "enabled" if checked else "disabled"
         self._append_log(f"Dry-run {state}.")
 
-    def _handle_cancel_orders(self) -> None:
-        self._append_log("Cancel all orders requested (not implemented).")
+    def _handle_start(self) -> None:
+        self._append_log(f"Start pressed (dry-run={self._dry_run_toggle.isChecked()}).")
+        self._change_state("RUNNING")
+
+    def _handle_pause(self) -> None:
+        self._append_log("Pause pressed.")
+        self._change_state("PAUSED")
+
+    def _handle_stop(self) -> None:
+        self._append_log("Stop pressed.")
+        self._change_state("IDLE")
+
+    def _handle_cancel_selected(self) -> None:
+        selected_rows = sorted({index.row() for index in self._orders_table.selectionModel().selectedRows()})
+        if not selected_rows:
+            self._append_log("Cancel selected: —")
+            return
+        if not self._dry_run_toggle.isChecked():
+            self._append_log("Cancel selected: not implemented.")
+            return
+        for row in reversed(selected_rows):
+            order_id = self._order_id_for_row(row)
+            self._orders_table.removeRow(row)
+            self._append_log(f"Cancel selected: {order_id}")
+        self._refresh_orders_metrics()
+
+    def _handle_cancel_all(self) -> None:
+        count = self._orders_table.rowCount()
+        if count == 0:
+            self._append_log("Cancel all: 0")
+            return
+        if not self._dry_run_toggle.isChecked():
+            self._append_log("Cancel all: not implemented.")
+            return
+        self._orders_table.setRowCount(0)
+        self._append_log(f"Cancel all: {count}")
+        self._refresh_orders_metrics()
 
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested (not implemented).")
@@ -386,11 +460,12 @@ class LiteGridWindow(QMainWindow):
     def _change_state(self, new_state: str) -> None:
         self._state = new_state
         self._state_label.setText(f"State: {self._state}")
-        self._append_log(f"State changed to {self._state}.")
 
     def _update_setting(self, key: str, value: Any) -> None:
         if hasattr(self._settings_state, key):
             setattr(self._settings_state, key, value)
+        if key == "budget":
+            self._refresh_orders_metrics()
 
     def _reset_defaults(self) -> None:
         defaults = GridSettingsState()
@@ -408,6 +483,106 @@ class LiteGridWindow(QMainWindow):
         self._max_orders_input.setValue(defaults.max_active_orders)
         self._order_size_combo.setCurrentText(defaults.order_size_mode)
         self._append_log("Settings reset to defaults.")
+
+    def _order_id_for_row(self, row: int) -> str:
+        item = self._orders_table.item(row, 0)
+        return item.text() if item and item.text() else "—"
+
+    def _extract_order_value(self, row: int) -> float:
+        price_item = self._orders_table.item(row, 2)
+        qty_item = self._orders_table.item(row, 3)
+        price = self._coerce_float(price_item.text() if price_item else "")
+        qty = self._coerce_float(qty_item.text() if qty_item else "")
+        if price is None or qty is None:
+            return 0.0
+        return price * qty
+
+    @staticmethod
+    def _coerce_float(value: str) -> float | None:
+        cleaned = value.replace(",", "").strip()
+        if not cleaned or cleaned == "—":
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def _refresh_orders_metrics(self) -> None:
+        budget = float(self._budget_input.value())
+        locked = sum(self._extract_order_value(row) for row in range(self._orders_table.rowCount()))
+        used = locked
+        free = max(budget - used, 0.0)
+        self._orders_label.setText(f"Open orders: {self._orders_table.rowCount()}")
+        self._budget_label.setText(f"Bot budget: {used:.2f} / {budget:.2f} USDT (used/total)")
+        self._used_label.setText(f"Used in orders: {used:.2f} USDT")
+        self._free_label.setText(f"Free in bot: {free:.2f} USDT")
+        self._locked_label.setText(f"Locked in orders: {locked:.2f} USDT")
+        self._max_exposure_label.setText("Max exposure: 100%")
+
+    def _apply_pnl_style(self, label: QLabel, value: float | None) -> None:
+        if value is None:
+            label.setStyleSheet("color: #6b7280;")
+            return
+        if value > 0:
+            label.setStyleSheet("color: #16a34a;")
+        elif value < 0:
+            label.setStyleSheet("color: #dc2626;")
+        else:
+            label.setStyleSheet("color: #6b7280;")
+
+    def _update_pnl(self, unrealized: float | None, realized: float | None) -> None:
+        if unrealized is None:
+            self._pnl_unrealized_label.setText("Unrealized: —")
+            self._apply_pnl_style(self._pnl_unrealized_label, None)
+        else:
+            budget = float(self._budget_input.value())
+            pct = (unrealized / budget * 100) if budget > 0 else None
+            pct_text = f" ({pct:+.2f}%)" if pct is not None else ""
+            self._pnl_unrealized_label.setText(f"Unrealized: {unrealized:+.2f} USDT{pct_text}")
+            self._apply_pnl_style(self._pnl_unrealized_label, unrealized)
+
+        if realized is None:
+            self._pnl_realized_label.setText("Realized: —")
+            self._apply_pnl_style(self._pnl_realized_label, None)
+            total = None
+        else:
+            self._pnl_realized_label.setText(f"Realized: {realized:+.2f} USDT")
+            self._apply_pnl_style(self._pnl_realized_label, realized)
+            total = realized + (unrealized or 0.0)
+
+        if total is None:
+            self._pnl_total_label.setText("Total: —")
+            self._apply_pnl_style(self._pnl_total_label, None)
+        else:
+            self._pnl_total_label.setText(f"Total: {total:+.2f} USDT")
+            self._apply_pnl_style(self._pnl_total_label, total)
+
+    def _show_order_context_menu(self, position: Any) -> None:
+        row = self._orders_table.rowAt(position.y())
+        if row < 0:
+            return
+        menu = QMenu(self)
+        cancel_action = menu.addAction("Cancel")
+        show_action = menu.addAction("Show in log")
+        action = menu.exec(self._orders_table.viewport().mapToGlobal(position))
+        if action == cancel_action:
+            if not self._dry_run_toggle.isChecked():
+                self._append_log("Cancel selected: not implemented.")
+                return
+            order_id = self._order_id_for_row(row)
+            self._orders_table.removeRow(row)
+            self._append_log(f"Cancel selected: {order_id}")
+            self._refresh_orders_metrics()
+        if action == show_action:
+            details = self._format_order_details(row)
+            self._append_log(f"Order context: show in log: {details}")
+
+    def _format_order_details(self, row: int) -> str:
+        values = []
+        for column in range(self._orders_table.columnCount()):
+            item = self._orders_table.item(row, column)
+            values.append(item.text() if item else "—")
+        return ", ".join(values)
 
     def _append_log(self, message: str) -> None:
         self._log_view.appendPlainText(message)
