@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QDialog, QWidget
 from src.gui.models.pair_mode import PAIR_MODE_TRADE_READY, PAIR_MODE_TRADING, PairMode
 from src.gui.pair_action_dialog import PairActionDialog
 from src.gui.trade_ready_mode_window import TradeReadyModeWindow
+from src.services.price_feed_manager import PriceFeedManager
 
 
 class PairModeManager:
@@ -15,12 +16,14 @@ class PairModeManager:
         open_trading_workspace: Callable[[str], None],
         market_state: object | None = None,
         exchange_name: str = "Binance",
+        price_feed_manager: PriceFeedManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
         self._open_trading_workspace = open_trading_workspace
         self._parent = parent
         self._market_state = market_state
         self._exchange_name = exchange_name
+        self._price_feed_manager = price_feed_manager
         self._trade_ready_windows: list[TradeReadyModeWindow] = []
 
     def open_pair_dialog(
@@ -54,6 +57,7 @@ class PairModeManager:
                 exchange=self._exchange_name,
                 last_price=last_price,
                 market_state=self._market_state,
+                price_feed_manager=self._price_feed_manager,
                 parent=window_parent,
             )
             window.show()

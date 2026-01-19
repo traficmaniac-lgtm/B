@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from src.core.logging import get_logger
 from src.runtime.engine import PnLSnapshot, RuntimeEngine
 from src.runtime.runtime_state import RuntimeState
-from src.services.price_feed_service import PriceFeedService, PriceTick
+from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class RuntimeRecommendation:
 
 
 class _PriceFeedSignals(QObject):
-    price_tick = Signal(float, int, object)
+    price_tick = Signal(object)
     ws_status = Signal(str, str)
 
 
@@ -56,6 +56,7 @@ class TradingRuntimeWindow(QMainWindow):
         strategy_snapshot: dict[str, Any],
         mode: str,
         trade_ready_window: QWidget | None = None,
+        price_feed_manager: PriceFeedManager,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -67,11 +68,11 @@ class TradingRuntimeWindow(QMainWindow):
         self._state = RuntimeState.IDLE
         self._uptime_seconds = 0
         self._logger = get_logger(f"gui.trading_runtime.{symbol.lower()}")
-        self._price_feed = PriceFeedService(symbol=symbol)
+        self._price_feed_manager = price_feed_manager
         self._engine = RuntimeEngine(
             symbol=symbol,
             strategy_snapshot=strategy_snapshot,
-            price_feed=self._price_feed,
+            price_feed_manager=self._price_feed_manager,
         )
         self._event_queue: Queue[tuple[str, Any]] = Queue()
         self._price_signals = _PriceFeedSignals()
@@ -114,9 +115,11 @@ class TradingRuntimeWindow(QMainWindow):
 
         self._apply_state(self._engine.get_state())
 
-        self._price_feed.subscribe(self._handle_price_tick)
-        self._price_feed.subscribe_status(self._handle_ws_status)
-        self._price_feed.start()
+        if self._price_feed_manager is not None:
+            self._price_feed_manager.register_symbol(self._symbol)
+            self._price_feed_manager.subscribe(self._symbol, self._handle_price_tick)
+            self._price_feed_manager.subscribe_status(self._symbol, self._handle_ws_status)
+            self._price_feed_manager.start()
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -144,6 +147,12 @@ class TradingRuntimeWindow(QMainWindow):
 
         self._latency_label = QLabel("Latency: —")
         layout.addWidget(self._latency_label)
+
+        self._age_label = QLabel("Age: —")
+        layout.addWidget(self._age_label)
+
+        self._source_label = QLabel("Source: —")
+        layout.addWidget(self._source_label)
 
         self._ws_status_label = QLabel("WS: LOST")
         layout.addWidget(self._ws_status_label)
@@ -498,18 +507,35 @@ class TradingRuntimeWindow(QMainWindow):
         self._observer_timer.start()
         self._log_event(f"Observer interval set to {value}.")
 
-    def _handle_price_tick(self, tick: PriceTick) -> None:
-        self._price_signals.price_tick.emit(tick.price, tick.latency_ms, tick.exchange_timestamp_ms)
+    def _handle_price_tick(self, tick: PriceUpdate) -> None:
+        self._price_signals.price_tick.emit(tick)
 
     def _handle_ws_status(self, status: str, details: str) -> None:
         self._price_signals.ws_status.emit(status, details)
 
-    def _update_price_display(self, price: float, latency_ms: int, exchange_ts: object) -> None:
-        self._price_label.setText(f"Price: {price:.6f}")
-        self._latency_label.setText(f"Latency: {latency_ms} ms")
+    def _update_price_display(self, update: PriceUpdate) -> None:
+        if update.last_price is None:
+            return
+        self._price_label.setText(f"Price: {update.last_price:.6f}")
+        latency = "—" if update.latency_ms is None else f"{update.latency_ms} ms"
+        age = "—" if update.price_age_ms is None else f"{update.price_age_ms} ms"
+        self._latency_label.setText(f"Latency: {latency}")
+        self._age_label.setText(f"Age: {age}")
+        self._source_label.setText(f"Source: {update.source}")
 
     def _update_ws_status(self, status: str, details: str) -> None:
-        self._ws_status_label.setText(f"WS: {status}")
+        label = status.replace("WS_", "")
+        if status == WS_CONNECTED:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #16a34a;")
+            return
+        if status == WS_DEGRADED:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #f59e0b;")
+            return
+        if status == WS_LOST:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #dc2626;")
 
     def _format_json(self, payload: dict[str, Any]) -> str:
         try:
@@ -601,7 +627,8 @@ class TradingRuntimeWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         self._engine.stop(cancel_orders=True)
-        self._price_feed.unsubscribe(self._handle_price_tick)
-        self._price_feed.unsubscribe_status(self._handle_ws_status)
-        self._price_feed.stop()
+        if self._price_feed_manager is not None:
+            self._price_feed_manager.unsubscribe(self._symbol, self._handle_price_tick)
+            self._price_feed_manager.unsubscribe_status(self._symbol, self._handle_ws_status)
+            self._price_feed_manager.unregister_symbol(self._symbol)
         super().closeEvent(event)

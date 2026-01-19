@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from src.core.logging import get_logger
 from src.gui.trading_runtime_window import TradingRuntimeWindow
+from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
 
 
 class TradeReadyState(str, Enum):
@@ -46,6 +47,11 @@ class TradeVariant:
     strategy: dict[str, Any]
 
 
+class _TradeReadySignals(QObject):
+    price_tick = Signal(object)
+    ws_status = Signal(str)
+
+
 class TradeReadyModeWindow(QMainWindow):
     def __init__(
         self,
@@ -53,6 +59,7 @@ class TradeReadyModeWindow(QMainWindow):
         exchange: str,
         last_price: str | None = None,
         market_state: object | None = None,
+        price_feed_manager: PriceFeedManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -60,6 +67,7 @@ class TradeReadyModeWindow(QMainWindow):
         self._exchange = exchange
         self._last_price = last_price
         self._market_state = market_state
+        self._price_feed_manager = price_feed_manager
         self._state = TradeReadyState.IDLE
         self._analysis_timer: QTimer | None = None
         self._latest_ai_report: dict[str, Any] | None = None
@@ -67,6 +75,9 @@ class TradeReadyModeWindow(QMainWindow):
         self._selected_variant: TradeVariant | None = None
         self._runtime_windows: list[TradingRuntimeWindow] = []
         self._logger = get_logger(f"gui.trade_ready.{symbol.lower()}")
+        self._price_signals = _TradeReadySignals()
+        self._price_signals.price_tick.connect(self._handle_price_tick)
+        self._price_signals.ws_status.connect(self._handle_ws_status)
 
         self.setWindowTitle(f"Trade Ready Mode — {symbol}")
         self.resize(1280, 860)
@@ -80,6 +91,7 @@ class TradeReadyModeWindow(QMainWindow):
 
         self._update_market_context()
         self._apply_state(TradeReadyState.IDLE)
+        self._start_price_feed()
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -94,6 +106,18 @@ class TradeReadyModeWindow(QMainWindow):
 
         self._last_price_label = QLabel(self._format_price_label())
         layout.addWidget(self._last_price_label)
+
+        self._source_label = QLabel("Источник: —")
+        layout.addWidget(self._source_label)
+
+        self._latency_label = QLabel("Latency: —")
+        layout.addWidget(self._latency_label)
+
+        self._age_label = QLabel("Age: —")
+        layout.addWidget(self._age_label)
+
+        self._ws_status_label = QLabel("WS: LOST")
+        layout.addWidget(self._ws_status_label)
 
         self._mode_badge = QLabel("Trade Ready Mode")
         self._mode_badge.setStyleSheet(
@@ -112,6 +136,45 @@ class TradeReadyModeWindow(QMainWindow):
 
         header.setLayout(layout)
         return header
+
+    def _start_price_feed(self) -> None:
+        if not self._price_feed_manager:
+            return
+        self._price_feed_manager.register_symbol(self._symbol)
+        self._price_feed_manager.subscribe(self._symbol, self._emit_price_tick)
+        self._price_feed_manager.subscribe_status(self._symbol, self._emit_ws_status)
+        self._price_feed_manager.start()
+
+    def _emit_price_tick(self, update: PriceUpdate) -> None:
+        self._price_signals.price_tick.emit(update)
+
+    def _emit_ws_status(self, status: str, _: str) -> None:
+        self._price_signals.ws_status.emit(status)
+
+    def _handle_price_tick(self, update: PriceUpdate) -> None:
+        if update.last_price is None:
+            return
+        self._last_price = f"{update.last_price:.6f}"
+        self._last_price_label.setText(self._format_price_label())
+        self._source_label.setText(f"Источник: {update.source}")
+        latency = "—" if update.latency_ms is None else f"{update.latency_ms} ms"
+        age = "—" if update.price_age_ms is None else f"{update.price_age_ms} ms"
+        self._latency_label.setText(f"Latency: {latency}")
+        self._age_label.setText(f"Age: {age}")
+
+    def _handle_ws_status(self, status: str) -> None:
+        label = status.replace("WS_", "")
+        if status == WS_CONNECTED:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #16a34a;")
+            return
+        if status == WS_DEGRADED:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #f59e0b;")
+            return
+        if status == WS_LOST:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #dc2626;")
 
     def _build_main_splitter(self) -> QSplitter:
         splitter = QSplitter(Qt.Vertical)
@@ -579,6 +642,7 @@ class TradeReadyModeWindow(QMainWindow):
             strategy_snapshot=snapshot,
             mode=mode,
             trade_ready_window=self,
+            price_feed_manager=self._price_feed_manager,
             parent=self.parentWidget(),
         )
         runtime.show()
@@ -639,3 +703,10 @@ class TradeReadyModeWindow(QMainWindow):
             return json.dumps(report, ensure_ascii=False, indent=2)
         except Exception:
             return str(report)
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802
+        if self._price_feed_manager is not None:
+            self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_tick)
+            self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_ws_status)
+            self._price_feed_manager.unregister_symbol(self._symbol)
+        super().closeEvent(event)

@@ -16,8 +16,10 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
+from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -30,14 +32,14 @@ from PySide6.QtWidgets import (
 )
 
 from src.ai.openai_client import OpenAIClient
+from src.binance.account_client import BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
-from src.binance.ws_client import BinanceWsClient
 from src.core.config import Config
 from src.core.logging import get_logger
 from src.core.models import Pair
 from src.gui.models.app_state import AppState
 from src.services.markets_service import MarketsService
-from src.services.price_service import PriceService
+from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
 
 
 class _WorkerSignals(QObject):
@@ -177,6 +179,7 @@ class OverviewTab(QWidget):
         config: Config,
         app_state: AppState,
         on_open_pair: Callable[[str, str | None], None],
+        price_feed_manager: PriceFeedManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -194,28 +197,29 @@ class OverviewTab(QWidget):
         self._markets_service = MarketsService(self._http_client)
         self._ws_status_signals = _WsStatusSignals()
         self._ws_status_signals.status.connect(self._handle_ws_status)
-        self._ws_client = BinanceWsClient(
-            ws_url=config.binance.ws_url,
-            on_tick=self._handle_ws_tick,
-            on_status=self._emit_ws_status,
-        )
-        self._price_service = PriceService(
-            http_client=self._http_client,
-            ws_client=self._ws_client,
-            ttl_ms=self._app_state.price_ttl_ms,
-            refresh_interval_ms=self._app_state.price_refresh_ms,
-            fallback_enabled=config.prices.fallback_enabled,
-        )
+        self._price_manager = price_feed_manager or PriceFeedManager.get_instance(config)
         self._thread_pool = QThreadPool.globalInstance()
         self._price_timer = QTimer(self)
         self._price_timer.setInterval(self._app_state.price_refresh_ms)
         self._price_timer.timeout.connect(self._refresh_prices)
         self._price_update_in_flight = False
+        self._selected_symbol: str | None = None
+        self._latest_price_update: PriceUpdate | None = None
         self._all_pairs: list[Pair] = []
         self._cache_partial = False
         self._pairs_model = _PairsTableModel(self)
         self._proxy_model = _PairsFilterProxyModel(self)
         self._proxy_model.setSourceModel(self._pairs_model)
+        self._account_client: BinanceAccountClient | None = None
+        self._account_balances: list[dict[str, object]] = []
+        self._account_balances_display: list[str] = []
+        self._account_last_error: str | None = None
+        self._account_timer = QTimer(self)
+        self._account_timer.setInterval(10_000)
+        self._account_timer.timeout.connect(self._refresh_account_balances)
+        self._open_orders_timer = QTimer(self)
+        self._open_orders_timer.setInterval(1500)
+        self._open_orders_timer.timeout.connect(self._refresh_open_orders)
 
         layout = QVBoxLayout()
         layout.addLayout(self._build_status_row())
@@ -244,6 +248,7 @@ class OverviewTab(QWidget):
 
         self.setLayout(layout)
         self._set_ai_status()
+        self.refresh_account_status()
 
     def _build_status_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -290,10 +295,35 @@ class OverviewTab(QWidget):
         balance_layout.addWidget(self._pnl_label)
         balance_box.setLayout(balance_layout)
 
+        account_box = QGroupBox("Account (read-only)")
+        account_layout = QVBoxLayout()
+        self._account_status_label = QLabel("Account: ключи не заданы")
+        self._account_balances_label = QLabel("Balances: —")
+        self._account_balances_label.setWordWrap(True)
+        self._account_show_all_btn = QPushButton("Показать все")
+        self._account_show_all_btn.clicked.connect(self._show_all_balances)
+        self._account_show_all_btn.setEnabled(False)
+        self._open_orders_label = QLabel("Open orders: —")
+        self._open_orders_model = QStandardItemModel(0, 7, self)
+        self._open_orders_model.setHorizontalHeaderLabels(
+            ["ID", "Side", "Price", "OrigQty", "ExecQty", "Status", "Time"]
+        )
+        self._open_orders_table = QTableView()
+        self._open_orders_table.setModel(self._open_orders_model)
+        self._open_orders_table.horizontalHeader().setStretchLastSection(True)
+        self._open_orders_table.setEditTriggers(QTableView.NoEditTriggers)
+        account_layout.addWidget(self._account_status_label)
+        account_layout.addWidget(self._account_balances_label)
+        account_layout.addWidget(self._account_show_all_btn)
+        account_layout.addWidget(self._open_orders_label)
+        account_layout.addWidget(self._open_orders_table)
+        account_box.setLayout(account_layout)
+
         grid.addWidget(config_box, 0, 0)
         grid.addWidget(binance_box, 0, 1)
         grid.addWidget(ai_box, 0, 2)
         grid.addWidget(balance_box, 0, 3)
+        grid.addWidget(account_box, 0, 4)
         return grid
 
     def _build_filters(self) -> QHBoxLayout:
@@ -329,9 +359,7 @@ class OverviewTab(QWidget):
         selected = self._table.selectionModel().selectedRows()
         if not selected:
             self._selected_label.setText("Selected pair: -")
-            self._price_service.set_symbols([])
-            self._price_timer.stop()
-            self._price_service.stop()
+            self._stop_selected_symbol_stream()
             return
         proxy_index = selected[0]
         source_index = self._proxy_model.mapToSource(proxy_index)
@@ -339,10 +367,7 @@ class OverviewTab(QWidget):
         if not symbol:
             return
         self._selected_label.setText(f"Selected pair: {symbol}")
-        self._price_service.set_symbols([symbol])
-        if not self._price_timer.isActive():
-            self._price_service.start()
-            self._price_timer.start()
+        self._start_selected_symbol_stream(symbol)
 
     def _handle_double_click(self, _: QModelIndex) -> None:
         selected = self._table.selectionModel().selectedRows()
@@ -361,6 +386,7 @@ class OverviewTab(QWidget):
         worker.signals.error.connect(self._handle_self_check_error)
         self._thread_pool.start(worker)
         self._run_ai_self_check()
+        self._refresh_account_balances()
 
     def _run_ai_self_check(self) -> None:
         if not self._app_state.openai_key_present:
@@ -398,6 +424,172 @@ class OverviewTab(QWidget):
     def _handle_self_check_error(self, message: str) -> None:
         self._logger.error("self-check failed: %s", message)
         self._set_binance_status_error(message)
+
+    def refresh_account_status(self) -> None:
+        api_key = self._app_state.binance_api_key.strip()
+        api_secret = self._app_state.binance_api_secret.strip()
+        if not api_key or not api_secret:
+            self._account_client = None
+            self._account_status_label.setText("Account: ключи не заданы")
+            self._account_balances_label.setText("Balances: —")
+            self._account_show_all_btn.setEnabled(False)
+            self._open_orders_label.setText("Open orders: —")
+            self._open_orders_model.removeRows(0, self._open_orders_model.rowCount())
+            self._account_timer.stop()
+            self._open_orders_timer.stop()
+            return
+        self._account_client = BinanceAccountClient(
+            base_url=self._config.binance.base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=self._config.binance.recv_window,
+            timeout_s=self._config.http.timeout_s,
+            retries=self._config.http.retries,
+            backoff_base_s=self._config.http.backoff_base_s,
+            backoff_max_s=self._config.http.backoff_max_s,
+        )
+        self._account_status_label.setText("Account: CHECKING")
+        self._account_timer.start()
+        if self._selected_symbol:
+            self._open_orders_timer.start()
+        self._refresh_account_balances()
+
+    def _refresh_account_balances(self) -> None:
+        if not self._account_client:
+            return
+        worker = _Worker(self._account_client.get_account_info)
+        worker.signals.success.connect(self._handle_account_info)
+        worker.signals.error.connect(self._handle_account_error)
+        self._thread_pool.start(worker)
+
+    def _handle_account_info(self, result: object, _: int) -> None:
+        if not isinstance(result, dict):
+            self._handle_account_error("Unexpected account response")
+            return
+        balances = result.get("balances", [])
+        if not isinstance(balances, list):
+            balances = []
+        parsed: list[dict[str, object]] = []
+        for item in balances:
+            if not isinstance(item, dict):
+                continue
+            asset = str(item.get("asset", "")).upper()
+            try:
+                free = float(item.get("free", 0))
+                locked = float(item.get("locked", 0))
+            except (TypeError, ValueError):
+                continue
+            total = free + locked
+            parsed.append({"asset": asset, "free": free, "locked": locked, "total": total})
+        self._account_balances = parsed
+        display = self._select_top_balances(parsed)
+        self._account_balances_display = display
+        self._account_status_label.setText("Account: CONNECTED")
+        self._account_show_all_btn.setEnabled(bool(parsed))
+        self._account_balances_label.setText("Balances: " + ", ".join(display) if display else "Balances: —")
+        self._account_last_error = None
+
+    def _handle_account_error(self, message: str) -> None:
+        summary = self._summarize_error(message)
+        self._logger.error("Account read-only error: %s", summary)
+        self._account_last_error = summary
+        self._account_status_label.setText(f"Account: ERROR ({summary})")
+
+    def _select_top_balances(self, balances: list[dict[str, object]]) -> list[str]:
+        priority_assets = ["USDT", "USDC", "FDUSD", "EURI", "EUR", "BTC"]
+        by_asset = {item["asset"]: item for item in balances if item.get("asset")}
+        selected: list[dict[str, object]] = []
+        for asset in priority_assets:
+            item = by_asset.get(asset)
+            if item and float(item.get("total", 0)) > 0:
+                selected.append(item)
+        if len(selected) < 6:
+            remaining = [
+                item for item in balances if item.get("asset") not in {s["asset"] for s in selected}
+            ]
+            remaining.sort(key=lambda x: float(x.get("total", 0)), reverse=True)
+            selected.extend(remaining[: 6 - len(selected)])
+        return [f"{item['asset']}: {item['total']:.4f}" for item in selected]
+
+    def _show_all_balances(self) -> None:
+        if not self._account_balances:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Все балансы (spot)")
+        layout = QVBoxLayout()
+        table = QTableView(dialog)
+        model = QStandardItemModel(0, 4, dialog)
+        model.setHorizontalHeaderLabels(["Asset", "Free", "Locked", "Total"])
+        for item in self._account_balances:
+            asset = str(item.get("asset", ""))
+            free = float(item.get("free", 0))
+            locked = float(item.get("locked", 0))
+            total = float(item.get("total", 0))
+            row = [
+                QStandardItem(asset),
+                QStandardItem(f"{free:.6f}"),
+                QStandardItem(f"{locked:.6f}"),
+                QStandardItem(f"{total:.6f}"),
+            ]
+            model.appendRow(row)
+        table.setModel(model)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        dialog.setLayout(layout)
+        dialog.resize(520, 420)
+        dialog.exec()
+
+    def _refresh_open_orders(self) -> None:
+        if not self._account_client or not self._selected_symbol:
+            return
+        worker = _Worker(lambda: self._account_client.get_open_orders(self._selected_symbol))
+        worker.signals.success.connect(self._handle_open_orders)
+        worker.signals.error.connect(self._handle_open_orders_error)
+        self._thread_pool.start(worker)
+
+    def _handle_open_orders(self, result: object, _: int) -> None:
+        if not isinstance(result, list):
+            self._handle_open_orders_error("Unexpected open orders response")
+            return
+        self._open_orders_model.removeRows(0, self._open_orders_model.rowCount())
+        for order in result:
+            if not isinstance(order, dict):
+                continue
+            order_id = str(order.get("orderId", ""))
+            side = str(order.get("side", ""))
+            price = str(order.get("price", ""))
+            orig_qty = str(order.get("origQty", ""))
+            exec_qty = str(order.get("executedQty", ""))
+            status = str(order.get("status", ""))
+            time_raw = order.get("time")
+            time_str = self._format_time(time_raw)
+            row = [
+                QStandardItem(order_id),
+                QStandardItem(side),
+                QStandardItem(price),
+                QStandardItem(orig_qty),
+                QStandardItem(exec_qty),
+                QStandardItem(status),
+                QStandardItem(time_str),
+            ]
+            self._open_orders_model.appendRow(row)
+        self._open_orders_label.setText(f"Open orders: {len(result)}")
+
+    def _handle_open_orders_error(self, message: str) -> None:
+        summary = self._summarize_error(message)
+        self._logger.warning("Open orders error: %s", summary)
+        self._open_orders_label.setText(f"Open orders: ERROR ({summary})")
+
+    @staticmethod
+    def _format_time(value: object) -> str:
+        if not isinstance(value, int):
+            return "—"
+        try:
+            from datetime import datetime, timezone
+
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%H:%M:%S")
+        except Exception:
+            return "—"
 
     def _handle_ai_self_check_success(self, result: object, latency_ms: int) -> None:
         if not isinstance(result, tuple) or len(result) != 2:
@@ -473,7 +665,6 @@ class OverviewTab(QWidget):
         self._pairs_model.set_pairs(pair_list)
         self._apply_filters()
         self._set_pairs_buttons_enabled(True)
-        self._price_service.set_symbols([])
         self._logger.info("Loaded %s pairs from %s.", len(pair_list), source)
         self._binance_status_label.setText(f"Binance: CONNECTED ({len(pair_list)} pairs, {source})")
         if source == "CACHE" and self._cache_partial:
@@ -513,29 +704,57 @@ class OverviewTab(QWidget):
             self._table.selectRow(0)
         else:
             self._selected_label.setText("Selected pair: -")
-            self._price_service.set_symbols([])
-            self._price_timer.stop()
-            self._price_service.stop()
+            self._stop_selected_symbol_stream()
 
     def _refresh_prices(self) -> None:
         selected = self._table.selectionModel().selectedRows()
         if self._price_update_in_flight or not selected:
             return
         self._price_update_in_flight = True
-        proxy_index = selected[0]
-        source_index = self._proxy_model.mapToSource(proxy_index)
-        symbol = self._pairs_model.symbol_for_row(source_index.row())
-        if symbol:
-            snapshot = self._price_service.snapshot([symbol])
-            price = snapshot.get(symbol)
-            if price is not None:
-                self._pairs_model.update_price(
-                    symbol,
-                    f"{price.price:.8f}",
-                    price.source,
-                    str(price.age_ms),
-                )
+        if self._latest_price_update and self._latest_price_update.last_price is not None:
+            symbol = self._latest_price_update.symbol
+            self._pairs_model.update_price(
+                symbol,
+                f"{self._latest_price_update.last_price:.8f}",
+                self._latest_price_update.source,
+                str(self._latest_price_update.price_age_ms or "--"),
+            )
         self._price_update_in_flight = False
+
+    def _handle_price_update(self, update: PriceUpdate) -> None:
+        if self._selected_symbol != update.symbol:
+            return
+        self._latest_price_update = update
+
+    def _start_selected_symbol_stream(self, symbol: str) -> None:
+        if self._selected_symbol == symbol:
+            return
+        if self._selected_symbol:
+            self._stop_selected_symbol_stream()
+        self._selected_symbol = symbol
+        self._latest_price_update = None
+        self._price_manager.register_symbol(symbol)
+        self._price_manager.subscribe(symbol, self._handle_price_update)
+        self._price_manager.subscribe_status(symbol, self._emit_ws_status)
+        self._price_manager.start()
+        if not self._price_timer.isActive():
+            self._price_timer.start()
+        if self._account_client:
+            self._open_orders_timer.start()
+
+    def _stop_selected_symbol_stream(self) -> None:
+        if not self._selected_symbol:
+            self._price_timer.stop()
+            self._open_orders_timer.stop()
+            return
+        symbol = self._selected_symbol
+        self._price_manager.unsubscribe(symbol, self._handle_price_update)
+        self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
+        self._price_manager.unregister_symbol(symbol)
+        self._selected_symbol = None
+        self._latest_price_update = None
+        self._price_timer.stop()
+        self._open_orders_timer.stop()
 
     def _set_pairs_buttons_enabled(self, enabled: bool) -> None:
         self._load_button.setEnabled(enabled)
@@ -548,18 +767,22 @@ class OverviewTab(QWidget):
         summary = self._summarize_error(message)
         self._binance_status_label.setText(f"Binance: ERROR ({summary})")
 
-    def _handle_ws_tick(self, symbol: str, price: float, timestamp_ms: int) -> None:
-        self._price_service.on_ws_tick(symbol, price, timestamp_ms)
-
     def _emit_ws_status(self, status: str, message: str | None) -> None:
         self._ws_status_signals.status.emit(status, message or status)
 
     def _handle_ws_status(self, status: str, message: str) -> None:
-        if status == "CONNECTED":
-            self._ws_status_label.setText("WS: CONNECTED")
+        label = status.replace("WS_", "")
+        if status == WS_CONNECTED:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #16a34a;")
             return
-        if status == "RECONNECTING":
-            self._ws_status_label.setText("WS: RECONNECTING")
+        if status == WS_DEGRADED:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #f59e0b;")
+            return
+        if status == WS_LOST:
+            self._ws_status_label.setText(f"WS: {label}")
+            self._ws_status_label.setStyleSheet("color: #dc2626;")
             return
         if status == "ERROR":
             summary = self._summarize_error(message)
@@ -587,7 +810,9 @@ class OverviewTab(QWidget):
 
     def shutdown(self) -> None:
         self._price_timer.stop()
-        self._price_service.stop()
+        self._account_timer.stop()
+        self._open_orders_timer.stop()
+        self._stop_selected_symbol_stream()
 
     @staticmethod
     def _summarize_error(message: str, max_len: int = 80) -> str:

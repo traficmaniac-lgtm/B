@@ -23,6 +23,7 @@ from src.gui.pair_mode_manager import PairModeManager
 from src.gui.pair_workspace_tab import PairWorkspaceTab
 from src.gui.settings_dialog import SettingsDialog
 from src.gui.widgets.log_dock import LogDock
+from src.services.price_feed_manager import PriceFeedManager
 from src.services.price_hub import PriceHub
 
 
@@ -39,15 +40,18 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self._tabs.setTabsClosable(True)
         self._market_state = MarketState(zero_fee_symbols=set(self._app_state.zero_fee_symbols))
+        self._price_feed_manager = PriceFeedManager.get_instance(self._config)
         self._pair_mode_manager = PairModeManager(
             open_trading_workspace=self.open_pair_tab,
             market_state=self._market_state,
+            price_feed_manager=self._price_feed_manager,
             parent=self,
         )
         self._overview_tab = OverviewTab(
             self._config,
             app_state=self._app_state,
             on_open_pair=self._pair_mode_manager.open_pair_dialog,
+            price_feed_manager=self._price_feed_manager,
         )
         self._tabs.addTab(self._overview_tab, "Overview")
         self._tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
@@ -56,7 +60,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         self._pair_tabs: dict[str, PairWorkspaceTab] = {}
-        self._price_hub = PriceHub(config=self._config, app_state=self._app_state, parent=self)
+        self._price_hub = PriceHub(
+            config=self._config,
+            app_state=self._app_state,
+            price_feed_manager=self._price_feed_manager,
+            parent=self,
+        )
 
         self._log_dock = LogDock(self)
         self._log_dock.handler.setFormatter(
@@ -113,6 +122,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Settings saved", 3000)
         self._status_right_label.setText(f"env: {app_state.env.lower()} | core: loaded")
         self._overview_tab.refresh_ai_status()
+        self._overview_tab.refresh_account_status()
 
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("File")
@@ -146,4 +156,5 @@ class MainWindow(QMainWindow):
         for tab in self._pair_tabs.values():
             tab.shutdown()
         self._price_hub.shutdown()
+        self._price_feed_manager.shutdown()
         super().closeEvent(event)
