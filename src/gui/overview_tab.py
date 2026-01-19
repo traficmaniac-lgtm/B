@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
+from time import perf_counter
 from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QGridLayout,
@@ -17,14 +20,69 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.binance.http_client import BinanceHttpClient
+from src.core.config import Config
 from src.core.logging import get_logger
+from src.core.models import Pair
+from src.services.markets_service import MarketsService
+
+
+class _WorkerSignals(QObject):
+    success = Signal(object, int)
+    error = Signal(str)
+
+
+class _Worker(QRunnable):
+    def __init__(self, fn: Callable[[], object]) -> None:
+        super().__init__()
+        self.signals = _WorkerSignals()
+        self._fn = fn
+
+    def run(self) -> None:
+        start = perf_counter()
+        try:
+            result = self._fn()
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+            return
+        latency_ms = int((perf_counter() - start) * 1000)
+        self.signals.success.emit(result, latency_ms)
+
+
+@dataclass(frozen=True)
+class _TableColumns:
+    symbol: int = 0
+    price: int = 1
+    source: int = 2
+    updated_ms: int = 3
 
 
 class OverviewTab(QWidget):
-    def __init__(self, on_open_pair: Callable[[str], None], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        on_open_pair: Callable[[str], None],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._config = config
         self._logger = get_logger("gui.overview")
         self._on_open_pair = on_open_pair
+        self._http_client = BinanceHttpClient(
+            base_url=config.binance.base_url,
+            timeout_s=config.http.timeout_s,
+            retries=config.http.retries,
+            backoff_base_s=config.http.backoff_base_s,
+            backoff_max_s=config.http.backoff_max_s,
+        )
+        self._markets_service = MarketsService(self._http_client)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._price_timer = QTimer(self)
+        self._price_timer.setInterval(self._config.prices.ttl_ms)
+        self._price_timer.timeout.connect(self._refresh_prices)
+        self._price_update_in_flight = False
+        self._symbol_rows: dict[str, int] = {}
+        self._table_columns = _TableColumns()
 
         layout = QVBoxLayout()
         layout.addLayout(self._build_status_row())
@@ -39,11 +97,10 @@ class OverviewTab(QWidget):
         self._table.itemDoubleClicked.connect(self._handle_double_click)
         layout.addWidget(self._table)
 
-        self._selected_label = QLabel("Selected pair: BTCUSDT")
+        self._selected_label = QLabel("Selected pair: -")
         layout.addWidget(self._selected_label)
 
         self.setLayout(layout)
-        self._load_demo_rows()
 
     def _build_status_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -64,7 +121,8 @@ class OverviewTab(QWidget):
 
         binance_box = QGroupBox("Binance")
         binance_layout = QVBoxLayout()
-        binance_layout.addWidget(QLabel("Binance: NOT CONNECTED"))
+        self._binance_status_label = QLabel("Binance: NOT CONNECTED")
+        binance_layout.addWidget(self._binance_status_label)
         binance_box.setLayout(binance_layout)
 
         ai_box = QGroupBox("AI")
@@ -87,7 +145,7 @@ class OverviewTab(QWidget):
         self._quote_combo.addItems(["USDT", "USDC", "FDUSD", "EUR"])
 
         self._load_button = QPushButton("Load Pairs")
-        self._load_button.setEnabled(False)
+        self._load_button.clicked.connect(self._handle_load_pairs)
 
         layout.addWidget(QLabel("Search"))
         layout.addWidget(self._search_input)
@@ -96,24 +154,6 @@ class OverviewTab(QWidget):
         layout.addWidget(self._load_button)
         layout.addStretch()
         return layout
-
-    def _load_demo_rows(self) -> None:
-        demo_rows = [
-            ("BTCUSDT", "68250.12", "DEMO", "120"),
-            ("ETHUSDT", "3580.45", "DEMO", "210"),
-            ("BNBUSDT", "604.80", "DEMO", "98"),
-            ("SOLUSDT", "148.25", "DEMO", "305"),
-            ("ADAUSDT", "0.4521", "DEMO", "412"),
-            ("XRPUSDT", "0.6123", "DEMO", "255"),
-            ("DOGEUSDT", "0.1581", "DEMO", "160"),
-            ("AVAXUSDT", "38.44", "DEMO", "142"),
-        ]
-        self._table.setRowCount(len(demo_rows))
-        for row_index, row in enumerate(demo_rows):
-            for column_index, value in enumerate(row):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignCenter)
-                self._table.setItem(row_index, column_index, item)
 
     def _update_selected_pair(self) -> None:
         selected_items = self._table.selectedItems()
@@ -130,4 +170,110 @@ class OverviewTab(QWidget):
         self._on_open_pair(symbol)
 
     def _run_self_check(self) -> None:
-        self._logger.info("self-check ok")
+        worker = _Worker(self._http_client.get_time)
+        worker.signals.success.connect(self._handle_self_check_success)
+        worker.signals.error.connect(self._handle_self_check_error)
+        self._thread_pool.start(worker)
+
+    def _handle_self_check_success(self, result: object, latency_ms: int) -> None:
+        if isinstance(result, dict) and "serverTime" in result:
+            self._logger.info("self-check ok (serverTime=%s, %sms)", result["serverTime"], latency_ms)
+        else:
+            self._logger.info("self-check ok (%sms)", latency_ms)
+        self._set_binance_status_connected()
+
+    def _handle_self_check_error(self, message: str) -> None:
+        self._logger.error("self-check failed: %s", message)
+        self._set_binance_status_error(message)
+
+    def _handle_load_pairs(self) -> None:
+        self._load_button.setEnabled(False)
+        self._symbol_rows.clear()
+        self._table.setRowCount(0)
+        quote = self._quote_combo.currentText().strip()
+        worker = _Worker(lambda: self._markets_service.load_pairs(quote))
+        worker.signals.success.connect(self._handle_pairs_loaded)
+        worker.signals.error.connect(self._handle_pairs_error)
+        self._thread_pool.start(worker)
+
+    def _handle_pairs_loaded(self, pairs: object, _: int) -> None:
+        self._set_binance_status_connected()
+        if not isinstance(pairs, Iterable):
+            self._logger.error("Unexpected pairs response: %s", pairs)
+            self._load_button.setEnabled(True)
+            return
+        pair_list = [pair for pair in pairs if isinstance(pair, Pair)]
+        self._populate_table(pair_list)
+        self._load_button.setEnabled(True)
+        self._refresh_prices()
+        if not self._price_timer.isActive():
+            self._price_timer.start()
+
+    def _handle_pairs_error(self, message: str) -> None:
+        self._logger.error("Failed to load pairs: %s", message)
+        self._set_binance_status_error(message)
+        self._load_button.setEnabled(True)
+
+    def _populate_table(self, pairs: list[Pair]) -> None:
+        self._table.setRowCount(len(pairs))
+        for row_index, pair in enumerate(pairs):
+            self._symbol_rows[pair.symbol] = row_index
+            self._set_table_item(row_index, self._table_columns.symbol, pair.symbol)
+            self._set_table_item(row_index, self._table_columns.price, "--")
+            self._set_table_item(row_index, self._table_columns.source, "--")
+            self._set_table_item(row_index, self._table_columns.updated_ms, "--")
+        if pairs:
+            self._table.selectRow(0)
+            self._selected_label.setText(f"Selected pair: {pairs[0].symbol}")
+        else:
+            self._selected_label.setText("Selected pair: -")
+
+    def _refresh_prices(self) -> None:
+        if self._price_update_in_flight or not self._symbol_rows:
+            return
+        self._price_update_in_flight = True
+        worker = _Worker(self._http_client.get_ticker_prices)
+        worker.signals.success.connect(self._handle_prices_loaded)
+        worker.signals.error.connect(self._handle_prices_error)
+        self._thread_pool.start(worker)
+
+    def _handle_prices_loaded(self, prices: object, latency_ms: int) -> None:
+        self._price_update_in_flight = False
+        if not isinstance(prices, dict):
+            self._logger.error("Unexpected prices payload: %s", prices)
+            return
+        self._set_binance_status_connected()
+        for symbol, row_index in self._symbol_rows.items():
+            price = prices.get(symbol)
+            if price is None:
+                continue
+            self._set_table_item(row_index, self._table_columns.price, str(price))
+            self._set_table_item(row_index, self._table_columns.source, "HTTP")
+            self._set_table_item(row_index, self._table_columns.updated_ms, str(latency_ms))
+
+    def _handle_prices_error(self, message: str) -> None:
+        self._price_update_in_flight = False
+        self._logger.error("Failed to refresh prices: %s", message)
+        self._set_binance_status_error(message)
+
+    def _set_table_item(self, row: int, column: int, value: str) -> None:
+        item = self._table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(row, column, item)
+        item.setText(value)
+
+    def _set_binance_status_connected(self) -> None:
+        self._binance_status_label.setText("Binance: CONNECTED")
+
+    def _set_binance_status_error(self, message: str) -> None:
+        summary = self._summarize_error(message)
+        self._binance_status_label.setText(f"Binance: ERROR ({summary})")
+
+    @staticmethod
+    def _summarize_error(message: str, max_len: int = 80) -> str:
+        summary = " ".join(message.split())
+        if len(summary) > max_len:
+            return summary[: max_len - 3] + "..."
+        return summary
