@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import random
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
-from PySide6.QtCore import QSignalBlocker, QTimer, Qt
+from PySide6.QtCore import QObject, QRunnable, QSignalBlocker, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ai.openai_client import OpenAIClient
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
 from src.gui.models.pair_state import BotState, PairState
@@ -55,6 +57,26 @@ class MarketContext:
     spread_status: str
 
 
+class _AiWorkerSignals(QObject):
+    success = Signal(str)
+    error = Signal(str)
+
+
+class _AiWorker(QRunnable):
+    def __init__(self, fn: Callable[[], str]) -> None:
+        super().__init__()
+        self.signals = _AiWorkerSignals()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+        except Exception as exc:  # noqa: BLE001
+            self.signals.error.emit(str(exc))
+            return
+        self.signals.success.emit(result)
+
+
 class PairWorkspaceTab(QWidget):
     def __init__(
         self,
@@ -80,6 +102,10 @@ class PairWorkspaceTab(QWidget):
         self._tick_count = 0
         self._ai_values: dict[str, Any] = {}
         self._user_touched: set[str] = set()
+        self._thread_pool = QThreadPool.globalInstance()
+        self._latest_price: float | None = None
+        self._latest_price_source: str | None = None
+        self._latest_price_age_ms: int | None = None
 
         layout = QVBoxLayout()
         self._topbar = PairTopBar(
@@ -367,20 +393,42 @@ class PairWorkspaceTab(QWidget):
             QMessageBox.warning(self, "No data", "Prepare data before AI analysis.")
             self._log_event("AI analyze requested without data.")
             return
+        if not self._app_state.openai_key_present:
+            QMessageBox.warning(self, "Missing OpenAI key", "Set the OpenAI API key in Settings.")
+            self._log_event("AI analyze skipped: missing OpenAI key.")
+            return
         self._set_state(BotState.ANALYZING, reason="ai_analyze")
         self._log_event("AI analysis started.")
         self._analysis_summary.setText(self._analyzing_summary())
-        delay_ms = random.randint(500, 1200)
-        QTimer.singleShot(delay_ms, self._finish_analysis)
+        worker = _AiWorker(self._run_ai_analyze)
+        worker.signals.success.connect(self._handle_ai_analyze_success)
+        worker.signals.error.connect(self._handle_ai_analyze_error)
+        self._thread_pool.start(worker)
 
-    def _finish_analysis(self) -> None:
+    def _run_ai_analyze(self) -> str:
+        datapack = self._build_datapack()
+        client = OpenAIClient(
+            api_key=self._app_state.openai_api_key,
+            model=self._app_state.openai_model,
+            timeout_s=25.0,
+            retries=1,
+        )
+        return asyncio.run(client.analyze_pair(datapack))
+
+    def _handle_ai_analyze_success(self, response: str) -> None:
         self._ai_request_card.hide()
-        self._analysis_summary.setText(self._format_market_summary(include_ai_note=True))
+        self._analysis_summary.setText("AI analysis complete.\nSee AI Chat for the response.")
         self._plan_preview_status.setText("AI analysis complete. Apply plan to populate strategy.")
         self._set_state(BotState.PLAN_READY, reason="analysis_complete")
-        self._log_event("AI plan ready.")
-        self._append_chat("AI", "Demo analysis complete. Click Apply Plan.")
+        self._log_event("AI analyze ok")
+        self._append_chat("AI", response)
         self._rebuild_plan_preview(reason="built")
+
+    def _handle_ai_analyze_error(self, message: str) -> None:
+        self._log_event(f"AI analyze failed: {message}")
+        self._append_chat("AI", f"AI error: {message}")
+        self._analysis_summary.setText("AI analysis failed. Check logs for details.")
+        self._set_state(BotState.DATA_READY, reason="analysis_failed")
 
     def _is_plan_applied(self) -> bool:
         return self._plan_applied
@@ -509,6 +557,9 @@ class PairWorkspaceTab(QWidget):
     def _handle_price_update(self, symbol: str, price: float, source: str, age_ms: int) -> None:
         if symbol != self.symbol:
             return
+        self._latest_price = price
+        self._latest_price_source = source
+        self._latest_price_age_ms = age_ms
         self._topbar.price_label.setText(f"Price: {price:.6f} ({source}, {age_ms} ms)")
 
     def _set_state(self, state: BotState, reason: str = "") -> None:
@@ -526,7 +577,8 @@ class PairWorkspaceTab(QWidget):
     def update_controls_by_state(self) -> None:
         state = self._pair_state.state
         self._topbar.prepare_button.setEnabled(state in {BotState.IDLE, BotState.ERROR})
-        self._topbar.analyze_button.setEnabled(state == BotState.DATA_READY)
+        ai_ready = self._app_state.ai_connected or self._app_state.openai_key_present
+        self._topbar.analyze_button.setEnabled(state == BotState.DATA_READY and ai_ready)
         self._topbar.apply_button.setEnabled(state == BotState.PLAN_READY)
         self._topbar.confirm_button.setEnabled(
             (state == BotState.PLAN_READY and self._plan_applied) or state == BotState.PAUSED
@@ -630,3 +682,29 @@ class PairWorkspaceTab(QWidget):
                 )
 
         return levels
+
+    def _build_datapack(self) -> dict[str, Any]:
+        period = self._topbar.period_combo.currentText()
+        quality = self._topbar.quality_combo.currentText()
+        summary = self._analysis_summary.toPlainText().strip()
+        now_price = self._latest_price if self._latest_price is not None else self._prepared_mid_price
+        source = self._latest_price_source or "None"
+        age_ms = self._latest_price_age_ms
+        strategy_inputs = {
+            "budget": self._budget_input.value(),
+            "mode": self._mode_input.currentText(),
+            "grid_count": self._grid_count_input.value(),
+            "grid_step_pct": self._grid_step_input.value(),
+            "range_low_pct": self._range_low_input.value(),
+            "range_high_pct": self._range_high_input.value(),
+        }
+        return {
+            "symbol": self.symbol,
+            "period": period,
+            "quality": quality,
+            "now_price": now_price,
+            "source": source,
+            "age_ms": age_ms,
+            "summary": summary,
+            "strategy_inputs": strategy_inputs,
+        }

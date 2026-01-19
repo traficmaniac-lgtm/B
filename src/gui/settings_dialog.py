@@ -57,6 +57,10 @@ class SettingsDialog(QDialog):
         self._openai_key_input = QLineEdit(self._app_state.openai_api_key)
         self._openai_key_input.setEchoMode(QLineEdit.Password)
 
+        self._openai_model_combo = QComboBox()
+        self._openai_model_combo.addItems(["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"])
+        self._openai_model_combo.setCurrentText(self._app_state.openai_model)
+
         self._default_period_combo = QComboBox()
         self._default_period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
         self._default_period_combo.setCurrentText(self._app_state.default_period)
@@ -83,6 +87,7 @@ class SettingsDialog(QDialog):
         form.addRow(QLabel("Binance API key"), self._binance_key_input)
         form.addRow(QLabel("Binance API secret"), self._binance_secret_input)
         form.addRow(QLabel("OpenAI API key"), self._openai_key_input)
+        form.addRow(QLabel("OpenAI model"), self._openai_model_combo)
         form.addRow(QLabel("Default period"), self._default_period_combo)
         form.addRow(QLabel("Default quality"), self._default_quality_combo)
         form.addRow(QLabel("Price TTL (ms)"), self._price_ttl_input)
@@ -92,15 +97,24 @@ class SettingsDialog(QDialog):
         return form
 
     def _handle_save(self) -> None:
+        previous_openai_key = self._app_state.openai_api_key
+        previous_model = self._app_state.openai_model
         self._app_state.binance_api_key = self._binance_key_input.text().strip()
         self._app_state.binance_api_secret = self._binance_secret_input.text().strip()
         self._app_state.openai_api_key = self._openai_key_input.text().strip()
+        self._app_state.openai_model = self._openai_model_combo.currentText().strip()
         self._app_state.default_period = self._default_period_combo.currentText()
         self._app_state.default_quality = self._default_quality_combo.currentText()
         self._app_state.price_ttl_ms = self._price_ttl_input.value()
         self._app_state.price_refresh_ms = self._price_refresh_input.value()
         self._app_state.default_quote = self._default_quote_combo.currentText()
         self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
+        if (
+            previous_openai_key != self._app_state.openai_api_key
+            or previous_model != self._app_state.openai_model
+        ):
+            self._app_state.ai_connected = False
+            self._app_state.ai_checked = False
         self._on_save(self._app_state)
         config_path = self._app_state.user_config_path or Path("config.user.yaml")
         self._logger.info("[SETTINGS] saved to %s", config_path.as_posix())

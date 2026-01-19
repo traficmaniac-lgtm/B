@@ -16,6 +16,7 @@ class AppState:
     binance_api_key: str = ""
     binance_api_secret: str = ""
     openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
     default_period: str = "4h"
     default_quality: str = "Standard"
     allow_ai_more_data: bool = True
@@ -23,6 +24,8 @@ class AppState:
     price_refresh_ms: int = 500
     default_quote: str = "USDT"
     pnl_period: str = "24h"
+    ai_connected: bool = False
+    ai_checked: bool = False
     user_config_path: Path | None = None
 
     @classmethod
@@ -39,6 +42,7 @@ class AppState:
         binance_api_key = str(data.get("binance_api_key", defaults.binance_api_key) or "")
         binance_api_secret = str(data.get("binance_api_secret", defaults.binance_api_secret) or "")
         openai_api_key = str(data.get("openai_api_key", defaults.openai_api_key) or "")
+        openai_model = str(data.get("openai_model", defaults.openai_model) or defaults.openai_model)
         default_period = str(data.get("default_period", defaults.default_period))
         default_quality = str(data.get("default_quality", defaults.default_quality))
         allow_ai_more_data = bool(data.get("allow_ai_more_data", defaults.allow_ai_more_data))
@@ -54,6 +58,7 @@ class AppState:
             binance_api_key=binance_api_key,
             binance_api_secret=binance_api_secret,
             openai_api_key=openai_api_key,
+            openai_model=openai_model,
             default_period=default_period,
             default_quality=default_quality,
             allow_ai_more_data=allow_ai_more_data,
@@ -73,6 +78,7 @@ class AppState:
             "binance_api_key": self.binance_api_key,
             "binance_api_secret": self.binance_api_secret,
             "openai_api_key": self.openai_api_key,
+            "openai_model": self.openai_model,
             "default_period": self.default_period,
             "default_quality": self.default_quality,
             "allow_ai_more_data": self.allow_ai_more_data,
@@ -85,3 +91,7 @@ class AppState:
     def save(self, path: Path) -> None:
         path.write_text(yaml.safe_dump(self.to_dict(), sort_keys=False), encoding="utf-8")
         self.user_config_path = path
+
+    @property
+    def openai_key_present(self) -> bool:
+        return bool(self.openai_api_key.strip())

@@ -31,6 +31,15 @@ Closing the Bot tab stops live price updates for that symbol.
 
 Open Settings from the toolbar or File → Settings menu. Changes are saved to `config.user.yaml`.
 
+### OpenAI (AI Analyze)
+
+1. Open **Settings** and paste your OpenAI API key.
+2. Select the **OpenAI model** (default: gpt-4o-mini).
+3. Click **Save**, then return to Overview.
+4. Press **Run Self-check** to verify the OpenAI connection.
+5. Open a Bot tab, click **Prepare Data**, then **AI Analyze**.
+6. The response appears in **AI Chat** and is logged in **Local logs**.
+
 ### Pair Workspace
 
 Double click any row in the Overview tab to open a Pair Workspace bot tab for that symbol.
