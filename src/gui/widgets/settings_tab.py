@@ -59,6 +59,29 @@ class SettingsTab(QWidget):
 
         self._config_path_input = QLineEdit(self._app_state.config_path)
 
+        self._binance_key_input = QLineEdit(self._app_state.binance_api_key)
+        self._binance_key_input.setEchoMode(QLineEdit.Password)
+        self._binance_key_hint = QLabel(self._key_present_label(self._app_state.binance_api_key))
+
+        self._binance_secret_input = QLineEdit(self._app_state.binance_api_secret)
+        self._binance_secret_input.setEchoMode(QLineEdit.Password)
+        self._binance_secret_hint = QLabel(self._key_present_label(self._app_state.binance_api_secret))
+
+        self._openai_key_input = QLineEdit(self._app_state.openai_api_key)
+        self._openai_key_input.setEchoMode(QLineEdit.Password)
+        self._openai_key_hint = QLabel(self._key_present_label(self._app_state.openai_api_key))
+
+        self._default_period_combo = QComboBox()
+        self._default_period_combo.addItems(["1h", "4h", "12h", "24h", "7d"])
+        self._default_period_combo.setCurrentText(self._app_state.default_period)
+
+        self._default_quality_combo = QComboBox()
+        self._default_quality_combo.addItems(["Standard", "Deep"])
+        self._default_quality_combo.setCurrentText(self._app_state.default_quality)
+
+        self._allow_ai_more_data = QCheckBox("Allow AI to request more data")
+        self._allow_ai_more_data.setChecked(self._app_state.allow_ai_more_data)
+
         self._show_logs_checkbox = QCheckBox("Show logs dock")
         self._show_logs_checkbox.setChecked(self._app_state.show_logs)
         self._show_logs_checkbox.toggled.connect(self._on_toggle_logs)
@@ -67,6 +90,16 @@ class SettingsTab(QWidget):
         form.addRow(QLabel("log level"), self._log_level_combo)
         form.addRow(QLabel("config file path"), self._config_path_input)
         form.addRow(self._show_logs_checkbox)
+
+        form.addRow(QLabel("Binance API key"), self._build_key_row(self._binance_key_input, self._binance_key_hint))
+        form.addRow(
+            QLabel("Binance API secret"),
+            self._build_key_row(self._binance_secret_input, self._binance_secret_hint),
+        )
+        form.addRow(QLabel("OpenAI key"), self._build_key_row(self._openai_key_input, self._openai_key_hint))
+        form.addRow(QLabel("Default period"), self._default_period_combo)
+        form.addRow(QLabel("Default quality"), self._default_quality_combo)
+        form.addRow(self._allow_ai_more_data)
         return form
 
     def _handle_save(self) -> None:
@@ -74,8 +107,32 @@ class SettingsTab(QWidget):
         self._app_state.log_level = self._log_level_combo.currentText().upper()
         self._app_state.config_path = self._config_path_input.text().strip()
         self._app_state.show_logs = self._show_logs_checkbox.isChecked()
+        self._app_state.binance_api_key = self._binance_key_input.text().strip()
+        self._app_state.binance_api_secret = self._binance_secret_input.text().strip()
+        self._app_state.openai_api_key = self._openai_key_input.text().strip()
+        self._app_state.default_period = self._default_period_combo.currentText()
+        self._app_state.default_quality = self._default_quality_combo.currentText()
+        self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
+        self._refresh_key_hints()
         self._on_save(self._app_state)
         self._logger.info(
             "settings saved to %s",
             Path(self._app_state.user_config_path).as_posix() if self._app_state.user_config_path else "",
         )
+
+    @staticmethod
+    def _key_present_label(value: str) -> str:
+        return "Key present: yes" if value else "Key present: no"
+
+    def _build_key_row(self, input_field: QLineEdit, hint: QLabel) -> QWidget:
+        layout = QHBoxLayout()
+        layout.addWidget(input_field)
+        layout.addWidget(hint)
+        wrapper = QWidget()
+        wrapper.setLayout(layout)
+        return wrapper
+
+    def _refresh_key_hints(self) -> None:
+        self._binance_key_hint.setText(self._key_present_label(self._app_state.binance_api_key))
+        self._binance_secret_hint.setText(self._key_present_label(self._app_state.binance_api_secret))
+        self._openai_key_hint.setText(self._key_present_label(self._app_state.openai_api_key))

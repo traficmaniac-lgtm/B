@@ -13,10 +13,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.gui.models.app_state import AppState
+from src.gui.pair_workspace_window import PairWorkspaceWindow
+
 
 class MarketsTab(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, app_state: AppState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._app_state = app_state
+        self._workspace_windows: list[PairWorkspaceWindow] = []
 
         main_layout = QVBoxLayout()
         main_layout.addLayout(self._build_controls())
@@ -27,6 +32,7 @@ class MarketsTab(QWidget):
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.itemSelectionChanged.connect(self._update_selected_pair)
+        self._table.itemDoubleClicked.connect(self._open_pair_workspace)
         main_layout.addWidget(self._table)
 
         self._selected_label = QLabel("Selected pair: BTCUSDT")
@@ -79,3 +85,12 @@ class MarketsTab(QWidget):
             return
         symbol = selected_items[0].text()
         self._selected_label.setText(f"Selected pair: {symbol}")
+
+    def _open_pair_workspace(self) -> None:
+        selected_items = self._table.selectedItems()
+        if not selected_items:
+            return
+        symbol = selected_items[0].text()
+        window = PairWorkspaceWindow(symbol=symbol, app_state=self._app_state, parent=self)
+        window.show()
+        self._workspace_windows.append(window)
