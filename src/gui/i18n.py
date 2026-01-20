@@ -64,7 +64,9 @@ TEXT = {
     "trade_status_disabled": "TRADE: DISABLED",
     "trade_status_enabled": "TRADE: ENABLED",
     "trade_confirm_title": "Enable LIVE trading?",
-    "trade_confirm_message": "Enable LIVE trading? This will allow real orders.",
+    "trade_confirm_message": "I understand this will place real orders. Continue?",
+    "trade_disabled_reason_spot": "Enable Spot Trading in API key settings",
+    "pnl_no_fills": "PnL: — (no fills data yet)",
 }
 
 
