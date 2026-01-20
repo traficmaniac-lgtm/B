@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -18,6 +19,13 @@ from src.core.timeutil import utc_ms
 WS_CONNECTED = "WS_CONNECTED"
 WS_DEGRADED = "WS_DEGRADED"
 WS_LOST = "WS_LOST"
+WS_OK = "WS_OK"
+HTTP_FALLBACK = "HTTP_FALLBACK"
+WS_DISABLED_404 = "WS_DISABLED_404"
+
+
+def _now_ms() -> int:
+    return utc_ms()
 
 
 def calculate_backoff(attempt: int, base_s: float = 1.0, max_s: float = 30.0) -> float:
@@ -149,7 +157,10 @@ class _BinanceBookTickerWsThread:
         on_message: Callable[[dict[str, Any]], None],
         on_status: Callable[[str, str], None],
     ) -> None:
-        self._ws_url = ws_url.rstrip("/")
+        ws_url = ws_url.rstrip("/")
+        if ws_url.endswith("/ws"):
+            ws_url = ws_url[: -len("/ws")]
+        self._ws_url = ws_url
         self._on_message = on_message
         self._on_status = on_status
         self._logger = get_logger("services.price_feed.ws")
@@ -160,6 +171,8 @@ class _BinanceBookTickerWsThread:
         self._symbols: set[str] = set()
         self._symbols_updated = threading.Event()
         self._websocket: websockets.WebSocketClientProtocol | None = None
+        self._disabled_until_ms = 0
+        self._logged_url = False
 
     def start(self) -> None:
         if self._thread.is_alive():
@@ -186,6 +199,9 @@ class _BinanceBookTickerWsThread:
             self._symbols = cleaned
         self._symbols_updated.set()
 
+    def set_disabled_until(self, disabled_until_ms: int) -> None:
+        self._disabled_until_ms = disabled_until_ms
+
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -203,6 +219,7 @@ class _BinanceBookTickerWsThread:
     async def _connect_loop(self) -> None:
         attempt = 0
         while not self._stop_event.is_set():
+            await self._wait_if_disabled()
             symbols = self._get_symbols()
             if not symbols:
                 await asyncio.sleep(1.0)
@@ -212,9 +229,20 @@ class _BinanceBookTickerWsThread:
                 await asyncio.sleep(1.0)
                 continue
             try:
-                self._logger.info("WS подключение (%s символов)", len(symbols))
+                if not self._logged_url:
+                    self._logger.debug("WS URL = %s", url)
+                    self._logged_url = True
+                self._logger.debug("WS подключение (%s символов)", len(symbols))
                 self._on_status("CONNECTED", "WS подключен")
                 await self._listen(url)
+                attempt = 0
+            except websockets.exceptions.InvalidStatusCode as exc:
+                if exc.status_code == 404:
+                    self._on_status(WS_DISABLED_404, "HTTP 404")
+                    await self._wait_if_disabled()
+                    continue
+                self._on_status("ERROR", f"ошибка WS: {exc}")
+                self._logger.error("WS error: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 self._on_status("ERROR", f"ошибка WS: {exc}")
                 self._logger.error("WS error: %s", exc)
@@ -222,7 +250,7 @@ class _BinanceBookTickerWsThread:
                 break
             attempt += 1
             delay = calculate_backoff(attempt, base_s=1.0, max_s=30.0)
-            self._logger.info("WS переподключение через %.1fs", delay)
+            self._logger.debug("WS переподключение через %.1fs", delay)
             self._on_status("RECONNECTING", f"backoff={delay:.1f}s")
             await asyncio.sleep(delay)
 
@@ -260,12 +288,22 @@ class _BinanceBookTickerWsThread:
         streams = [f"{symbol}@bookTicker" for symbol in symbols if symbol]
         if not streams:
             return None
+        if len(streams) == 1:
+            return f"{self._ws_url}/ws/{streams[0]}"
         joined = "/".join(streams)
         return f"{self._ws_url}/stream?streams={joined}"
 
     def _get_symbols(self) -> list[str]:
         with self._symbols_lock:
             return list(self._symbols)
+
+    async def _wait_if_disabled(self) -> None:
+        while not self._stop_event.is_set():
+            now_ms = _now_ms()
+            if now_ms >= self._disabled_until_ms:
+                return
+            sleep_s = max((self._disabled_until_ms - now_ms) / 1000.0, 0.5)
+            await asyncio.sleep(min(sleep_s, 5.0))
 
 
 class PriceFeedManager:
@@ -277,11 +315,12 @@ class PriceFeedManager:
         config: Config,
         http_client: BinanceHttpClient | None = None,
         heartbeat_interval_s: float = 2.0,
-        degraded_after_ms: int = 4000,
-        lost_after_ms: int = 12000,
+        degraded_after_ms: int = 5000,
+        lost_after_ms: int = 8000,
     ) -> None:
         self._config = config
         self._logger = get_logger("services.price_feed.manager")
+        logging.getLogger("httpx").setLevel(logging.WARNING)
         self._http_client = http_client or BinanceHttpClient(
             base_url=config.binance.base_url,
             timeout_s=config.http.timeout_s,
@@ -303,6 +342,9 @@ class PriceFeedManager:
         self._exchange_info_loaded = False
         self._exchange_info_loading = False
         self._exchange_info_lock = threading.Lock()
+        self._ws_disabled_until_ms = 0
+        self._switch_cooldown_until_ms = 0
+        self._log_limiter: dict[tuple[str, str], int] = {}
         self._ws_thread = _BinanceBookTickerWsThread(
             ws_url=config.binance.ws_url.rstrip("/"),
             on_message=self._handle_ws_message,
@@ -408,15 +450,63 @@ class PriceFeedManager:
             return None
         return self._build_snapshot(cleaned, state)
 
+    def _log_rate_limited(self, symbol: str, kind: str, level: str, message: str) -> None:
+        now_ms = _now_ms()
+        key = (symbol, kind)
+        last_ms = self._log_limiter.get(key, 0)
+        if now_ms - last_ms < 10_000:
+            return
+        self._log_limiter[key] = now_ms
+        getattr(self._logger, level)(message)
+
+    def _can_switch(self, now_ms: int) -> bool:
+        return now_ms >= self._switch_cooldown_until_ms
+
+    def _set_switch_cooldown(self, now_ms: int) -> None:
+        self._switch_cooldown_until_ms = now_ms + 15_000
+
+    def _should_restore_ws(self, state: dict[str, Any], now_ms: int) -> bool:
+        streak = state.get("ws_streak", 0)
+        recovery_start = state.get("ws_recovery_start_ms")
+        if streak >= 3:
+            return True
+        if isinstance(recovery_start, int) and now_ms - recovery_start >= 2000:
+            return True
+        return False
+
+    def _get_poll_interval_ms(self, symbol: str) -> int:
+        with self._lock:
+            tick_count = len(self._tick_subscribers.get(symbol, {}))
+            status_count = len(self._status_subscribers.get(symbol, {}))
+        if tick_count > 0:
+            return 1000
+        if status_count > 0:
+            return 4000
+        return 0
+
     def _handle_ws_status(self, status: str, details: str) -> None:
+        now_ms = _now_ms()
+        if status == WS_DISABLED_404:
+            self._ws_disabled_until_ms = now_ms + 300_000
+            self._ws_thread.set_disabled_until(self._ws_disabled_until_ms)
+            self._log_rate_limited("*", "ws_disabled_404", "warning", "WS отключен из-за 404 на 5 минут")
+            symbols_to_notify: list[str] = []
+            with self._lock:
+                for symbol, symbol_state in self._symbol_state.items():
+                    symbol_state["feed_state"] = WS_DISABLED_404
+                    symbol_state["ws_status"] = WS_LOST
+                    symbols_to_notify.append(symbol)
+            for symbol in symbols_to_notify:
+                self._publish_status(symbol, WS_LOST)
+            return
         if status == "CONNECTED":
-            self._logger.info("WS подключен")
+            self._log_rate_limited("*", "ws_connected", "info", "WS подключен")
             return
         if status == "RECONNECTING":
-            self._logger.warning("WS переподключение: %s", details)
+            self._log_rate_limited("*", "ws_reconnect", "warning", f"WS переподключение: {details}")
             return
         if status == "ERROR":
-            self._logger.error("WS ошибка: %s", details)
+            self._log_rate_limited("*", "ws_error", "error", f"WS ошибка: {details}")
 
     def _handle_ws_message(self, data: dict[str, Any]) -> None:
         symbol = data.get("s")
@@ -433,12 +523,23 @@ class PriceFeedManager:
         if not isinstance(event_ts, int):
             event_ts = None
         symbol = symbol.upper()
-        now_ms = utc_ms()
+        now_ms = _now_ms()
         latency_ms = max(now_ms - event_ts, 0) if event_ts else None
         spread_abs, spread_pct, mid_price = estimate_spread(best_bid, best_ask)
         last_price = mid_price
         with self._lock:
             state = self._symbol_state.setdefault(symbol, {})
+            last_update = state.get("updated_ms")
+            if state.get("ws_status") != WS_CONNECTED:
+                if isinstance(last_update, int) and now_ms - last_update <= 2000:
+                    state["ws_streak"] = state.get("ws_streak", 0) + 1
+                else:
+                    state["ws_streak"] = 1
+                if state.get("ws_recovery_start_ms") is None:
+                    state["ws_recovery_start_ms"] = now_ms
+            else:
+                state["ws_streak"] = 0
+                state["ws_recovery_start_ms"] = None
             state.update(
                 {
                     "last_price": last_price,
@@ -448,7 +549,6 @@ class PriceFeedManager:
                     "updated_ms": now_ms,
                     "latency_ms": latency_ms,
                     "source": "WS",
-                    "ws_status": WS_CONNECTED,
                     "spread_abs": spread_abs,
                     "spread_pct": spread_pct,
                     "mid_price": mid_price,
@@ -478,22 +578,58 @@ class PriceFeedManager:
             state = self._symbol_state.get(cleaned)
             last_update = state.get("updated_ms") if state else None
             current_status = state.get("ws_status") if state else WS_LOST
+            feed_state = state.get("feed_state", WS_OK) if state else WS_OK
         if last_update is None:
             new_status = WS_LOST
         else:
             age_ms = max(now_ms - last_update, 0)
             new_status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
+        if new_status == WS_CONNECTED and current_status != WS_CONNECTED:
+            with self._lock:
+                state = self._symbol_state.setdefault(cleaned, {})
+                if not self._should_restore_ws(state, now_ms):
+                    new_status = current_status
         if new_status != current_status:
             with self._lock:
                 state = self._symbol_state.setdefault(cleaned, {})
                 state["ws_status"] = new_status
+                if new_status != WS_CONNECTED:
+                    state["ws_streak"] = 0
+                    state["ws_recovery_start_ms"] = None
             if new_status == WS_DEGRADED:
-                self._logger.warning("WS деградирован для %s", cleaned)
+                self._log_rate_limited(cleaned, "ws_degraded", "warning", f"WS деградирован для {cleaned}")
             elif new_status == WS_LOST:
-                self._logger.warning("WS потерян для %s; включаем HTTP фолбэк", cleaned)
+                self._log_rate_limited(cleaned, "ws_lost", "warning", f"WS потерян для {cleaned}")
             elif new_status == WS_CONNECTED:
-                self._logger.info("WS восстановлен для %s; HTTP фолбэк выключен", cleaned)
+                self._log_rate_limited(cleaned, "ws_restored", "info", f"WS восстановлен для {cleaned}")
             self._publish_status(cleaned, new_status)
+
+        desired_feed_state = feed_state
+        if now_ms < self._ws_disabled_until_ms:
+            desired_feed_state = WS_DISABLED_404
+        elif new_status == WS_LOST:
+            desired_feed_state = HTTP_FALLBACK
+        elif new_status == WS_DEGRADED:
+            desired_feed_state = WS_DEGRADED
+        else:
+            desired_feed_state = WS_OK
+
+        if desired_feed_state != feed_state:
+            allow_switch = True
+            if desired_feed_state != WS_DISABLED_404 and {feed_state, desired_feed_state} <= {WS_OK, HTTP_FALLBACK}:
+                allow_switch = self._can_switch(now_ms)
+            if allow_switch:
+                with self._lock:
+                    state = self._symbol_state.setdefault(cleaned, {})
+                    state["feed_state"] = desired_feed_state
+                if {feed_state, desired_feed_state} <= {WS_OK, HTTP_FALLBACK}:
+                    self._set_switch_cooldown(now_ms)
+                if desired_feed_state == HTTP_FALLBACK:
+                    self._log_rate_limited(cleaned, "http_fallback_on", "warning", f"HTTP фолбэк включен для {cleaned}")
+                elif desired_feed_state == WS_OK:
+                    self._log_rate_limited(cleaned, "http_fallback_off", "info", f"HTTP фолбэк выключен для {cleaned}")
+                elif desired_feed_state == WS_DISABLED_404:
+                    self._log_rate_limited(cleaned, "ws_disabled", "warning", f"WS отключен (404) для {cleaned}")
 
     def _maybe_poll_http(self, symbol: str, now_ms: int) -> None:
         cleaned = symbol.strip().upper()
@@ -501,11 +637,14 @@ class PriceFeedManager:
             return
         with self._lock:
             state = self._symbol_state.setdefault(cleaned, {})
-            status = state.get("ws_status", WS_LOST)
+            feed_state = state.get("feed_state", WS_OK)
             last_poll = state.get("http_poll_ms", 0)
-        if status != WS_LOST:
+        if feed_state not in {HTTP_FALLBACK, WS_DISABLED_404}:
             return
-        if now_ms - last_poll < self._config.prices.refresh_interval_ms:
+        poll_interval_ms = self._get_poll_interval_ms(cleaned)
+        if poll_interval_ms <= 0:
+            return
+        if now_ms - last_poll < poll_interval_ms:
             return
         try:
             price_raw = self._http_client.get_ticker_price(cleaned)

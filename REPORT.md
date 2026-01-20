@@ -61,3 +61,13 @@
 2. Toggle DRY-RUN off, confirm LIVE mode, keep grid_count/max_active_orders at 2–4, set a small budget.
 3. Press Start and confirm the LIVE dialog; expect [LIVE] place logs and 2–4 open orders in the table.
 4. Wait 10–20 seconds and verify orders remain in Binance Open Orders and the bot table (no auto-cancel).
+
+### v7.1 WS stabilization (BBOT)
+- Corrected Binance WS base URL usage and stream formatting; added a one-time DEBUG log to verify the final WS URL.
+- Added WS anti-flapping with disabled-404 TTL, switch cooldown, and recovery hysteresis to prevent noisy reconnects.
+- Reduced HTTP polling when WS is unhealthy based on active subscribers and tuned GUI close events to stop timers.
+
+Manual checks:
+1. Open Overview → select BTCUSDT → confirm WS stream connects without HTTP 404s.
+2. Disconnect network for ~10s → observe clean fallback without rapid log spam.
+3. Close a pair window → ensure symbol polling stops within a few seconds.
