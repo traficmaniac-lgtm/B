@@ -148,6 +148,7 @@ class OpenAIClient:
             "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
             "Строго следуй схеме:\n"
             "{\n"
+ codex/implement-fullpack-data-fetching-strategy
             '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
             '  "reason_short": "<=120 chars",\n'
             '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
@@ -197,6 +198,32 @@ class OpenAIClient:
             "Всегда возвращай три профиля и recommended_profile.\n"
             "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
             "Будь краток."
+
+            '  "state": "TRADE|WAIT|DO_NOT_TRADE",\n'
+            '  "reason_short": "короткая причина",\n'
+            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
+            '  "profiles": {\n'
+            '    "AGGRESSIVE": {"strategy_patch": {...}},\n'
+            '    "BALANCED": {"strategy_patch": {...}},\n'
+            '    "CONSERVATIVE": {"strategy_patch": {...}}\n'
+            "  },\n"
+            '  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],\n'
+            '  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": "..."},\n'
+            '  "risks": ["...", "..."]\n'
+            "}\n"
+            "strategy_patch допускает поля: budget, bias, levels, step_pct, range_down_pct, "
+            "range_up_pct, take_profit_pct, max_exposure. Заполняй null для параметров, которые не нужно менять.\n"
+            "Если action содержит START или REBUILD_GRID — strategy_patch обязателен "
+            "(хотя бы одно поле должно быть задано).\n"
+            "Если datapack.user_intent содержит бюджет/шаг/tp/уровни — включи их в strategy_patch.\n"
+            "Если стакан пустой или нет market depth, state=WAIT и reason_short='нет market depth'.\n"
+            "Не запрашивай дополнительные данные — только вывод или WAIT.\n"
+            "Если is_zero_fee=true, обязательно упомяни это в reason_short или forecast.comment.\n"
+            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
+            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
+            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
+            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_exposure."
+ main
         )
 
         async def _analyze() -> str:
@@ -235,6 +262,7 @@ class OpenAIClient:
             "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
             "Строго следуй схеме:\n"
             "{\n"
+ codex/implement-fullpack-data-fetching-strategy
             '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
             '  "reason_short": "<=120 chars",\n'
             '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
@@ -284,6 +312,33 @@ class OpenAIClient:
             "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
             "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
             "Будь краток."
+
+            '  "state": "TRADE|WAIT|DO_NOT_TRADE",\n'
+            '  "reason_short": "короткая причина",\n'
+            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
+            '  "profiles": {\n'
+            '    "AGGRESSIVE": {"strategy_patch": {...}},\n'
+            '    "BALANCED": {"strategy_patch": {...}},\n'
+            '    "CONSERVATIVE": {"strategy_patch": {...}}\n'
+            "  },\n"
+            '  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],\n'
+            '  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": "..."},\n'
+            '  "risks": ["...", "..."]\n'
+            "}\n"
+            "strategy_patch допускает поля: budget, bias, levels, step_pct, range_down_pct, "
+            "range_up_pct, take_profit_pct, max_exposure. Заполняй null для параметров, которые не нужно менять.\n"
+            "Если action содержит START или REBUILD_GRID — strategy_patch обязателен "
+            "(хотя бы одно поле должно быть задано).\n"
+            "Если datapack.user_intent содержит бюджет/шаг/tp/уровни — включи их в strategy_patch.\n"
+            "Если стакан пустой или нет market depth, state=WAIT и reason_short='нет market depth'.\n"
+            "Не запрашивай дополнительные данные — только вывод или WAIT.\n"
+            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
+            "Если is_zero_fee=true, обязательно упомяни это в reason_short или forecast.comment.\n"
+            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
+            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
+            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
+            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_exposure."
+ main
         )
 
         async def _chat() -> str:
