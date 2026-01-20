@@ -9,7 +9,9 @@ from src.core.logging import get_logger
 
 _LOGGER = get_logger("ai.operator_models")
 
-_ALLOWED_STATES = {"OK", "WAIT", "DO_NOT_TRADE"}
+_ALLOWED_STATES = {"SAFE", "WARNING", "DANGER"}
+_ALLOWED_RECOMMENDATIONS = {"WAIT", "TRADE_OK", "DO_NOT_TRADE"}
+_ALLOWED_NEXT_ACTIONS = {"WAIT", "APPLY_PATCH", "START", "STOP", "ADJUST_PARAMS"}
 _ALLOWED_ACTIONS = {
     "START",
     "STOP",
@@ -54,6 +56,8 @@ class OperatorAIForecast:
 @dataclass
 class OperatorAIResult:
     state: str
+    recommendation: str
+    next_action: str
     reason_short: str
     recommended_profile: str
     profiles: dict[str, OperatorAIProfile]
@@ -92,9 +96,15 @@ def parse_ai_operator_response(text: str) -> OperatorAIResult:
 
 
 def _parse_payload(payload: dict[str, Any]) -> OperatorAIResult:
-    state = str(payload.get("state", "WAIT")).strip().upper()
-    if state not in _ALLOWED_STATES:
-        state = "WAIT"
+    state = _normalize_state(str(payload.get("state", "WARNING")).strip().upper())
+
+    recommendation = str(payload.get("recommendation", "WAIT")).strip().upper()
+    if recommendation not in _ALLOWED_RECOMMENDATIONS:
+        recommendation = "WAIT"
+
+    next_action = str(payload.get("next_action", "")).strip().upper()
+    if next_action not in _ALLOWED_NEXT_ACTIONS:
+        next_action = ""
 
     recommended_profile = str(payload.get("recommended_profile", "BALANCED")).strip().upper()
     if recommended_profile not in _ALLOWED_PROFILES:
@@ -126,8 +136,18 @@ def _parse_payload(payload: dict[str, Any]) -> OperatorAIResult:
     risks_payload = payload.get("risks")
     risks = [str(item) for item in risks_payload if item] if isinstance(risks_payload, list) else []
 
+    strategy_patch = profiles.get(recommended_profile).strategy_patch if recommended_profile in profiles else None
+    if _strategy_patch_has_values(strategy_patch):
+        next_action = "APPLY_PATCH"
+    if not next_action:
+        next_action = next((item for item in actions if item != "WAIT"), "WAIT")
+    if next_action not in actions:
+        actions = [next_action] + actions
+
     return OperatorAIResult(
         state=state,
+        recommendation=recommendation,
+        next_action=next_action,
         reason_short=reason_short,
         recommended_profile=recommended_profile,
         profiles=profiles,
@@ -156,10 +176,15 @@ def _parse_json_payload(text: str) -> dict[str, Any] | None:
 
 
 def _parse_text_protocol(text: str) -> OperatorAIResult | None:
-    state = _extract_line_value(text, "State") or "WAIT"
-    state = state.strip().upper()
-    if state not in _ALLOWED_STATES:
-        state = "WAIT"
+    state = _normalize_state(_extract_line_value(text, "State") or "WARNING")
+    recommendation = _extract_line_value(text, "Recommendation") or "WAIT"
+    recommendation = recommendation.strip().upper()
+    if recommendation not in _ALLOWED_RECOMMENDATIONS:
+        recommendation = "WAIT"
+    next_action = _extract_line_value(text, "Next_action") or _extract_line_value(text, "Next Action") or ""
+    next_action = next_action.strip().upper()
+    if next_action not in _ALLOWED_NEXT_ACTIONS:
+        next_action = ""
     actions_line = _extract_line_value(text, "Actions") or ""
     actions = _split_actions(actions_line)
     actions = _normalize_actions(actions)
@@ -171,8 +196,16 @@ def _parse_text_protocol(text: str) -> OperatorAIResult | None:
     profiles = {key: OperatorAIProfile(strategy_patch=None) for key in _ALLOWED_PROFILES}
     recommended_profile = "BALANCED"
     profiles[recommended_profile] = OperatorAIProfile(strategy_patch=patch)
+    if _strategy_patch_has_values(patch):
+        next_action = "APPLY_PATCH"
+    if not next_action:
+        next_action = next((item for item in actions if item != "WAIT"), "WAIT")
+    if next_action not in actions:
+        actions = [next_action] + actions
     return OperatorAIResult(
         state=state,
+        recommendation=recommendation,
+        next_action=next_action,
         reason_short=reason_short[:120],
         recommended_profile=recommended_profile,
         profiles=profiles,
@@ -215,6 +248,8 @@ def _extract_patch_payload(text: str) -> dict[str, Any] | None:
 def operator_ai_result_to_dict(result: OperatorAIResult) -> dict[str, Any]:
     return {
         "state": result.state,
+        "recommendation": result.recommendation,
+        "next_action": result.next_action,
         "reason_short": result.reason_short,
         "recommended_profile": result.recommended_profile,
         "profiles": {
@@ -239,7 +274,9 @@ def operator_ai_result_to_json(result: OperatorAIResult) -> str:
 def _fallback_result(reason: str) -> OperatorAIResult:
     profiles = {key: OperatorAIProfile(strategy_patch=None) for key in _ALLOWED_PROFILES}
     return OperatorAIResult(
-        state="WAIT",
+        state="WARNING",
+        recommendation="WAIT",
+        next_action="WAIT",
         reason_short=reason,
         recommended_profile="BALANCED",
         profiles=profiles,
@@ -257,6 +294,33 @@ def _normalize_actions(actions: list[str]) -> list[str]:
         if action in _ALLOWED_ACTIONS and action not in normalized:
             normalized.append(action)
     return normalized
+
+
+def _normalize_state(state: str) -> str:
+    if state in _ALLOWED_STATES:
+        return state
+    legacy = {
+        "OK": "SAFE",
+        "WAIT": "WARNING",
+        "DO_NOT_TRADE": "DANGER",
+    }
+    return legacy.get(state, "WARNING")
+
+
+def _strategy_patch_has_values(patch: StrategyPatch | None) -> bool:
+    if patch is None:
+        return False
+    values = [
+        patch.budget,
+        patch.step_pct,
+        patch.range_down_pct,
+        patch.range_up_pct,
+        patch.levels,
+        patch.tp_pct,
+        patch.bias,
+        patch.max_active_orders,
+    ]
+    return any(value is not None for value in values)
 
 
 def _parse_strategy_patch(payload: Any) -> StrategyPatch | None:

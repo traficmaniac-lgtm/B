@@ -52,20 +52,31 @@ class _WorkerSignals(QObject):
 
 
 class _Worker(QRunnable):
-    def __init__(self, fn: Callable[[], object]) -> None:
+    def __init__(self, fn: Callable[[], object], should_emit: Callable[[], bool] | None = None) -> None:
         super().__init__()
         self.signals = _WorkerSignals()
         self._fn = fn
+        self._should_emit = should_emit
 
     def run(self) -> None:
         start = perf_counter()
         try:
             result = self._fn()
         except Exception as exc:
-            self.signals.error.emit(str(exc))
+            if self._should_emit and not self._should_emit():
+                return
+            try:
+                self.signals.error.emit(str(exc))
+            except RuntimeError:
+                return
             return
         latency_ms = int((perf_counter() - start) * 1000)
-        self.signals.success.emit(result, latency_ms)
+        if self._should_emit and not self._should_emit():
+            return
+        try:
+            self.signals.success.emit(result, latency_ms)
+        except RuntimeError:
+            return
 
 
 @dataclass
@@ -562,6 +573,7 @@ class LiteGridWindow(QMainWindow):
         self._state = "IDLE"
         self._engine_state = "WAITING"
         self._ws_status = ""
+        self._closing = False
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
         self._settings_state = GridSettingsState()
@@ -1767,7 +1779,7 @@ class LiteGridWindow(QMainWindow):
         if self._balances_in_flight and not force:
             return
         self._balances_in_flight = True
-        worker = _Worker(self._account_client.get_account_info)
+        worker = _Worker(self._account_client.get_account_info, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_account_info)
         worker.signals.error.connect(self._handle_account_error)
         self._thread_pool.start(worker)
@@ -1850,7 +1862,7 @@ class LiteGridWindow(QMainWindow):
         if self._orders_in_flight and not force:
             return
         self._orders_in_flight = True
-        worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol))
+        worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_open_orders)
         worker.signals.error.connect(self._handle_open_orders_error)
         self._thread_pool.start(worker)
@@ -1865,7 +1877,10 @@ class LiteGridWindow(QMainWindow):
         if self._fills_in_flight:
             return
         self._fills_in_flight = True
-        worker = _Worker(lambda: self._account_client.get_my_trades(self._symbol, limit=50))
+        worker = _Worker(
+            lambda: self._account_client.get_my_trades(self._symbol, limit=50),
+            self._can_emit_worker_results,
+        )
         worker.signals.success.connect(self._handle_fill_poll)
         worker.signals.error.connect(self._handle_fill_poll_error)
         self._thread_pool.start(worker)
@@ -2053,7 +2068,7 @@ class LiteGridWindow(QMainWindow):
                 results.append({"status": status, "order": order, "trade": None})
             return {"results": results}
 
-        worker = _Worker(_reconcile)
+        worker = _Worker(_reconcile, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_reconcile_missing_orders)
         worker.signals.error.connect(self._handle_reconcile_error)
         self._thread_pool.start(worker)
@@ -2344,7 +2359,7 @@ class LiteGridWindow(QMainWindow):
                     results["errors"].append(restore_error)
             return results
 
-        worker = _Worker(_place)
+        worker = _Worker(_place, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_replacement_order)
         worker.signals.error.connect(self._handle_live_order_error)
         self._thread_pool.start(worker)
@@ -2715,7 +2730,7 @@ class LiteGridWindow(QMainWindow):
                 self._handle_exchange_info(cached, latency_ms=0)
                 return
         self._rules_in_flight = True
-        worker = _Worker(lambda: self._http_client.get_exchange_info_symbol(self._symbol))
+        worker = _Worker(lambda: self._http_client.get_exchange_info_symbol(self._symbol), self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_exchange_info)
         worker.signals.error.connect(self._handle_exchange_error)
         self._thread_pool.start(worker)
@@ -2723,7 +2738,7 @@ class LiteGridWindow(QMainWindow):
     def _sync_account_time(self) -> None:
         if not self._account_client:
             return
-        worker = _Worker(self._account_client.sync_time_offset)
+        worker = _Worker(self._account_client.sync_time_offset, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_time_sync)
         worker.signals.error.connect(self._handle_time_sync_error)
         self._thread_pool.start(worker)
@@ -2793,7 +2808,7 @@ class LiteGridWindow(QMainWindow):
         if not force and self._fees_last_fetch_ts and now - self._fees_last_fetch_ts < 1800:
             return
         self._fees_in_flight = True
-        worker = _Worker(lambda: self._account_client.get_trade_fees(self._symbol))
+        worker = _Worker(lambda: self._account_client.get_trade_fees(self._symbol), self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_trade_fees)
         worker.signals.error.connect(self._handle_trade_fees_error)
         self._thread_pool.start(worker)
@@ -3105,9 +3120,6 @@ class LiteGridWindow(QMainWindow):
         skip_sells = base_free <= 0
         step = self._rule_decimal(self._exchange_rules.get("step"))
         fee_rate = self._effective_fee_rate()
-        available_effective = self.as_decimal(base_free)
-        if fee_rate > 0:
-            available_effective = available_effective * (Decimal("1") - fee_rate)
         has_sells = any(order.side == "SELL" for order in planned)
         if skip_sells and has_sells:
             self._append_log(
@@ -3119,6 +3131,9 @@ class LiteGridWindow(QMainWindow):
             results: list[dict[str, Any]] = []
             errors: list[str] = []
             last_open_orders: list[dict[str, Any]] | None = None
+            available_effective = self.as_decimal(base_free)
+            if fee_rate > 0:
+                available_effective = available_effective * (Decimal("1") - fee_rate)
             for idx, order in enumerate(planned, start=1):
                 if skip_sells and order.side == "SELL":
                     continue
@@ -3164,7 +3179,7 @@ class LiteGridWindow(QMainWindow):
                         last_open_orders = None
             return {"results": results, "errors": errors, "open_orders": last_open_orders}
 
-        worker = _Worker(_place)
+        worker = _Worker(_place, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_live_order_placement)
         worker.signals.error.connect(self._handle_live_order_error)
         self._thread_pool.start(worker)
@@ -3265,7 +3280,7 @@ class LiteGridWindow(QMainWindow):
                     self._sleep_ms(250)
             return responses
 
-        worker = _Worker(_cancel)
+        worker = _Worker(_cancel, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_cancel_selected_result)
         worker.signals.error.connect(self._handle_cancel_error)
         self._thread_pool.start(worker)
@@ -3578,7 +3593,11 @@ class LiteGridWindow(QMainWindow):
         )
         self._update_auto_values_label(self._settings_state.grid_step_mode == "AUTO_ATR")
 
+    def _can_emit_worker_results(self) -> bool:
+        return not self._closing
+
     def closeEvent(self, event: object) -> None:  # noqa: N802
+        self._closing = True
         self._balances_timer.stop()
         self._orders_timer.stop()
         self._fills_timer.stop()

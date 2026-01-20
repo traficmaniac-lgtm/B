@@ -46,6 +46,8 @@ class OpenAIClient:
             reply = await self._run_with_retries(_check)
         except Exception as exc:  # noqa: BLE001
             return False, f"OpenAI self-check failed: {exc}"
+        finally:
+            await self._close_client()
 
         return True, f"OpenAI self-check ok: {reply.strip()}"
 
@@ -140,6 +142,8 @@ class OpenAIClient:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning("OpenAI analyze failed: %s", exc)
             raise
+        finally:
+            await self._close_client()
 
     async def analyze_operator(self, datapack: dict[str, Any], follow_up_note: str | None = None) -> str:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
@@ -148,7 +152,9 @@ class OpenAIClient:
 Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).
 Строго следуй схеме:
 {
-  "state": "OK|WAIT|DO_NOT_TRADE",
+  "state": "SAFE|WARNING|DANGER",
+  "recommendation": "WAIT|TRADE_OK|DO_NOT_TRADE",
+  "next_action": "WAIT|APPLY_PATCH|START|STOP|ADJUST_PARAMS",
   "reason_short": "<=120 chars",
   "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",
   "profiles": {
@@ -156,10 +162,11 @@ class OpenAIClient:
     "BALANCED": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
     "CONSERVATIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}}
   },
-  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],
+  "actions": ["WAIT", "APPLY_PATCH", "START", "STOP", "ADJUST_PARAMS"],
   "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": ""},
   "risks": ["..."]
 }
+Если есть strategy_patch с любыми изменениями, next_action должен быть APPLY_PATCH.
 Всегда возвращай три профиля и recommended_profile.
 Никаких REQUEST_MORE_DATA. Данные уже полные.
 Будь краток."""
@@ -185,6 +192,8 @@ class OpenAIClient:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning("OpenAI operator analyze failed: %s", exc)
             raise
+        finally:
+            await self._close_client()
 
     async def chat_operator(
         self,
@@ -201,7 +210,9 @@ class OpenAIClient:
 Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).
 Строго следуй схеме:
 {
-  "state": "OK|WAIT|DO_NOT_TRADE",
+  "state": "SAFE|WARNING|DANGER",
+  "recommendation": "WAIT|TRADE_OK|DO_NOT_TRADE",
+  "next_action": "WAIT|APPLY_PATCH|START|STOP|ADJUST_PARAMS",
   "reason_short": "<=120 chars",
   "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",
   "profiles": {
@@ -209,10 +220,11 @@ class OpenAIClient:
     "BALANCED": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
     "CONSERVATIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}}
   },
-  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],
+  "actions": ["WAIT", "APPLY_PATCH", "START", "STOP", "ADJUST_PARAMS"],
   "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": ""},
   "risks": ["..."]
 }
+Если есть strategy_patch с любыми изменениями, next_action должен быть APPLY_PATCH.
 Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.
 Никаких REQUEST_MORE_DATA. Данные уже полные.
 Будь краток."""
@@ -239,6 +251,8 @@ class OpenAIClient:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning("OpenAI operator chat failed: %s", exc)
             raise
+        finally:
+            await self._close_client()
 
     async def monitor_datapack(self, datapack: dict[str, Any]) -> tuple[AiResponseEnvelope, str]:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
@@ -297,6 +311,8 @@ class OpenAIClient:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning("OpenAI monitor failed: %s", exc)
             raise
+        finally:
+            await self._close_client()
 
     async def chat_adjust(
         self,
@@ -386,6 +402,8 @@ class OpenAIClient:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning("OpenAI chat adjust failed: %s", exc)
             raise
+        finally:
+            await self._close_client()
 
     async def _run_with_retries(self, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
         last_exc: Exception | None = None
@@ -413,3 +431,9 @@ class OpenAIClient:
         request_id = getattr(response, "id", None)
         self._logger.info("OpenAI response id=%s latency=%.1fms", request_id, latency_ms)
         return response
+
+    async def _close_client(self) -> None:
+        try:
+            await self._client.close()
+        except Exception as exc:  # noqa: BLE001
+            self._logger.debug("OpenAI client close ignored: %s", exc)
