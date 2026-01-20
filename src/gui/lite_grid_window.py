@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMenu,
@@ -967,7 +968,10 @@ class LiteGridWindow(QMainWindow):
         self._orders_table = QTableWidget(0, 6, self)
         self._orders_table.setHorizontalHeaderLabels(TEXT["orders_columns"])
         self._orders_table.setColumnHidden(0, True)
-        self._orders_table.horizontalHeader().setStretchLastSection(True)
+        header = self._orders_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        for column in (1, 2, 3, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self._orders_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._orders_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._orders_table.verticalHeader().setDefaultSectionSize(22)
