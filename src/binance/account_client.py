@@ -53,6 +53,20 @@ class BinanceAccountClient:
             raise ValueError("Unexpected trade fee response format")
         return [item for item in payload if isinstance(item, dict)]
 
+    def get_my_trades(self, symbol: str, limit: int = 50) -> list[dict[str, Any]]:
+        params = {"symbol": symbol, "limit": limit}
+        payload = self._request_signed("GET", "/api/v3/myTrades", params=params)
+        if not isinstance(payload, list):
+            raise ValueError("Unexpected trades response format")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def get_order(self, symbol: str, order_id: str) -> dict[str, Any]:
+        params = {"symbol": symbol, "orderId": order_id}
+        payload = self._request_signed("GET", "/api/v3/order", params=params)
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected order response format")
+        return payload
+
     def place_limit_order(
         self,
         symbol: str,
