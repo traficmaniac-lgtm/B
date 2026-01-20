@@ -1278,6 +1278,15 @@ class LiteGridWindow(QMainWindow):
             )
             self._change_state("IDLE")
             return
+        if not dry_run:
+            self._append_log(
+                (
+                    "[LIVE] TEST: MANUAL step_pct=0.01 tp_pct=0.10 levels=2 budget=100 "
+                    "(EURIUSDT/USDCUSDT) -> expect 4 orders; after FILLED BUY expect TP SELL + new BUY; "
+                    "bot_open_orders count stable; no PLACE TP skipped."
+                ),
+                kind="INFO",
+            )
         self._append_log(
             f"grid plan: buys={buy_count} sells={sell_count}",
             kind="ORDERS",
@@ -1821,21 +1830,24 @@ class LiteGridWindow(QMainWindow):
     def _is_bot_order(self, order: dict[str, Any]) -> bool:
         prefix = self._bot_order_prefix()
         client_order_id = str(order.get("clientOrderId", ""))
-        if prefix and client_order_id.startswith(prefix):
-            return True
-        order_id = str(order.get("orderId", ""))
-        if order_id and order_id in self._bot_order_ids and prefix:
-            return True
-        return False
+        return bool(prefix and client_order_id.startswith(prefix))
 
     def _bot_order_prefix(self) -> str:
         if not self._bot_session_id:
             return ""
-        return f"BBOT_LITE_{self._symbol}{self._bot_session_id}"
+        return f"BBOT_LITE_{self._symbol}_{self._bot_session_id}_"
 
     @staticmethod
     def _limit_client_order_id(client_id: str) -> str:
         return client_id[:36]
+
+    def _make_client_order_id(self, role: str, idx: int, suffix: str = "") -> str:
+        prefix = self._bot_order_prefix()
+        return self._limit_client_order_id(f"{prefix}{role}_{idx}{suffix}")
+
+    def _next_client_order_id(self, role: str, suffix: str = "") -> str:
+        self._replacement_counter += 1
+        return self._make_client_order_id(role, self._replacement_counter, suffix)
 
     def _queue_reconcile_missing_orders(self, missing: list[dict[str, Any]]) -> None:
         if not self._account_client:
@@ -2004,26 +2016,91 @@ class LiteGridWindow(QMainWindow):
         tp_pct = settings.take_profit_pct or settings.grid_step_pct
         if tp_pct <= 0:
             return
-        side = "SELL" if fill.side == "BUY" else "BUY"
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        tp_side = "SELL" if fill.side == "BUY" else "BUY"
         tp_dec = self.as_decimal(tp_pct) / Decimal("100")
         fill_price = self.as_decimal(fill.price)
-        raw_price = fill_price * (Decimal("1") + tp_dec) if side == "SELL" else fill_price * (Decimal("1") - tp_dec)
-        price = self.floor_to_tick(raw_price, self._rule_decimal(self._exchange_rules.get("tick")))
-        qty = self.floor_to_step(self.as_decimal(fill.qty), self._rule_decimal(self._exchange_rules.get("step")))
-        if self._tp_exists(side, float(price), float(qty)):
+        fill_qty = self.as_decimal(fill.qty)
+        raw_tp_price = fill_price * (Decimal("1") + tp_dec) if tp_side == "SELL" else fill_price * (Decimal("1") - tp_dec)
+        tp_price = self.q_price(raw_tp_price, tick)
+        tp_qty = self.q_qty(fill_qty, step)
+        if tp_price <= 0 or tp_qty <= 0:
             self._append_log(
-                f"[LIVE] PLACE TP skipped: exists side={side} price={price} qty={qty}",
-                kind="INFO",
+                f"[LIVE] TP skipped: invalid side={tp_side} price={tp_price} qty={tp_qty}",
+                kind="WARN",
             )
             return
-        self._replacement_counter += 1
-        client_order_id = self._limit_client_order_id(
-            f"BBOT_LITE_{self._symbol}{self._bot_session_id}{side}_{self._replacement_counter}"
-        )
+        existing_tp = self.find_matching_order(tp_side, tp_price, tp_qty, tolerance_ticks=0)
+        existing_qty = Decimal("0")
+        existing_order_id = ""
+        if existing_tp:
+            existing_order_id = str(existing_tp.get("orderId", ""))
+            existing_qty = self.q_qty(
+                self.as_decimal(self._coerce_float(str(existing_tp.get("origQty", ""))) or 0.0),
+                step,
+            )
+            merged_qty = self.q_qty(existing_qty + tp_qty, step)
+            self._append_log(
+                (
+                    "[LIVE] MERGE TP "
+                    f"price={self.fmt_price(tp_price, tick)} old_qty={self.fmt_qty(existing_qty, step)} "
+                    f"add={self.fmt_qty(tp_qty, step)} new={self.fmt_qty(merged_qty, step)}"
+                ),
+                kind="ORDERS",
+            )
+        else:
+            merged_qty = tp_qty
 
-        def _place() -> dict[str, Any] | None:
-            result, error = self._place_limit(side, price, qty, client_order_id, reason="replacement")
-            return result or {"error": error} if error else None
+        step_pct = settings.grid_step_pct or 0.0
+        reference_price = self._last_price or fill.price
+        step_abs = self.q_price(
+            self.as_decimal(reference_price) * self.as_decimal(step_pct) / Decimal("100"),
+            tick,
+        )
+        restore_side = fill.side
+        if restore_side == "BUY":
+            restore_price = self.q_price(fill_price - step_abs, tick)
+        else:
+            restore_price = self.q_price(fill_price + step_abs, tick)
+        restore_qty = self.q_qty(fill_qty, step)
+
+        tp_client_order_id = self._next_client_order_id("TP", suffix="M" if existing_tp else "")
+        restore_client_order_id = self._next_client_order_id("GRID") if restore_price > 0 else ""
+
+        def _place() -> dict[str, Any]:
+            results: dict[str, Any] = {"tp": None, "restore": None, "errors": []}
+            if existing_tp and existing_order_id:
+                try:
+                    self._account_client.cancel_order(self._symbol, existing_order_id)
+                except Exception as exc:  # noqa: BLE001
+                    results["errors"].append(self._format_cancel_exception(exc, existing_order_id))
+                self._sleep_ms(75)
+            tp_response, tp_error = self._place_limit(
+                tp_side,
+                tp_price,
+                merged_qty,
+                tp_client_order_id,
+                reason="tp_merge" if existing_tp else "tp",
+            )
+            if tp_response:
+                results["tp"] = tp_response
+            if tp_error:
+                results["errors"].append(tp_error)
+            self._sleep_ms(75)
+            if restore_price > 0 and restore_qty > 0 and restore_client_order_id:
+                restore_response, restore_error = self._place_limit(
+                    restore_side,
+                    restore_price,
+                    restore_qty,
+                    restore_client_order_id,
+                    reason="restore",
+                )
+                if restore_response:
+                    results["restore"] = restore_response
+                if restore_error:
+                    results["errors"].append(restore_error)
+            return results
 
         worker = _Worker(_place)
         worker.signals.success.connect(self._handle_replacement_order)
@@ -2031,22 +2108,24 @@ class LiteGridWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_replacement_order(self, result: object, latency_ms: int) -> None:
-        if result is None:
-            return
-        if isinstance(result, dict) and "error" in result:
-            message = str(result.get("error"))
-            if message:
-                self._append_log(message, kind="ERROR")
-                self._auto_pause_on_api_error(message)
-                self._auto_pause_on_exception(message)
-            return
         if not isinstance(result, dict):
-            self._handle_live_order_error("Unexpected replacement response")
             return
-        order_id = str(result.get("orderId", ""))
-        if order_id:
-            self._bot_order_ids.add(order_id)
-        self._append_log(f"[LIVE] PLACE TP orderId={order_id}", kind="ORDERS")
+        errors = result.get("errors", [])
+        if isinstance(errors, list):
+            for message in errors:
+                if not message:
+                    continue
+                self._append_log(str(message), kind="ERROR")
+                self._auto_pause_on_api_error(str(message))
+                self._auto_pause_on_exception(str(message))
+        for key, label in (("tp", "TP"), ("restore", "RESTORE")):
+            entry = result.get(key)
+            if not isinstance(entry, dict):
+                continue
+            order_id = str(entry.get("orderId", ""))
+            if order_id:
+                self._bot_order_ids.add(order_id)
+            self._append_log(f"[LIVE] PLACE {label} orderId={order_id}", kind="ORDERS")
         self._refresh_open_orders(force=True)
 
     def _place_limit(
@@ -2064,49 +2143,58 @@ class LiteGridWindow(QMainWindow):
         min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
         min_qty = self._rule_decimal(self._exchange_rules.get("min_qty"))
         max_qty = self._rule_decimal(self._exchange_rules.get("max_qty"))
-        price = self.floor_to_tick(price, tick)
-        qty = self.floor_to_step(qty, step)
+        price = self.q_price(price, tick)
+        qty = self.q_qty(qty, step)
         if min_qty is not None and qty < min_qty:
             self._signals.log_append.emit(
-                f"[LIVE] place skipped: minQty side={side} price={price} qty={qty} minQty={min_qty}",
+                (
+                    "[LIVE] place skipped: minQty "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+                    f"minQty={self.fmt_qty(min_qty, step)}"
+                ),
                 "WARN",
             )
             return None, None
         if max_qty is not None and qty > max_qty:
-            qty = self.floor_to_step(max_qty, step)
+            qty = self.q_qty(max_qty, step)
         notional = price * qty
         if min_notional is not None and price > 0 and notional < min_notional:
             target_qty = self.ceil_to_step(min_notional / price, step)
-            qty = self.floor_to_step(target_qty, step)
+            qty = target_qty
             if max_qty is not None and qty > max_qty:
-                qty = self.floor_to_step(max_qty, step)
+                qty = self.q_qty(max_qty, step)
             notional = price * qty
             if (min_qty is not None and qty < min_qty) or notional < min_notional:
                 self._signals.log_append.emit(
                     (
                         "[LIVE] place skipped: minNotional"
-                        f" side={side} price={price} qty={qty} notional={notional} minNotional={min_notional}"
+                        f" side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+                        f"notional={self.fmt_price(notional, None)} minNotional={self.fmt_price(min_notional, None)}"
                     ),
                     "WARN",
                 )
                 return None, None
         if price <= 0 or qty <= 0:
             self._signals.log_append.emit(
-                f"[LIVE] place skipped: invalid side={side} price={price} qty={qty}",
+                (
+                    "[LIVE] place skipped: invalid "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                ),
                 "WARN",
             )
             return None, None
         log_message = (
-            f"[LIVE] place {reason} side={side} price={price} qty={qty} notional={notional} "
-            f"tick={self._format_rule(tick)} step={self._format_rule(step)} minNotional={self._format_rule(min_notional)}"
+            f"[LIVE] place {reason} side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+            f"notional={self.fmt_price(notional, None)} tick={self._format_rule(tick)} "
+            f"step={self._format_rule(step)} minNotional={self._format_rule(min_notional)}"
         )
         self._signals.log_append.emit(log_message, "ORDERS")
         try:
             response = self._account_client.place_limit_order(
                 symbol=self._symbol,
                 side=side,
-                price=self._decimal_to_str(price),
-                quantity=self._decimal_to_str(qty),
+                price=self.fmt_price(price, tick),
+                quantity=self.fmt_qty(qty, step),
                 time_in_force="GTC",
                 new_client_order_id=client_id,
             )
@@ -2125,6 +2213,36 @@ class LiteGridWindow(QMainWindow):
     @staticmethod
     def _decimal_to_str(value: Decimal) -> str:
         return format(value, "f")
+
+    @staticmethod
+    def _decimal_places(value: Decimal) -> int:
+        if value == 0:
+            return 0
+        exponent = value.normalize().as_tuple().exponent
+        return max(-exponent, 0)
+
+    def _format_decimal(self, value: Decimal, step: Decimal | None) -> str:
+        if step is None or step <= 0:
+            return format(value, "f")
+        decimals = self._decimal_places(step)
+        quant = Decimal("1").scaleb(-decimals)
+        return format(value.quantize(quant), "f")
+
+    def q_price(self, price: Decimal, tick: Decimal | None) -> Decimal:
+        if tick is None or tick <= 0:
+            return price
+        return (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+
+    def q_qty(self, qty: Decimal, step: Decimal | None) -> Decimal:
+        if step is None or step <= 0:
+            return qty
+        return (qty / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+    def fmt_price(self, price: Decimal, tick: Decimal | None) -> str:
+        return self._format_decimal(price, tick)
+
+    def fmt_qty(self, qty: Decimal, step: Decimal | None) -> str:
+        return self._format_decimal(qty, step)
 
     @staticmethod
     def _rule_decimal(value: float | None) -> Decimal | None:
@@ -2200,19 +2318,43 @@ class LiteGridWindow(QMainWindow):
                 response_body = response.text
         return status, code, message, response_body
 
-    def _tp_exists(self, side: str, price: float, qty: float) -> bool:
-        tick = self._exchange_rules.get("tick") or 0.0
-        step = self._exchange_rules.get("step") or 0.0
-        price_tol = max(tick, 1e-8)
-        qty_tol = max(step, 1e-8)
+    def _format_cancel_exception(self, exc: Exception, order_id: str) -> str:
+        status, code, message, response_body = self._parse_binance_exception(exc)
+        return (
+            "[LIVE] cancel failed "
+            f"orderId={order_id} status={status} code={code} msg={message} response={response_body}"
+        )
+
+    def find_matching_order(
+        self,
+        side: str,
+        price: Decimal,
+        qty: Decimal,
+        tolerance_ticks: int = 0,
+    ) -> dict[str, Any] | None:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        target_price = self.q_price(price, tick)
+        target_qty = self.q_qty(qty, step)
+        tolerance = (tick or Decimal("0")) * Decimal(tolerance_ticks)
+        fallback_match: dict[str, Any] | None = None
         for order in self._open_orders:
             if str(order.get("side", "")).upper() != side:
                 continue
             order_price = self._coerce_float(str(order.get("price", ""))) or 0.0
             order_qty = self._coerce_float(str(order.get("origQty", ""))) or 0.0
-            if abs(order_price - price) <= price_tol and abs(order_qty - qty) <= qty_tol:
-                return True
-        return False
+            order_price_dec = self.q_price(self.as_decimal(order_price), tick)
+            order_qty_dec = self.q_qty(self.as_decimal(order_qty), step)
+            if tolerance > 0:
+                if abs(order_price_dec - target_price) > tolerance:
+                    continue
+            elif order_price_dec != target_price:
+                continue
+            if order_qty_dec == target_qty:
+                return order
+            if fallback_match is None:
+                fallback_match = order
+        return fallback_match
 
     def _refresh_exchange_rules(self, force: bool = False) -> None:
         if self._rules_in_flight:
@@ -2601,7 +2743,6 @@ class LiteGridWindow(QMainWindow):
             return
         if not self._bot_session_id:
             self._bot_session_id = uuid4().hex[:8]
-        prefix = self._bot_order_prefix()
         batch_size = 5
 
         def _place() -> dict[str, Any]:
@@ -2609,8 +2750,7 @@ class LiteGridWindow(QMainWindow):
             errors: list[str] = []
             last_open_orders: list[dict[str, Any]] | None = None
             for idx, order in enumerate(planned, start=1):
-                side_code = "B" if order.side == "BUY" else "S"
-                client_order_id = self._limit_client_order_id(f"{prefix}{side_code}_{idx}")
+                client_order_id = self._make_client_order_id("GRID", idx)
                 try:
                     price = self.as_decimal(order.price)
                     qty = self.as_decimal(order.qty)

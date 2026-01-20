@@ -116,14 +116,39 @@ class BinanceAccountClient:
         }
         if new_client_order_id:
             params["newClientOrderId"] = new_client_order_id
-        payload = self._request_signed("POST", "/api/v3/order", params=params, retry_on_timestamp=True)
+        try:
+            payload = self._request_signed("POST", "/api/v3/order", params=params, retry_on_timestamp=True)
+        except Exception as exc:  # noqa: BLE001
+            self._log_order_error(
+                "place",
+                exc,
+                symbol=symbol,
+                side=side,
+                price=price,
+                quantity=quantity,
+                client_order_id=new_client_order_id,
+            )
+            raise
         if not isinstance(payload, dict):
             raise ValueError("Unexpected order response format")
         return payload
 
     def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
         params = {"symbol": symbol, "orderId": order_id}
-        payload = self._request_signed("DELETE", "/api/v3/order", params=params, retry_on_timestamp=True)
+        try:
+            payload = self._request_signed("DELETE", "/api/v3/order", params=params, retry_on_timestamp=True)
+        except Exception as exc:  # noqa: BLE001
+            self._log_order_error(
+                "cancel",
+                exc,
+                symbol=symbol,
+                side=None,
+                price=None,
+                quantity=None,
+                client_order_id=None,
+                order_id=order_id,
+            )
+            raise
         if not isinstance(payload, dict):
             raise ValueError("Unexpected cancel order response format")
         return payload
@@ -151,6 +176,42 @@ class BinanceAccountClient:
         self._time_offset_ms = server_time - local_time
         self._logger.info("Time sync offset=%sms", self._time_offset_ms)
         return {"server_time": server_time, "local_time": local_time, "offset_ms": self._time_offset_ms}
+
+    def _log_order_error(
+        self,
+        action: str,
+        exc: Exception,
+        *,
+        symbol: str,
+        side: str | None,
+        price: str | None,
+        quantity: str | None,
+        client_order_id: str | None,
+        order_id: str | None = None,
+    ) -> None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        response_text = None
+        if response is not None:
+            try:
+                response_text = response.json()
+            except Exception:  # noqa: BLE001
+                response_text = response.text
+        timestamp = int(time.time() * 1000) + self._time_offset_ms
+        self._logger.error(
+            "Binance %s error status=%s response=%s symbol=%s side=%s price=%s qty=%s orderId=%s clientOrderId=%s recvWindow=%s timestamp=%s",
+            action,
+            status,
+            response_text,
+            symbol,
+            side,
+            price,
+            quantity,
+            order_id,
+            client_order_id,
+            self._recv_window,
+            timestamp,
+        )
 
     def _request_signed(
         self,
