@@ -148,6 +148,57 @@ class OpenAIClient:
             "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
             "Строго следуй схеме:\n"
             "{\n"
+ codex/implement-fullpack-data-fetching-strategy
+            '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
+            '  "reason_short": "<=120 chars",\n'
+            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
+            '  "profiles": {\n'
+            '    "AGGRESSIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "BALANCED": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "CONSERVATIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    }\n"
+            "  },\n"
+            '  "forecast": {\n'
+            '    "bias": "UP|DOWN|FLAT",\n'
+            '    "confidence": 0.0,\n'
+            '    "horizon_min": 30,\n'
+            '    "comment": "<=120 chars"\n'
+            "  },\n"
+            '  "risks": ["..."]\n'
+            "}\n"
+            "Всегда возвращай три профиля и recommended_profile.\n"
+            "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
+            "Будь краток."
+
             '  "state": "TRADE|WAIT|DO_NOT_TRADE",\n'
             '  "reason_short": "короткая причина",\n'
             '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
@@ -172,6 +223,7 @@ class OpenAIClient:
             "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
             "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
             "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_exposure."
+ main
         )
 
         async def _analyze() -> str:
@@ -210,6 +262,57 @@ class OpenAIClient:
             "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
             "Строго следуй схеме:\n"
             "{\n"
+ codex/implement-fullpack-data-fetching-strategy
+            '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
+            '  "reason_short": "<=120 chars",\n'
+            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
+            '  "profiles": {\n'
+            '    "AGGRESSIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "BALANCED": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "CONSERVATIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    }\n"
+            "  },\n"
+            '  "forecast": {\n'
+            '    "bias": "UP|DOWN|FLAT",\n'
+            '    "confidence": 0.0,\n'
+            '    "horizon_min": 30,\n'
+            '    "comment": "<=120 chars"\n'
+            "  },\n"
+            '  "risks": ["..."]\n'
+            "}\n"
+            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
+            "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
+            "Будь краток."
+
             '  "state": "TRADE|WAIT|DO_NOT_TRADE",\n'
             '  "reason_short": "короткая причина",\n'
             '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
@@ -235,6 +338,7 @@ class OpenAIClient:
             "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
             "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
             "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_exposure."
+ main
         )
 
         async def _chat() -> str:
