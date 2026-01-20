@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import Enum
 from time import perf_counter, time
 from typing import Any, Callable
 
@@ -81,6 +82,14 @@ class _LiteGridSignals(QObject):
     status_update = Signal(str, str)
 
 
+class TradeGate(Enum):
+    TRADE_OK = "ok"
+    TRADE_DISABLED_NO_KEYS = "no keys"
+    TRADE_DISABLED_AUTH = "auth error"
+    TRADE_DISABLED_READONLY = "read-only"
+    TRADE_DISABLED_NO_PERMS = "no permissions"
+
+
 class LiteGridWindow(QMainWindow):
     def __init__(
         self,
@@ -134,17 +143,18 @@ class LiteGridWindow(QMainWindow):
         self._last_price: float | None = None
         self._account_can_trade = False
         self._symbol_tradeable = False
-        self._trade_disabled_reason = ""
-        self._last_trade_disabled_reason = ""
         self._suppress_dry_run_event = False
         self._exchange_rules: dict[str, float | None] = {}
         self._trade_fees: tuple[float | None, float | None] = (None, None)
-        self._quote_asset, self._base_asset = self._infer_assets_from_symbol(self._symbol)
+        self._quote_asset = ""
+        self._base_asset = ""
         self._balances_in_flight = False
         self._balances_loaded = False
         self._orders_in_flight = False
         self._rules_in_flight = False
         self._fees_in_flight = False
+        self._auth_error = False
+        self._trade_gate = TradeGate.TRADE_DISABLED_NO_KEYS if not self._has_api_keys else TradeGate.TRADE_DISABLED_READONLY
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -166,7 +176,7 @@ class LiteGridWindow(QMainWindow):
         outer_layout.addWidget(self._build_logs())
 
         self.setCentralWidget(central)
-        self._apply_trade_status_label()
+        self._apply_trade_gate()
 
         self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
@@ -179,9 +189,8 @@ class LiteGridWindow(QMainWindow):
             self._refresh_balances()
             self._refresh_open_orders()
         else:
-            self._trade_disabled_reason = "no keys"
             self._set_account_status("no_keys")
-            self._apply_trading_permissions()
+            self._apply_trade_gate()
         self._append_log("Lite Grid Terminal opened.", kind="INFO")
 
     @property
@@ -448,6 +457,8 @@ class LiteGridWindow(QMainWindow):
                 quote="—",
                 base="—",
                 equity="—",
+                quote_asset="—",
+                base_asset="—",
             )
         )
         self._balance_quote_label.setFont(fixed_font)
@@ -618,13 +629,16 @@ class LiteGridWindow(QMainWindow):
             label.setStyleSheet("color: #9ca3af; font-size: 10px;")
 
     def _update_runtime_balances(self) -> None:
-        if self._balances_loaded:
+        if self._balances_loaded and self._quote_asset and self._base_asset:
             quote_total = self._asset_total(self._quote_asset)
             base_total = self._asset_total(self._base_asset)
-            equity = quote_total + (base_total * self._last_price if self._last_price else 0.0)
             quote_text = f"{quote_total:.2f}"
             base_text = f"{base_total:.8f}"
-            equity_text = f"{equity:.2f}"
+            if self._last_price is None:
+                equity_text = "—"
+            else:
+                equity = quote_total + (base_total * self._last_price)
+                equity_text = f"{equity:.2f}"
             used = self._open_orders_value()
             locked = used
             free = max(quote_total - used, 0.0)
@@ -639,12 +653,16 @@ class LiteGridWindow(QMainWindow):
             free_text = "—"
             locked_text = "—"
 
+        quote_asset = self._quote_asset or "—"
+        base_asset = self._base_asset or "—"
         self._balance_quote_label.setText(
             tr(
                 "runtime_account_line",
                 quote=quote_text,
                 base=base_text,
                 equity=equity_text,
+                quote_asset=quote_asset,
+                base_asset=base_asset,
             )
         )
         self._balance_bot_label.setText(
@@ -703,7 +721,7 @@ class LiteGridWindow(QMainWindow):
             f"Trade enabled state changed: live={str(not checked).lower()}.",
             kind="INFO",
         )
-        self._apply_trade_status_label()
+        self._apply_trade_gate()
 
     def _handle_start(self) -> None:
         self._append_log(f"Start pressed (dry-run={self._dry_run_toggle.isChecked()}).", kind="ORDERS")
@@ -790,9 +808,9 @@ class LiteGridWindow(QMainWindow):
         self._append_log("balances refresh tick", kind="INFO")
         if not self._account_client:
             self._balances_loaded = False
-            self._trade_disabled_reason = "no keys"
             self._set_account_status("no_keys")
             self._append_log("balances fetch skipped: no keys", kind="INFO")
+            self._apply_trade_gate()
             self._update_runtime_balances()
             return
         if self._balances_in_flight and not force:
@@ -823,6 +841,7 @@ class LiteGridWindow(QMainWindow):
         self._balances = balances
         self._balances_loaded = True
         self._set_account_status("ready")
+        self._auth_error = False
         can_trade = result.get("canTrade")
         permissions = result.get("permissions")
         self._account_can_trade = True
@@ -831,23 +850,18 @@ class LiteGridWindow(QMainWindow):
         if isinstance(permissions, list):
             if permissions:
                 self._account_can_trade = self._account_can_trade and "SPOT" in permissions
-                if "SPOT" not in permissions:
-                    self._trade_disabled_reason = "no permissions"
             else:
                 self._account_can_trade = False
-                self._trade_disabled_reason = "no permissions"
-        if not self._account_can_trade and not self._trade_disabled_reason:
-            self._trade_disabled_reason = "no permissions"
-        if self._account_can_trade:
-            self._trade_disabled_reason = ""
         self._apply_trade_fees_from_account(result)
-        self._apply_trading_permissions()
+        self._apply_trade_gate()
         self._update_runtime_balances()
-        quote_total = self._asset_total(self._quote_asset)
-        base_total = self._asset_total(self._base_asset)
+        quote_asset = self._quote_asset or "—"
+        base_asset = self._base_asset or "—"
+        quote_total = self._asset_total(quote_asset)
+        base_total = self._asset_total(base_asset)
         self._append_log(
-            f"balances updated: {self._quote_asset}={quote_total:.2f}, "
-            f"{self._base_asset}={base_total:.8f}",
+            f"balances updated: {quote_asset}={quote_total:.2f}, "
+            f"{base_asset}={base_total:.8f}",
             kind="INFO",
         )
         self._refresh_trade_fees()
@@ -857,9 +871,9 @@ class LiteGridWindow(QMainWindow):
         self._account_can_trade = False
         self._balances_loaded = False
         self._set_account_status(self._infer_account_status(message))
-        self._trade_disabled_reason = self._infer_trade_error_reason(message)
+        self._auth_error = self._is_auth_error(message)
         self._append_log(f"balances fetch failed: {message}", kind="WARN")
-        self._apply_trading_permissions()
+        self._apply_trade_gate()
         self._update_runtime_balances()
 
     def _refresh_open_orders(self, force: bool = False) -> None:
@@ -869,6 +883,7 @@ class LiteGridWindow(QMainWindow):
             self._open_orders = []
             self._render_open_orders()
             self._append_log("openOrders skipped: no keys", kind="INFO")
+            self._apply_trade_gate()
             return
         if self._orders_in_flight and not force:
             return
@@ -892,9 +907,10 @@ class LiteGridWindow(QMainWindow):
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
-        self._trade_disabled_reason = self._infer_trade_error_reason(message)
+        if self._is_auth_error(message):
+            self._auth_error = True
         self._append_log(f"openOrders fetch failed: {message}", kind="WARN")
-        self._apply_trading_permissions()
+        self._apply_trade_gate()
 
     def _refresh_exchange_rules(self) -> None:
         if self._rules_in_flight:
@@ -929,7 +945,7 @@ class LiteGridWindow(QMainWindow):
             "step": step_size,
             "min_notional": min_notional,
         }
-        self._apply_trading_permissions()
+        self._apply_trade_gate()
         self._update_rules_label()
         self._update_grid_preview()
         self._update_runtime_balances()
@@ -942,6 +958,7 @@ class LiteGridWindow(QMainWindow):
         self._rules_in_flight = False
         self._symbol_tradeable = False
         self._append_log(f"Exchange rules error: {message}", kind="ERROR")
+        self._apply_trade_gate()
         self._update_rules_label()
 
     def _refresh_trade_fees(self) -> None:
@@ -983,42 +1000,43 @@ class LiteGridWindow(QMainWindow):
         self._trade_fees = (maker / 10_000, taker / 10_000)
         self._update_rules_label()
 
-    def _apply_trading_permissions(self) -> None:
-        can_trade = self._can_trade()
-        if not can_trade:
-            if not self._trade_disabled_reason:
-                self._trade_disabled_reason = "read-only"
-            if self._trade_disabled_reason != self._last_trade_disabled_reason:
-                self._append_log(
-                    f"cannot trade: reason={self._trade_disabled_reason}",
-                    kind="WARN",
-                )
-                self._last_trade_disabled_reason = self._trade_disabled_reason
+    def _apply_trade_gate(self) -> None:
+        gate = self._determine_trade_gate()
+        if gate != self._trade_gate:
+            self._append_log(
+                f"trade_gate: {self._trade_gate.value} -> {gate.value}",
+                kind="INFO",
+            )
+            self._trade_gate = gate
+        if gate in {
+            TradeGate.TRADE_DISABLED_NO_KEYS,
+            TradeGate.TRADE_DISABLED_AUTH,
+            TradeGate.TRADE_DISABLED_NO_PERMS,
+        }:
             self._suppress_dry_run_event = True
             self._dry_run_toggle.setChecked(True)
             self._suppress_dry_run_event = False
             self._dry_run_toggle.setEnabled(False)
-            self._dry_run_toggle.setToolTip(tr("trade_disabled_tooltip"))
         else:
-            self._trade_disabled_reason = ""
-            self._last_trade_disabled_reason = ""
             self._dry_run_toggle.setEnabled(True)
-            self._dry_run_toggle.setToolTip("")
         self._apply_trade_status_label()
         self._update_grid_preview()
 
     def _apply_trade_status_label(self) -> None:
-        if not self._can_trade():
+        if self._trade_gate != TradeGate.TRADE_OK:
+            reason = self._trade_gate_reason()
             self._trade_status_label.setText(tr("trade_status_disabled"))
             self._trade_status_label.setStyleSheet(
                 "color: #dc2626; font-size: 11px; font-weight: 600;"
             )
+            self._trade_status_label.setToolTip(tr("trade_disabled_tooltip", reason=reason))
             self._set_cancel_buttons_enabled(True)
         else:
             self._trade_status_label.setText(tr("trade_status_enabled"))
             self._trade_status_label.setStyleSheet(
                 "color: #16a34a; font-size: 11px; font-weight: 600;"
             )
+            self._trade_status_label.setToolTip("")
             self._set_cancel_buttons_enabled(self._dry_run_toggle.isChecked())
 
     def _set_cancel_buttons_enabled(self, enabled: bool) -> None:
@@ -1034,14 +1052,35 @@ class LiteGridWindow(QMainWindow):
             return False
         return self._account_can_trade
 
+    def _determine_trade_gate(self) -> TradeGate:
+        if not self._has_api_keys:
+            return TradeGate.TRADE_DISABLED_NO_KEYS
+        if self._auth_error:
+            return TradeGate.TRADE_DISABLED_AUTH
+        if self._dry_run_toggle.isChecked():
+            return TradeGate.TRADE_DISABLED_READONLY
+        if not self._can_trade():
+            return TradeGate.TRADE_DISABLED_NO_PERMS
+        return TradeGate.TRADE_OK
+
+    def _trade_gate_reason(self) -> str:
+        mapping = {
+            TradeGate.TRADE_DISABLED_NO_KEYS: "no keys",
+            TradeGate.TRADE_DISABLED_AUTH: "auth error",
+            TradeGate.TRADE_DISABLED_READONLY: "read-only",
+            TradeGate.TRADE_DISABLED_NO_PERMS: "no permissions",
+        }
+        return mapping.get(self._trade_gate, "unknown")
+
     @staticmethod
-    def _infer_trade_error_reason(message: str) -> str:
+    def _is_auth_error(message: str) -> bool:
         message_lower = message.lower()
-        if "401" in message_lower or "unauthorized" in message_lower:
-            return "auth"
-        if "403" in message_lower or "forbidden" in message_lower:
-            return "auth"
-        return "read-only"
+        return (
+            "401" in message_lower
+            or "unauthorized" in message_lower
+            or "403" in message_lower
+            or "forbidden" in message_lower
+        )
 
     def _infer_account_status(self, message: str) -> str:
         message_lower = message.lower()
@@ -1347,6 +1386,7 @@ class LiteGridWindow(QMainWindow):
         range_pct = max(range_low, range_high)
         budget = float(self._budget_input.value())
         min_order = budget / levels if levels > 0 else 0.0
+        quote_ccy = self._quote_asset or "—"
         self._grid_preview_label.setText(
             tr(
                 "grid_preview",
@@ -1355,18 +1395,9 @@ class LiteGridWindow(QMainWindow):
                 range=f"{range_pct:.2f}",
                 orders=str(levels),
                 min_order=f"{min_order:.2f}",
-                quote_ccy=self._quote_asset,
+                quote_ccy=quote_ccy,
             )
         )
-
-    @staticmethod
-    def _infer_assets_from_symbol(symbol: str) -> tuple[str, str]:
-        candidates = ["USDT", "USDC", "BUSD", "BTC", "ETH", "BNB"]
-        for quote in candidates:
-            if symbol.endswith(quote):
-                base = symbol[: -len(quote)]
-                return quote, base or symbol
-        return "USDT", symbol
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
         self._balances_timer.stop()
