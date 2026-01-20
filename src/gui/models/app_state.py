@@ -19,7 +19,6 @@ class AppState:
     openai_model: str = "gpt-4o-mini"
     default_period: str = "4h"
     default_quality: str = "Standard"
-    allow_ai_more_data: bool = True
     price_ttl_ms: int = 2500
     price_refresh_ms: int = 500
     default_quote: str = "USDT"
@@ -46,7 +45,6 @@ class AppState:
         openai_model = str(data.get("openai_model", defaults.openai_model) or defaults.openai_model)
         default_period = str(data.get("default_period", defaults.default_period))
         default_quality = str(data.get("default_quality", defaults.default_quality))
-        allow_ai_more_data = bool(data.get("allow_ai_more_data", defaults.allow_ai_more_data))
         price_ttl_ms = int(data.get("price_ttl_ms", defaults.price_ttl_ms))
         price_refresh_ms = int(data.get("price_refresh_ms", defaults.price_refresh_ms))
         default_quote = str(data.get("default_quote", defaults.default_quote)).upper()
@@ -63,7 +61,6 @@ class AppState:
             openai_model=openai_model,
             default_period=default_period,
             default_quality=default_quality,
-            allow_ai_more_data=allow_ai_more_data,
             price_ttl_ms=price_ttl_ms,
             price_refresh_ms=price_refresh_ms,
             default_quote=default_quote,
@@ -84,7 +81,6 @@ class AppState:
             "openai_model": self.openai_model,
             "default_period": self.default_period,
             "default_quality": self.default_quality,
-            "allow_ai_more_data": self.allow_ai_more_data,
             "price_ttl_ms": self.price_ttl_ms,
             "price_refresh_ms": self.price_refresh_ms,
             "default_quote": self.default_quote,

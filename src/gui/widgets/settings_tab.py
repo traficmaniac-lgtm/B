@@ -94,9 +94,6 @@ class SettingsTab(QWidget):
         self._default_quote_combo.addItems(["USDT", "USDC", "FDUSD", "EUR"])
         self._default_quote_combo.setCurrentText(self._app_state.default_quote)
 
-        self._allow_ai_more_data = QCheckBox("Allow AI to request more data")
-        self._allow_ai_more_data.setChecked(self._app_state.allow_ai_more_data)
-
         self._show_logs_checkbox = QCheckBox("Show logs dock")
         self._show_logs_checkbox.setChecked(self._app_state.show_logs)
         self._show_logs_checkbox.toggled.connect(self._on_toggle_logs)
@@ -117,7 +114,6 @@ class SettingsTab(QWidget):
         form.addRow(QLabel("Price TTL (ms)"), self._price_ttl_input)
         form.addRow(QLabel("Price refresh (ms)"), self._price_refresh_input)
         form.addRow(QLabel("Default quote"), self._default_quote_combo)
-        form.addRow(self._allow_ai_more_data)
         return form
 
     def _handle_save(self) -> None:
@@ -133,7 +129,6 @@ class SettingsTab(QWidget):
         self._app_state.price_ttl_ms = self._price_ttl_input.value()
         self._app_state.price_refresh_ms = self._price_refresh_input.value()
         self._app_state.default_quote = self._default_quote_combo.currentText()
-        self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
         self._refresh_key_hints()
         api_key, api_secret = self._app_state.get_binance_keys()
         self._logger.info("binance keys present: %s", bool(api_key and api_secret))

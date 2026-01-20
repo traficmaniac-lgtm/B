@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.gui.models.app_state import AppState
-from src.gui.models.pair_workspace import DataPackSummary, DataRequest, StrategyPlan, StrategyPatch
+from src.gui.models.pair_workspace import DataPackSummary, StrategyPlan, StrategyPatch
 from src.services.ai_provider import AIProvider, apply_patch
 
 
@@ -33,7 +33,6 @@ class PairWorkspaceWindow(QMainWindow):
         self._datapack: DataPackSummary | None = None
         self._latest_plan: StrategyPlan | None = None
         self._pending_patch: StrategyPatch | None = None
-        self._latest_request: DataRequest | None = None
 
         self.setWindowTitle(f"Pair Workspace — {symbol}")
         self.resize(1200, 800)
@@ -76,11 +75,6 @@ class PairWorkspaceWindow(QMainWindow):
         self._analyze_button.clicked.connect(self._run_ai_analysis)
         self._analyze_button.setEnabled(False)
         layout.addWidget(self._analyze_button)
-
-        self._fetch_more_button = QPushButton("Fetch more data")
-        self._fetch_more_button.clicked.connect(self._fetch_more_data)
-        self._fetch_more_button.setEnabled(False)
-        layout.addWidget(self._fetch_more_button)
 
         self._apply_button = QPushButton("Apply")
         self._apply_button.clicked.connect(self._apply_latest_plan)
@@ -224,35 +218,12 @@ class PairWorkspaceWindow(QMainWindow):
             mode=self._mode_combo.currentText(),
             chat_context=self._chat_history.toPlainText().splitlines(),
         )
-        if isinstance(result, DataRequest):
-            self._latest_request = result
-            self._fetch_more_button.setEnabled(self._app_state.allow_ai_more_data)
-            self._append_chat("AI", f"Need more data: {result.reason}")
-            self._analysis_text.setText(self._format_datapack(self._datapack))
-            self._log_event("AI requested more data.")
-            return
         self._latest_plan = result
         self._apply_button.setEnabled(True)
         self._confirm_button.setEnabled(True)
         self._fill_strategy_fields(result)
         self._append_chat("AI", "AI proposed plan. Apply?")
         self._log_event("AI strategy plan ready.")
-
-    def _fetch_more_data(self) -> None:
-        if not self._datapack or not self._latest_request:
-            return
-        self._datapack = DataPackSummary(
-            symbol=self._datapack.symbol,
-            period=self._latest_request.target_period,
-            quality=self._latest_request.target_quality,
-            candles_count=self._latest_request.required_candles,
-            last_price=self._datapack.last_price,
-            volatility_est=self._datapack.volatility_est,
-        )
-        self._analysis_text.setText(self._format_datapack(self._datapack))
-        self._fetch_more_button.setEnabled(False)
-        self._append_chat("System", "Fetched more demo data. Re-running analysis.")
-        self._run_ai_analysis()
 
     def _apply_latest_plan(self) -> None:
         if not self._latest_plan:

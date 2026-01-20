@@ -14,14 +14,6 @@ class DataPackSummary:
 
 
 @dataclass
-class DataRequest:
-    reason: str
-    required_candles: int
-    target_period: str
-    target_quality: str
-
-
-@dataclass
 class StrategyPlan:
     budget: float
     mode: str
