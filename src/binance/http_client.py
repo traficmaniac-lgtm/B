@@ -81,6 +81,20 @@ class BinanceHttpClient:
             raise ValueError("Unexpected klines response format")
         return data
 
+    def get_orderbook_depth(self, symbol: str, limit: int = 50) -> dict[str, Any]:
+        symbol_clean = symbol.strip().upper()
+        data = self._request_json(f"/api/v3/depth?symbol={symbol_clean}&limit={limit}")
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected depth response format")
+        return data
+
+    def get_recent_trades(self, symbol: str, limit: int = 500) -> list[dict[str, Any]]:
+        symbol_clean = symbol.strip().upper()
+        data = self._request_json(f"/api/v3/trades?symbol={symbol_clean}&limit={limit}")
+        if not isinstance(data, list):
+            raise ValueError("Unexpected trades response format")
+        return [item for item in data if isinstance(item, dict)]
+
     def _request_json(self, path: str) -> dict[str, Any] | list[Any]:
         last_exc: Exception | None = None
         attempts = self._retries + 1
