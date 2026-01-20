@@ -190,6 +190,10 @@ class OverviewTab(QWidget):
         self._price_timer = QTimer(self)
         self._price_timer.setInterval(self._app_state.price_refresh_ms)
         self._price_timer.timeout.connect(self._refresh_prices)
+        self._search_timer = QTimer(self)
+        self._search_timer.setInterval(400)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._apply_filters)
         self._price_update_in_flight = False
         self._selected_symbol: str | None = None
         self._latest_price_update: PriceUpdate | None = None
@@ -517,6 +521,7 @@ class OverviewTab(QWidget):
             self._stop_selected_symbol_stream()
 
     def _refresh_prices(self) -> None:
+        self._update_ws_status_badge()
         selected = self._table.selectionModel().selectedRows()
         if self._price_update_in_flight or not selected:
             return
@@ -578,6 +583,15 @@ class OverviewTab(QWidget):
         self._ws_status_signals.status.emit(status, message or status)
 
     def _handle_ws_status(self, status: str, message: str) -> None:
+        self._update_ws_status_badge()
+        if status == "ERROR":
+            summary = self._summarize_error(message)
+            self._set_status_badge("WS", "✖", "LOST", "#dc2626")
+            self._logger.warning("WS status error: %s", summary)
+        return
+
+    def _update_ws_status_badge(self) -> None:
+        status = self._price_manager.get_ws_overall_status()
         if status == WS_CONNECTED:
             self._set_status_badge("WS", "✔", "OK", "#16a34a")
             return
@@ -587,10 +601,6 @@ class OverviewTab(QWidget):
         if status == WS_LOST:
             self._set_status_badge("WS", "✖", "LOST", "#dc2626")
             return
-        if status == "ERROR":
-            summary = self._summarize_error(message)
-            self._set_status_badge("WS", "✖", "LOST", "#dc2626")
-            self._logger.warning("WS status error: %s", summary)
 
     def _handle_quote_change(self, quote: str) -> None:
         self._app_state.default_quote = quote
@@ -598,7 +608,7 @@ class OverviewTab(QWidget):
         self._apply_filters()
 
     def _handle_search_text(self, _: str) -> None:
-        self._apply_filters()
+        self._search_timer.start()
 
     def _persist_app_state(self) -> None:
         if self._app_state.user_config_path is None:
