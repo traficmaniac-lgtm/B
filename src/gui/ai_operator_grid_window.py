@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.gui.i18n import TEXT, tr
+
 
 class AiOperatorGridWindow(QMainWindow):
     def __init__(self, symbol: str, parent: QWidget | None = None) -> None:
@@ -29,6 +32,8 @@ class AiOperatorGridWindow(QMainWindow):
 
         self.setWindowTitle(f"AI Operator Grid — {symbol}")
         self.resize(1050, 720)
+        self._state = "READY"
+        self._engine_state = "—"
 
         central = QWidget(self)
         outer_layout = QVBoxLayout(central)
@@ -52,17 +57,17 @@ class AiOperatorGridWindow(QMainWindow):
         self._symbol_label = QLabel(self._symbol)
         self._symbol_label.setStyleSheet("font-weight: 600; font-size: 16px;")
 
-        self._last_price_label = QLabel("LAST —")
+        self._last_price_label = QLabel(tr("last_price", price="—"))
         self._last_price_label.setStyleSheet("font-weight: 600;")
 
-        self._start_button = QPushButton("Start")
-        self._pause_button = QPushButton("Pause")
-        self._stop_button = QPushButton("Stop")
+        self._start_button = QPushButton(tr("start"))
+        self._pause_button = QPushButton(tr("pause"))
+        self._stop_button = QPushButton(tr("stop"))
         self._start_button.clicked.connect(lambda: self._log_ui_click("Start"))
         self._pause_button.clicked.connect(lambda: self._log_ui_click("Pause"))
         self._stop_button.clicked.connect(lambda: self._log_ui_click("Stop"))
 
-        self._dry_run_toggle = QPushButton("DRY-RUN")
+        self._dry_run_toggle = QPushButton(tr("dry_run"))
         self._dry_run_toggle.setCheckable(True)
         self._dry_run_toggle.setChecked(True)
         self._dry_run_toggle.clicked.connect(lambda: self._log_ui_click("DRY-RUN"))
@@ -78,6 +83,11 @@ class AiOperatorGridWindow(QMainWindow):
             "QPushButton:disabled {background: #e5e7eb; color: #9ca3af;}"
         )
 
+        self._state_badge = QLabel(f"{tr('state')}: {self._state}")
+        self._state_badge.setStyleSheet(
+            f"{badge_base} background: #111827; color: white;"
+        )
+
         row_top.addWidget(self._symbol_label)
         row_top.addWidget(self._last_price_label)
         row_top.addStretch()
@@ -85,19 +95,32 @@ class AiOperatorGridWindow(QMainWindow):
         row_top.addWidget(self._pause_button)
         row_top.addWidget(self._stop_button)
         row_top.addWidget(self._dry_run_toggle)
+        row_top.addWidget(self._state_badge)
 
-        self._feed_indicator = QLabel("HTTP — | WS — | CLOCK —")
+        self._feed_indicator = QLabel(
+            f"{tr('source_http')} ✓ | {tr('source_ws')} — | {tr('source_clock')} —"
+        )
         self._feed_indicator.setStyleSheet("color: #6b7280; font-size: 11px;")
 
-        self._age_label = QLabel("AGE —")
+        self._age_label = QLabel(tr("age", age="—"))
         self._age_label.setStyleSheet("color: #6b7280; font-size: 11px;")
-        self._latency_label = QLabel("LAT —")
+        self._latency_label = QLabel(tr("latency", latency="—"))
         self._latency_label.setStyleSheet("color: #6b7280; font-size: 11px;")
 
         row_bottom.addWidget(self._feed_indicator)
         row_bottom.addWidget(self._age_label)
         row_bottom.addWidget(self._latency_label)
         row_bottom.addStretch()
+        self._trade_status_label = QLabel(tr("trade_status_disabled"))
+        self._trade_status_label.setStyleSheet(
+            "color: #dc2626; font-size: 11px; font-weight: 600;"
+        )
+        self._engine_state_label = QLabel(f"{tr('engine')}: {self._engine_state}")
+        self._engine_state_label.setStyleSheet(
+            "color: #6b7280; font-size: 11px; font-weight: 600;"
+        )
+        row_bottom.addWidget(self._trade_status_label)
+        row_bottom.addWidget(self._engine_state_label)
 
         wrapper.addLayout(row_top)
         wrapper.addLayout(row_bottom)
@@ -133,7 +156,7 @@ class AiOperatorGridWindow(QMainWindow):
 
         self._history = QPlainTextEdit()
         self._history.setReadOnly(True)
-        self._history.appendPlainText("[AI] Watching…")
+        self._history.appendPlainText("[AI] Waiting…")
         layout.addWidget(self._history, stretch=1)
 
         input_row = QHBoxLayout()
@@ -158,31 +181,23 @@ class AiOperatorGridWindow(QMainWindow):
         return group
 
     def _build_grid_panel(self) -> QWidget:
-        group = QGroupBox("Grid Parameters")
+        group = QGroupBox(tr("grid_settings"))
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
         layout = QVBoxLayout(group)
-        layout.setSpacing(6)
 
         control_frame = QFrame()
         control_layout = QHBoxLayout(control_frame)
         control_layout.setContentsMargins(0, 0, 0, 0)
         control_label = QLabel("AI Control")
-        control_label.setStyleSheet("font-weight: 600;")
         self._ai_control_mode = QComboBox()
         self._ai_control_mode.addItems(["AUTO", "LOCKED", "OVERRIDE"])
         control_layout.addWidget(control_label)
         control_layout.addWidget(self._ai_control_mode)
         control_layout.addStretch()
 
-        self._reset_button = QPushButton("Reset defaults")
-        self._reset_button.clicked.connect(self._handle_reset_defaults)
-        self._ai_fill_button = QPushButton("AI fill")
-        self._ai_fill_button.clicked.connect(self._handle_ai_fill)
-        control_layout.addWidget(self._reset_button)
-        control_layout.addWidget(self._ai_fill_button)
         layout.addWidget(control_frame)
 
         form = QFormLayout()
@@ -193,46 +208,102 @@ class AiOperatorGridWindow(QMainWindow):
         self._budget_input.setRange(10.0, 1_000_000.0)
         self._budget_input.setDecimals(2)
         self._budget_input.setValue(100.0)
-        form.addRow("Budget (USDT)", self._budget_input)
+        form.addRow(tr("budget"), self._budget_input)
 
         self._direction_combo = QComboBox()
-        self._direction_combo.addItems(["Neutral", "Long", "Short"])
-        form.addRow("Direction/Bias", self._direction_combo)
+        self._direction_combo.addItem("Нейтрально", "Neutral")
+        self._direction_combo.addItem("Преимущественно Long", "Long-biased")
+        self._direction_combo.addItem("Преимущественно Short", "Short-biased")
+        form.addRow(tr("direction"), self._direction_combo)
 
-        self._levels_input = QSpinBox()
-        self._levels_input.setRange(2, 500)
-        self._levels_input.setValue(10)
-        form.addRow("Levels", self._levels_input)
+        self._grid_count_input = QSpinBox()
+        self._grid_count_input.setRange(2, 200)
+        self._grid_count_input.setValue(10)
+        form.addRow(tr("grid_count"), self._grid_count_input)
 
-        self._step_input = self._make_double_spin()
-        form.addRow("Step %", self._step_input)
+        self._grid_step_mode_combo = QComboBox()
+        self._grid_step_mode_combo.addItem("AUTO ATR", "AUTO_ATR")
+        self._grid_step_mode_combo.addItem("MANUAL", "MANUAL")
+        form.addRow(tr("grid_step_mode"), self._grid_step_mode_combo)
 
-        range_row = QHBoxLayout()
-        self._range_down_input = self._make_double_spin()
-        self._range_up_input = self._make_double_spin()
-        range_row.addWidget(QLabel("Down"))
-        range_row.addWidget(self._range_down_input)
-        range_row.addWidget(QLabel("Up"))
-        range_row.addWidget(self._range_up_input)
-        form.addRow("Range down/up", range_row)
+        self._grid_step_input = QDoubleSpinBox()
+        self._grid_step_input.setRange(0.000001, 10.0)
+        self._grid_step_input.setDecimals(8)
+        self._grid_step_input.setSingleStep(0.0001)
+        self._grid_step_input.setValue(0.5)
+        self._manual_override_button = QPushButton(tr("manual_override"))
+        self._manual_override_button.setFixedHeight(24)
+        grid_step_row = QHBoxLayout()
+        grid_step_row.addWidget(self._grid_step_input)
+        grid_step_row.addWidget(self._manual_override_button)
+        form.addRow(tr("grid_step"), grid_step_row)
 
-        self._take_profit_input = self._make_double_spin()
-        form.addRow("Take-profit %", self._take_profit_input)
+        self._range_mode_combo = QComboBox()
+        self._range_mode_combo.addItem("Авто", "Auto")
+        self._range_mode_combo.addItem("Ручной", "Manual")
+        form.addRow(tr("range_mode"), self._range_mode_combo)
+
+        self._range_low_input = QDoubleSpinBox()
+        self._range_low_input.setRange(0.000001, 10.0)
+        self._range_low_input.setDecimals(8)
+        self._range_low_input.setSingleStep(0.0001)
+        self._range_low_input.setValue(1.0)
+        form.addRow(tr("range_low"), self._range_low_input)
+
+        self._range_high_input = QDoubleSpinBox()
+        self._range_high_input.setRange(0.000001, 10.0)
+        self._range_high_input.setDecimals(8)
+        self._range_high_input.setSingleStep(0.0001)
+        self._range_high_input.setValue(1.0)
+        form.addRow(tr("range_high"), self._range_high_input)
+
+        self._take_profit_input = QDoubleSpinBox()
+        self._take_profit_input.setRange(0.000001, 50.0)
+        self._take_profit_input.setDecimals(8)
+        self._take_profit_input.setSingleStep(0.0001)
+        self._take_profit_input.setValue(1.0)
+        form.addRow(tr("take_profit"), self._take_profit_input)
+
+        self._auto_values_label = QLabel(tr("auto_values_line", values="—"))
+        self._auto_values_label.setStyleSheet("color: #6b7280; font-size: 10px;")
+        form.addRow("", self._auto_values_label)
+
+        stop_loss_row = QHBoxLayout()
+        self._stop_loss_toggle = QCheckBox(tr("enable"))
+        self._stop_loss_input = QDoubleSpinBox()
+        self._stop_loss_input.setRange(0.1, 100.0)
+        self._stop_loss_input.setDecimals(2)
+        self._stop_loss_input.setValue(1.0)
+        self._stop_loss_input.setEnabled(False)
+        stop_loss_row.addWidget(self._stop_loss_toggle)
+        stop_loss_row.addWidget(self._stop_loss_input)
+        form.addRow(tr("stop_loss"), stop_loss_row)
 
         self._max_orders_input = QSpinBox()
         self._max_orders_input.setRange(1, 200)
         self._max_orders_input.setValue(10)
-        form.addRow("Max active orders", self._max_orders_input)
+        form.addRow(tr("max_active_orders"), self._max_orders_input)
 
-        self._max_exposure_input = self._make_double_spin()
-        form.addRow("Max exposure", self._max_exposure_input)
+        self._order_size_combo = QComboBox()
+        self._order_size_combo.addItem("Равный", "Equal")
+        form.addRow(tr("order_size_mode"), self._order_size_combo)
 
         layout.addLayout(form)
-        layout.addStretch()
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self._reset_button = QPushButton(tr("reset_defaults"))
+        self._reset_button.clicked.connect(self._handle_reset_defaults)
+        actions.addWidget(self._reset_button)
+        layout.addLayout(actions)
+
+        self._grid_preview_label = QLabel("—")
+        self._grid_preview_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        layout.addWidget(self._grid_preview_label)
         return group
 
     def _build_runtime_panel(self) -> QWidget:
-        group = QGroupBox("Runtime")
+        group = QGroupBox(tr("runtime"))
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
@@ -244,28 +315,43 @@ class AiOperatorGridWindow(QMainWindow):
         fixed_font.setStyleHint(QFont.Monospace)
         fixed_font.setFixedPitch(True)
 
-        account_status = QLabel("Account READY")
-        account_status.setFont(fixed_font)
-        account_status.setStyleSheet("color: #16a34a; font-size: 11px; font-weight: 600;")
+        self._account_status_label = QLabel(tr("account_status_ready"))
+        self._account_status_label.setFont(fixed_font)
+        self._account_status_label.setStyleSheet(
+            "color: #16a34a; font-size: 11px; font-weight: 600;"
+        )
 
-        balances = QLabel("Quote — | Base — | Equity —")
-        balances.setFont(fixed_font)
+        self._balance_quote_label = QLabel(
+            tr(
+                "runtime_account_line",
+                quote="—",
+                base="—",
+                equity="—",
+                quote_asset="—",
+                base_asset="—",
+            )
+        )
+        self._balance_quote_label.setFont(fixed_font)
 
-        balance_state = QLabel("Used — | Free — | Locked —")
-        balance_state.setFont(fixed_font)
+        self._balance_bot_label = QLabel(tr("runtime_bot_line", used="—", free="—", locked="—"))
+        self._balance_bot_label.setFont(fixed_font)
 
-        pnl_label = QLabel("PnL —")
-        pnl_label.setFont(fixed_font)
+        self._pnl_label = QLabel(tr("pnl_no_fills"))
+        self._pnl_label.setFont(fixed_font)
+        self._pnl_label.setTextFormat(Qt.RichText)
 
-        layout.addWidget(account_status)
-        layout.addWidget(balances)
-        layout.addWidget(balance_state)
-        layout.addWidget(pnl_label)
+        self._orders_count_label = QLabel(tr("orders_count", count="0"))
+        self._orders_count_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self._orders_count_label.setFont(fixed_font)
+
+        layout.addWidget(self._account_status_label)
+        layout.addWidget(self._balance_quote_label)
+        layout.addWidget(self._balance_bot_label)
+        layout.addWidget(self._pnl_label)
+        layout.addWidget(self._orders_count_label)
 
         self._orders_table = QTableWidget(0, 6, self)
-        self._orders_table.setHorizontalHeaderLabels(
-            ["ID", "Side", "Price", "Qty", "Status", "Time"]
-        )
+        self._orders_table.setHorizontalHeaderLabels(TEXT["orders_columns"])
         self._orders_table.setColumnHidden(0, True)
         self._orders_table.horizontalHeader().setStretchLastSection(True)
         self._orders_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -275,9 +361,9 @@ class AiOperatorGridWindow(QMainWindow):
         layout.addWidget(self._orders_table)
 
         buttons = QHBoxLayout()
-        self._cancel_selected_button = QPushButton("Cancel selected")
-        self._cancel_all_button = QPushButton("Cancel all")
-        self._refresh_button = QPushButton("Refresh")
+        self._cancel_selected_button = QPushButton(tr("cancel_selected"))
+        self._cancel_all_button = QPushButton(tr("cancel_all"))
+        self._refresh_button = QPushButton(tr("refresh"))
         for button in (self._cancel_selected_button, self._cancel_all_button, self._refresh_button):
             button.setFixedHeight(28)
         self._cancel_selected_button.clicked.connect(
@@ -291,15 +377,8 @@ class AiOperatorGridWindow(QMainWindow):
         layout.addLayout(buttons)
         return group
 
-    @staticmethod
-    def _make_double_spin() -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
-        spin.setDecimals(4)
-        spin.setRange(0.0, 1_000_000.0)
-        spin.setSingleStep(0.1)
-        return spin
-
     def _handle_send(self) -> None:
+        self._log_ui_click("Send")
         text = self._command_input.text().strip()
         if not text:
             return
@@ -307,19 +386,20 @@ class AiOperatorGridWindow(QMainWindow):
         self._history.appendPlainText("[AI] (stub) received")
         self._command_input.clear()
 
-    def _handle_ai_fill(self) -> None:
-        self._history.appendPlainText("[AI] (stub) filled")
-
     def _handle_reset_defaults(self) -> None:
         self._budget_input.setValue(100.0)
         self._direction_combo.setCurrentIndex(0)
-        self._levels_input.setValue(10)
-        self._step_input.setValue(0.5)
-        self._range_down_input.setValue(1.0)
-        self._range_up_input.setValue(1.0)
+        self._grid_count_input.setValue(10)
+        self._grid_step_mode_combo.setCurrentIndex(0)
+        self._grid_step_input.setValue(0.5)
+        self._range_mode_combo.setCurrentIndex(0)
+        self._range_low_input.setValue(1.0)
+        self._range_high_input.setValue(1.0)
         self._take_profit_input.setValue(1.0)
         self._max_orders_input.setValue(10)
-        self._max_exposure_input.setValue(0.0)
+        self._stop_loss_toggle.setChecked(False)
+        self._stop_loss_input.setValue(1.0)
+        self._order_size_combo.setCurrentIndex(0)
         self._log_ui_click("Reset defaults")
 
     def _log_ui_click(self, label: str) -> None:
