@@ -1140,13 +1140,18 @@ class LiteGridWindow(QMainWindow):
         self._refresh_unrealized_pnl()
 
     def _apply_status_update(self, status: str, _: str) -> None:
-        if status == WS_CONNECTED:
+        overall_status = (
+            self._price_feed_manager.get_ws_overall_status()
+            if hasattr(self, "_price_feed_manager")
+            else status
+        )
+        if overall_status == WS_CONNECTED:
             self._ws_status = WS_CONNECTED
             self._feed_indicator.setToolTip("")
-        elif status == WS_DEGRADED:
+        elif overall_status == WS_DEGRADED:
             self._ws_status = WS_DEGRADED
             self._feed_indicator.setToolTip(tr("ws_degraded_tooltip"))
-        elif status == WS_LOST:
+        elif overall_status == WS_LOST:
             self._ws_status = WS_LOST
             self._feed_indicator.setToolTip(tr("ws_degraded_tooltip"))
         else:
