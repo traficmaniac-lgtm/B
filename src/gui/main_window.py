@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         window = LiteGridWindow(
             symbol=symbol,
             config=self._config,
+            app_state=self._app_state,
             price_feed_manager=self._price_feed_manager,
             parent=self,
         )

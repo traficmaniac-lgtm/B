@@ -359,12 +359,11 @@ class OverviewTab(QWidget):
         self._set_binance_status_error(message)
 
     def refresh_account_status(self) -> None:
-        api_key = self._app_state.binance_api_key.strip()
-        api_secret = self._app_state.binance_api_secret.strip()
+        api_key, api_secret = self._app_state.get_binance_keys()
         if not api_key or not api_secret:
             self._account_client = None
             self._account_timer.stop()
-            self._set_status_badge("Account", "✖", "LOST", "#dc2626")
+            self._set_status_badge("Account", "✖", "NOT CONNECTED", "#dc2626")
             return
         self._account_client = BinanceAccountClient(
             base_url=self._config.binance.base_url,
@@ -415,7 +414,16 @@ class OverviewTab(QWidget):
         summary = self._summarize_error(message)
         self._logger.error("Account read-only error: %s", summary)
         self._account_last_error = summary
-        self._set_status_badge("Account", "⚠", "DEGRADED", "#f59e0b")
+        message_lower = message.lower()
+        if (
+            "401" in message_lower
+            or "403" in message_lower
+            or "unauthorized" in message_lower
+            or "forbidden" in message_lower
+        ):
+            self._set_status_badge("Account", "✖", "NO PERMISSION", "#dc2626")
+            return
+        self._set_status_badge("Account", "⚠", "WARNING", "#f59e0b")
 
 
 

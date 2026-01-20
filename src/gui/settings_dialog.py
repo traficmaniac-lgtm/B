@@ -120,6 +120,8 @@ class SettingsDialog(QDialog):
             for item in self._zero_fee_symbols_input.text().replace("\n", ",").split(",")
             if item.strip()
         ]
+        api_key, api_secret = self._app_state.get_binance_keys()
+        self._logger.info("binance keys present: %s", bool(api_key and api_secret))
         if (
             previous_openai_key != self._app_state.openai_api_key
             or previous_model != self._app_state.openai_model
