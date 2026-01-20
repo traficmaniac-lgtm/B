@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QObject, QPointer, Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -21,14 +21,14 @@ class LogEmitter(QObject):
 class QtLogHandler(logging.Handler):
     def __init__(self, emitter: LogEmitter) -> None:
         super().__init__()
-        self._emitter = QPointer(emitter)
+        self._emitter = emitter
         self._enabled = True
 
     def disable(self) -> None:
         self._enabled = False
 
     def emit(self, record: logging.LogRecord) -> None:
-        if not self._enabled or self._emitter.isNull():
+        if not self._enabled:
             return
         try:
             message = self.format(record)
