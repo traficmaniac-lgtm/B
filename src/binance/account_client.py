@@ -3,12 +3,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 
 from src.core.logging import get_logger
+
+
+@dataclass
+class AccountStatus:
+    can_trade: bool
+    permissions: list[str]
+    msg: str | None
 
 
 class BinanceAccountClient:
@@ -39,6 +47,16 @@ class BinanceAccountClient:
             raise ValueError("Unexpected account response format")
         return payload
 
+    def get_account_status(self, account_info: dict[str, Any] | None = None) -> "AccountStatus":
+        try:
+            info = account_info or self.get_account_info()
+        except Exception as exc:  # noqa: BLE001
+            return AccountStatus(can_trade=False, permissions=[], msg=str(exc))
+        can_trade = bool(info.get("canTrade")) if "canTrade" in info else False
+        permissions_raw = info.get("permissions")
+        permissions = [str(item) for item in permissions_raw if isinstance(item, str)] if isinstance(permissions_raw, list) else []
+        return AccountStatus(can_trade=can_trade, permissions=permissions, msg=None)
+
     def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         params = {"symbol": symbol}
         payload = self._request_signed("GET", "/api/v3/openOrders", params=params)
@@ -60,8 +78,19 @@ class BinanceAccountClient:
             raise ValueError("Unexpected trades response format")
         return [item for item in payload if isinstance(item, dict)]
 
-    def get_order(self, symbol: str, order_id: str) -> dict[str, Any]:
-        params = {"symbol": symbol, "orderId": order_id}
+    def get_order(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        orig_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not order_id and not orig_client_order_id:
+            raise ValueError("order_id or orig_client_order_id is required")
+        params: dict[str, str] = {"symbol": symbol}
+        if orig_client_order_id:
+            params["origClientOrderId"] = orig_client_order_id
+        else:
+            params["orderId"] = str(order_id)
         payload = self._request_signed("GET", "/api/v3/order", params=params)
         if not isinstance(payload, dict):
             raise ValueError("Unexpected order response format")
