@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -53,7 +54,6 @@ class _AiWorker(QRunnable):
         self.signals.success.emit(result)
 
 
- codex/implement-fullpack-data-fetching-strategy
 
 @dataclass
 class MarketSnapshot:
@@ -92,7 +92,6 @@ class MarketSnapshotCache:
     last_good_snapshot: MarketSnapshot | None = None
 
 
- main
 class AiOperatorGridWindow(LiteGridWindow):
     def __init__(
         self,
@@ -116,7 +115,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts: float = 0.0
         self._ai_busy = False
         self._runtime_stopping = False
- codex/implement-fullpack-data-fetching-strategy
         self._last_full_pack: dict[str, Any] | None = None
         self._data_cache = DataCache()
         self._http_client = BinanceHttpClient(
@@ -135,7 +133,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._data_cache = DataCache()
         self._user_intent: dict[str, Any] = {}
         self._http_client = BinanceHttpClient()
- main
         self._cache_ttls = {
             "exchange_info": 3600.0,
             "book_ticker": 2.0,
@@ -205,7 +202,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         top_actions.addStretch()
         layout.addLayout(top_actions)
 
- codex/implement-fullpack-data-fetching-strategy
         profile_row = QHBoxLayout()
         profile_row.addWidget(QLabel("Profile"))
         self._profile_combo = QComboBox()
@@ -217,7 +213,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         layout.addLayout(profile_row)
 
 
- main
         self._ai_snapshot_label = QLabel("snapshot: —")
         self._ai_snapshot_label.setStyleSheet("color: #374151; font-size: 12px;")
         layout.addWidget(self._ai_snapshot_label)
@@ -273,12 +268,10 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_log("[AI] analyze skipped: missing OpenAI key.", "WARN")
             self._append_chat_line("AI", "Не задан ключ OpenAI.")
             return
- codex/implement-fullpack-data-fetching-strategy
         datapack = self._build_full_market_pack()
 
         snapshot = self._refresh_ai_snapshot(reason="analyze")
         datapack = self._build_ai_datapack(snapshot)
- main
         self._append_chat_line("YOU", "AI Analyze")
         self._append_log("[AI] fullpack prepared", "INFO")
         self._log_ai_fullpack_snapshot(datapack)
@@ -310,7 +303,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         except ValueError as exc:
             self._handle_ai_analyze_error(str(exc))
             return
- codex/implement-fullpack-data-fetching-strategy
         self._last_ai_response = parsed
         self._last_ai_result_json = response
         self._append_ai_response_to_chat(parsed)
@@ -326,7 +318,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions)
         self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
- main
         self._append_log("[AI] response received", "INFO")
 
     def _handle_ai_analyze_error(self, message: str) -> None:
@@ -350,11 +341,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts = now
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
- codex/implement-fullpack-data-fetching-strategy
         self._apply_strategy_patch_to_form(patch)
 
         self._apply_strategy_patch_to_ui(self._last_strategy_patch)
- main
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
 
@@ -368,7 +357,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         self._append_chat_line("YOU", message)
         self._chat_input.clear()
- codex/implement-fullpack-data-fetching-strategy
         datapack = self._build_full_market_pack()
 
         self._update_user_intent_from_message(message)
@@ -376,7 +364,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         if snapshot is None:
             snapshot = self._refresh_ai_snapshot(reason="chat")
         datapack = self._build_ai_datapack(snapshot)
- main
         current_ui_params = self.dump_settings()
         self._set_ai_busy(True)
         self._log_ai_fullpack_snapshot(datapack)
@@ -426,7 +413,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         except ValueError as exc:
             self._handle_ai_chat_error(str(exc))
             return
- codex/implement-fullpack-data-fetching-strategy
         self._last_ai_response = parsed
         self._last_ai_result_json = response
         self._append_ai_response_to_chat(parsed)
@@ -442,7 +428,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions)
         self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
- main
         self._append_log("[AI] chat response received", "INFO")
 
     def _handle_ai_chat_error(self, message: str) -> None:
@@ -518,10 +503,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._analyze_button.setEnabled(not busy)
         self._chat_input.setEnabled(not busy)
         self._send_button.setEnabled(not busy)
- codex/implement-fullpack-data-fetching-strategy
         self._update_apply_plan_state()
 
- main
 
     def _append_chat_line(self, author: str, message: str) -> None:
         if not message:
@@ -531,7 +514,6 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _append_ai_response_to_chat(self, response: AiOperatorResponse) -> None:
         lines = ["AI:"]
- codex/implement-fullpack-data-fetching-strategy
         lines.append(f"STATE: {response.state} | recommended: {response.recommended_profile}")
         lines.append(f"Reason: {response.reason_short or '—'}")
         for key in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE"):
@@ -554,7 +536,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             step = f"{patch.step_pct}" if patch.step_pct is not None else "—"
             levels = f"{patch.levels}" if patch.levels is not None else "—"
             if patch.range_down_pct is not None or patch.range_up_pct is not None:
- main
                 range_down = patch.range_down_pct if patch.range_down_pct is not None else "—"
                 range_up = patch.range_up_pct if patch.range_up_pct is not None else "—"
                 range_text = f"{range_down}..{range_up}"
@@ -565,7 +546,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             lines.append(
                 f"{key}: step={step} range={range_text} levels={levels} tp={tp} bias={bias}"
             )
- codex/implement-fullpack-data-fetching-strategy
         forecast = response.forecast
         lines.append(
             f"Forecast: {forecast.bias} {forecast.confidence:.2f} {forecast.horizon_min}m "
@@ -580,7 +560,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         lines.append(
             f"Forecast: {forecast.bias} {forecast.confidence:.2f} ({forecast.horizon_min}m)"
         )
- main
         self._append_chat_block(lines)
 
     def _append_chat_block(self, lines: list[str]) -> None:
@@ -667,7 +646,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         applied_fields: list[str] = []
         missing_fields: list[str] = []
         if patch.bias:
- codex/implement-fullpack-data-fetching-strategy
             mapping = {
                 "NEUTRAL": "Neutral",
                 "FLAT": "Neutral",
@@ -695,7 +673,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 if index >= 0:
                     self._direction_combo.setCurrentIndex(index)
                     applied_fields.append("bias")
- main
         if patch.levels is not None:
             if not hasattr(self, "_grid_count_input"):
                 self._append_log("[AI] patch field skipped: levels", "INFO")
@@ -733,7 +710,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 self._range_low_input.setValue(patch.range_down_pct)
                 applied_fields.append("range_down_pct")
         if patch.range_up_pct is not None:
- codex/implement-fullpack-data-fetching-strategy
             self._range_high_input.setValue(patch.range_up_pct)
         if patch.tp_pct is not None:
             self._take_profit_input.setValue(patch.tp_pct)
@@ -763,7 +739,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             f"[AI] ui_patch_applied fields={applied_fields} missing={missing_fields}",
             "INFO",
         )
- main
 
     def _handle_start(self) -> None:
         self._runtime_stopping = False
@@ -798,7 +773,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 return value
         return str(value)
 
- codex/implement-fullpack-data-fetching-strategy
     def _log_ai_fullpack_snapshot(self, datapack: dict[str, Any]) -> None:
         meta = datapack.get("meta") or {}
         ws_ok = meta.get("ws_ok")
@@ -834,7 +808,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         stale = snapshot.get("stale")
         fee_text = self._format_fee(fees.get("maker_fee_pct"), fees.get("taker_fee_pct"))
         spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
- main
         self._append_log(
             (
                 "[AI] fullpack built "
@@ -854,7 +827,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         )
 
     def _handle_refresh_snapshot(self) -> None:
- codex/implement-fullpack-data-fetching-strategy
         datapack = self._build_full_market_pack()
         self._last_full_pack = datapack
         self._update_ai_snapshot_label(datapack)
@@ -1057,7 +1029,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 trades_summary = self._compute_trades_summary(trades)
                 is_good_snapshot = self._is_snapshot_good(orderbook_summary, trades_summary)
         stale = stale or not is_good_snapshot
- main
         maker_fee, taker_fee = self._trade_fees
         maker_fee_pct = maker_fee * 100 if maker_fee is not None else None
         taker_fee_pct = taker_fee * 100 if taker_fee is not None else None
@@ -1070,7 +1041,6 @@ class AiOperatorGridWindow(LiteGridWindow):
 
         base_asset = self._base_asset or ""
         quote_asset = self._quote_asset or ""
- codex/implement-fullpack-data-fetching-strategy
         base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
         quote_free, _ = self._balances.get(quote_asset, (0.0, 0.0))
         equity_quote = quote_free + (base_free * last_price) if last_price else None
@@ -1178,7 +1148,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "has_rules": has_rules,
                 "has_price": last_price is not None,
             },
- main
         }
         pack = {
             "meta": {
@@ -1197,7 +1166,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "mid": mid,
                 "spread_pct": spread_pct,
             },
- codex/implement-fullpack-data-fetching-strategy
             "micro": {
                 "last_ticks": last_ticks[-60:],
                 "micro_vola_pct": micro_vola_pct,
@@ -1212,7 +1180,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             "grid_settings": grid_settings,
             "runtime": runtime,
             "user_intent": user_intent,
- main
             "fees": {
                 "maker": maker_fee_pct,
                 "taker": taker_fee_pct,
@@ -1277,7 +1244,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             "klines_1h": 60.0,
             "klines_1d": 60.0,
         }
- codex/implement-fullpack-data-fetching-strategy
         with ThreadPoolExecutor(max_workers=6) as executor:
             future_map = {
                 executor.submit(self._fetch_http_block, name, tasks[name], limits[name]): name
@@ -1303,7 +1269,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             volatility=self._compute_volatility_metrics(),
             timestamp_utc=datetime.now(timezone.utc).isoformat(),
             user_intent=dict(self._user_intent),
- main
         )
         return results, timings, errors
 
@@ -1456,7 +1421,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             "levels": levels,
         }
 
- codex/implement-fullpack-data-fetching-strategy
     def _compute_trades_1m_summary(self, trades: Any) -> dict[str, Any]:
         if not isinstance(trades, list):
             return {"n": None, "vwap": None, "buy_ratio": None, "sell_ratio": None, "volume_quote": None}
@@ -1499,7 +1463,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         vwap_numerator = 0.0
         vwap_denominator = 0.0
         last_ts = None
- main
         count = 0
         for trade in trades:
             if not isinstance(trade, dict):
@@ -1633,7 +1596,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         price = datapack.get("price") or {}
         trades = datapack.get("trades_1m") or {}
         fees = datapack.get("fees") or {}
- codex/implement-fullpack-data-fetching-strategy
         meta = datapack.get("meta") or {}
         bid = price.get("bid")
         ask = price.get("ask")
@@ -1653,7 +1615,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         trades_count = trades_summary.get("count")
         maker_fee_pct = fees.get("maker_fee_pct")
         taker_fee_pct = fees.get("taker_fee_pct")
- main
         bid_text = f"{bid:.8f}" if isinstance(bid, (int, float)) else "—"
         ask_text = f"{ask:.8f}" if isinstance(ask, (int, float)) else "—"
         spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
@@ -1664,12 +1625,10 @@ class AiOperatorGridWindow(LiteGridWindow):
         stale_text = "stale" if stale else "fresh"
         self._ai_snapshot_label.setText(
             (
- codex/implement-fullpack-data-fetching-strategy
                 f"snapshot={meta.get('ts', '—')} bid={bid_text} ask={ask_text} spread={spread_text} "
 
                 f"snapshot={snapshot_id} src={source} {stale_text} "
                 f"bid={bid_text} ask={ask_text} spread={spread_text} "
- main
                 f"trades1m={trades_text} fee(m/t)={fee_text} ws_age={ws_age_text}"
             )
         )
@@ -1711,7 +1670,6 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _apply_price_update(self, update: PriceUpdate) -> None:
         super()._apply_price_update(update)
- codex/implement-fullpack-data-fetching-strategy
 
         snapshot = self._get_ai_snapshot()
         if snapshot is None:
@@ -1734,7 +1692,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         micro_window = returns[-20:] if len(returns) >= 20 else returns
         micro_avg = sum(micro_window) / len(micro_window)
         return round(avg_return * 100, 6), round(micro_avg * 100, 6)
- main
 
     def _place_limit(
         self,
