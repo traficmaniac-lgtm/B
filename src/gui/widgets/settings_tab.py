@@ -135,6 +135,8 @@ class SettingsTab(QWidget):
         self._app_state.default_quote = self._default_quote_combo.currentText()
         self._app_state.allow_ai_more_data = self._allow_ai_more_data.isChecked()
         self._refresh_key_hints()
+        api_key, api_secret = self._app_state.get_binance_keys()
+        self._logger.info("binance keys present: %s", bool(api_key and api_secret))
         self._on_save(self._app_state)
         self._logger.info(
             "settings saved to %s",

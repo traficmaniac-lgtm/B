@@ -100,6 +100,9 @@ class AppState:
     def openai_key_present(self) -> bool:
         return bool(self.openai_api_key.strip())
 
+    def get_binance_keys(self) -> tuple[str, str]:
+        return self.binance_api_key.strip(), self.binance_api_secret.strip()
+
 
 def _parse_symbol_list(value: Any) -> list[str]:
     if isinstance(value, list):

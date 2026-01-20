@@ -34,6 +34,7 @@ from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
 from src.core.logging import get_logger
 from src.gui.i18n import TEXT, tr
+from src.gui.models.app_state import AppState
 from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
 
 
@@ -85,12 +86,14 @@ class LiteGridWindow(QMainWindow):
         self,
         symbol: str,
         config: Config,
+        app_state: AppState,
         price_feed_manager: PriceFeedManager,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._logger = get_logger("gui.lite_grid")
         self._config = config
+        self._app_state = app_state
         self._symbol = symbol.strip().upper()
         self._price_feed_manager = price_feed_manager
         self._signals = _LiteGridSignals()
@@ -103,7 +106,8 @@ class LiteGridWindow(QMainWindow):
         self._log_entries: list[tuple[str, str]] = []
         self._thread_pool = QThreadPool.globalInstance()
         self._account_client: BinanceAccountClient | None = None
-        self._has_api_keys = bool(self._config.binance.api_key and self._config.binance.api_secret)
+        api_key, api_secret = self._app_state.get_binance_keys()
+        self._has_api_keys = bool(api_key and api_secret)
         self._can_read_account = False
         self._last_account_status = ""
         self._http_client = BinanceHttpClient(
@@ -116,14 +120,15 @@ class LiteGridWindow(QMainWindow):
         if self._has_api_keys:
             self._account_client = BinanceAccountClient(
                 base_url=self._config.binance.base_url,
-                api_key=self._config.binance.api_key,
-                api_secret=self._config.binance.api_secret,
+                api_key=api_key,
+                api_secret=api_secret,
                 recv_window=self._config.binance.recv_window,
                 timeout_s=self._config.http.timeout_s,
                 retries=self._config.http.retries,
                 backoff_base_s=self._config.http.backoff_base_s,
                 backoff_max_s=self._config.http.backoff_max_s,
             )
+        self._logger.info("binance keys present: %s", self._has_api_keys)
         self._balances: dict[str, tuple[float, float]] = {}
         self._open_orders: list[dict[str, Any]] = []
         self._last_price: float | None = None
@@ -785,8 +790,9 @@ class LiteGridWindow(QMainWindow):
         self._append_log("balances refresh tick", kind="INFO")
         if not self._account_client:
             self._balances_loaded = False
+            self._trade_disabled_reason = "no keys"
             self._set_account_status("no_keys")
-            self._append_log("balances fetch failed: no keys", kind="WARN")
+            self._append_log("balances fetch skipped: no keys", kind="INFO")
             self._update_runtime_balances()
             return
         if self._balances_in_flight and not force:
@@ -822,15 +828,16 @@ class LiteGridWindow(QMainWindow):
         self._account_can_trade = True
         if can_trade is not None:
             self._account_can_trade = bool(can_trade)
-        if isinstance(permissions, list) and permissions:
-            self._account_can_trade = self._account_can_trade and "SPOT" in permissions
-            if "SPOT" not in permissions:
+        if isinstance(permissions, list):
+            if permissions:
+                self._account_can_trade = self._account_can_trade and "SPOT" in permissions
+                if "SPOT" not in permissions:
+                    self._trade_disabled_reason = "no permissions"
+            else:
+                self._account_can_trade = False
                 self._trade_disabled_reason = "no permissions"
-        elif isinstance(permissions, list) and not permissions:
-            self._account_can_trade = False
-            self._trade_disabled_reason = "no permissions"
         if not self._account_can_trade and not self._trade_disabled_reason:
-            self._trade_disabled_reason = "canTrade=false"
+            self._trade_disabled_reason = "no permissions"
         if self._account_can_trade:
             self._trade_disabled_reason = ""
         self._apply_trade_fees_from_account(result)
@@ -859,7 +866,9 @@ class LiteGridWindow(QMainWindow):
         self._append_log("orders refresh tick", kind="INFO")
         if not self._account_client:
             self._set_account_status("no_keys")
-            self._append_log("openOrders fetch failed: no keys", kind="WARN")
+            self._open_orders = []
+            self._render_open_orders()
+            self._append_log("openOrders skipped: no keys", kind="INFO")
             return
         if self._orders_in_flight and not force:
             return
@@ -875,7 +884,6 @@ class LiteGridWindow(QMainWindow):
             self._handle_open_orders_error("Unexpected open orders response")
             return
         self._open_orders = [item for item in result if isinstance(item, dict)]
-        self._set_account_status("ready")
         self._render_open_orders()
         self._append_log(
             f"open orders updated (n={len(self._open_orders)}).",
@@ -884,7 +892,6 @@ class LiteGridWindow(QMainWindow):
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
-        self._set_account_status(self._infer_account_status(message))
         self._trade_disabled_reason = self._infer_trade_error_reason(message)
         self._append_log(f"openOrders fetch failed: {message}", kind="WARN")
         self._apply_trading_permissions()
@@ -1031,9 +1038,9 @@ class LiteGridWindow(QMainWindow):
     def _infer_trade_error_reason(message: str) -> str:
         message_lower = message.lower()
         if "401" in message_lower or "unauthorized" in message_lower:
-            return "invalid keys"
+            return "auth"
         if "403" in message_lower or "forbidden" in message_lower:
-            return "no permissions"
+            return "auth"
         return "read-only"
 
     def _infer_account_status(self, message: str) -> str:
