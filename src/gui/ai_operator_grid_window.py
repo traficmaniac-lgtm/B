@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -27,7 +29,7 @@ from src.core.timeutil import utc_ms
 from src.gui.lite_grid_window import LiteGridWindow, TradeGate
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
-from src.services.price_feed_manager import PriceFeedManager
+from src.services.price_feed_manager import PriceFeedManager, PriceUpdate
 
 
 class _AiWorkerSignals(QObject):
@@ -76,6 +78,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts: float = 0.0
         self._max_exposure_warned = False
         self._ai_busy = False
+        self._runtime_stopping = False
+        self._last_ai_datapack_signature: str | None = None
         self._data_cache = DataCache()
         self._http_client = BinanceHttpClient()
         self._cache_ttls = {
@@ -130,6 +134,15 @@ class AiOperatorGridWindow(LiteGridWindow):
         top_actions.addStretch()
         layout.addLayout(top_actions)
 
+        self._ai_request_hint = QLabel("AI просит данные — нажмите Fetch requested data.")
+        self._ai_request_hint.setStyleSheet("color: #6b7280; font-size: 12px;")
+        self._ai_request_hint.setVisible(False)
+        layout.addWidget(self._ai_request_hint)
+
+        self._ai_snapshot_label = QLabel("snapshot: —")
+        self._ai_snapshot_label.setStyleSheet("color: #374151; font-size: 12px;")
+        layout.addWidget(self._ai_snapshot_label)
+
         self._chat_history = QPlainTextEdit()
         self._chat_history.setReadOnly(True)
         self._chat_history.setPlaceholderText("AI chat history will appear here.")
@@ -169,6 +182,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         datapack = self._build_ai_datapack()
         self._append_chat_line("YOU", "AI Analyze")
         self._append_log("[AI] datapack prepared", "INFO")
+        self._log_ai_datapack_snapshot(datapack)
+        self._last_ai_datapack_signature = self._datapack_signature(datapack)
         self._set_ai_busy(True)
         worker = _AiWorker(lambda: self._run_ai_analyze(datapack))
         worker.signals.success.connect(self._handle_ai_analyze_success)
@@ -243,6 +258,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         datapack = self._build_ai_datapack()
         current_ui_params = self.dump_settings()
         self._set_ai_busy(True)
+        self._log_ai_datapack_snapshot(datapack)
+        self._last_ai_datapack_signature = self._datapack_signature(datapack)
         worker = _AiWorker(
             lambda: self._run_ai_chat_adjust(
                 datapack=datapack,
@@ -449,6 +466,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         should_show = self._can_fetch_requested_data()
         self._fetch_data_button.setVisible(should_show)
         self._fetch_data_button.setEnabled(should_show and not self._ai_busy)
+        if hasattr(self, "_ai_request_hint"):
+            self._ai_request_hint.setVisible(should_show)
 
     def _can_fetch_requested_data(self) -> bool:
         if not self._last_ai_response:
@@ -490,23 +509,43 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._handle_fetch_requested_data_error("Unexpected fetch response.")
             return
         results: dict[str, tuple[bool, str | None]] = payload
-        orderbook_ok, orderbook_err = results.get("orderbook_depth_50", (False, None))
-        trades_ok, trades_err = results.get("recent_trades_1m", (False, None))
+        _, orderbook_err = results.get("orderbook_depth_50", (False, None))
+        _, trades_err = results.get("recent_trades_1m", (False, None))
         if orderbook_err:
             self._append_log(f"[AI] orderbook fetch failed: {orderbook_err}", "WARN")
         if trades_err:
             self._append_log(f"[AI] trades fetch failed: {trades_err}", "WARN")
-        orderbook_status = "OK" if orderbook_ok else "FAIL"
-        trades_status = "OK" if trades_ok else "FAIL"
+        datapack = self._build_ai_datapack()
+        orderbook_summary = datapack.get("orderbook_summary") or {}
+        trades_summary = datapack.get("trades_1m_summary") or {}
+        bids = orderbook_summary.get("bid_count")
+        asks = orderbook_summary.get("ask_count")
+        spread_pct = orderbook_summary.get("spread_pct")
+        trades_count = trades_summary.get("count")
+        spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
         self._append_log(
-            f"[AI] requested data fetched: orderbook={orderbook_status} trades={trades_status}",
+            (
+                "[AI] requested data fetched: "
+                f"bids={bids or 0} asks={asks or 0} spread={spread_text} trades_1m={trades_count or 0}"
+            ),
             "INFO",
         )
         self._append_chat_line(
             "AI",
-            f"Получены данные: стакан={orderbook_status}, трейды={trades_status}",
+            (
+                "Получены данные: "
+                f"bids={bids or 0} asks={asks or 0} spread={spread_text} trades_1m={trades_count or 0}"
+            ),
         )
-        datapack = self._build_ai_datapack()
+        self._update_ai_snapshot_label(datapack)
+        self._log_ai_datapack_snapshot(datapack)
+        signature = self._datapack_signature(datapack)
+        if signature == self._last_ai_datapack_signature:
+            self._set_ai_busy(False)
+            self._append_log("[AI] follow-up skipped (dedup/no changes)", "INFO")
+            self._update_fetch_data_button()
+            return
+        self._last_ai_datapack_signature = signature
         worker = _AiWorker(lambda: self._run_ai_follow_up(datapack))
         worker.signals.success.connect(self._handle_ai_follow_up_success)
         worker.signals.error.connect(self._handle_ai_follow_up_error)
@@ -557,6 +596,14 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_log(f"[AI] follow-up response invalid: {message}", "WARN")
         self._append_chat_line("AI", f"Ошибка AI: {message}")
         self._update_fetch_data_button()
+
+    def _handle_start(self) -> None:
+        self._runtime_stopping = False
+        super()._handle_start()
+
+    def _handle_stop(self) -> None:
+        self._runtime_stopping = True
+        super()._handle_stop()
 
     def _fetch_orderbook_depth_cached(self) -> tuple[bool, str | None]:
         cached = self._get_cached_data("orderbook_depth_50")
@@ -642,6 +689,31 @@ class AiOperatorGridWindow(LiteGridWindow):
                 return value
         return str(value)
 
+    def _datapack_signature(self, datapack: dict[str, Any]) -> str:
+        snapshot = datapack.get("snapshot") or {}
+        payload = {
+            "orderbook_summary": datapack.get("orderbook_summary"),
+            "trades_1m_summary": datapack.get("trades_1m_summary"),
+            "flags": snapshot.get("flags"),
+            "fees": datapack.get("fees"),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _log_ai_datapack_snapshot(self, datapack: dict[str, Any]) -> None:
+        snapshot = datapack.get("snapshot") or {}
+        flags = snapshot.get("flags") or {}
+        has_orderbook = flags.get("has_orderbook")
+        has_trades = flags.get("has_trades_1m")
+        fees = datapack.get("fees") or {}
+        is_zero_fee = fees.get("is_zero_fee")
+        self._append_log(
+            (
+                "[AI] datapack snapshot: "
+                f"has_orderbook={has_orderbook} has_trades_1m={has_trades} is_zero_fee={is_zero_fee}"
+            ),
+            "INFO",
+        )
+
     def build_market_snapshot(self, symbol: str, use_cache: bool = True) -> dict[str, Any]:
         snapshot = self._price_feed_manager.get_snapshot(symbol)
         last_price = self._last_price or (snapshot.last_price if snapshot else None)
@@ -676,6 +748,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         spread_pct = market_snapshot.get("spread_pct")
         atr_pct, micro_vol_pct = self._compute_volatility_metrics()
         maker_fee, taker_fee = self._trade_fees
+        maker_fee_pct = maker_fee * 100 if maker_fee is not None else None
+        taker_fee_pct = taker_fee * 100 if taker_fee is not None else None
         is_zero_fee = bool(
             maker_fee is not None
             and taker_fee is not None
@@ -688,15 +762,51 @@ class AiOperatorGridWindow(LiteGridWindow):
         quote_free, quote_locked = self._balances.get(quote_asset, (0.0, 0.0))
         orderbook = market_snapshot.get("orderbook")
         trades_1m = market_snapshot.get("trades_1m")
-        orderbook_snapshot = {
-            "bids": [{"price": best_bid, "qty": None}] if best_bid is not None else [],
-            "asks": [{"price": best_ask, "qty": None}] if best_ask is not None else [],
-            "depth": 1,
-            "source": market_snapshot.get("source"),
+        orderbook_summary = self._compute_orderbook_summary(orderbook, best_bid, best_ask)
+        trades_summary = self._compute_trades_summary(trades_1m)
+        has_orderbook = bool(
+            orderbook_summary.get("bid_count")
+            or orderbook_summary.get("ask_count")
+            or orderbook_summary.get("best_bid") is not None
+            or orderbook_summary.get("best_ask") is not None
+        )
+        has_trades_1m = bool(trades_summary.get("count"))
+        has_fees = maker_fee_pct is not None and taker_fee_pct is not None
+        has_balances = self._quote_asset != "" or self._base_asset != ""
+        has_rules = bool(self._exchange_rules)
+        ws_age_ms = market_snapshot.get("price_age_ms")
+        datapack_snapshot = {
+            "price_last": last_price,
+            "price_source": market_snapshot.get("source"),
+            "ws_age_ms": ws_age_ms,
+            "fees": {
+                "maker_fee_pct": maker_fee_pct,
+                "taker_fee_pct": taker_fee_pct,
+                "is_zero_fee": is_zero_fee,
+            },
+            "orderbook_summary": orderbook_summary,
+            "trades_1m_summary": trades_summary,
+            "balances": {
+                "quote_free": quote_free,
+                "base_free": base_free,
+                "quote_locked": quote_locked,
+                "base_locked": base_locked,
+            },
+            "rules": {
+                "tickSize": self._exchange_rules.get("tick"),
+                "stepSize": self._exchange_rules.get("step"),
+                "minQty": self._exchange_rules.get("min_qty"),
+                "minNotional": self._exchange_rules.get("min_notional"),
+            },
+            "flags": {
+                "has_orderbook": has_orderbook,
+                "has_trades_1m": has_trades_1m,
+                "has_fees": has_fees,
+                "has_balances": has_balances,
+                "has_rules": has_rules,
+                "has_price": last_price is not None,
+            },
         }
-        orderbook_top_count = len(orderbook_snapshot["bids"]) + len(orderbook_snapshot["asks"])
-        depth_levels = orderbook.get("level_count") if isinstance(orderbook, dict) else None
-        trades_count = trades_1m.get("count") if isinstance(trades_1m, dict) else None
         return {
             "symbol": self._symbol,
             "market": {
@@ -707,31 +817,9 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "atr_pct": atr_pct,
                 "micro_vol_pct": micro_vol_pct,
             },
-            "orderbook_snapshot": orderbook_snapshot,
-            "orderbook": orderbook,
-            "trades_1m": trades_1m,
-            "flags": {
-                "has_orderbook": orderbook is not None,
-                "has_trades_1m": trades_1m is not None,
-            },
-            "rules": {
-                "tick": self._exchange_rules.get("tick"),
-                "step": self._exchange_rules.get("step"),
-                "min_qty": self._exchange_rules.get("min_qty"),
-                "min_notional": self._exchange_rules.get("min_notional"),
-            },
-            "balances": {
-                "quote": {
-                    "asset": quote_asset,
-                    "free": quote_free,
-                    "used": quote_locked,
-                },
-                "base": {
-                    "asset": base_asset,
-                    "free": base_free,
-                    "used": base_locked,
-                },
-            },
+            "orderbook_summary": orderbook_summary,
+            "trades_1m_summary": trades_summary,
+            "snapshot": datapack_snapshot,
             "grid_settings": self.dump_settings(),
             "runtime": {
                 "state": self._state,
@@ -740,27 +828,121 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "trade_gate": self._trade_gate.value,
             },
             "fees": {
-                "maker_fee": maker_fee,
-                "taker_fee": taker_fee,
+                "maker_fee_pct": maker_fee_pct,
+                "taker_fee_pct": taker_fee_pct,
                 "is_zero_fee": is_zero_fee,
-            },
-            "liquidity_hint": {
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "spread_pct": spread_pct,
-                "depth_levels": depth_levels,
-                "trades_count_1m": trades_count,
-            },
-            "liquidity_hints": {
-                "orderbook_topN_count": orderbook_top_count,
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "spread_pct": spread_pct,
             },
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "price_age_ms": market_snapshot.get("price_age_ms"),
             "latency_ms": market_snapshot.get("latency_ms"),
         }
+
+    def _compute_orderbook_summary(
+        self,
+        orderbook: Any,
+        fallback_bid: float | None,
+        fallback_ask: float | None,
+    ) -> dict[str, float | int | None]:
+        has_depth = isinstance(orderbook, dict)
+        bids_raw = orderbook.get("bids") if has_depth else None
+        asks_raw = orderbook.get("asks") if has_depth else None
+        bids = bids_raw if isinstance(bids_raw, list) else []
+        asks = asks_raw if isinstance(asks_raw, list) else []
+        best_bid = None
+        best_ask = None
+        if bids:
+            first_bid = bids[0]
+            if isinstance(first_bid, list) and first_bid:
+                best_bid = self._coerce_depth_value(first_bid[0])
+        if asks:
+            first_ask = asks[0]
+            if isinstance(first_ask, list) and first_ask:
+                best_ask = self._coerce_depth_value(first_ask[0])
+        if isinstance(best_bid, str):
+            best_bid = None
+        if isinstance(best_ask, str):
+            best_ask = None
+        if best_bid is None:
+            best_bid = fallback_bid
+        if best_ask is None:
+            best_ask = fallback_ask
+        bid_count = len(bids) if has_depth else None
+        ask_count = len(asks) if has_depth else None
+        mid = None
+        spread_pct = None
+        if isinstance(best_bid, (int, float)) and isinstance(best_ask, (int, float)) and best_bid > 0:
+            mid = (best_bid + best_ask) / 2
+            spread_pct = (best_ask - best_bid) / best_bid * 100
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bid_count": bid_count,
+            "ask_count": ask_count,
+            "mid": mid,
+            "spread_pct": spread_pct,
+        }
+
+    def _compute_trades_summary(self, trades_1m: Any) -> dict[str, float | int | None]:
+        if not isinstance(trades_1m, dict):
+            return {"count": None, "last_ts": None, "vwap_1m": None}
+        items = trades_1m.get("items")
+        if not isinstance(items, list):
+            return {"count": trades_1m.get("count"), "last_ts": None, "vwap_1m": None}
+        vwap_numerator = 0.0
+        vwap_denominator = 0.0
+        last_ts = None
+        count = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            price = item.get("price")
+            qty = item.get("qty")
+            ts = item.get("ts")
+            try:
+                price_val = float(price)
+                qty_val = float(qty)
+            except (TypeError, ValueError):
+                continue
+            vwap_numerator += price_val * qty_val
+            vwap_denominator += qty_val
+            count += 1
+            if isinstance(ts, int):
+                last_ts = ts if last_ts is None else max(last_ts, ts)
+        vwap = vwap_numerator / vwap_denominator if vwap_denominator > 0 else None
+        return {"count": count, "last_ts": last_ts, "vwap_1m": vwap}
+
+    def _update_ai_snapshot_label(self, datapack: dict[str, Any]) -> None:
+        orderbook_summary = datapack.get("orderbook_summary") or {}
+        trades_summary = datapack.get("trades_1m_summary") or {}
+        fees = datapack.get("fees") or {}
+        ws_age_ms = datapack.get("snapshot", {}).get("ws_age_ms")
+        bid = orderbook_summary.get("best_bid")
+        ask = orderbook_summary.get("best_ask")
+        spread_pct = orderbook_summary.get("spread_pct")
+        trades_count = trades_summary.get("count")
+        maker_fee_pct = fees.get("maker_fee_pct")
+        taker_fee_pct = fees.get("taker_fee_pct")
+        bid_text = f"{bid:.8f}" if isinstance(bid, (int, float)) else "—"
+        ask_text = f"{ask:.8f}" if isinstance(ask, (int, float)) else "—"
+        spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
+        trades_text = str(trades_count or 0)
+        fee_text = (
+            f"{maker_fee_pct:.4f}%/{taker_fee_pct:.4f}%"
+            if isinstance(maker_fee_pct, (int, float)) and isinstance(taker_fee_pct, (int, float))
+            else "—"
+        )
+        ws_age_text = f"{ws_age_ms}ms" if isinstance(ws_age_ms, int) else "—"
+        self._ai_snapshot_label.setText(
+            (
+                f"bid={bid_text} ask={ask_text} spread={spread_text} "
+                f"trades1m={trades_text} fee(m/t)={fee_text} ws_age={ws_age_text}"
+            )
+        )
+
+    def _apply_price_update(self, update: PriceUpdate) -> None:
+        super()._apply_price_update(update)
+        datapack = self._build_ai_datapack()
+        self._update_ai_snapshot_label(datapack)
 
     def _compute_volatility_metrics(self) -> tuple[float | None, float | None]:
         prices = self._price_history[-200:]
@@ -778,3 +960,187 @@ class AiOperatorGridWindow(LiteGridWindow):
         micro_window = returns[-20:] if len(returns) >= 20 else returns
         micro_avg = sum(micro_window) / len(micro_window)
         return round(avg_return * 100, 6), round(micro_avg * 100, 6)
+
+    def _place_limit(
+        self,
+        side: str,
+        price: Decimal,
+        qty: Decimal,
+        client_id: str,
+        reason: str,
+        *,
+        ignore_order_id: str | None = None,
+        ignore_keys: set[str] | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if self._runtime_stopping:
+            self._signals.log_append.emit("[LIVE] place skipped: stopping=true", "WARN")
+            return None, None
+        if not self._account_client:
+            return None, "[LIVE] place skipped: no account client"
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
+        min_qty = self._rule_decimal(self._exchange_rules.get("min_qty"))
+        max_qty = self._rule_decimal(self._exchange_rules.get("max_qty"))
+        price = self.q_price(price, tick)
+        qty = self.q_qty(qty, step)
+        if min_qty is not None and qty < min_qty:
+            self._signals.log_append.emit(
+                (
+                    "[LIVE] place skipped: minQty "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+                    f"minQty={self.fmt_qty(min_qty, step)}"
+                ),
+                "WARN",
+            )
+            return None, None
+        if max_qty is not None and qty > max_qty:
+            qty = self.q_qty(max_qty, step)
+        notional = price * qty
+        if min_notional is not None and price > 0 and notional < min_notional:
+            target_qty = self.ceil_to_step(min_notional / price, step)
+            qty = target_qty
+            if max_qty is not None and qty > max_qty:
+                qty = self.q_qty(max_qty, step)
+            notional = price * qty
+            if (min_qty is not None and qty < min_qty) or notional < min_notional:
+                self._signals.log_append.emit(
+                    (
+                        "[LIVE] place skipped: minNotional"
+                        f" side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+                        f"notional={self.fmt_price(notional, None)} minNotional={self.fmt_price(min_notional, None)}"
+                    ),
+                    "WARN",
+                )
+                return None, None
+        if price <= 0 or qty <= 0:
+            self._signals.log_append.emit(
+                (
+                    "[LIVE] place skipped: invalid "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                ),
+                "WARN",
+            )
+            return None, None
+        if not self._passes_balance_guard(side, price, qty):
+            return None, None
+        key = self._order_key(side, price, qty)
+        if self._has_duplicate_order(
+            side,
+            price,
+            qty,
+            tolerance_ticks=0,
+            ignore_order_id=ignore_order_id,
+            ignore_keys=ignore_keys,
+        ):
+            self._signals.log_append.emit(
+                (
+                    f"[LIVE] SKIP duplicate key {key} "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                ),
+                "WARN",
+            )
+            return None, None
+        log_message = (
+            f"[LIVE] place {reason} side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+            f"notional={self.fmt_price(notional, None)} tick={self._format_rule(tick)} "
+            f"step={self._format_rule(step)} minNotional={self._format_rule(min_notional)}"
+        )
+        self._signals.log_append.emit(log_message, "ORDERS")
+        try:
+            response = self._account_client.place_limit_order(
+                symbol=self._symbol,
+                side=side,
+                price=self.fmt_price(price, tick),
+                quantity=self.fmt_qty(qty, step),
+                time_in_force="GTC",
+                new_client_order_id=client_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            status, code, message, response_body = self._parse_binance_exception(exc)
+            if code == -2010:
+                reason_tag = self._classify_2010_reason(message)
+                if reason_tag == "DUPLICATE":
+                    self._signals.log_append.emit(
+                        (
+                            "[LIVE] duplicate order skipped "
+                            f"status={status} code={code} msg={message} response={response_body}"
+                        ),
+                        "WARN",
+                    )
+                    return None, None
+                if reason_tag == "INSUFFICIENT_BALANCE":
+                    self._signals.log_append.emit(
+                        (
+                            "[LIVE] order rejected: reason=INSUFFICIENT_BALANCE "
+                            f"status={status} code={code} msg={message} response={response_body}"
+                        ),
+                        "WARN",
+                    )
+                    return None, None
+                self._signals.log_append.emit(
+                    (
+                        "[LIVE] order rejected: reason=UNKNOWN_2010 "
+                        f"status={status} code={code} msg={message} response={response_body}"
+                    ),
+                    "WARN",
+                )
+                return None, None
+            message = self._format_binance_exception(
+                exc,
+                context=f"place {reason}",
+                side=side,
+                price=price,
+                qty=qty,
+                notional=notional,
+            )
+            return None, message
+        return response, None
+
+    def _passes_balance_guard(self, side: str, price: Decimal, qty: Decimal) -> bool:
+        base_asset = self._base_asset
+        quote_asset = self._quote_asset
+        base_free = 0.0
+        quote_free = 0.0
+        if base_asset:
+            base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
+        if quote_asset:
+            quote_free, _ = self._balances.get(quote_asset, (0.0, 0.0))
+        taker_fee = self._trade_fees[1] or 0.0
+        required_quote = float(price * qty) * (1 + taker_fee)
+        safety_quote = max(required_quote * 0.005, 1.0)
+        if side.upper() == "BUY":
+            if quote_free < required_quote + safety_quote:
+                self._signals.log_append.emit(
+                    (
+                        "[LIVE] order rejected: reason=INSUFFICIENT_BALANCE "
+                        f"side=BUY required={required_quote:.6f} {quote_asset} "
+                        f"free={quote_free:.6f} buffer={safety_quote:.6f}"
+                    ),
+                    "WARN",
+                )
+                return False
+            return True
+        required_base = float(qty)
+        min_base_buffer = (1.0 / float(price)) if price > 0 else 0.0
+        safety_base = max(required_base * 0.005, min_base_buffer)
+        if base_free < required_base + safety_base:
+            self._signals.log_append.emit(
+                (
+                    "[LIVE] order rejected: reason=INSUFFICIENT_BALANCE "
+                    f"side=SELL required={required_base:.6f} {base_asset} "
+                    f"free={base_free:.6f} buffer={safety_base:.6f}"
+                ),
+                "WARN",
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _classify_2010_reason(message: str) -> str:
+        lowered = (message or "").lower()
+        if "duplicate" in lowered:
+            return "DUPLICATE"
+        if "insufficient balance" in lowered:
+            return "INSUFFICIENT_BALANCE"
+        return "UNKNOWN_2010"
