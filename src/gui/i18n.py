@@ -46,7 +46,7 @@ TEXT = {
     "account_status_checking": "ACCOUNT: CHECKING",
     "runtime_account_line": "Quote({quote_asset}) {quote} | Base({base_asset}) {base} | Equity({quote_asset}) {equity}",
     "runtime_bot_line": "Bot: Used {used} | Free {free} | Locked {locked}",
-    "pnl_line": "PnL: U {unreal} | R {real} | <b>T {total}</b>",
+    "pnl_line": "Realized PnL (USDT): {real} | Fees (USDT): {fees} | Unrealized PnL (USDT): {unreal}",
     "orders": "Ордера",
     "orders_count": "Открытых ордеров: {count}",
     "orders_columns": ["ID", "Side", "Price", "Qty", "Filled", "Age"],
@@ -85,7 +85,7 @@ TEXT = {
     "stop_cancel_orders": "Отменить ордера бота",
     "trade_disabled_reason_spot": "Enable Spot Trading in API key settings",
     "trade_disabled_reason_confirm": "Confirm LIVE mode to trade",
-    "pnl_no_fills": "PnL: — (no fills data yet)",
+    "pnl_no_fills": "Realized PnL (USDT): — | Fees (USDT): — | Unrealized PnL (USDT): —",
 }
 
 

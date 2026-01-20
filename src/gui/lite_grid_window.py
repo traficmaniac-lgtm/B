@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+from collections import deque
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
@@ -121,6 +123,20 @@ class TradeFill:
     commission_asset: str
     time_ms: int
     order_id: str
+    trade_id: str
+
+
+@dataclass
+class BaseLot:
+    qty: float
+    cost_per_unit: float
+    trade_id: str
+
+
+@dataclass
+class BaseLot:
+    qty: float
+    cost_per_unit: float
 
 
 class GridEngine:
@@ -542,7 +558,8 @@ class LiteGridWindow(QMainWindow):
         self._open_orders: list[dict[str, Any]] = []
         self._open_orders_all: list[dict[str, Any]] = []
         self._bot_order_ids: set[str] = set()
-        self._processed_fills: set[str] = set()
+        self._bot_order_keys: set[str] = set()
+        self._fill_keys: set[str] = set()
         self._bot_session_id: str | None = None
         self._last_price: float | None = None
         self._price_history: list[float] = []
@@ -568,6 +585,7 @@ class LiteGridWindow(QMainWindow):
         self._live_settings: GridSettingsState | None = None
         self._open_orders_map: dict[str, dict[str, Any]] = {}
         self._fills: list[TradeFill] = []
+        self._base_lots: deque[BaseLot] = deque()
         self._fills_in_flight = False
         self._seen_trade_ids: set[str] = set()
         self._realized_pnl = 0.0
@@ -1060,6 +1078,7 @@ class LiteGridWindow(QMainWindow):
             self._market_spread.setText(f"{tr('spread')}: —")
             self._set_market_label_state(self._market_spread, active=False)
         self._update_runtime_balances()
+        self._refresh_unrealized_pnl()
 
     def _apply_status_update(self, status: str, _: str) -> None:
         if status == WS_CONNECTED:
@@ -1128,6 +1147,11 @@ class LiteGridWindow(QMainWindow):
                 locked=locked_text,
             )
         )
+
+    def _refresh_unrealized_pnl(self) -> None:
+        if not self._fills and not self._base_lots:
+            return
+        self._update_pnl(self._estimate_unrealized_pnl(), self._realized_pnl)
 
     def _asset_total(self, asset: str) -> float:
         free, locked = self._balances.get(asset, (0.0, 0.0))
@@ -1282,8 +1306,8 @@ class LiteGridWindow(QMainWindow):
             self._append_log(
                 (
                     "[LIVE] TEST: MANUAL step_pct=0.01 tp_pct=0.10 levels=2 budget=100 "
-                    "(EURIUSDT/USDCUSDT) -> expect 4 orders; after FILLED BUY expect TP SELL + new BUY; "
-                    "bot_open_orders count stable; no PLACE TP skipped."
+                    "(EURIUSDT/USDCUSDT) -> expect 4 orders; after FILLED SELL expect TP BUY + restore SELL; "
+                    "no -2010; Realized PnL grows on sell->buy."
                 ),
                 kind="INFO",
             )
@@ -1328,9 +1352,11 @@ class LiteGridWindow(QMainWindow):
             return
         self._bot_session_id = uuid4().hex[:8]
         self._bot_order_ids.clear()
-        self._processed_fills.clear()
+        self._bot_order_keys.clear()
+        self._fill_keys.clear()
         self._open_orders_map = {}
         self._fills = []
+        self._base_lots.clear()
         self._seen_trade_ids.clear()
         self._realized_pnl = 0.0
         self._fees_total = 0.0
@@ -1699,6 +1725,7 @@ class LiteGridWindow(QMainWindow):
             self._open_orders_all = []
             self._open_orders = []
             self._open_orders_map = {}
+            self._bot_order_keys = set()
             self._render_open_orders()
             self._apply_trade_gate()
             return
@@ -1789,6 +1816,11 @@ class LiteGridWindow(QMainWindow):
             for order in self._open_orders
             if str(order.get("orderId", ""))
         }
+        self._bot_order_keys = {
+            key
+            for order in self._open_orders
+            if (key := self._order_key_from_order(order)) is not None
+        }
         for order in self._open_orders:
             order_id = str(order.get("orderId", ""))
             if order_id:
@@ -1836,6 +1868,23 @@ class LiteGridWindow(QMainWindow):
         if not self._bot_session_id:
             return ""
         return f"BBOT_LITE_{self._symbol}_{self._bot_session_id}_"
+
+    def _order_key(self, side: str, price: Decimal, qty: Decimal) -> str:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        price_key = self._format_decimal(self.q_price(price, tick), tick)
+        qty_key = self._format_decimal(self.q_qty(qty, step), step)
+        return f"{self._symbol}|{side}|{price_key}|{qty_key}"
+
+    def _order_key_from_order(self, order: dict[str, Any]) -> str | None:
+        side = str(order.get("side", "")).upper()
+        if not side:
+            return None
+        price = self._coerce_float(str(order.get("price", ""))) or 0.0
+        qty = self._coerce_float(str(order.get("origQty", ""))) or 0.0
+        if price <= 0 or qty <= 0:
+            return None
+        return self._order_key(side, self.as_decimal(price), self.as_decimal(qty))
 
     @staticmethod
     def _limit_client_order_id(client_id: str) -> str:
@@ -1939,6 +1988,7 @@ class LiteGridWindow(QMainWindow):
             commission = self._coerce_float(str(trade.get("commission", ""))) or 0.0
             commission_asset = str(trade.get("commissionAsset", "")).upper()
             time_ms = int(trade.get("time", 0) or 0)
+            trade_id = str(trade.get("id", "")) if trade.get("id") is not None else ""
         else:
             price = self._coerce_float(str(order.get("price", ""))) or 0.0
             qty = self._coerce_float(str(order.get("executedQty", ""))) or 0.0
@@ -1946,6 +1996,7 @@ class LiteGridWindow(QMainWindow):
             commission = 0.0
             commission_asset = ""
             time_ms = int(order.get("updateTime", 0) or order.get("time", 0) or 0)
+            trade_id = ""
         if price <= 0 or qty <= 0:
             return None
         side = str(order.get("side", "")).upper()
@@ -1958,14 +2009,20 @@ class LiteGridWindow(QMainWindow):
             commission_asset=commission_asset,
             time_ms=time_ms,
             order_id=str(order.get("orderId", "")),
+            trade_id=trade_id,
         )
 
     def _process_fill(self, fill: TradeFill) -> None:
-        fill_key = fill.order_id or f"{fill.side}:{fill.price:.8f}:{fill.qty:.8f}:{fill.time_ms}"
-        if fill_key in self._processed_fills:
+        fill_key = self._fill_key(fill)
+        if fill_key in self._fill_keys:
             return
-        self._processed_fills.add(fill_key)
+        self._fill_keys.add(fill_key)
+        if fill.trade_id:
+            self._seen_trade_ids.add(fill.trade_id)
         self._record_fill(fill)
+        self._bot_order_keys.discard(
+            self._order_key(fill.side, self.as_decimal(fill.price), self.as_decimal(fill.qty))
+        )
         self._append_log(
             (
                 f"[LIVE] FILLED orderId={fill.order_id} side={fill.side}"
@@ -1975,17 +2032,58 @@ class LiteGridWindow(QMainWindow):
         )
         self._place_replacement_order(fill)
 
+    def _fill_key(self, fill: TradeFill) -> str:
+        if fill.trade_id:
+            return fill.trade_id
+        base = f"{fill.side}:{fill.price:.8f}:{fill.qty:.8f}:{fill.time_ms}"
+        return f"{fill.order_id}:{base}" if fill.order_id else base
+
+    def _estimate_fee_usdt(self, fill: TradeFill) -> float:
+        if fill.commission <= 0:
+            return 0.0
+        if fill.commission_asset == self._quote_asset:
+            return fill.commission
+        if fill.commission_asset == self._base_asset:
+            return fill.commission * fill.price
+        return 0.0
+
     def _record_fill(self, fill: TradeFill) -> None:
         self._fills.append(fill)
-        delta = fill.quote_qty if fill.side == "SELL" else -fill.quote_qty
-        self._realized_pnl += delta
-        if fill.commission_asset == self._quote_asset:
-            self._fees_total += fill.commission
-        self._closed_trades += 1
-        if delta > 0:
-            self._win_trades += 1
-        self._update_pnl(None, self._realized_pnl)
+        realized_delta = 0.0
+        if fill.side == "BUY":
+            self._base_lots.append(BaseLot(qty=fill.qty, cost_per_unit=fill.price))
+        else:
+            remaining = fill.qty
+            while remaining > 0 and self._base_lots:
+                lot = self._base_lots[0]
+                take_qty = min(lot.qty, remaining)
+                realized_delta += take_qty * (fill.price - lot.cost_per_unit)
+                lot.qty -= take_qty
+                remaining -= take_qty
+                if lot.qty <= 0:
+                    self._base_lots.popleft()
+            self._closed_trades += 1
+            if realized_delta > 0:
+                self._win_trades += 1
+        fee_usdt = self._estimate_fee_usdt(fill)
+        if fee_usdt:
+            self._fees_total += fee_usdt
+            realized_delta -= fee_usdt
+        self._realized_pnl += realized_delta
+        self._update_pnl(self._estimate_unrealized_pnl(), self._realized_pnl)
         self._update_trade_summary()
+
+    def _estimate_unrealized_pnl(self) -> float | None:
+        if self._last_price is None:
+            return None
+        if not self._base_lots:
+            return 0.0
+        total_qty = sum(lot.qty for lot in self._base_lots)
+        if total_qty <= 0:
+            return 0.0
+        total_cost = sum(lot.qty * lot.cost_per_unit for lot in self._base_lots)
+        avg_cost = total_cost / total_qty
+        return (self._last_price - avg_cost) * total_qty
 
     def _update_trade_summary(self) -> None:
         if self._closed_trades > 0:
@@ -2125,6 +2223,13 @@ class LiteGridWindow(QMainWindow):
             order_id = str(entry.get("orderId", ""))
             if order_id:
                 self._bot_order_ids.add(order_id)
+            side = str(entry.get("side", "")).upper()
+            price = self._coerce_float(str(entry.get("price", ""))) or 0.0
+            qty = self._coerce_float(str(entry.get("origQty", ""))) or 0.0
+            if side in {"BUY", "SELL"} and price > 0 and qty > 0:
+                self._bot_order_keys.add(
+                    self._order_key(side, self.as_decimal(price), self.as_decimal(qty))
+                )
             self._append_log(f"[LIVE] PLACE {label} orderId={order_id}", kind="ORDERS")
         self._refresh_open_orders(force=True)
 
@@ -2135,6 +2240,9 @@ class LiteGridWindow(QMainWindow):
         qty: Decimal,
         client_id: str,
         reason: str,
+        *,
+        ignore_order_id: str | None = None,
+        ignore_keys: set[str] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         if not self._account_client:
             return None, "[LIVE] place skipped: no account client"
@@ -2183,6 +2291,23 @@ class LiteGridWindow(QMainWindow):
                 "WARN",
             )
             return None, None
+        key = self._order_key(side, price, qty)
+        if self._has_duplicate_order(
+            side,
+            price,
+            qty,
+            tolerance_ticks=0,
+            ignore_order_id=ignore_order_id,
+            ignore_keys=ignore_keys,
+        ):
+            self._signals.log_append.emit(
+                (
+                    f"[LIVE] SKIP duplicate key {key} "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                ),
+                "WARN",
+            )
+            return None, None
         log_message = (
             f"[LIVE] place {reason} side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
             f"notional={self.fmt_price(notional, None)} tick={self._format_rule(tick)} "
@@ -2199,6 +2324,16 @@ class LiteGridWindow(QMainWindow):
                 new_client_order_id=client_id,
             )
         except Exception as exc:  # noqa: BLE001
+            status, code, message, response_body = self._parse_binance_exception(exc)
+            if code == -2010:
+                self._signals.log_append.emit(
+                    (
+                        "[LIVE] duplicate order skipped "
+                        f"status={status} code={code} msg={message} response={response_body}"
+                    ),
+                    "WARN",
+                )
+                return None, None
             message = self._format_binance_exception(
                 exc,
                 context=f"place {reason}",
@@ -2355,6 +2490,42 @@ class LiteGridWindow(QMainWindow):
             if fallback_match is None:
                 fallback_match = order
         return fallback_match
+
+    def _has_duplicate_order(
+        self,
+        side: str,
+        price: Decimal,
+        qty: Decimal,
+        tolerance_ticks: int = 0,
+        ignore_order_id: str | None = None,
+        ignore_keys: set[str] | None = None,
+    ) -> bool:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        target_price = self.q_price(price, tick)
+        target_qty = self.q_qty(qty, step)
+        key = self._order_key(side, target_price, target_qty)
+        if key in self._bot_order_keys and (ignore_keys is None or key not in ignore_keys):
+            return True
+        tolerance = (tick or Decimal("0")) * Decimal(tolerance_ticks)
+        qty_tolerance = step or Decimal("0.00000001")
+        for order in self._open_orders:
+            if ignore_order_id and str(order.get("orderId", "")) == ignore_order_id:
+                continue
+            if str(order.get("side", "")).upper() != side:
+                continue
+            order_price = self._coerce_float(str(order.get("price", ""))) or 0.0
+            order_qty = self._coerce_float(str(order.get("origQty", ""))) or 0.0
+            order_price_dec = self.q_price(self.as_decimal(order_price), tick)
+            order_qty_dec = self.q_qty(self.as_decimal(order_qty), step)
+            if tolerance > 0:
+                if abs(order_price_dec - target_price) > tolerance:
+                    continue
+            elif order_price_dec != target_price:
+                continue
+            if abs(order_qty_dec - target_qty) <= qty_tolerance:
+                return True
+        return False
 
     def _refresh_exchange_rules(self, force: bool = False) -> None:
         if self._rules_in_flight:
@@ -2794,9 +2965,20 @@ class LiteGridWindow(QMainWindow):
                 order_id = str(entry.get("orderId", ""))
                 if order_id:
                     self._bot_order_ids.add(order_id)
-                side = str(entry.get("side", "—"))
+                side = str(entry.get("side", "—")).upper()
                 price = str(entry.get("price", "—"))
                 qty = str(entry.get("origQty", "—"))
+                if side in {"BUY", "SELL"} and price and qty:
+                    parsed_price = self._coerce_float(price) or 0.0
+                    parsed_qty = self._coerce_float(qty) or 0.0
+                    if parsed_price > 0 and parsed_qty > 0:
+                        self._bot_order_keys.add(
+                            self._order_key(
+                                side,
+                                self.as_decimal(parsed_price),
+                                self.as_decimal(parsed_qty),
+                            )
+                        )
                 self._append_log(
                     f"[LIVE] place orderId={order_id} side={side} price={price} qty={qty}",
                     kind="ORDERS",
@@ -3044,21 +3226,22 @@ class LiteGridWindow(QMainWindow):
             return
 
         unreal_text = "—" if unrealized is None else f"{unrealized:.2f}"
-        if realized is None:
-            real_text = "—"
-            total = None
-        else:
-            real_text = f"{realized:.2f}"
-            total = realized + (unrealized or 0.0)
-
-        if total is None:
-            total_text = "—"
+        real_text = "—" if realized is None else f"{realized:.2f}"
+        fees_text = f"{self._fees_total:.2f}"
+        if realized is None and unrealized is None:
             self._apply_pnl_style(self._pnl_label, None)
         else:
-            total_text = f"{total:+.2f}"
+            total = (realized or 0.0) + (unrealized or 0.0)
             self._apply_pnl_style(self._pnl_label, total)
 
-        self._pnl_label.setText(tr("pnl_line", unreal=unreal_text, real=real_text, total=total_text))
+        self._pnl_label.setText(
+            tr(
+                "pnl_line",
+                unreal=unreal_text,
+                real=real_text,
+                fees=fees_text,
+            )
+        )
 
     def _show_order_context_menu(self, position: Any) -> None:
         row = self._orders_table.rowAt(position.y())
