@@ -148,34 +148,55 @@ class OpenAIClient:
             "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
             "Строго следуй схеме:\n"
             "{\n"
-            '  "analysis_result": {\n'
-            '    "state": "TRADE|WAIT|PAUSE",\n'
-            '    "summary": "1–3 коротких предложения",\n'
-            '    "risks": ["..."]\n'
+            '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
+            '  "reason_short": "<=120 chars",\n'
+            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
+            '  "profiles": {\n'
+            '    "AGGRESSIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "BALANCED": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "CONSERVATIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    }\n"
             "  },\n"
-            '  "strategy_patch": {\n'
-            '    "budget": 0,\n'
-            '    "bias": "NEUTRAL|LONG|SHORT|null",\n'
-            '    "levels": 0,\n'
-            '    "step_pct": 0,\n'
-            '    "range_down_pct": 0,\n'
-            '    "range_up_pct": 0,\n'
-            '    "take_profit_pct": 0,\n'
-            '    "max_exposure": 0\n'
+            '  "forecast": {\n'
+            '    "bias": "UP|DOWN|FLAT",\n'
+            '    "confidence": 0.0,\n'
+            '    "horizon_min": 30,\n'
+            '    "comment": "<=120 chars"\n'
             "  },\n"
-            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT", "REQUEST_MORE_DATA"],\n'
-            '  "need_data": ["orderbook_depth_50", "recent_trades_1m"]\n'
+            '  "risks": ["..."]\n'
             "}\n"
-            "Заполняй null для параметров, которые не нужно менять.\n"
-            "Сначала проверь fees.is_zero_fee и fees.maker_fee/taker_fee. Если комиссии не заданы, попроси данные.\n"
-            "Если has_orderbook=true (orderbook_summary) и/или trades_1m_summary.count > 0, "
-            "не запрашивай те же данные повторно — дай вывод или WAIT.\n"
-            "Если is_zero_fee=true, обязательно упомяни это в Summary.\n"
-            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
-            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
-            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
-            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_orders.\n"
-            "Если стакан пустой, state=WAIT и запроси orderbook/трейды через REQUEST_MORE_DATA."
+            "Всегда возвращай три профиля и recommended_profile.\n"
+            "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
+            "Будь краток."
         )
 
         async def _analyze() -> str:
@@ -214,35 +235,55 @@ class OpenAIClient:
             "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
             "Строго следуй схеме:\n"
             "{\n"
-            '  "analysis_result": {\n'
-            '    "state": "TRADE|WAIT|PAUSE",\n'
-            '    "summary": "1–3 коротких предложения",\n'
-            '    "risks": ["..."]\n'
+            '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
+            '  "reason_short": "<=120 chars",\n'
+            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
+            '  "profiles": {\n'
+            '    "AGGRESSIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "BALANCED": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    },\n"
+            '    "CONSERVATIVE": {\n'
+            '      "strategy_patch": {\n'
+            '        "step_pct": 0,\n'
+            '        "range_down_pct": 0,\n'
+            '        "range_up_pct": 0,\n'
+            '        "levels": 0,\n'
+            '        "tp_pct": 0,\n'
+            '        "bias": "UP|DOWN|FLAT",\n'
+            '        "max_active_orders": 0\n'
+            "      }\n"
+            "    }\n"
             "  },\n"
-            '  "strategy_patch": {\n'
-            '    "budget": 0,\n'
-            '    "bias": "NEUTRAL|LONG|SHORT|null",\n'
-            '    "levels": 0,\n'
-            '    "step_pct": 0,\n'
-            '    "range_down_pct": 0,\n'
-            '    "range_up_pct": 0,\n'
-            '    "take_profit_pct": 0,\n'
-            '    "max_exposure": 0\n'
+            '  "forecast": {\n'
+            '    "bias": "UP|DOWN|FLAT",\n'
+            '    "confidence": 0.0,\n'
+            '    "horizon_min": 30,\n'
+            '    "comment": "<=120 chars"\n'
             "  },\n"
-            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT", "REQUEST_MORE_DATA"],\n'
-            '  "need_data": ["orderbook_depth_50", "recent_trades_1m"]\n'
+            '  "risks": ["..."]\n'
             "}\n"
-            "Если изменений нет, ставь null для параметров, которые не нужно менять.\n"
             "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
-            "Сначала проверь fees.is_zero_fee и fees.maker_fee/taker_fee. Если комиссии не заданы, попроси данные.\n"
-            "Если has_orderbook=true (orderbook_summary) и/или trades_1m_summary.count > 0, "
-            "не запрашивай те же данные повторно — дай вывод или WAIT.\n"
-            "Если is_zero_fee=true, обязательно упомяни это в Summary.\n"
-            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
-            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
-            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
-            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_orders.\n"
-            "Если стакан пустой, state=WAIT и запроси orderbook/трейды через REQUEST_MORE_DATA."
+            "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
+            "Будь краток."
         )
 
         async def _chat() -> str:

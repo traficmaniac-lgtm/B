@@ -5,35 +5,43 @@ import json
 from typing import Any
 
 
-_ALLOWED_STATES = {"TRADE", "WAIT", "PAUSE"}
-_ALLOWED_BIAS = {"NEUTRAL", "LONG", "SHORT"}
+_ALLOWED_STATES = {"OK", "WAIT", "DO_NOT_TRADE"}
+_ALLOWED_PROFILES = {"AGGRESSIVE", "BALANCED", "CONSERVATIVE"}
+_ALLOWED_FORECAST_BIAS = {"UP", "DOWN", "FLAT"}
 
 
 @dataclass
-class AiOperatorAnalysisResult:
-    state: str
-    summary: str
-    risks: list[str]
+class AiOperatorForecast:
+    bias: str
+    confidence: float
+    horizon_min: int
+    comment: str
 
 
 @dataclass
 class AiOperatorStrategyPatch:
-    budget: float | None = None
-    bias: str | None = None
-    levels: int | None = None
     step_pct: float | None = None
     range_down_pct: float | None = None
     range_up_pct: float | None = None
-    take_profit_pct: float | None = None
-    max_exposure: float | None = None
+    levels: int | None = None
+    tp_pct: float | None = None
+    bias: str | None = None
+    max_active_orders: int | None = None
+
+
+@dataclass
+class AiOperatorProfile:
+    strategy_patch: AiOperatorStrategyPatch
 
 
 @dataclass
 class AiOperatorResponse:
-    analysis_result: AiOperatorAnalysisResult
-    strategy_patch: AiOperatorStrategyPatch | None
-    actions_suggested: list[str]
-    need_data: list[str]
+    state: str
+    reason_short: str
+    recommended_profile: str
+    profiles: dict[str, AiOperatorProfile]
+    forecast: AiOperatorForecast
+    risks: list[str]
 
 
 def parse_ai_operator_response(text: str) -> AiOperatorResponse:
@@ -46,59 +54,54 @@ def parse_ai_operator_response(text: str) -> AiOperatorResponse:
     if not isinstance(payload, dict):
         raise ValueError("Invalid AI JSON payload")
 
-    analysis_payload = payload.get("analysis_result")
-    if not isinstance(analysis_payload, dict):
-        raise ValueError("Missing analysis_result")
-    state = str(analysis_payload.get("state", "")).upper()
+    state = str(payload.get("state", "")).strip().upper()
     if state not in _ALLOWED_STATES:
-        raise ValueError("Invalid analysis_result.state")
-    summary = str(analysis_payload.get("summary", "")).strip()
-    risks_payload = analysis_payload.get("risks")
+        raise ValueError("Invalid state")
+    reason_short = str(payload.get("reason_short", "")).strip()
+    recommended_profile = str(payload.get("recommended_profile", "")).strip().upper()
+    if recommended_profile not in _ALLOWED_PROFILES:
+        raise ValueError("Invalid recommended_profile")
+    profiles_payload = payload.get("profiles")
+    if not isinstance(profiles_payload, dict):
+        raise ValueError("Invalid profiles")
+    profiles: dict[str, AiOperatorProfile] = {}
+    for key in _ALLOWED_PROFILES:
+        raw_profile = profiles_payload.get(key)
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"Invalid profiles.{key}")
+        patch_payload = raw_profile.get("strategy_patch")
+        if not isinstance(patch_payload, dict):
+            raise ValueError(f"Invalid profiles.{key}.strategy_patch")
+        profiles[key] = AiOperatorProfile(strategy_patch=_parse_strategy_patch(patch_payload))
+
+    forecast_payload = payload.get("forecast")
+    if not isinstance(forecast_payload, dict):
+        raise ValueError("Invalid forecast")
+    forecast_bias = str(forecast_payload.get("bias", "")).strip().upper()
+    if forecast_bias not in _ALLOWED_FORECAST_BIAS:
+        raise ValueError("Invalid forecast.bias")
+    confidence = _to_float_or_none(forecast_payload.get("confidence"))
+    if confidence is None or not (0.0 <= confidence <= 1.0):
+        raise ValueError("Invalid forecast.confidence")
+    horizon_min = _to_int_or_none(forecast_payload.get("horizon_min"))
+    if horizon_min is None or horizon_min < 0:
+        raise ValueError("Invalid forecast.horizon_min")
+    comment = str(forecast_payload.get("comment", "")).strip()
+
+    risks_payload = payload.get("risks")
     if not isinstance(risks_payload, list):
-        raise ValueError("Invalid analysis_result.risks")
+        raise ValueError("Invalid risks")
     risks = [str(item) for item in risks_payload if item is not None]
 
-    strategy_patch_payload = payload.get("strategy_patch")
-    strategy_patch = None
-    if strategy_patch_payload is not None:
-        if not isinstance(strategy_patch_payload, dict):
-            raise ValueError("Invalid strategy_patch")
-        bias = _to_str_or_none(strategy_patch_payload.get("bias"))
-        if bias is not None and bias not in _ALLOWED_BIAS:
-            raise ValueError("Invalid strategy_patch.bias")
-        strategy_patch = AiOperatorStrategyPatch(
-            budget=_to_float_or_none(strategy_patch_payload.get("budget")),
-            bias=bias,
-            levels=_to_int_or_none(strategy_patch_payload.get("levels")),
-            step_pct=_to_float_or_none(strategy_patch_payload.get("step_pct")),
-            range_down_pct=_to_float_or_none(strategy_patch_payload.get("range_down_pct")),
-            range_up_pct=_to_float_or_none(strategy_patch_payload.get("range_up_pct")),
-            take_profit_pct=_to_float_or_none(strategy_patch_payload.get("take_profit_pct")),
-            max_exposure=_to_float_or_none(strategy_patch_payload.get("max_exposure")),
-        )
-
-    actions_payload = payload.get("actions_suggested")
-    if not isinstance(actions_payload, list):
-        raise ValueError("Invalid actions_suggested")
-    actions = [str(item).strip().upper() for item in actions_payload if item is not None]
-
-    need_data_payload = payload.get("need_data", [])
-    if need_data_payload is None:
-        need_data_payload = []
-    if not isinstance(need_data_payload, list):
-        raise ValueError("Invalid need_data")
-    raw_need_data = [str(item) for item in need_data_payload if item is not None]
-    need_data: list[str] = []
-    for item in raw_need_data:
-        normalized = _normalize_need_data_key(item)
-        if normalized:
-            need_data.append(normalized)
-
     return AiOperatorResponse(
-        analysis_result=AiOperatorAnalysisResult(state=state, summary=summary, risks=risks),
-        strategy_patch=strategy_patch,
-        actions_suggested=actions,
-        need_data=need_data,
+        state=state,
+        reason_short=reason_short,
+        recommended_profile=recommended_profile,
+        profiles=profiles,
+        forecast=AiOperatorForecast(
+            bias=forecast_bias, confidence=float(confidence), horizon_min=int(horizon_min), comment=comment
+        ),
+        risks=risks,
     )
 
 
@@ -127,16 +130,19 @@ def _to_int_or_none(value: Any) -> int | None:
 def _to_str_or_none(value: Any) -> str | None:
     if value is None:
         return None
-    return str(value).strip().upper() or None
+    return str(value).strip() or None
 
 
-def _normalize_need_data_key(value: str) -> str:
-    cleaned = str(value).strip()
-    if not cleaned:
-        return ""
-    lowered = cleaned.lower()
-    if lowered in {"orderbook", "orderbook_depth", "orderbook_depth_50"}:
-        return "orderbook_depth_50"
-    if lowered in {"trades", "recent_trades", "recent_trades_1m"}:
-        return "recent_trades_1m"
-    return cleaned
+def _parse_strategy_patch(payload: dict[str, Any]) -> AiOperatorStrategyPatch:
+    bias = _to_str_or_none(payload.get("bias"))
+    if bias:
+        bias = bias.upper()
+    return AiOperatorStrategyPatch(
+        step_pct=_to_float_or_none(payload.get("step_pct")),
+        range_down_pct=_to_float_or_none(payload.get("range_down_pct")),
+        range_up_pct=_to_float_or_none(payload.get("range_up_pct")),
+        levels=_to_int_or_none(payload.get("levels")),
+        tp_pct=_to_float_or_none(payload.get("tp_pct")),
+        bias=bias,
+        max_active_orders=_to_int_or_none(payload.get("max_active_orders")),
+    )
