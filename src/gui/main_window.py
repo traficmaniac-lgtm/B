@@ -36,6 +36,8 @@ class MainWindow(QMainWindow):
         self._price_feed_manager = PriceFeedManager.get_instance(self._config)
         self._pair_mode_manager = PairModeManager(
             open_trading_workspace=self.open_lite_grid_window,
+            config=self._config,
+            app_state=self._app_state,
             price_feed_manager=self._price_feed_manager,
             parent=self,
         )
