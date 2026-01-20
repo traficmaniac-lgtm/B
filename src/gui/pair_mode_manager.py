@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QDialog, QWidget
 
 from src.core.logging import get_logger
 from src.gui.models.pair_mode import (
+    PAIR_MODE_LITE,
     PAIR_MODE_AI_OPERATOR_GRID,
     PAIR_MODE_TRADE_READY,
     PAIR_MODE_TRADING,
@@ -48,9 +49,9 @@ class PairModeManager:
         if dialog.selected_mode is None:
             return
         self._logger.info(
-            "[MODE] dialog accepted symbol=%s selected=%s",
-            symbol,
+            "[MODE] selected=%s symbol=%s",
             dialog.selected_mode.name,
+            symbol,
         )
         self.open_pair_mode(symbol, dialog.selected_mode, last_price=last_price, parent=parent)
 
@@ -62,6 +63,10 @@ class PairModeManager:
         parent: QWidget | None = None,
     ) -> None:
         window_parent = parent or self._parent
+        if mode == PAIR_MODE_LITE:
+            self._logger.info("[MODE] open window=LiteGridWindow symbol=%s", symbol)
+            self._open_trading_workspace(symbol)
+            return
         if mode == PAIR_MODE_TRADING:
             self._logger.info("[MODE] open window=LiteGridWindow symbol=%s", symbol)
             self._open_trading_workspace(symbol)
