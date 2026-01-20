@@ -626,6 +626,10 @@ class TradingRuntimeWindow(QMainWindow):
         self._log_event("Фокус возвращён на Trade Ready.")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
+        self._uptime_timer.stop()
+        self._event_timer.stop()
+        self._orders_refresh_timer.stop()
+        self._observer_timer.stop()
         self._engine.stop(cancel_orders=True)
         if self._price_feed_manager is not None:
             self._price_feed_manager.unsubscribe(self._symbol, self._handle_price_tick)

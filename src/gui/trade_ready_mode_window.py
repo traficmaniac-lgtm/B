@@ -705,6 +705,8 @@ class TradeReadyModeWindow(QMainWindow):
             return str(report)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
+        if self._analysis_timer:
+            self._analysis_timer.stop()
         if self._price_feed_manager is not None:
             self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_tick)
             self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_ws_status)

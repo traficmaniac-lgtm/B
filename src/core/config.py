@@ -35,7 +35,7 @@ class PricesConfig:
 @dataclass(frozen=True)
 class BinanceConfig:
     base_url: str = "https://api.binance.com"
-    ws_url: str = "wss://stream.binance.com:9443/ws"
+    ws_url: str = "wss://stream.binance.com:9443"
     recv_window: int = 5000
     api_key: str | None = None
     api_secret: str | None = None
