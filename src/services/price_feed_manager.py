@@ -26,9 +26,15 @@ WS_HEALTH_DEGRADED = "DEGRADED"
 WS_HEALTH_DEAD = "DEAD"
 
 WS_GRACE_MS = 4000
-WS_DEGRADED_AFTER_MS = 5000
-WS_LOST_AFTER_MS = 15000
-WS_RECOVER_AFTER_N = 3
+WS_DEGRADED_AFTER_MS = 3000
+WS_LOST_AFTER_MS = 10000
+WS_RECOVER_AFTER_N = 5
+WS_OK_AFTER_MS = 2000
+WS_STATE_CONNECTED = "CONNECTED"
+WS_STATE_DEGRADED = "DEGRADED"
+WS_STATE_LOST = "LOST"
+WS_STATE_RECONNECTING = "RECONNECTING"
+WS_STATE_STOPPED = "STOPPED"
 HTTP_DISABLE_GRACE_MS = 3000
 INVALID_SYMBOL_LOG_MS = 60_000
 SYMBOL_UPDATE_DEBOUNCE_MS = 400
@@ -50,14 +56,6 @@ def resolve_health_state(status: str) -> str:
     if status == WS_DEGRADED:
         return WS_HEALTH_DEGRADED
     return WS_HEALTH_DEAD
-
-
-def resolve_ws_status(age_ms: int, degraded_after_ms: int, lost_after_ms: int) -> str:
-    if age_ms >= lost_after_ms:
-        return WS_LOST
-    if age_ms >= degraded_after_ms:
-        return WS_DEGRADED
-    return WS_CONNECTED
 
 
 def estimate_spread(best_bid: float | None, best_ask: float | None) -> tuple[float | None, float | None, float | None]:
@@ -180,8 +178,6 @@ class _BinanceBookTickerWsThread:
         on_message: Callable[[dict[str, Any]], None],
         on_status: Callable[[str, str], None],
         now_ms_fn: Callable[[], int],
-        debounce_ms: int = 400,
-        min_reconnect_interval_ms: int = 5000,
         heartbeat_interval_s: float = 10.0,
         heartbeat_timeout_s: float = 5.0,
         dead_after_ms: int = WS_LOST_AFTER_MS,
@@ -197,16 +193,15 @@ class _BinanceBookTickerWsThread:
         self._thread = threading.Thread(target=self._run_loop, name="price-feed-ws", daemon=True)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connect_task: asyncio.Task | None = None
+        self._command_queue: asyncio.Queue[dict[str, Any]] | None = None
+        self._pending_commands: list[dict[str, Any]] = []
         self._stop_event = threading.Event()
         self._symbols_lock = threading.Lock()
         self._symbols: set[str] = set()
-        self._symbols_updated = threading.Event()
-        self._symbols_updated_ms: int | None = None
+        self._subscribed_symbols: set[str] = set()
         self._websocket: websockets.WebSocketClientProtocol | None = None
         self._disabled_until_ms = 0
         self._logged_url = False
-        self._debounce_ms = debounce_ms
-        self._min_reconnect_interval_ms = min_reconnect_interval_ms
         self._heartbeat_interval_s = heartbeat_interval_s
         self._heartbeat_timeout_s = heartbeat_timeout_s
         self._dead_after_ms = dead_after_ms
@@ -217,6 +212,8 @@ class _BinanceBookTickerWsThread:
         self._close_lock = threading.Lock()
         self._reconnect_in_progress = False
         self._reconnect_lock = asyncio.Lock()
+        self._state_lock = threading.Lock()
+        self._state = WS_STATE_STOPPED
         self._stopping = False
 
     def start(self) -> None:
@@ -243,6 +240,7 @@ class _BinanceBookTickerWsThread:
                 self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
+        self._set_state(WS_STATE_STOPPED, "stopped")
 
     def set_symbols(self, symbols: list[str]) -> None:
         cleaned = {symbol.strip().lower() for symbol in symbols if symbol.strip()}
@@ -250,15 +248,35 @@ class _BinanceBookTickerWsThread:
             if cleaned == self._symbols:
                 return
             self._symbols = cleaned
-            self._symbols_updated_ms = self._now_ms()
-        self._symbols_updated.set()
+        self._enqueue_command({"type": "sync_symbols"})
+
+    def _enqueue_command(self, command: dict[str, Any]) -> None:
+        if self._loop and self._command_queue:
+            self._loop.call_soon_threadsafe(self._command_queue.put_nowait, command)
+        else:
+            self._pending_commands.append(command)
 
     def set_disabled_until(self, disabled_until_ms: int) -> None:
         self._disabled_until_ms = disabled_until_ms
 
+    def _set_state(self, new_state: str, details: str = "") -> None:
+        with self._state_lock:
+            if new_state == self._state:
+                return
+            self._state = new_state
+        self._on_status(new_state, details)
+
+    def _get_state(self) -> str:
+        with self._state_lock:
+            return self._state
+
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._command_queue = asyncio.Queue()
+        for command in self._pending_commands:
+            self._command_queue.put_nowait(command)
+        self._pending_commands.clear()
         try:
             self._connect_task = self._loop.create_task(self._connect_loop())
             self._loop.run_forever()
@@ -276,14 +294,19 @@ class _BinanceBookTickerWsThread:
             await self._wait_if_disabled()
             symbols = self._get_symbols()
             if not symbols:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
                 continue
-            await self._wait_for_debounce()
-            await self._wait_for_reconnect_window()
-            url = self._build_url(symbols)
-            if url is None:
-                await asyncio.sleep(1.0)
+            if self._get_state() == WS_STATE_STOPPED:
+                self._set_state(WS_STATE_LOST, "ready")
+            if self._get_state() != WS_STATE_LOST:
+                await asyncio.sleep(0.1)
                 continue
+            if attempt > 0:
+                delay = calculate_backoff(attempt)
+                self._set_state(WS_STATE_RECONNECTING, f"backoff={delay:.1f}s")
+                await asyncio.sleep(delay)
+            self._set_state(WS_STATE_RECONNECTING, "connecting")
+            url = self._build_url()
             if self._reconnect_in_progress:
                 await asyncio.sleep(0.1)
                 continue
@@ -293,7 +316,6 @@ class _BinanceBookTickerWsThread:
                     self._logger.debug("WS URL = %s", url)
                     self._logged_url = True
                 self._logger.debug("WS подключение (%s символов)", len(symbols))
-                self._on_status("CONNECTED", "WS подключен")
                 self._generation += 1
                 self._last_connect_ms = self._now_ms()
                 try:
@@ -302,48 +324,41 @@ class _BinanceBookTickerWsThread:
                 except websockets.exceptions.InvalidStatusCode as exc:
                     if exc.status_code == 404:
                         self._on_status(WS_DISABLED_404, "HTTP 404")
+                        self._set_state(WS_STATE_LOST, "HTTP 404")
                         await self._wait_if_disabled()
                         continue
-                    self._on_status("ERROR", f"ошибка WS: {exc}")
+                    self._set_state(WS_STATE_LOST, f"handshake error: {exc}")
                 except Exception as exc:  # noqa: BLE001
-                    self._on_status("ERROR", f"ошибка WS: {exc}")
+                    self._set_state(WS_STATE_LOST, f"ws error: {exc}")
                 finally:
                     self._reconnect_in_progress = False
             if self._stop_event.is_set():
                 break
             attempt += 1
-            delay = calculate_backoff(attempt)
-            self._logger.debug("WS переподключение через %.1fs", delay)
-            self._on_status("RECONNECTING", f"backoff={delay:.1f}s")
-            await asyncio.sleep(delay)
 
     async def _listen(self, url: str, generation: int) -> None:
         async with websockets.connect(url, ping_interval=None, ping_timeout=None) as websocket:
             self._websocket = websocket
             with self._close_lock:
                 self._closing = False
-            self._symbols_updated.clear()
+            self._subscribed_symbols = set()
             self._last_message_ms = self._now_ms()
+            self._set_state(WS_STATE_CONNECTED, "WS подключен")
+            await self._sync_subscriptions(websocket, force=True)
             next_ping_ms = self._last_message_ms + int(self._heartbeat_interval_s * 1000)
             while not self._stop_event.is_set():
                 if generation != self._generation:
                     break
-                if self._symbols_updated.is_set():
-                    if await self._should_reconnect_for_update():
-                        self._symbols_updated.clear()
-                        self._logger.debug("WS обновляет список символов")
-                        break
+                await self._drain_commands(websocket)
                 now_ms = self._now_ms()
                 if self._last_message_ms is not None and now_ms - self._last_message_ms > self._dead_after_ms:
-                    self._on_status("ERROR", f"heartbeat: no messages > {self._dead_after_ms}ms")
-                    break
+                    raise RuntimeError(f"heartbeat: no messages > {self._dead_after_ms}ms")
                 if now_ms >= next_ping_ms:
                     try:
                         pong_waiter = websocket.ping()
                         await asyncio.wait_for(pong_waiter, timeout=self._heartbeat_timeout_s)
                     except Exception as exc:  # noqa: BLE001
-                        self._on_status("ERROR", f"heartbeat: ping timeout {exc}")
-                        break
+                        raise RuntimeError(f"heartbeat: ping timeout {exc}") from exc
                     next_ping_ms = now_ms + int(self._heartbeat_interval_s * 1000)
                 try:
                     message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
@@ -366,6 +381,49 @@ class _BinanceBookTickerWsThread:
             return
         self._on_message(payload)
 
+    async def _drain_commands(self, websocket: websockets.WebSocketClientProtocol) -> None:
+        if not self._command_queue:
+            return
+        while True:
+            try:
+                command = self._command_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if command.get("type") == "sync_symbols":
+                await self._sync_subscriptions(websocket, force=False)
+
+    async def _sync_subscriptions(
+        self,
+        websocket: websockets.WebSocketClientProtocol,
+        *,
+        force: bool,
+    ) -> None:
+        desired = self._get_symbols()
+        if force:
+            to_add = desired
+            to_remove: set[str] = set()
+        else:
+            to_add = desired - self._subscribed_symbols
+            to_remove = self._subscribed_symbols - desired
+        if to_remove:
+            await self._send_subscription(websocket, "UNSUBSCRIBE", to_remove)
+            self._subscribed_symbols -= to_remove
+        if to_add:
+            await self._send_subscription(websocket, "SUBSCRIBE", to_add)
+            self._subscribed_symbols |= to_add
+
+    async def _send_subscription(
+        self,
+        websocket: websockets.WebSocketClientProtocol,
+        action: str,
+        symbols: set[str],
+    ) -> None:
+        if not symbols:
+            return
+        params = [f"{symbol}@bookTicker" for symbol in sorted(symbols)]
+        payload = {"method": action, "params": params, "id": int(self._now_ms())}
+        await websocket.send(json.dumps(payload))
+
     async def _shutdown(self) -> None:
         websocket = self._websocket
         if websocket is None:
@@ -380,48 +438,12 @@ class _BinanceBookTickerWsThread:
             self._logger.warning("WS shutdown close error", exc_info=True)
         self._websocket = None
 
-    def _build_url(self, symbols: list[str]) -> str | None:
-        streams = [f"{symbol}@bookTicker" for symbol in symbols if symbol]
-        if not streams:
-            return None
-        if len(streams) == 1:
-            return f"{self._ws_url}/ws/{streams[0]}"
-        joined = "/".join(streams)
-        return f"{self._ws_url}/stream?streams={joined}"
+    def _build_url(self) -> str:
+        return f"{self._ws_url}/ws"
 
-    def _get_symbols(self) -> list[str]:
+    def _get_symbols(self) -> set[str]:
         with self._symbols_lock:
-            return list(self._symbols)
-
-    async def _wait_for_debounce(self) -> None:
-        while not self._stop_event.is_set():
-            updated_ms = self._symbols_updated_ms
-            if updated_ms is None:
-                return
-            now_ms = self._now_ms()
-            elapsed = now_ms - updated_ms
-            if elapsed >= self._debounce_ms:
-                return
-            await asyncio.sleep(min((self._debounce_ms - elapsed) / 1000.0, 0.5))
-
-    async def _wait_for_reconnect_window(self) -> None:
-        while not self._stop_event.is_set():
-            now_ms = self._now_ms()
-            elapsed = now_ms - self._last_connect_ms
-            if elapsed >= self._min_reconnect_interval_ms:
-                return
-            await asyncio.sleep(min((self._min_reconnect_interval_ms - elapsed) / 1000.0, 0.5))
-
-    async def _should_reconnect_for_update(self) -> bool:
-        updated_ms = self._symbols_updated_ms
-        if updated_ms is None:
-            return True
-        now_ms = self._now_ms()
-        if now_ms - updated_ms < self._debounce_ms:
-            return False
-        if now_ms - self._last_connect_ms < self._min_reconnect_interval_ms:
-            return False
-        return True
+            return set(self._symbols)
 
     async def _wait_if_disabled(self) -> None:
         while not self._stop_event.is_set():
@@ -463,6 +485,10 @@ class PriceFeedManager:
         self._recover_after_n = recover_after_n
         self._http_disable_grace_ms = http_disable_grace_ms
         self._now_ms = now_ms_fn
+        self._ws_ok_after_ms = WS_OK_AFTER_MS
+        self._ws_state_lock = threading.Lock()
+        self._ws_state = WS_STATE_STOPPED
+        self._ws_state_details = ""
         self._registry = SymbolSubscriptionRegistry()
         self._lock = threading.Lock()
         self._symbol_state: dict[str, dict[str, Any]] = {}
@@ -497,6 +523,20 @@ class PriceFeedManager:
                 cls._instance = cls(config)
             return cls._instance
 
+    def _set_ws_state(self, new_state: str, details: str) -> None:
+        with self._ws_state_lock:
+            old_state = self._ws_state
+            if new_state == old_state:
+                return
+            self._ws_state = new_state
+            self._ws_state_details = details
+        suffix = f" ({details})" if details else ""
+        self._logger.info("WS state: %s -> %s%s", old_state, new_state, suffix)
+
+    def _get_ws_state(self) -> str:
+        with self._ws_state_lock:
+            return self._ws_state
+
     def start(self) -> None:
         if self._monitor_thread.is_alive():
             return
@@ -528,14 +568,15 @@ class PriceFeedManager:
         if is_new:
             self._logger.info("subscribe %s", cleaned)
             now_ms = self._now_ms()
+            initial_status = WS_CONNECTED if self._get_ws_state() == WS_STATE_CONNECTED else WS_LOST
             with self._lock:
                 state = self._symbol_state.setdefault(cleaned, {})
                 state.update(
                     {
                         "subscribed_ms": now_ms,
                         "ws_grace_until_ms": now_ms + WS_GRACE_MS,
-                        "ws_status": WS_CONNECTED,
-                        "ws_health_state": resolve_health_state(WS_CONNECTED),
+                        "ws_status": initial_status,
+                        "ws_health_state": resolve_health_state(initial_status),
                         "ws_recover_streak": 0,
                         "last_ws_msg_ms": None,
                         "last_ws_price_ms": None,
@@ -560,6 +601,8 @@ class PriceFeedManager:
         now_ms = self._now_ms()
         if now_ms < self._ws_disabled_until_ms:
             return WS_LOST
+        if self._get_ws_state() in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
+            return WS_LOST
         active_symbols = self._registry.active_symbols()
         if not active_symbols:
             return WS_LOST
@@ -568,16 +611,7 @@ class PriceFeedManager:
             states = {symbol: self._symbol_state.get(symbol, {}) for symbol in active_symbols}
         for symbol in active_symbols:
             state = states.get(symbol, {})
-            last_ws_msg = state.get("last_ws_msg_ms")
-            subscribed_ms = state.get("subscribed_ms", now_ms)
-            ws_grace_until = state.get("ws_grace_until_ms")
-            if isinstance(last_ws_msg, int):
-                age_ms = max(now_ms - last_ws_msg, 0)
-            else:
-                age_ms = max(now_ms - subscribed_ms, 0)
-            if ws_grace_until is not None and now_ms < ws_grace_until:
-                age_ms = 0
-            status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
+            status = state.get("ws_status", WS_LOST)
             if status == WS_CONNECTED:
                 return WS_CONNECTED
             if status == WS_DEGRADED:
@@ -711,6 +745,7 @@ class PriceFeedManager:
             self._ws_disabled_until_ms = now_ms + 300_000
             self._ws_thread.set_disabled_until(self._ws_disabled_until_ms)
             self._log_rate_limited("*", "ws_disabled_404", "warning", "WS отключен из-за 404 на 5 минут")
+            self._set_ws_state(WS_STATE_LOST, "HTTP 404")
             symbols_to_notify: list[str] = []
             with self._lock:
                 for symbol, symbol_state in self._symbol_state.items():
@@ -723,14 +758,29 @@ class PriceFeedManager:
             for symbol in symbols_to_notify:
                 self._publish_status(symbol, WS_LOST)
             return
-        if status == "CONNECTED":
-            self._log_rate_limited("*", "ws_connected", "info", "WS подключен")
+        if status in {
+            WS_STATE_CONNECTED,
+            WS_STATE_RECONNECTING,
+            WS_STATE_LOST,
+            WS_STATE_STOPPED,
+        }:
+            self._set_ws_state(status, details)
+            if status == WS_STATE_CONNECTED:
+                with self._lock:
+                    for symbol_state in self._symbol_state.values():
+                        symbol_state["ws_grace_until_ms"] = now_ms + WS_GRACE_MS
+            if status in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
+                symbols_to_notify = []
+                with self._lock:
+                    for symbol, symbol_state in self._symbol_state.items():
+                        symbol_state["ws_status"] = WS_LOST
+                        symbol_state["ws_health_state"] = resolve_health_state(WS_LOST)
+                        symbol_state["ws_recover_streak"] = 0
+                        symbols_to_notify.append(symbol)
+                for symbol in symbols_to_notify:
+                    self._publish_status(symbol, WS_LOST)
             return
-        if status == "RECONNECTING":
-            self._log_rate_limited("*", "ws_reconnect", "warning", f"WS переподключение: {details}")
-            return
-        if status == "ERROR":
-            self._log_rate_limited("*", "ws_error", "error", f"WS ошибка: {details}")
+        self._log_rate_limited("*", "ws_error", "error", f"WS ошибка: {details}")
 
     def _handle_ws_message(self, data: dict[str, Any]) -> None:
         symbol = self._sanitize_symbol(data.get("s"))
@@ -753,7 +803,7 @@ class PriceFeedManager:
         with self._lock:
             state = self._symbol_state.setdefault(symbol, {})
             last_ws_msg = state.get("last_ws_msg_ms")
-            if isinstance(last_ws_msg, int) and now_ms - last_ws_msg <= self._degraded_after_ms:
+            if isinstance(last_ws_msg, int) and now_ms - last_ws_msg <= self._ws_ok_after_ms:
                 state["ws_recover_streak"] = state.get("ws_recover_streak", 0) + 1
             else:
                 state["ws_recover_streak"] = 1
@@ -804,18 +854,25 @@ class PriceFeedManager:
             subscribed_ms = state.get("subscribed_ms", now_ms)
             ws_grace_until = state.get("ws_grace_until_ms")
         ws_disabled = now_ms < self._ws_disabled_until_ms
-        if ws_disabled:
+        ws_state = self._get_ws_state()
+        age_ms = None
+        if ws_disabled or ws_state in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
             desired_status = WS_LOST
         else:
             if last_ws_msg is None:
                 age_ms = max(now_ms - subscribed_ms, 0)
                 if ws_grace_until is not None and now_ms < ws_grace_until:
-                    desired_status = WS_CONNECTED
-                else:
-                    desired_status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
+                    age_ms = 0
             else:
                 age_ms = max(now_ms - last_ws_msg, 0)
-                desired_status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
+            if age_ms is None:
+                desired_status = WS_LOST
+            elif age_ms >= self._lost_after_ms:
+                desired_status = WS_LOST
+            elif age_ms >= self._degraded_after_ms:
+                desired_status = WS_DEGRADED
+            else:
+                desired_status = WS_CONNECTED
         if desired_status == WS_CONNECTED and current_status != WS_CONNECTED:
             if ws_recover_streak < self._recover_after_n:
                 desired_status = current_status
@@ -824,7 +881,9 @@ class PriceFeedManager:
                 state = self._symbol_state.setdefault(cleaned, {})
                 state["ws_status"] = desired_status
                 state["ws_health_state"] = resolve_health_state(desired_status)
-                state["ws_ok"] = desired_status == WS_CONNECTED
+                state["ws_ok"] = desired_status == WS_CONNECTED and (
+                    age_ms is None or age_ms < self._ws_ok_after_ms
+                )
                 state["ws_degraded"] = desired_status == WS_DEGRADED
                 state["ws_lost"] = desired_status == WS_LOST
                 if desired_status != WS_CONNECTED:

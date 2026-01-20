@@ -41,6 +41,7 @@ from src.services.price_feed_manager import (
     WS_CONNECTED,
     WS_DEGRADED,
     WS_DEGRADED_AFTER_MS,
+    WS_OK_AFTER_MS,
 )
 from src.services.rate_limiter import RateLimiter
 
@@ -1105,8 +1106,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_start = time.perf_counter()
         ws_snapshot = self._price_feed_manager.get_snapshot(self._symbol)
         ws_ms = (time.perf_counter() - ws_start) * 1000
-        ws_ok = bool(ws_snapshot and ws_snapshot.ws_status in {WS_CONNECTED, WS_DEGRADED})
         ws_age_ms = ws_snapshot.price_age_ms if ws_snapshot else None
+        ws_ok = bool(
+            ws_snapshot
+            and ws_snapshot.ws_status == WS_CONNECTED
+            and isinstance(ws_age_ms, int)
+            and ws_age_ms < WS_OK_AFTER_MS
+        )
         ws_stale = isinstance(ws_age_ms, int) and ws_age_ms > WS_DEGRADED_AFTER_MS
         last_update_ts = None
         now_ms = utc_ms()
