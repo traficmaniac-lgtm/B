@@ -425,7 +425,7 @@ class LiteGridWindow(QMainWindow):
         self._fees_total = 0.0
         self._closed_trades = 0
         self._win_trades = 0
-        self._replacement_index = len(planned)
+        self._replacement_index = 0
         self._balances_tick_count = 0
         self._orders_tick_count = 0
         self._orders_last_count: int | None = None
