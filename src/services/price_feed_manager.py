@@ -196,6 +196,7 @@ class _BinanceBookTickerWsThread:
         self._logger = get_logger("services.price_feed.ws")
         self._thread = threading.Thread(target=self._run_loop, name="price-feed-ws", daemon=True)
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._connect_task: asyncio.Task | None = None
         self._stop_event = threading.Event()
         self._symbols_lock = threading.Lock()
         self._symbols: set[str] = set()
@@ -215,6 +216,8 @@ class _BinanceBookTickerWsThread:
         self._closing = False
         self._close_lock = threading.Lock()
         self._reconnect_in_progress = False
+        self._reconnect_lock = asyncio.Lock()
+        self._stopping = False
 
     def start(self) -> None:
         if self._thread.is_alive():
@@ -223,13 +226,21 @@ class _BinanceBookTickerWsThread:
         self._thread.start()
 
     def stop(self) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
         self._stop_event.set()
         if self._loop and self._loop.is_running():
             try:
+                if self._connect_task:
+                    self._loop.call_soon_threadsafe(self._connect_task.cancel)
                 asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop).result(timeout=5.0)
-            except Exception as exc:  # noqa: BLE001
+            except TimeoutError:
+                self._logger.warning("WS shutdown timeout; continuing stop.")
+            except Exception:  # noqa: BLE001
                 self._logger.warning("WS shutdown error", exc_info=True)
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            finally:
+                self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
 
@@ -249,7 +260,7 @@ class _BinanceBookTickerWsThread:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
-            self._loop.create_task(self._connect_loop())
+            self._connect_task = self._loop.create_task(self._connect_loop())
             self._loop.run_forever()
         finally:
             pending = asyncio.all_tasks(self._loop)
@@ -277,7 +288,7 @@ class _BinanceBookTickerWsThread:
                 await asyncio.sleep(0.1)
                 continue
             self._reconnect_in_progress = True
-            try:
+            async with self._reconnect_lock:
                 if not self._logged_url:
                     self._logger.debug("WS URL = %s", url)
                     self._logged_url = True
@@ -285,18 +296,19 @@ class _BinanceBookTickerWsThread:
                 self._on_status("CONNECTED", "WS подключен")
                 self._generation += 1
                 self._last_connect_ms = self._now_ms()
-                await self._listen(url, self._generation)
-                attempt = 0
-            except websockets.exceptions.InvalidStatusCode as exc:
-                if exc.status_code == 404:
-                    self._on_status(WS_DISABLED_404, "HTTP 404")
-                    await self._wait_if_disabled()
-                    continue
-                self._on_status("ERROR", f"ошибка WS: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                self._on_status("ERROR", f"ошибка WS: {exc}")
-            finally:
-                self._reconnect_in_progress = False
+                try:
+                    await self._listen(url, self._generation)
+                    attempt = 0
+                except websockets.exceptions.InvalidStatusCode as exc:
+                    if exc.status_code == 404:
+                        self._on_status(WS_DISABLED_404, "HTTP 404")
+                        await self._wait_if_disabled()
+                        continue
+                    self._on_status("ERROR", f"ошибка WS: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    self._on_status("ERROR", f"ошибка WS: {exc}")
+                finally:
+                    self._reconnect_in_progress = False
             if self._stop_event.is_set():
                 break
             attempt += 1

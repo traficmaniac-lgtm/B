@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QPointer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -21,20 +21,30 @@ class LogEmitter(QObject):
 class QtLogHandler(logging.Handler):
     def __init__(self, emitter: LogEmitter) -> None:
         super().__init__()
-        self._emitter = emitter
+        self._emitter = QPointer(emitter)
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
 
     def emit(self, record: logging.LogRecord) -> None:
+        if not self._enabled or self._emitter.isNull():
+            return
         try:
             message = self.format(record)
         except Exception:
             message = record.getMessage()
-        self._emitter.message.emit(message)
+        try:
+            self._emitter.message.emit(message)
+        except RuntimeError:
+            return
 
 
 class LogDock(QDockWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Logs", parent)
         self.setObjectName("LogsDock")
+        self._closing = False
 
         self._text = QTextEdit()
         self._text.setReadOnly(True)
@@ -72,3 +82,12 @@ class LogDock(QDockWidget):
     def _copy_all(self) -> None:
         clipboard = QApplication.clipboard()
         clipboard.setText(self._text.toPlainText())
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802
+        self._closing = True
+        self._handler.disable()
+        try:
+            self._emitter.message.disconnect(self._append_message)
+        except RuntimeError:
+            pass
+        super().closeEvent(event)

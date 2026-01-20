@@ -445,7 +445,8 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _approve_ai_action(self) -> None:
         pending_action = self._pending_action
-        action = pending_action.action_type.value if pending_action else self._actions_combo.currentText().strip().upper()
+        selected_action = self._actions_combo.currentText().strip().upper()
+        action = selected_action or (pending_action.action_type.value if pending_action else "")
         if not action:
             self._append_log("[AI] approve skipped: no action selected.", "WARN")
             return
@@ -454,7 +455,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_log(f"[AI] approve ignored: action {action} debounced.", "WARN")
             return
         self._last_approve_ts = now
-        source = "AI" if pending_action else "manual"
+        source = "AI" if pending_action and action == pending_action.action_type.value else "manual"
         self._append_log(f"[AI] approve clicked action={action} source={source}", "INFO")
         try:
             self._apply_approved_action(action, pending_action)
@@ -519,6 +520,8 @@ class AiOperatorGridWindow(LiteGridWindow):
     def _append_ai_response_to_chat(self, response: AiOperatorResponse) -> None:
         lines = ["AI:"]
         lines.append(f"State: {response.state}")
+        lines.append(f"Recommendation: {response.recommendation}")
+        lines.append(f"Next Action: {response.next_action}")
         lines.append(f"Reason: {response.reason_short or '—'}")
         lines.append(f"Profile: {response.recommended_profile}")
         actions_text = ", ".join(response.actions) if response.actions else "—"
@@ -613,6 +616,8 @@ class AiOperatorGridWindow(LiteGridWindow):
             actions = [item for item in actions if item not in {"START", "REBUILD_GRID"}]
             if "WAIT" not in actions:
                 actions.append("WAIT")
+        if response.next_action and response.next_action not in actions:
+            response.next_action = "WAIT"
         response.actions = actions
         return response
 
@@ -634,7 +639,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         )
 
     def _select_pending_action(self, response: AiOperatorResponse) -> tuple[PendingActionType, str]:
-        raw_action = next((item for item in response.actions if item and item != "WAIT"), "WAIT")
+        raw_action = response.next_action or next((item for item in response.actions if item and item != "WAIT"), "WAIT")
+        if self._strategy_patch_has_values(response.strategy_patch):
+            raw_action = "APPLY_PATCH"
         reason = response.reason_short or ""
         if raw_action == "REBUILD_GRID":
             reason = f"{reason} | action=REBUILD_GRID".strip(" |")
