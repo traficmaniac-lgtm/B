@@ -40,6 +40,7 @@ class BinanceAccountClient:
         self._backoff_base_s = backoff_base_s
         self._backoff_max_s = backoff_max_s
         self._logger = get_logger("binance.account")
+        self._time_offset_ms = 0
 
     def get_account_info(self) -> dict[str, Any]:
         payload = self._request_signed("GET", "/api/v3/account")
@@ -115,14 +116,14 @@ class BinanceAccountClient:
         }
         if new_client_order_id:
             params["newClientOrderId"] = new_client_order_id
-        payload = self._request_signed("POST", "/api/v3/order", params=params)
+        payload = self._request_signed("POST", "/api/v3/order", params=params, retry_on_timestamp=True)
         if not isinstance(payload, dict):
             raise ValueError("Unexpected order response format")
         return payload
 
     def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
         params = {"symbol": symbol, "orderId": order_id}
-        payload = self._request_signed("DELETE", "/api/v3/order", params=params)
+        payload = self._request_signed("DELETE", "/api/v3/order", params=params, retry_on_timestamp=True)
         if not isinstance(payload, dict):
             raise ValueError("Unexpected cancel order response format")
         return payload
@@ -134,26 +135,45 @@ class BinanceAccountClient:
             raise ValueError("Unexpected cancel open orders response format")
         return [item for item in payload if isinstance(item, dict)]
 
+    def get_server_time(self) -> dict[str, Any]:
+        with httpx.Client(base_url=self._base_url, timeout=self._timeout_s) as client:
+            response = client.get("/api/v3/time")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected server time response format")
+        return payload
+
+    def sync_time_offset(self) -> dict[str, int]:
+        payload = self.get_server_time()
+        server_time = int(payload.get("serverTime", 0) or 0)
+        local_time = int(time.time() * 1000)
+        self._time_offset_ms = server_time - local_time
+        self._logger.info("Time sync offset=%sms", self._time_offset_ms)
+        return {"server_time": server_time, "local_time": local_time, "offset_ms": self._time_offset_ms}
+
     def _request_signed(
         self,
         method: str,
         path: str,
         params: dict[str, Any] | None = None,
+        retry_on_timestamp: bool = False,
     ) -> Any:
         if not self._api_key or not self._api_secret:
             raise RuntimeError("Binance API key/secret not configured")
-        data = dict(params or {})
-        data["timestamp"] = int(time.time() * 1000)
-        data["recvWindow"] = self._recv_window
-        query = urlencode(data, doseq=True)
-        signature = hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-        signed_query = f"{query}&signature={signature}"
-        url = f"{path}?{signed_query}"
-        headers = {"X-MBX-APIKEY": self._api_key}
         last_exc: Exception | None = None
         attempts = self._retries + 1
+        retried_time_sync = False
         for attempt in range(attempts):
             try:
+                data = dict(params or {})
+                data["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+                data["recvWindow"] = self._recv_window
+                query = urlencode(data, doseq=True)
+                signature = hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+                signed_query = f"{query}&signature={signature}"
+                url = f"{path}?{signed_query}"
+                headers = {"X-MBX-APIKEY": self._api_key}
                 with httpx.Client(base_url=self._base_url, timeout=self._timeout_s) as client:
                     response = client.request(method, url, headers=headers)
                 if response.status_code == 429 or response.status_code >= 500:
@@ -162,6 +182,17 @@ class BinanceAccountClient:
                         request=response.request,
                         response=response,
                     )
+                if response.status_code >= 400:
+                    payload = None
+                    try:
+                        payload = response.json()
+                    except Exception:  # noqa: BLE001
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("code") == -1021:
+                        self.sync_time_offset()
+                        if retry_on_timestamp and not retried_time_sync:
+                            retried_time_sync = True
+                            continue
                 response.raise_for_status()
                 return response.json()
             except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as exc:
