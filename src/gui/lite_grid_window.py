@@ -5,6 +5,7 @@ from enum import Enum
 from math import ceil, floor
 from time import perf_counter, sleep, time
 from typing import Any, Callable
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QFont
@@ -68,6 +69,7 @@ class GridSettingsState:
     direction: str = "Neutral"
     grid_count: int = 10
     grid_step_pct: float = 0.5
+    grid_step_mode: str = "AUTO_ATR"
     range_mode: str = "Auto"
     range_low_pct: float = 1.0
     range_high_pct: float = 1.0
@@ -96,6 +98,7 @@ class GridPlannedOrder:
     side: str
     price: float
     qty: float
+    level_index: int
 
 
 class GridEngine:
@@ -129,10 +132,8 @@ class GridEngine:
             raise ValueError("Grid step must be > 0.")
         if settings.range_low_pct <= 0 or settings.range_high_pct <= 0:
             raise ValueError("Range must be > 0.")
-        self._set_state("PLACING_GRID")
         plan = self._build_plan(settings, last_price, rules)
         self._planned_orders = plan
-        self._set_state("RUNNING")
         return plan
 
     def pause(self) -> None:
@@ -169,6 +170,8 @@ class GridEngine:
         tick = rules.get("tick")
         step = rules.get("step")
         min_notional = rules.get("min_notional")
+        min_qty = rules.get("min_qty")
+        max_qty = rules.get("max_qty")
         levels = int(settings.grid_count)
         budget = float(settings.budget)
         step_pct = float(settings.grid_step_pct)
@@ -187,6 +190,8 @@ class GridEngine:
             tick=tick,
             step=step,
             min_notional=min_notional,
+            min_qty=min_qty,
+            max_qty=max_qty,
         )
         sell_orders = self._build_side(
             side="SELL",
@@ -198,6 +203,8 @@ class GridEngine:
             tick=tick,
             step=step,
             min_notional=min_notional,
+            min_qty=min_qty,
+            max_qty=max_qty,
         )
         plan = buy_orders + sell_orders
         return plan
@@ -223,6 +230,8 @@ class GridEngine:
         tick: float | None,
         step: float | None,
         min_notional: float | None,
+        min_qty: float | None,
+        max_qty: float | None,
     ) -> list[GridPlannedOrder]:
         orders: list[GridPlannedOrder] = []
         for idx in range(count):
@@ -240,11 +249,19 @@ class GridEngine:
             price = self._quantize(raw_price, tick, round_up=False)
             qty = per_order_quote / price if price > 0 else 0.0
             qty = self._quantize(qty, step, round_up=False)
-            if min_notional is not None and price * qty < min_notional:
-                qty = self._quantize(min_notional / price, step, round_up=True)
-            if qty <= 0:
+            price, qty = self._apply_filters(
+                side=side,
+                price=price,
+                qty=qty,
+                tick=tick,
+                step=step,
+                min_notional=min_notional,
+                min_qty=min_qty,
+                max_qty=max_qty,
+            )
+            if qty <= 0 or price <= 0:
                 continue
-            orders.append(GridPlannedOrder(side=side, price=price, qty=qty))
+            orders.append(GridPlannedOrder(side=side, price=price, qty=qty, level_index=idx + 1))
         return orders
 
     def _quantize(self, value: float, step: float | None, round_up: bool) -> float:
@@ -253,6 +270,52 @@ class GridEngine:
         if round_up:
             return ceil(value / step) * step
         return floor(value / step) * step
+
+    def _apply_filters(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        tick: float | None,
+        step: float | None,
+        min_notional: float | None,
+        min_qty: float | None,
+        max_qty: float | None,
+    ) -> tuple[float, float]:
+        price = self._quantize(price, tick, round_up=False)
+        qty = self._quantize(qty, step, round_up=False)
+        if min_notional is not None and price > 0:
+            notional = price * qty
+            if notional < min_notional:
+                qty = self._quantize(min_notional / price, step, round_up=True)
+                notional = price * qty
+                if notional < min_notional:
+                    self._on_log(
+                        (
+                            "order skipped: minNotional"
+                            f" side={side} price={price:.8f} qty={qty:.8f}"
+                            f" notional={notional:.8f} min={min_notional:.8f}"
+                        ),
+                        "WARN",
+                    )
+                    return price, 0.0
+        if min_qty is not None and qty < min_qty:
+            qty = self._quantize(min_qty, step, round_up=True)
+        if max_qty is not None and qty > max_qty:
+            qty = self._quantize(max_qty, step, round_up=False)
+        if qty <= 0:
+            return price, 0.0
+        if min_notional is not None and price * qty < min_notional:
+            self._on_log(
+                (
+                    "order skipped: minNotional"
+                    f" side={side} price={price:.8f} qty={qty:.8f}"
+                    f" notional={(price * qty):.8f} min={min_notional:.8f}"
+                ),
+                "WARN",
+            )
+            return price, 0.0
+        return price, qty
 
 
 class LiteGridWindow(QMainWindow):
@@ -279,6 +342,7 @@ class LiteGridWindow(QMainWindow):
         self._settings_state = GridSettingsState()
         self._log_entries: list[tuple[str, str]] = []
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
+        self._manual_grid_step_pct = self._settings_state.grid_step_pct
         self._thread_pool = QThreadPool.globalInstance()
         self._account_client: BinanceAccountClient | None = None
         api_key, api_secret = self._app_state.get_binance_keys()
@@ -306,7 +370,11 @@ class LiteGridWindow(QMainWindow):
         self._logger.info("binance keys present: %s", self._has_api_keys)
         self._balances: dict[str, tuple[float, float]] = {}
         self._open_orders: list[dict[str, Any]] = []
+        self._open_orders_all: list[dict[str, Any]] = []
+        self._bot_order_ids: set[str] = set()
+        self._bot_session_id: str | None = None
         self._last_price: float | None = None
+        self._price_history: list[float] = []
         self._account_can_trade = False
         self._symbol_tradeable = False
         self._suppress_dry_run_event = False
@@ -360,6 +428,7 @@ class LiteGridWindow(QMainWindow):
             self._orders_timer.start(3_000)
             self._refresh_balances()
             self._refresh_open_orders()
+            self._update_orders_timer_interval()
         else:
             self._set_account_status("no_keys")
             self._apply_trade_gate()
@@ -515,6 +584,16 @@ class LiteGridWindow(QMainWindow):
         self._grid_count_input.setValue(self._settings_state.grid_count)
         self._grid_count_input.valueChanged.connect(lambda value: self._update_setting("grid_count", value))
 
+        self._grid_step_mode_combo = QComboBox()
+        self._grid_step_mode_combo.addItem("AUTO ATR", "AUTO_ATR")
+        self._grid_step_mode_combo.addItem("MANUAL", "MANUAL")
+        self._grid_step_mode_combo.setCurrentIndex(
+            self._grid_step_mode_combo.findData(self._settings_state.grid_step_mode)
+        )
+        self._grid_step_mode_combo.currentIndexChanged.connect(
+            lambda _: self._handle_grid_step_mode_change(self._grid_step_mode_combo.currentData())
+        )
+
         self._grid_step_input = QDoubleSpinBox()
         self._grid_step_input.setRange(0.05, 25.0)
         self._grid_step_input.setDecimals(2)
@@ -584,6 +663,7 @@ class LiteGridWindow(QMainWindow):
         form.addRow(tr("budget"), self._budget_input)
         form.addRow(tr("direction"), self._direction_combo)
         form.addRow(tr("grid_count"), self._grid_count_input)
+        form.addRow(tr("grid_step_mode"), self._grid_step_mode_combo)
         form.addRow(tr("grid_step"), self._grid_step_input)
         form.addRow(tr("range_mode"), self._range_mode_combo)
         form.addRow(tr("range_low"), self._range_low_input)
@@ -607,6 +687,7 @@ class LiteGridWindow(QMainWindow):
         layout.addWidget(self._grid_preview_label)
 
         self._apply_range_mode(self._settings_state.range_mode)
+        self._apply_grid_step_mode(self._settings_state.grid_step_mode)
         self._update_grid_preview()
         return group
 
@@ -750,6 +831,7 @@ class LiteGridWindow(QMainWindow):
     def _apply_price_update(self, update: PriceUpdate) -> None:
         if update.last_price is not None:
             self._last_price = update.last_price
+            self._record_price(update.last_price)
             self._last_price_label.setText(tr("last_price", price=f"{update.last_price:.8f}"))
             self._market_price.setText(f"{tr('price')}: {update.last_price:.8f}")
             self._set_market_label_state(self._market_price, active=True)
@@ -858,10 +940,32 @@ class LiteGridWindow(QMainWindow):
         self._update_setting("range_mode", value)
         self._apply_range_mode(value)
 
+    def _handle_grid_step_mode_change(self, value: str) -> None:
+        self._update_setting("grid_step_mode", value)
+        self._apply_grid_step_mode(value)
+        self._update_grid_preview()
+
     def _apply_range_mode(self, value: str) -> None:
         manual = value == "Manual"
         self._range_low_input.setEnabled(manual)
         self._range_high_input.setEnabled(manual)
+
+    def _apply_grid_step_mode(self, value: str) -> None:
+        auto = value == "AUTO_ATR"
+        self._grid_step_input.setEnabled(not auto)
+        self._grid_step_mode_combo.setToolTip(tr("grid_step_mode_tip_auto") if auto else "")
+        if auto:
+            self._manual_grid_step_pct = self._settings_state.grid_step_pct
+            self._range_mode_combo.setCurrentIndex(self._range_mode_combo.findData("Auto"))
+            self._range_mode_combo.setEnabled(False)
+            self._update_setting("range_mode", "Auto")
+            self._apply_range_mode("Auto")
+            auto_params = self._auto_grid_params_from_history()
+            if auto_params:
+                self._set_grid_step_input(auto_params["grid_step_pct"], update_setting=False)
+        else:
+            self._set_grid_step_input(self._manual_grid_step_pct, update_setting=False)
+            self._range_mode_combo.setEnabled(True)
 
     def _handle_stop_loss_toggle(self, enabled: bool) -> None:
         self._stop_loss_input.setEnabled(enabled)
@@ -905,7 +1009,8 @@ class LiteGridWindow(QMainWindow):
             return
         self._grid_engine.set_mode("DRY_RUN" if dry_run else "LIVE")
         try:
-            planned = self._grid_engine.start(self._settings_state, self._last_price, self._exchange_rules)
+            settings = self._resolve_start_settings()
+            planned = self._grid_engine.start(settings, self._last_price, self._exchange_rules)
         except ValueError as exc:
             self._append_log(f"Start failed: {exc}", kind="WARN")
             self._change_state("IDLE")
@@ -913,14 +1018,41 @@ class LiteGridWindow(QMainWindow):
         planned = planned[: self._settings_state.max_active_orders]
         buy_count = sum(1 for order in planned if order.side == "BUY")
         sell_count = sum(1 for order in planned if order.side == "SELL")
+        if buy_count < 1 or sell_count < 1:
+            self._append_log(
+                f"Start blocked: insufficient orders after filters (buys={buy_count}, sells={sell_count}).",
+                kind="WARN",
+            )
+            self._change_state("IDLE")
+            return
         self._append_log(
             f"grid plan: buys={buy_count} sells={sell_count} minNotional ok",
             kind="ORDERS",
         )
-        self._change_state("RUNNING")
         if dry_run:
+            self._change_state("RUNNING")
             self._render_sim_orders(planned)
             return
+        max_exposure = sum(order.price * order.qty for order in planned if order.side == "BUY")
+        quote_asset = self._quote_asset or "USDT"
+        confirm = QMessageBox.question(
+            self,
+            tr("grid_confirm_title"),
+            tr(
+                "grid_confirm_message",
+                count=str(len(planned)),
+                exposure=f"{max_exposure:.2f}",
+                quote_asset=quote_asset,
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            self._append_log("Start cancelled by user.", kind="INFO")
+            self._change_state("IDLE")
+            return
+        self._bot_session_id = uuid4().hex[:8]
+        self._change_state("PLACING_GRID")
         self._place_live_orders(planned)
 
     def _handle_pause(self) -> None:
@@ -932,8 +1064,19 @@ class LiteGridWindow(QMainWindow):
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("IDLE")
-        if not self._dry_run_toggle.isChecked():
-            self._handle_cancel_all()
+        if self._dry_run_toggle.isChecked():
+            return
+        confirm = QMessageBox.question(
+            self,
+            tr("stop_confirm_title"),
+            tr("stop_confirm_message"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            self._append_log("Stop: left bot orders open.", kind="INFO")
+            return
+        self._cancel_bot_orders()
 
     def _handle_cancel_selected(self) -> None:
         selected_rows = sorted({index.row() for index in self._orders_table.selectionModel().selectedRows()})
@@ -953,6 +1096,17 @@ class LiteGridWindow(QMainWindow):
         order_ids = [self._order_id_for_row(row) for row in selected_rows]
         self._cancel_live_orders(order_ids)
 
+    def _cancel_bot_orders(self) -> None:
+        if not self._account_client:
+            self._append_log("Cancel bot orders: no account client.", kind="WARN")
+            return
+        order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
+        order_ids = [order_id for order_id in order_ids if order_id and order_id != "—"]
+        if not order_ids:
+            self._append_log("Cancel bot orders: 0", kind="ORDERS")
+            return
+        self._cancel_live_orders(order_ids)
+
     def _handle_cancel_all(self) -> None:
         count = self._orders_table.rowCount()
         if count == 0:
@@ -966,7 +1120,7 @@ class LiteGridWindow(QMainWindow):
         if not self._account_client:
             self._append_log("Cancel all: no account client.", kind="WARN")
             return
-        self._cancel_all_live_orders()
+        self._cancel_bot_orders()
 
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested.", kind="INFO")
@@ -981,22 +1135,117 @@ class LiteGridWindow(QMainWindow):
         self._engine_state = self._engine_state_from_status(new_state)
         self._engine_state_label.setText(f"{tr('engine')}: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
+        self._update_orders_timer_interval()
 
     def _update_setting(self, key: str, value: Any) -> None:
         if hasattr(self._settings_state, key):
             setattr(self._settings_state, key, value)
+        if key == "grid_step_pct" and self._settings_state.grid_step_mode == "MANUAL":
+            self._manual_grid_step_pct = float(value)
         if key == "budget":
             self._refresh_orders_metrics()
         self._update_grid_preview()
 
+    def _set_grid_step_input(self, value: float, update_setting: bool) -> None:
+        self._grid_step_input.blockSignals(True)
+        self._grid_step_input.setValue(value)
+        self._grid_step_input.blockSignals(False)
+        if update_setting:
+            self._update_setting("grid_step_pct", value)
+
+    def _record_price(self, price: float) -> None:
+        if price <= 0:
+            return
+        self._price_history.append(price)
+        if len(self._price_history) > 500:
+            self._price_history = self._price_history[-500:]
+        if self._settings_state.grid_step_mode == "AUTO_ATR":
+            auto_params = self._auto_grid_params_from_history()
+            if auto_params:
+                self._set_grid_step_input(auto_params["grid_step_pct"], update_setting=False)
+            self._update_grid_preview()
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(value, high))
+
+    def _auto_grid_params_from_history(self) -> dict[str, float] | None:
+        if len(self._price_history) < 2:
+            return None
+        prices = self._price_history[-300:]
+        return self._compute_auto_grid_params(prices)
+
+    def _auto_grid_params_from_http(self) -> dict[str, float] | None:
+        try:
+            klines = self._http_client.get_klines(self._symbol, interval="1h", limit=120)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"Auto ATR fallback failed: {exc}", kind="WARN")
+            return None
+        closes: list[float] = []
+        for entry in klines:
+            if not isinstance(entry, list) or len(entry) < 5:
+                continue
+            close_raw = entry[4]
+            try:
+                close = float(close_raw)
+            except (TypeError, ValueError):
+                continue
+            if close > 0:
+                closes.append(close)
+        return self._compute_auto_grid_params(closes)
+
+    def _compute_auto_grid_params(self, prices: list[float]) -> dict[str, float] | None:
+        if len(prices) < 2:
+            return None
+        returns: list[float] = []
+        for idx in range(1, len(prices)):
+            prev = prices[idx - 1]
+            if prev <= 0:
+                continue
+            returns.append(abs(prices[idx] / prev - 1))
+        if not returns:
+            return None
+        avg_abs_return = sum(returns) / len(returns)
+        grid_step_pct = self._clamp(avg_abs_return * 1.5 * 100, 0.05, 0.8)
+        range_pct = self._clamp(grid_step_pct * self._settings_state.grid_count / 2, 0.5, 6.0)
+        fee_candidates = [fee for fee in self._trade_fees if fee is not None]
+        fee_pct = max(fee_candidates) * 100 if fee_candidates else 0.0
+        tp_pct = max(grid_step_pct * 1.1, fee_pct * 2 + 0.01)
+        return {
+            "grid_step_pct": grid_step_pct,
+            "range_pct": range_pct,
+            "take_profit_pct": tp_pct,
+        }
+
+    def _resolve_start_settings(self) -> GridSettingsState:
+        settings = GridSettingsState(**asdict(self._settings_state))
+        if settings.grid_step_mode != "AUTO_ATR":
+            return settings
+        auto_params = self._auto_grid_params_from_history()
+        if not auto_params:
+            auto_params = self._auto_grid_params_from_http()
+        if not auto_params:
+            self._append_log("Auto ATR unavailable: fallback to manual grid values.", kind="WARN")
+            return settings
+        settings.grid_step_pct = auto_params["grid_step_pct"]
+        settings.range_low_pct = auto_params["range_pct"]
+        settings.range_high_pct = auto_params["range_pct"]
+        settings.range_mode = "Auto"
+        settings.take_profit_pct = auto_params["take_profit_pct"]
+        return settings
+
     def _reset_defaults(self) -> None:
         defaults = GridSettingsState()
         self._settings_state = defaults
+        self._manual_grid_step_pct = defaults.grid_step_pct
         self._budget_input.setValue(defaults.budget)
         self._direction_combo.setCurrentIndex(
             self._direction_combo.findData(defaults.direction)
         )
         self._grid_count_input.setValue(defaults.grid_count)
+        self._grid_step_mode_combo.setCurrentIndex(
+            self._grid_step_mode_combo.findData(defaults.grid_step_mode)
+        )
         self._grid_step_input.setValue(defaults.grid_step_pct)
         self._range_mode_combo.setCurrentIndex(
             self._range_mode_combo.findData(defaults.range_mode)
@@ -1011,6 +1260,7 @@ class LiteGridWindow(QMainWindow):
             self._order_size_combo.findData(defaults.order_size_mode)
         )
         self._append_log("Settings reset to defaults.", kind="INFO")
+        self._apply_grid_step_mode(defaults.grid_step_mode)
         self._update_grid_preview()
 
     def _refresh_balances(self, force: bool = False) -> None:
@@ -1099,6 +1349,7 @@ class LiteGridWindow(QMainWindow):
             self._logger.debug("orders refresh tick")
         if not self._account_client:
             self._set_account_status("no_keys")
+            self._open_orders_all = []
             self._open_orders = []
             self._render_open_orders()
             self._apply_trade_gate()
@@ -1111,12 +1362,25 @@ class LiteGridWindow(QMainWindow):
         worker.signals.error.connect(self._handle_open_orders_error)
         self._thread_pool.start(worker)
 
+    def _update_orders_timer_interval(self) -> None:
+        if not hasattr(self, "_orders_timer"):
+            return
+        slow_poll = self._state == "IDLE" and not self._open_orders
+        interval = 10_000 if slow_poll else 3_000
+        if self._orders_timer.interval() != interval:
+            self._orders_timer.setInterval(interval)
+
     def _handle_open_orders(self, result: object, latency_ms: int) -> None:
         self._orders_in_flight = False
         if not isinstance(result, list):
             self._handle_open_orders_error("Unexpected open orders response")
             return
-        self._open_orders = [item for item in result if isinstance(item, dict)]
+        self._open_orders_all = [item for item in result if isinstance(item, dict)]
+        self._open_orders = self._filter_bot_orders(self._open_orders_all)
+        for order in self._open_orders:
+            order_id = str(order.get("orderId", ""))
+            if order_id:
+                self._bot_order_ids.add(order_id)
         self._render_open_orders()
         self._grid_engine.sync_open_orders(self._open_orders)
         count = len(self._open_orders)
@@ -1126,6 +1390,7 @@ class LiteGridWindow(QMainWindow):
                 kind="INFO",
             )
             self._orders_last_count = count
+        self._update_orders_timer_interval()
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
@@ -1135,6 +1400,26 @@ class LiteGridWindow(QMainWindow):
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
         self._apply_trade_gate()
+
+    def _filter_bot_orders(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        prefix = self._bot_order_prefix()
+        for order in orders:
+            client_order_id = str(order.get("clientOrderId", ""))
+            order_id = str(order.get("orderId", ""))
+            is_bot = False
+            if prefix and client_order_id.startswith(prefix):
+                is_bot = True
+            if order_id and order_id in self._bot_order_ids:
+                is_bot = True
+            if is_bot:
+                filtered.append(order)
+        return filtered
+
+    def _bot_order_prefix(self) -> str:
+        if not self._bot_session_id:
+            return ""
+        return f"BBOT_LITE_{self._symbol}_{self._bot_session_id}_"
 
     def _refresh_exchange_rules(self, force: bool = False) -> None:
         if self._rules_in_flight:
@@ -1163,6 +1448,8 @@ class LiteGridWindow(QMainWindow):
         filters = info.get("filters", [])
         tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
         step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
+        min_qty = self._extract_filter_value(filters, "LOT_SIZE", "minQty")
+        max_qty = self._extract_filter_value(filters, "LOT_SIZE", "maxQty")
         min_notional = self._extract_filter_value(filters, "MIN_NOTIONAL", "minNotional")
         if min_notional is None:
             min_notional = self._extract_filter_value(filters, "NOTIONAL", "minNotional")
@@ -1170,6 +1457,8 @@ class LiteGridWindow(QMainWindow):
             "tick": tick_size,
             "step": step_size,
             "min_notional": min_notional,
+            "min_qty": min_qty,
+            "max_qty": max_qty,
         }
         self._rules_loaded = True
         self._apply_trade_gate()
@@ -1382,8 +1671,10 @@ class LiteGridWindow(QMainWindow):
         tick = self._exchange_rules.get("tick")
         step = self._exchange_rules.get("step")
         min_notional = self._exchange_rules.get("min_notional")
+        min_qty = self._exchange_rules.get("min_qty")
+        max_qty = self._exchange_rules.get("max_qty")
         maker, taker = self._trade_fees
-        has_rules = any(value is not None for value in (tick, step, min_notional, maker, taker))
+        has_rules = any(value is not None for value in (tick, step, min_notional, min_qty, max_qty, maker, taker))
         if not has_rules:
             self._rules_label.setText(tr("rules_line", rules="—"))
             self._market_fee.setText(f"{tr('fee')}: —")
@@ -1392,9 +1683,15 @@ class LiteGridWindow(QMainWindow):
         tick_text = f"{tick:.8f}" if tick is not None else "—"
         step_text = f"{step:.8f}" if step is not None else "—"
         min_text = f"{min_notional:.4f}" if min_notional is not None else "—"
+        min_qty_text = f"{min_qty:.8f}" if min_qty is not None else "—"
+        max_qty_text = f"{max_qty:.8f}" if max_qty is not None else "—"
         maker_text = f"{(maker or 0.0) * 100:.2f}%" if maker is not None else "—"
         taker_text = f"{(taker or 0.0) * 100:.2f}%" if taker is not None else "—"
-        rules = f"tick {tick_text} | step {step_text} | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
+        rules = (
+            f"tick {tick_text} | step {step_text}"
+            f" | minQty {min_qty_text} | maxQty {max_qty_text}"
+            f" | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
+        )
         self._rules_label.setText(tr("rules_line", rules=rules))
         self._market_fee.setText(f"{tr('fee')}: {maker_text}/{taker_text}")
         self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
@@ -1464,21 +1761,31 @@ class LiteGridWindow(QMainWindow):
         if not self._account_client:
             self._append_log("Live order placement skipped: no account client.", kind="WARN")
             return
+        if not self._bot_session_id:
+            self._bot_session_id = uuid4().hex[:8]
+        prefix = self._bot_order_prefix()
+        batch_size = 4
 
-        def _place() -> list[dict[str, Any]]:
+        def _place() -> dict[str, Any]:
             results: list[dict[str, Any]] = []
+            errors: list[str] = []
             for idx, order in enumerate(planned, start=1):
-                response = self._account_client.place_limit_order(
-                    symbol=self._symbol,
-                    side=order.side,
-                    price=f"{order.price:.8f}",
-                    quantity=f"{order.qty:.8f}",
-                    time_in_force="GTC",
-                )
-                results.append(response)
-                if idx % 4 == 0:
-                    self._sleep_ms(200)
-            return results
+                client_order_id = f"{prefix}{order.side}_{order.level_index}"
+                try:
+                    response = self._account_client.place_limit_order(
+                        symbol=self._symbol,
+                        side=order.side,
+                        price=f"{order.price:.8f}",
+                        quantity=f"{order.qty:.8f}",
+                        time_in_force="GTC",
+                        new_client_order_id=client_order_id,
+                    )
+                    results.append(response)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(self._format_binance_error(exc, order))
+                if idx % batch_size == 0:
+                    self._sleep_ms(300)
+            return {"results": results, "errors": errors}
 
         worker = _Worker(_place)
         worker.signals.success.connect(self._handle_live_order_placement)
@@ -1486,14 +1793,28 @@ class LiteGridWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_live_order_placement(self, result: object, latency_ms: int) -> None:
-        if not isinstance(result, list):
+        if not isinstance(result, dict):
             self._handle_live_order_error("Unexpected live order response")
             return
-        self._append_log(f"placed: n={len(result)}", kind="ORDERS")
+        results = result.get("results", [])
+        errors = result.get("errors", [])
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                order_id = str(entry.get("orderId", ""))
+                if order_id:
+                    self._bot_order_ids.add(order_id)
+        if isinstance(errors, list):
+            for message in errors:
+                self._append_log(message, kind="ERROR")
+        self._append_log(f"placed: n={len(results)}", kind="ORDERS")
         self._refresh_open_orders(force=True)
+        self._change_state("RUNNING")
 
     def _handle_live_order_error(self, message: str) -> None:
         self._append_log(f"Live order placement failed: {message}", kind="WARN")
+        self._change_state("IDLE")
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
 
@@ -1550,6 +1871,45 @@ class LiteGridWindow(QMainWindow):
         self._append_log(f"Cancel failed: {message}", kind="WARN")
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
+
+    def _format_binance_error(self, exc: Exception, order: GridPlannedOrder) -> str:
+        message = str(exc)
+        code = None
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001
+                payload = None
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                message = str(payload.get("msg") or message)
+        filter_name = self._extract_filter_failure(message)
+        price = order.price
+        qty = order.qty
+        notional = price * qty
+        min_notional = self._exchange_rules.get("min_notional")
+        if filter_name:
+            min_note = f" min={min_notional:.8f}" if min_notional is not None else ""
+            code_note = f" code={code}" if code is not None else ""
+            return (
+                f"order rejected:{code_note} FILTER_FAILURE {filter_name} "
+                f"price={price:.8f} qty={qty:.8f} notional={notional:.8f}{min_note}"
+            )
+        if code is not None:
+            return f"order rejected: code={code} msg={message}"
+        return f"order rejected: {message}"
+
+    @staticmethod
+    def _extract_filter_failure(message: str) -> str | None:
+        text = message.strip()
+        lower = text.lower()
+        if "filter failure" not in lower:
+            return None
+        parts = text.split(":", 1)
+        if len(parts) == 2:
+            return parts[1].strip().upper()
+        return "UNKNOWN"
 
     @staticmethod
     def _sleep_ms(duration_ms: int) -> None:
@@ -1755,6 +2115,7 @@ class LiteGridWindow(QMainWindow):
             "RUNNING": "RUNNING",
             "PAUSED": "PAUSED",
             "STOPPING": "STOPPING",
+            "PLACING_GRID": "PLACING_GRID",
             "ERROR": "ERROR",
         }
         return mapping.get(state, state)
@@ -1764,6 +2125,13 @@ class LiteGridWindow(QMainWindow):
         step = float(self._grid_step_input.value())
         range_low = float(self._range_low_input.value())
         range_high = float(self._range_high_input.value())
+        if self._settings_state.grid_step_mode == "AUTO_ATR":
+            auto_params = self._auto_grid_params_from_history()
+            if auto_params:
+                step = auto_params["grid_step_pct"]
+                range_low = auto_params["range_pct"]
+                range_high = auto_params["range_pct"]
+                self._set_grid_step_input(step, update_setting=False)
         range_pct = max(range_low, range_high)
         budget = float(self._budget_input.value())
         min_order = budget / levels if levels > 0 else 0.0

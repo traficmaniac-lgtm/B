@@ -69,6 +69,12 @@ class BinanceHttpClient:
     def get_time(self) -> dict[str, Any]:
         return self._request_json("/api/v3/time")
 
+    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 120) -> list[Any]:
+        data = self._request_json(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
+        if not isinstance(data, list):
+            raise ValueError("Unexpected klines response format")
+        return data
+
     def _request_json(self, path: str) -> dict[str, Any] | list[Any]:
         last_exc: Exception | None = None
         attempts = self._retries + 1

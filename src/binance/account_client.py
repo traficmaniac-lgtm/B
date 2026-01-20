@@ -60,6 +60,7 @@ class BinanceAccountClient:
         price: str,
         quantity: str,
         time_in_force: str = "GTC",
+        new_client_order_id: str | None = None,
     ) -> dict[str, Any]:
         params = {
             "symbol": symbol,
@@ -69,6 +70,8 @@ class BinanceAccountClient:
             "quantity": quantity,
             "price": price,
         }
+        if new_client_order_id:
+            params["newClientOrderId"] = new_client_order_id
         payload = self._request_signed("POST", "/api/v3/order", params=params)
         if not isinstance(payload, dict):
             raise ValueError("Unexpected order response format")
