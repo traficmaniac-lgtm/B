@@ -199,15 +199,23 @@ class GridEngine:
         range_low = float(settings.range_low_pct)
         range_high = float(settings.range_high_pct)
         buys, sells = self._split_levels(levels, settings.direction)
-        per_order_quote = budget / levels if levels else 0.0
+        buy_budget, sell_budget = self._split_budget(budget, buys, sells, settings.direction)
+        per_order_quote_buy = buy_budget / buys if buys else 0.0
+        per_order_quote_sell = sell_budget / sells if sells else 0.0
+        anchor_price = last_price
+        buy_min = anchor_price * (1 - range_low / 100.0)
+        sell_max = anchor_price * (1 + range_high / 100.0)
+        buy_max = anchor_price
+        sell_min = anchor_price
 
         buy_orders = self._build_side(
             side="BUY",
             count=buys,
-            mid_price=last_price,
+            anchor_price=anchor_price,
             step_pct=step_pct,
-            range_pct=range_low,
-            per_order_quote=per_order_quote,
+            price_min=buy_min,
+            price_max=buy_max,
+            per_order_quote=per_order_quote_buy,
             tick=tick,
             step=step,
             min_notional=min_notional,
@@ -217,10 +225,11 @@ class GridEngine:
         sell_orders = self._build_side(
             side="SELL",
             count=sells,
-            mid_price=last_price,
+            anchor_price=anchor_price,
             step_pct=step_pct,
-            range_pct=range_high,
-            per_order_quote=per_order_quote,
+            price_min=sell_min,
+            price_max=sell_max,
+            per_order_quote=per_order_quote_sell,
             tick=tick,
             step=step,
             min_notional=min_notional,
@@ -233,20 +242,23 @@ class GridEngine:
     def _split_levels(self, total: int, direction: str) -> tuple[int, int]:
         if direction == "Long-biased":
             buy = int(ceil(total * 0.6))
+            sell = max(total - buy, 0)
+            return buy, sell
         elif direction == "Short-biased":
             buy = int(floor(total * 0.4))
-        else:
-            buy = total // 2
-        sell = max(total - buy, 0)
-        return buy, sell
+            sell = max(total - buy, 0)
+            return buy, sell
+        per_side = max(total // 2, 1)
+        return per_side, per_side
 
     def _build_side(
         self,
         side: str,
         count: int,
-        mid_price: float,
+        anchor_price: float,
         step_pct: float,
-        range_pct: float,
+        price_min: float,
+        price_max: float,
         per_order_quote: float,
         tick: float | None,
         step: float | None,
@@ -255,32 +267,104 @@ class GridEngine:
         max_qty: float | None,
     ) -> list[GridPlannedOrder]:
         orders: list[GridPlannedOrder] = []
+        use_tick_ladder = False
+        last_price: float | None = None
         for idx in range(count):
             offset = step_pct * (idx + 1) / 100.0
             if side == "BUY":
-                raw_price = mid_price * (1 - offset)
-                min_price = mid_price * (1 - range_pct / 100.0)
-                if raw_price < min_price:
+                raw_price = anchor_price * (1 - offset)
+                if raw_price < price_min:
+                    break
+                price = self.round_price_to_tick(raw_price, tick, mode="down")
+                if price < price_min:
                     break
             else:
-                raw_price = mid_price * (1 + offset)
-                max_price = mid_price * (1 + range_pct / 100.0)
-                if raw_price > max_price:
+                raw_price = anchor_price * (1 + offset)
+                if raw_price > price_max:
                     break
-            price = self.normalize_price(raw_price, tick)
+                price = self.round_price_to_tick(raw_price, tick, mode="up")
+                if price > price_max:
+                    break
+            if price <= 0:
+                continue
+            if last_price is not None and price == last_price:
+                use_tick_ladder = True
+                break
             qty = per_order_quote / price if price > 0 else 0.0
-            qty = self.normalize_qty(qty, step)
-            price, qty = self._apply_filters(
+            qty = self.quantize_qty(qty, step, mode="down")
+            qty = self._adjust_qty_for_filters(
                 side=side,
                 price=price,
                 qty=qty,
-                tick=tick,
                 step=step,
                 min_notional=min_notional,
                 min_qty=min_qty,
                 max_qty=max_qty,
             )
-            if qty <= 0 or price <= 0:
+            if qty <= 0:
+                continue
+            orders.append(GridPlannedOrder(side=side, price=price, qty=qty, level_index=idx + 1))
+            last_price = price
+        if use_tick_ladder and tick and tick > 0:
+            self._on_log(
+                "[PLAN] pct_step too small vs tick; switching to tick ladder",
+                "INFO",
+            )
+            return self._build_tick_ladder(
+                side=side,
+                count=count,
+                anchor_price=anchor_price,
+                tick=tick,
+                price_min=price_min,
+                price_max=price_max,
+                per_order_quote=per_order_quote,
+                step=step,
+                min_notional=min_notional,
+                min_qty=min_qty,
+                max_qty=max_qty,
+            )
+        return orders
+
+    def _build_tick_ladder(
+        self,
+        side: str,
+        count: int,
+        anchor_price: float,
+        tick: float,
+        price_min: float,
+        price_max: float,
+        per_order_quote: float,
+        step: float | None,
+        min_notional: float | None,
+        min_qty: float | None,
+        max_qty: float | None,
+    ) -> list[GridPlannedOrder]:
+        orders: list[GridPlannedOrder] = []
+        for idx in range(count):
+            ladder_price = anchor_price + (idx + 1) * tick if side == "SELL" else anchor_price - (idx + 1) * tick
+            if side == "BUY" and ladder_price < price_min:
+                break
+            if side == "SELL" and ladder_price > price_max:
+                break
+            price = self.round_price_to_tick(ladder_price, tick, mode="up" if side == "SELL" else "down")
+            if side == "BUY" and price < price_min:
+                break
+            if side == "SELL" and price > price_max:
+                break
+            if price <= 0:
+                continue
+            qty = per_order_quote / price if price > 0 else 0.0
+            qty = self.quantize_qty(qty, step, mode="down")
+            qty = self._adjust_qty_for_filters(
+                side=side,
+                price=price,
+                qty=qty,
+                step=step,
+                min_notional=min_notional,
+                min_qty=min_qty,
+                max_qty=max_qty,
+            )
+            if qty <= 0:
                 continue
             orders.append(GridPlannedOrder(side=side, price=price, qty=qty, level_index=idx + 1))
         return orders
@@ -292,49 +376,97 @@ class GridEngine:
             return ceil(value / step) * step
         return floor(value / step) * step
 
-    def normalize_price(self, price: float, tick: float | None) -> float:
-        return self._quantize(price, tick, round_up=False)
+    def round_price_to_tick(self, price: float, tick: float | None, mode: str) -> float:
+        if tick is None or tick <= 0:
+            return price
+        round_up = mode == "up"
+        return self._quantize(price, tick, round_up=round_up)
 
-    def normalize_qty(self, qty: float, step: float | None) -> float:
-        return self._quantize(qty, step, round_up=False)
+    def quantize_price(self, price: float, tick: float | None) -> float:
+        return self.round_price_to_tick(price, tick, mode="down")
 
-    def _apply_filters(
+    def quantize_qty(self, qty: float, step: float | None, mode: str) -> float:
+        if step is None or step <= 0:
+            return qty
+        return self._quantize(qty, step, round_up=(mode == "up"))
+
+    def _adjust_qty_for_filters(
         self,
         side: str,
         price: float,
         qty: float,
-        tick: float | None,
         step: float | None,
         min_notional: float | None,
         min_qty: float | None,
         max_qty: float | None,
-    ) -> tuple[float, float]:
+    ) -> float:
         if price <= 0 or qty <= 0:
-            return price, 0.0
+            return 0.0
         if max_qty is not None and qty > max_qty:
-            qty = self._quantize(max_qty, step, round_up=False)
+            qty = self.quantize_qty(max_qty, step, mode="down")
         if min_qty is not None and qty < min_qty:
-            self._log_skip(
-                "minQty",
-                side=side,
-                price=price,
-                qty=qty,
-                min_value=min_qty,
-            )
-            return price, 0.0
-        if min_notional is not None and price * qty < min_notional:
+            qty = self.quantize_qty(min_qty, step, mode="up")
+            if max_qty is not None and qty > max_qty:
+                self._log_skip(
+                    "minQty",
+                    side=side,
+                    price=price,
+                    qty=qty,
+                    min_value=min_qty,
+                )
+                return 0.0
+        qty = self.ensure_min_notional(
+            side=side,
+            price=price,
+            qty=qty,
+            step=step,
+            min_notional=min_notional,
+            min_qty=min_qty,
+            max_qty=max_qty,
+        )
+        return qty
+
+    def ensure_min_notional(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        step: float | None,
+        min_notional: float | None,
+        min_qty: float | None,
+        max_qty: float | None,
+    ) -> float:
+        if min_notional is None or price <= 0 or qty <= 0:
+            return qty
+        if price * qty >= min_notional:
+            return qty
+        required_qty = min_notional / price
+        required_qty = self.quantize_qty(required_qty, step, mode="up")
+        if min_qty is not None and required_qty < min_qty:
+            required_qty = self.quantize_qty(min_qty, step, mode="up")
+        if max_qty is not None and required_qty > max_qty:
             self._plan_stats.min_notional_failed += 1
             self._log_skip(
                 "minNotional",
                 side=side,
                 price=price,
-                qty=qty,
+                qty=required_qty,
                 min_value=min_notional,
             )
-            return price, 0.0
-        if qty <= 0:
-            return price, 0.0
-        return price, qty
+            return 0.0
+        return required_qty
+
+    def _split_budget(self, budget: float, buys: int, sells: int, direction: str) -> tuple[float, float]:
+        if buys + sells <= 0:
+            return 0.0, 0.0
+        if direction == "Neutral":
+            buy_budget = budget / 2
+            sell_budget = budget - buy_budget
+            return buy_budget, sell_budget
+        buy_weight = buys / (buys + sells)
+        buy_budget = budget * buy_weight
+        sell_budget = budget - buy_budget
+        return buy_budget, sell_budget
 
     def _log_skip(self, reason: str, side: str, price: float, qty: float, min_value: float) -> None:
         self._on_log(
@@ -644,8 +776,9 @@ class LiteGridWindow(QMainWindow):
         )
 
         self._grid_step_input = QDoubleSpinBox()
-        self._grid_step_input.setRange(0.05, 25.0)
-        self._grid_step_input.setDecimals(2)
+        self._grid_step_input.setRange(0.000001, 10.0)
+        self._grid_step_input.setDecimals(8)
+        self._grid_step_input.setSingleStep(0.0001)
         self._grid_step_input.setValue(self._settings_state.grid_step_pct)
         self._grid_step_input.valueChanged.connect(
             lambda value: self._update_setting("grid_step_pct", value)
@@ -665,24 +798,27 @@ class LiteGridWindow(QMainWindow):
         )
 
         self._range_low_input = QDoubleSpinBox()
-        self._range_low_input.setRange(0.1, 50.0)
-        self._range_low_input.setDecimals(2)
+        self._range_low_input.setRange(0.000001, 10.0)
+        self._range_low_input.setDecimals(8)
+        self._range_low_input.setSingleStep(0.0001)
         self._range_low_input.setValue(self._settings_state.range_low_pct)
         self._range_low_input.valueChanged.connect(
             lambda value: self._update_setting("range_low_pct", value)
         )
 
         self._range_high_input = QDoubleSpinBox()
-        self._range_high_input.setRange(0.1, 50.0)
-        self._range_high_input.setDecimals(2)
+        self._range_high_input.setRange(0.000001, 10.0)
+        self._range_high_input.setDecimals(8)
+        self._range_high_input.setSingleStep(0.0001)
         self._range_high_input.setValue(self._settings_state.range_high_pct)
         self._range_high_input.valueChanged.connect(
             lambda value: self._update_setting("range_high_pct", value)
         )
 
         self._take_profit_input = QDoubleSpinBox()
-        self._take_profit_input.setRange(0.1, 100.0)
-        self._take_profit_input.setDecimals(2)
+        self._take_profit_input.setRange(0.000001, 50.0)
+        self._take_profit_input.setDecimals(8)
+        self._take_profit_input.setSingleStep(0.0001)
         self._take_profit_input.setValue(self._settings_state.take_profit_pct)
         self._take_profit_input.valueChanged.connect(
             lambda value: self._update_setting("take_profit_pct", value)
@@ -1107,6 +1243,16 @@ class LiteGridWindow(QMainWindow):
             if not dry_run and self._first_live_session:
                 settings.grid_count = min(settings.grid_count, 4)
                 settings.max_active_orders = min(settings.max_active_orders, 4)
+            tick = self._exchange_rules.get("tick")
+            step = self._exchange_rules.get("step")
+            self._append_log(
+                (
+                    f"[START] mode={settings.grid_step_mode} range={settings.range_mode} "
+                    f"step_pct={settings.grid_step_pct:.6f} tp_pct={settings.take_profit_pct:.6f} "
+                    f"tick={tick} step={step}"
+                ),
+                kind="INFO",
+            )
             self._last_price = anchor_price
             self._last_price_label.setText(tr("last_price", price=f"{anchor_price:.8f}"))
             self._market_price.setText(f"{tr('price')}: {anchor_price:.8f}")
