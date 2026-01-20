@@ -9,6 +9,7 @@ from typing import Any
 from src.binance.http_client import BinanceHttpClient
 from src.core.logging import get_logger
 from src.core.models import Pair
+from src.core.symbols import sanitize_symbol
 
 DEFAULT_BLACKLIST_SUBSTRINGS = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S")
 
@@ -28,6 +29,7 @@ class MarketsService:
         )
         self._cache_dir = cache_dir or self._default_cache_dir()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._invalid_symbols_logged: set[str] = set()
 
     def load_pairs(
         self,
@@ -53,8 +55,9 @@ class MarketsService:
                 continue
             if str(item.get("quoteAsset", "")).upper() != quote:
                 continue
-            symbol = str(item.get("symbol", ""))
+            symbol = sanitize_symbol(item.get("symbol", ""))
             if not symbol:
+                self._log_invalid_symbol(item.get("symbol", ""))
                 continue
             if any(substring in symbol for substring in blacklist):
                 continue
@@ -96,8 +99,9 @@ class MarketsService:
                 continue
             if str(item.get("status", "")).upper() != status_filter:
                 continue
-            symbol = str(item.get("symbol", ""))
+            symbol = sanitize_symbol(item.get("symbol", ""))
             if not symbol:
+                self._log_invalid_symbol(item.get("symbol", ""))
                 continue
             if any(substring in symbol for substring in blacklist):
                 continue
@@ -203,7 +207,11 @@ class MarketsService:
         pairs_payload = payload.get("pairs")
         if not isinstance(pairs_payload, list):
             return None
-        pairs = [pair for pair in (self._payload_to_pair(item) for item in pairs_payload) if pair]
+        pairs = [
+            pair
+            for pair in (self._payload_to_pair(item) for item in pairs_payload)
+            if pair and self._validate_cached_symbol(pair.symbol)
+        ]
         return saved_at, pairs, meta if isinstance(meta, dict) else {}
 
     def _write_cache(self, quote_asset: str, pairs: list[Pair], scope: str) -> None:
@@ -240,6 +248,8 @@ class MarketsService:
         base_asset = payload.get("base_asset")
         quote_asset = payload.get("quote_asset")
         if not all(isinstance(value, str) and value for value in (symbol, base_asset, quote_asset)):
+            return None
+        if sanitize_symbol(symbol) is None:
             return None
         status = payload.get("status")
         filters = payload.get("filters")
@@ -281,3 +291,16 @@ class MarketsService:
         if isinstance(value, str):
             return value
         return None
+
+    def _validate_cached_symbol(self, symbol: str) -> bool:
+        if sanitize_symbol(symbol) is None:
+            self._log_invalid_symbol(symbol)
+            return False
+        return True
+
+    def _log_invalid_symbol(self, symbol: object) -> None:
+        symbol_text = str(symbol)
+        if symbol_text in self._invalid_symbols_logged:
+            return
+        self._invalid_symbols_logged.add(symbol_text)
+        self._logger.warning("invalid symbol dropped: %s", symbol_text)
