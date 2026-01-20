@@ -682,6 +682,36 @@ class AiOperatorGridWindow(LiteGridWindow):
             "INFO",
         )
 
+    def _apply_strategy_patch_to_form(self, patch: AiOperatorStrategyPatch) -> None:
+        if patch.bias:
+            mapping = {
+                "NEUTRAL": "Neutral",
+                "FLAT": "Neutral",
+                "LONG": "Long-biased",
+                "UP": "Long-biased",
+                "SHORT": "Short-biased",
+                "DOWN": "Short-biased",
+            }
+            direction_value = mapping.get(patch.bias, "Neutral")
+            self._update_setting("direction", direction_value)
+        if patch.levels is not None:
+            self._update_setting("grid_count", patch.levels)
+        if patch.budget is not None:
+            self._update_setting("budget", patch.budget)
+        if patch.step_pct is not None:
+            self._update_setting("grid_step_mode", "MANUAL")
+            self._update_setting("grid_step_pct", patch.step_pct)
+        if patch.range_down_pct is not None or patch.range_up_pct is not None:
+            self._update_setting("range_mode", "Manual")
+        if patch.range_down_pct is not None:
+            self._update_setting("range_low_pct", patch.range_down_pct)
+        if patch.range_up_pct is not None:
+            self._update_setting("range_high_pct", patch.range_up_pct)
+        if patch.tp_pct is not None:
+            self._update_setting("take_profit_pct", patch.tp_pct)
+        if patch.max_active_orders is not None:
+            self._update_setting("max_active_orders", patch.max_active_orders)
+
     def _handle_start(self) -> None:
         self._runtime_stopping = False
         super()._handle_start()
