@@ -21,9 +21,12 @@ from PySide6.QtWidgets import (
 
 from src.ai.openai_client import OpenAIClient
 from src.ai.operator_models import AiOperatorResponse, AiOperatorStrategyPatch, parse_ai_operator_response
+from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
+from src.core.timeutil import utc_ms
 from src.gui.lite_grid_window import LiteGridWindow, TradeGate
 from src.gui.models.app_state import AppState
+from src.services.data_cache import DataCache
 from src.services.price_feed_manager import PriceFeedManager
 
 
@@ -72,6 +75,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_approve_ts: float = 0.0
         self._last_apply_ts: float = 0.0
         self._max_exposure_warned = False
+        self._ai_busy = False
+        self._data_cache = DataCache()
+        self._http_client = BinanceHttpClient()
+        self._cache_ttls = {
+            "orderbook_depth_50": 2.0,
+            "recent_trades_1m": 2.0,
+        }
 
     def _build_body(self) -> QSplitter:
         splitter = QSplitter(Qt.Horizontal)
@@ -110,6 +120,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_plan_button.setEnabled(False)
         self._apply_plan_button.clicked.connect(self._apply_ai_plan)
         top_actions.addWidget(self._apply_plan_button)
+
+        self._fetch_data_button = QPushButton("Fetch requested data")
+        self._fetch_data_button.setVisible(False)
+        self._fetch_data_button.setEnabled(False)
+        self._fetch_data_button.clicked.connect(self._handle_fetch_requested_data)
+        top_actions.addWidget(self._fetch_data_button)
+
         top_actions.addStretch()
         layout.addLayout(top_actions)
 
@@ -185,14 +202,17 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions_suggested)
         self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
+        self._update_fetch_data_button()
         self._append_log("[AI] response received", "INFO")
 
     def _handle_ai_analyze_error(self, message: str) -> None:
         self._set_ai_busy(False)
         self._append_log(f"[AI] response invalid: {message}", "WARN")
         self._append_chat_line("AI", f"Ошибка AI: {message}")
+        self._last_ai_response = None
         self._actions_combo.clear()
         self._apply_plan_button.setEnabled(False)
+        self._update_fetch_data_button()
         self._update_approve_button_state()
 
     def _apply_ai_plan(self) -> None:
@@ -275,12 +295,14 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions_suggested)
         self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
+        self._update_fetch_data_button()
         self._append_log("[AI] chat response received", "INFO")
 
     def _handle_ai_chat_error(self, message: str) -> None:
         self._set_ai_busy(False)
         self._append_log(f"[AI] chat response invalid: {message}", "WARN")
         self._append_chat_line("AI", f"Ошибка AI: {message}")
+        self._update_fetch_data_button()
 
     def _approve_ai_action(self) -> None:
         action = self._actions_combo.currentText().strip().upper()
@@ -323,9 +345,11 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._approve_button.setEnabled(self._actions_combo.count() > 0)
 
     def _set_ai_busy(self, busy: bool) -> None:
+        self._ai_busy = busy
         self._analyze_button.setEnabled(not busy)
         self._chat_input.setEnabled(not busy)
         self._send_button.setEnabled(not busy)
+        self._update_fetch_data_button()
 
     def _append_chat_line(self, author: str, message: str) -> None:
         if not message:
@@ -419,14 +443,237 @@ class AiOperatorGridWindow(LiteGridWindow):
                 self._append_log("[AI] max_exposure ignored (UI field not present)", "INFO")
                 self._max_exposure_warned = True
 
-    def _build_ai_datapack(self) -> dict[str, Any]:
-        snapshot = self._price_feed_manager.get_snapshot(self._symbol)
+    def _update_fetch_data_button(self) -> None:
+        if not hasattr(self, "_fetch_data_button"):
+            return
+        should_show = self._can_fetch_requested_data()
+        self._fetch_data_button.setVisible(should_show)
+        self._fetch_data_button.setEnabled(should_show and not self._ai_busy)
+
+    def _can_fetch_requested_data(self) -> bool:
+        if not self._last_ai_response:
+            return False
+        actions = {action.upper() for action in self._last_ai_response.actions_suggested}
+        if "REQUEST_MORE_DATA" not in actions:
+            return False
+        return any(item.strip() for item in self._last_ai_response.need_data)
+
+    def _handle_fetch_requested_data(self) -> None:
+        if not self._app_state.openai_key_present:
+            self._append_log("[AI] fetch skipped: missing OpenAI key.", "WARN")
+            self._append_chat_line("AI", "Не задан ключ OpenAI.")
+            return
+        if not self._can_fetch_requested_data():
+            self._append_log("[AI] fetch skipped: no requested data.", "WARN")
+            return
+        requested = [item for item in self._last_ai_response.need_data if item]
+        self._set_ai_busy(True)
+        worker = _AiWorker(lambda: self._run_fetch_requested_data(requested))
+        worker.signals.success.connect(self._handle_fetch_requested_data_success)
+        worker.signals.error.connect(self._handle_fetch_requested_data_error)
+        self._thread_pool.start(worker)
+        self._append_log("[AI] requested data fetch started", "INFO")
+
+    def _run_fetch_requested_data(
+        self,
+        requested: list[str],
+    ) -> dict[str, tuple[bool, str | None]]:
+        results: dict[str, tuple[bool, str | None]] = {}
+        if "orderbook_depth_50" in requested:
+            results["orderbook_depth_50"] = self._fetch_orderbook_depth_cached()
+        if "recent_trades_1m" in requested:
+            results["recent_trades_1m"] = self._fetch_recent_trades_cached()
+        return results
+
+    def _handle_fetch_requested_data_success(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            self._handle_fetch_requested_data_error("Unexpected fetch response.")
+            return
+        results: dict[str, tuple[bool, str | None]] = payload
+        orderbook_ok, orderbook_err = results.get("orderbook_depth_50", (False, None))
+        trades_ok, trades_err = results.get("recent_trades_1m", (False, None))
+        if orderbook_err:
+            self._append_log(f"[AI] orderbook fetch failed: {orderbook_err}", "WARN")
+        if trades_err:
+            self._append_log(f"[AI] trades fetch failed: {trades_err}", "WARN")
+        orderbook_status = "OK" if orderbook_ok else "FAIL"
+        trades_status = "OK" if trades_ok else "FAIL"
+        self._append_log(
+            f"[AI] requested data fetched: orderbook={orderbook_status} trades={trades_status}",
+            "INFO",
+        )
+        self._append_chat_line(
+            "AI",
+            f"Получены данные: стакан={orderbook_status}, трейды={trades_status}",
+        )
+        datapack = self._build_ai_datapack()
+        worker = _AiWorker(lambda: self._run_ai_follow_up(datapack))
+        worker.signals.success.connect(self._handle_ai_follow_up_success)
+        worker.signals.error.connect(self._handle_ai_follow_up_error)
+        self._thread_pool.start(worker)
+        self._append_log("[AI] follow-up sent", "INFO")
+
+    def _handle_fetch_requested_data_error(self, message: str) -> None:
+        self._set_ai_busy(False)
+        self._append_log(f"[AI] requested data fetch failed: {message}", "WARN")
+        self._append_chat_line("AI", f"Ошибка AI: {message}")
+
+    def _run_ai_follow_up(self, datapack: dict[str, Any]) -> str:
+        client = OpenAIClient(
+            api_key=self._app_state.openai_api_key,
+            model=self._app_state.openai_model,
+            timeout_s=25.0,
+            retries=2,
+        )
+        return asyncio.run(
+            client.analyze_operator(
+                datapack,
+                follow_up_note="Follow-up: attached requested data",
+            )
+        )
+
+    def _handle_ai_follow_up_success(self, response: object) -> None:
+        self._set_ai_busy(False)
+        if not isinstance(response, str):
+            self._handle_ai_follow_up_error("AI response invalid or empty.")
+            return
+        try:
+            parsed = parse_ai_operator_response(response)
+        except ValueError as exc:
+            self._handle_ai_follow_up_error(str(exc))
+            return
+        self._last_ai_response = parsed
+        self._last_ai_result_json = response
+        self._last_strategy_patch = parsed.strategy_patch
+        self._last_actions_suggested = list(parsed.actions_suggested)
+        self._append_ai_response_to_chat(parsed)
+        self._render_actions(parsed.actions_suggested)
+        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
+        self._update_fetch_data_button()
+        self._append_log("[AI] follow-up received", "INFO")
+
+    def _handle_ai_follow_up_error(self, message: str) -> None:
+        self._set_ai_busy(False)
+        self._append_log(f"[AI] follow-up response invalid: {message}", "WARN")
+        self._append_chat_line("AI", f"Ошибка AI: {message}")
+        self._update_fetch_data_button()
+
+    def _fetch_orderbook_depth_cached(self) -> tuple[bool, str | None]:
+        cached = self._get_cached_data("orderbook_depth_50")
+        if cached is not None:
+            return True, None
+        try:
+            depth = self._http_client.get_orderbook_depth(self._symbol, limit=50)
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        bids = self._normalize_depth_side(depth.get("bids"))
+        asks = self._normalize_depth_side(depth.get("asks"))
+        payload = {
+            "bids": bids,
+            "asks": asks,
+            "level_count": len(bids) + len(asks),
+            "ts": utc_ms(),
+        }
+        self._data_cache.set(self._symbol, "orderbook_depth_50", payload)
+        return True, None
+
+    def _fetch_recent_trades_cached(self) -> tuple[bool, str | None]:
+        cached = self._get_cached_data("recent_trades_1m")
+        if cached is not None:
+            return True, None
+        try:
+            trades = self._http_client.get_recent_trades(self._symbol, limit=500)
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        now_ms = utc_ms()
+        cutoff_ms = now_ms - 60_000
+        items: list[dict[str, Any]] = []
+        for trade in trades:
+            trade_ts = trade.get("time")
+            if not isinstance(trade_ts, int):
+                continue
+            if trade_ts < cutoff_ms:
+                continue
+            items.append(
+                {
+                    "price": trade.get("price"),
+                    "qty": trade.get("qty"),
+                    "isBuyerMaker": trade.get("isBuyerMaker"),
+                    "ts": trade_ts,
+                }
+            )
+        payload = {
+            "items": items,
+            "count": len(items),
+            "ts": now_ms,
+        }
+        self._data_cache.set(self._symbol, "recent_trades_1m", payload)
+        return True, None
+
+    def _get_cached_data(self, data_type: str) -> Any | None:
+        cached = self._data_cache.get(self._symbol, data_type)
+        if not cached:
+            return None
+        data, saved_at = cached
+        ttl = self._cache_ttls.get(data_type)
+        if ttl is None or not self._data_cache.is_fresh(saved_at, ttl):
+            return None
+        return data
+
+    def _normalize_depth_side(self, raw: Any) -> list[list[float | str]]:
+        if not isinstance(raw, list):
+            return []
+        normalized: list[list[float | str]] = []
+        for item in raw:
+            if not isinstance(item, list) or len(item) < 2:
+                continue
+            price = self._coerce_depth_value(item[0])
+            qty = self._coerce_depth_value(item[1])
+            normalized.append([price, qty])
+        return normalized
+
+    def _coerce_depth_value(self, value: Any) -> float | str:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return value
+        return str(value)
+
+    def build_market_snapshot(self, symbol: str, use_cache: bool = True) -> dict[str, Any]:
+        snapshot = self._price_feed_manager.get_snapshot(symbol)
         last_price = self._last_price or (snapshot.last_price if snapshot else None)
         best_bid = snapshot.best_bid if snapshot else None
         best_ask = snapshot.best_ask if snapshot else None
         spread_pct = snapshot.spread_pct if snapshot else None
         if spread_pct is None and best_bid and best_ask and best_bid > 0:
             spread_pct = (best_ask - best_bid) / best_bid * 100
+        orderbook = None
+        trades = None
+        if use_cache:
+            orderbook = self._get_cached_data("orderbook_depth_50")
+            trades = self._get_cached_data("recent_trades_1m")
+        return {
+            "symbol": symbol,
+            "last_price": last_price,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_pct": spread_pct,
+            "price_age_ms": snapshot.price_age_ms if snapshot else None,
+            "latency_ms": snapshot.ws_latency_ms if snapshot else None,
+            "source": snapshot.source if snapshot else None,
+            "orderbook": orderbook,
+            "trades_1m": trades,
+        }
+
+    def _build_ai_datapack(self) -> dict[str, Any]:
+        market_snapshot = self.build_market_snapshot(self._symbol, use_cache=True)
+        last_price = market_snapshot.get("last_price")
+        best_bid = market_snapshot.get("best_bid")
+        best_ask = market_snapshot.get("best_ask")
+        spread_pct = market_snapshot.get("spread_pct")
         atr_pct, micro_vol_pct = self._compute_volatility_metrics()
         maker_fee, taker_fee = self._trade_fees
         is_zero_fee = bool(
@@ -439,13 +686,17 @@ class AiOperatorGridWindow(LiteGridWindow):
         quote_asset = self._quote_asset or ""
         base_free, base_locked = self._balances.get(base_asset, (0.0, 0.0))
         quote_free, quote_locked = self._balances.get(quote_asset, (0.0, 0.0))
+        orderbook = market_snapshot.get("orderbook")
+        trades_1m = market_snapshot.get("trades_1m")
         orderbook_snapshot = {
             "bids": [{"price": best_bid, "qty": None}] if best_bid is not None else [],
             "asks": [{"price": best_ask, "qty": None}] if best_ask is not None else [],
             "depth": 1,
-            "source": snapshot.source if snapshot else None,
+            "source": market_snapshot.get("source"),
         }
         orderbook_top_count = len(orderbook_snapshot["bids"]) + len(orderbook_snapshot["asks"])
+        depth_levels = orderbook.get("level_count") if isinstance(orderbook, dict) else None
+        trades_count = trades_1m.get("count") if isinstance(trades_1m, dict) else None
         return {
             "symbol": self._symbol,
             "market": {
@@ -457,6 +708,12 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "micro_vol_pct": micro_vol_pct,
             },
             "orderbook_snapshot": orderbook_snapshot,
+            "orderbook": orderbook,
+            "trades_1m": trades_1m,
+            "flags": {
+                "has_orderbook": orderbook is not None,
+                "has_trades_1m": trades_1m is not None,
+            },
             "rules": {
                 "tick": self._exchange_rules.get("tick"),
                 "step": self._exchange_rules.get("step"),
@@ -483,11 +740,16 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "trade_gate": self._trade_gate.value,
             },
             "fees": {
-                "maker": maker_fee,
-                "taker": taker_fee,
                 "maker_fee": maker_fee,
                 "taker_fee": taker_fee,
                 "is_zero_fee": is_zero_fee,
+            },
+            "liquidity_hint": {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_pct": spread_pct,
+                "depth_levels": depth_levels,
+                "trades_count_1m": trades_count,
             },
             "liquidity_hints": {
                 "orderbook_topN_count": orderbook_top_count,
@@ -496,8 +758,8 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "spread_pct": spread_pct,
             },
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "price_age_ms": snapshot.price_age_ms if snapshot else None,
-            "latency_ms": snapshot.ws_latency_ms if snapshot else None,
+            "price_age_ms": market_snapshot.get("price_age_ms"),
+            "latency_ms": market_snapshot.get("latency_ms"),
         }
 
     def _compute_volatility_metrics(self) -> tuple[float | None, float | None]:

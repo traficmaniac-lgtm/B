@@ -140,7 +140,7 @@ class OpenAIClient:
             self._logger.warning("OpenAI analyze failed: %s", exc)
             raise
 
-    async def analyze_operator(self, datapack: dict[str, Any]) -> str:
+    async def analyze_operator(self, datapack: dict[str, Any], follow_up_note: str | None = None) -> str:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         system_prompt = (
             "Ты торговый оператор. Дай оценку рынка и рекомендации.\n"
@@ -180,6 +180,8 @@ class OpenAIClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Analyze this datapack:\n{payload}"},
             ]
+            if follow_up_note:
+                messages.append({"role": "user", "content": follow_up_note})
             response = await self._chat_completion(
                 messages=messages,
                 max_tokens=520,
