@@ -2919,12 +2919,24 @@ class LiteGridWindow(QMainWindow):
         if not self._bot_session_id:
             self._bot_session_id = uuid4().hex[:8]
         batch_size = 5
+        base_asset = self._base_asset
+        base_free = 0.0
+        if base_asset:
+            base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
+        skip_sells = base_free <= 0
+        if skip_sells:
+            self._append_log(
+                "[LIVE] sell orders skipped: base balance is 0.",
+                kind="INFO",
+            )
 
         def _place() -> dict[str, Any]:
             results: list[dict[str, Any]] = []
             errors: list[str] = []
             last_open_orders: list[dict[str, Any]] | None = None
             for idx, order in enumerate(planned, start=1):
+                if skip_sells and order.side == "SELL":
+                    continue
                 client_order_id = self._make_client_order_id("GRID", idx)
                 try:
                     price = self.as_decimal(order.price)
