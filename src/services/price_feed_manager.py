@@ -180,7 +180,7 @@ class _BinanceBookTickerWsThread:
         on_message: Callable[[dict[str, Any]], None],
         on_status: Callable[[str, str], None],
         now_ms_fn: Callable[[], int],
-        debounce_ms: int = 700,
+        debounce_ms: int = 400,
         min_reconnect_interval_ms: int = 5000,
         heartbeat_interval_s: float = 10.0,
         heartbeat_timeout_s: float = 5.0,
@@ -214,6 +214,7 @@ class _BinanceBookTickerWsThread:
         self._last_message_ms: int | None = None
         self._closing = False
         self._close_lock = threading.Lock()
+        self._reconnect_in_progress = False
 
     def start(self) -> None:
         if self._thread.is_alive():
@@ -272,6 +273,10 @@ class _BinanceBookTickerWsThread:
             if url is None:
                 await asyncio.sleep(1.0)
                 continue
+            if self._reconnect_in_progress:
+                await asyncio.sleep(0.1)
+                continue
+            self._reconnect_in_progress = True
             try:
                 if not self._logged_url:
                     self._logger.debug("WS URL = %s", url)
@@ -290,6 +295,8 @@ class _BinanceBookTickerWsThread:
                 self._on_status("ERROR", f"ошибка WS: {exc}")
             except Exception as exc:  # noqa: BLE001
                 self._on_status("ERROR", f"ошибка WS: {exc}")
+            finally:
+                self._reconnect_in_progress = False
             if self._stop_event.is_set():
                 break
             attempt += 1
@@ -355,10 +362,10 @@ class _BinanceBookTickerWsThread:
             if self._closing:
                 return
             self._closing = True
-        if websocket.closed:
-            self._websocket = None
-            return
-        await websocket.close()
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            self._logger.warning("WS shutdown close error", exc_info=True)
         self._websocket = None
 
     def _build_url(self, symbols: list[str]) -> str | None:

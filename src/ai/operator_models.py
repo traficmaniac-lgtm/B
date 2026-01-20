@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Any
 
 from src.core.logging import get_logger
@@ -9,7 +10,17 @@ from src.core.logging import get_logger
 _LOGGER = get_logger("ai.operator_models")
 
 _ALLOWED_STATES = {"OK", "WAIT", "DO_NOT_TRADE"}
-_ALLOWED_ACTIONS = {"START", "REBUILD_GRID", "WAIT", "PAUSE"}
+_ALLOWED_ACTIONS = {
+    "START",
+    "STOP",
+    "PAUSE",
+    "RESUME",
+    "WAIT",
+    "APPLY_PATCH",
+    "CANCEL_ORDERS",
+    "ADJUST_PARAMS",
+    "REBUILD_GRID",
+}
 _ALLOWED_PROFILES = {"AGGRESSIVE", "BALANCED", "CONSERVATIVE"}
 _ALLOWED_FORECAST_BIAS = {"UP", "DOWN", "FLAT"}
 _ALLOWED_BIAS = {"NEUTRAL", "LONG", "SHORT", "UP", "DOWN", "FLAT"}
@@ -66,15 +77,21 @@ def parse_ai_operator_response(text: str) -> OperatorAIResult:
     if not text:
         _LOGGER.warning("[AI] parse failed: empty response -> fallback WAIT")
         return _fallback_result("AI_PARSE_FAIL")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        _LOGGER.warning("[AI] parse failed: %s -> fallback WAIT", exc)
-        return _fallback_result("AI_PARSE_FAIL")
+    payload = _parse_json_payload(text)
+    if payload is None:
+        parsed = _parse_text_protocol(text)
+        if parsed is None:
+            _LOGGER.warning("[AI] parse_failed: no action -> fallback WAIT")
+            return _fallback_result("AI_PARSE_FAIL")
+        return parsed
     if not isinstance(payload, dict):
         _LOGGER.warning("[AI] parse failed: payload not dict -> fallback WAIT")
         return _fallback_result("AI_PARSE_FAIL")
 
+    return _parse_payload(payload)
+
+
+def _parse_payload(payload: dict[str, Any]) -> OperatorAIResult:
     state = str(payload.get("state", "WAIT")).strip().upper()
     if state not in _ALLOWED_STATES:
         state = "WAIT"
@@ -118,6 +135,81 @@ def parse_ai_operator_response(text: str) -> OperatorAIResult:
         forecast=forecast,
         risks=risks,
     )
+
+
+def _parse_json_payload(text: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        _LOGGER.warning("[AI] parse failed: %s -> fallback WAIT", exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _parse_text_protocol(text: str) -> OperatorAIResult | None:
+    state = _extract_line_value(text, "State") or "WAIT"
+    state = state.strip().upper()
+    if state not in _ALLOWED_STATES:
+        state = "WAIT"
+    actions_line = _extract_line_value(text, "Actions") or ""
+    actions = _split_actions(actions_line)
+    actions = _normalize_actions(actions)
+    if not actions:
+        return None
+    reason_short = _extract_line_value(text, "Reason") or ""
+    patch_payload = _extract_patch_payload(text)
+    patch = _parse_strategy_patch(patch_payload)
+    profiles = {key: OperatorAIProfile(strategy_patch=None) for key in _ALLOWED_PROFILES}
+    recommended_profile = "BALANCED"
+    profiles[recommended_profile] = OperatorAIProfile(strategy_patch=patch)
+    return OperatorAIResult(
+        state=state,
+        reason_short=reason_short[:120],
+        recommended_profile=recommended_profile,
+        profiles=profiles,
+        actions=actions,
+        forecast=OperatorAIForecast(bias="FLAT", confidence=0.0, horizon_min=0, comment=""),
+        risks=[],
+    )
+
+
+def _extract_line_value(text: str, key: str) -> str | None:
+    match = re.search(rf"^\\s*{re.escape(key)}\\s*:\\s*(.+)$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _split_actions(actions_line: str) -> list[str]:
+    if not actions_line:
+        return []
+    tokens = re.split(r"[,\n;|]+", actions_line)
+    return [token.strip().upper() for token in tokens if token.strip()]
+
+
+def _extract_patch_payload(text: str) -> dict[str, Any] | None:
+    match = re.search(r"^\\s*Patch\\s*:\\s*(.*)$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    remainder = match.group(1).strip()
+    if remainder:
+        payload = _parse_json_payload(remainder)
+        if payload is not None:
+            return payload
+    after = text[match.end() :]
+    payload = _parse_json_payload(after)
+    if payload is not None:
+        return payload
+    return None
 
 
 def operator_ai_result_to_dict(result: OperatorAIResult) -> dict[str, Any]:

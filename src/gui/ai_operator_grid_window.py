@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, Qt, Signal, QTimer
@@ -102,6 +103,26 @@ class MarketSnapshotCache:
     last_good_snapshot: MarketSnapshot | None = None
 
 
+class PendingActionType(str, Enum):
+    WAIT = "WAIT"
+    APPLY_PATCH = "APPLY_PATCH"
+    START = "START"
+    STOP = "STOP"
+    PAUSE = "PAUSE"
+    RESUME = "RESUME"
+    CANCEL_ORDERS = "CANCEL_ORDERS"
+    ADJUST_PARAMS = "ADJUST_PARAMS"
+
+
+@dataclass
+class PendingAction:
+    action_type: PendingActionType
+    reason: str
+    patch: AiOperatorStrategyPatch | None
+    source_msg_id: str | None
+    ts: float
+
+
 class AiOperatorGridWindow(LiteGridWindow):
     def __init__(
         self,
@@ -130,6 +151,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_full_pack: dict[str, Any] | None = None
         self._last_strategy_patch: AiOperatorStrategyPatch | None = None
         self._last_actions_suggested: list[str] = []
+        self._pending_action: PendingAction | None = None
         self._max_exposure_warned = False
         self._data_cache = DataCache()
         self._http_client = BinanceHttpClient(
@@ -310,7 +332,8 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         parsed = parse_ai_operator_response(response)
         parsed = self._enforce_action_patch_requirements(parsed)
-        self._store_ai_result(parsed, response)
+        response_id = self._store_ai_result(parsed, response)
+        self._set_pending_action(parsed, response_id)
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions)
         self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
@@ -324,6 +347,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_ai_result_json = None
         self._last_ai_result_id = None
         self._last_applied_ai_result_id = None
+        self._pending_action = None
         self._actions_combo.clear()
         self._apply_plan_button.setEnabled(False)
         self._update_approve_button_state()
@@ -344,15 +368,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts = now
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
-        apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
-        if callable(apply_to_form):
-            apply_to_form(patch)
-        else:
-            self._append_log("[AI] apply patch skipped: form handler missing", "WARN")
-        self._apply_strategy_patch_to_ui(patch)
-        self._append_log("[AI] strategy_patch applied", "INFO")
-        self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
-        self._last_applied_ai_result_id = self._last_ai_result_id
+        self._apply_ai_patch(patch, source_label="Apply Plan")
 
     def _handle_ai_send(self) -> None:
         message = self._chat_input.text().strip()
@@ -415,7 +431,8 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         parsed = parse_ai_operator_response(response)
         parsed = self._enforce_action_patch_requirements(parsed)
-        self._store_ai_result(parsed, response)
+        response_id = self._store_ai_result(parsed, response)
+        self._set_pending_action(parsed, response_id)
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions)
         self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
@@ -427,7 +444,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_chat_line("AI", f"Ошибка AI: {message}")
 
     def _approve_ai_action(self) -> None:
-        action = self._actions_combo.currentText().strip().upper()
+        pending_action = self._pending_action
+        action = pending_action.action_type.value if pending_action else self._actions_combo.currentText().strip().upper()
         if not action:
             self._append_log("[AI] approve skipped: no action selected.", "WARN")
             return
@@ -436,21 +454,16 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_log(f"[AI] approve ignored: action {action} debounced.", "WARN")
             return
         self._last_approve_ts = now
-        if action == "START":
-            self._handle_start()
-        elif action == "REBUILD_GRID":
-            self._handle_stop()
-            self._handle_start()
-        elif action == "PAUSE":
-            self._handle_pause()
-        elif action == "WAIT":
-            self._append_log("[AI] approved WAIT (no-op)", "INFO")
-            return
+        source = "AI" if pending_action else "manual"
+        self._append_log(f"[AI] approve clicked action={action} source={source}", "INFO")
+        try:
+            self._apply_approved_action(action, pending_action)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[AI] approve applied failed {exc}", "WARN")
         else:
-            self._append_log(f"[AI] approve ignored: unknown action {action}.", "WARN")
-            return
-        self._append_log(f"[AI] approved action: {action}", "INFO")
-        self._append_chat_line("AI", f"approved action: {action}")
+            self._append_log("[AI] approve applied ok", "INFO")
+        if pending_action:
+            self._pending_action = None
 
     def _render_actions(self, actions: list[str]) -> None:
         self._actions_combo.clear()
@@ -553,7 +566,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             return False
         return True
 
-    def _store_ai_result(self, response: AiOperatorResponse, raw_json: str) -> None:
+    def _store_ai_result(self, response: AiOperatorResponse, raw_json: str) -> str:
         response_id = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
         self._last_ai_response = response
         self._last_ai_result_json = raw_json
@@ -561,6 +574,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_applied_ai_result_id = None
         self._last_strategy_patch = response.strategy_patch
         self._last_actions_suggested = list(response.actions)
+        return response_id
 
     def _strategy_patch_has_values(self, patch: AiOperatorStrategyPatch | None) -> bool:
         if patch is None:
@@ -601,6 +615,118 @@ class AiOperatorGridWindow(LiteGridWindow):
                 actions.append("WAIT")
         response.actions = actions
         return response
+
+    def _set_pending_action(self, response: AiOperatorResponse, source_msg_id: str | None) -> None:
+        action, reason = self._select_pending_action(response)
+        patch = response.strategy_patch
+        patch_fields = self._patch_fields(patch)
+        self._append_log(f"[AI] parsed action={action.value} patch_fields={patch_fields}", "INFO")
+        self._pending_action = PendingAction(
+            action_type=action,
+            reason=reason,
+            patch=patch,
+            source_msg_id=source_msg_id,
+            ts=time.time(),
+        )
+        self._append_log(
+            f"[AI] pending_action set action={action.value} source_msg_id={source_msg_id}",
+            "INFO",
+        )
+
+    def _select_pending_action(self, response: AiOperatorResponse) -> tuple[PendingActionType, str]:
+        raw_action = next((item for item in response.actions if item and item != "WAIT"), "WAIT")
+        reason = response.reason_short or ""
+        if raw_action == "REBUILD_GRID":
+            reason = f"{reason} | action=REBUILD_GRID".strip(" |")
+        action = self._map_action_type(raw_action)
+        return action, reason
+
+    def _map_action_type(self, action: str) -> PendingActionType:
+        action = action.strip().upper()
+        mapping = {
+            "WAIT": PendingActionType.WAIT,
+            "APPLY_PATCH": PendingActionType.APPLY_PATCH,
+            "START": PendingActionType.START,
+            "STOP": PendingActionType.STOP,
+            "PAUSE": PendingActionType.PAUSE,
+            "RESUME": PendingActionType.RESUME,
+            "CANCEL_ORDERS": PendingActionType.CANCEL_ORDERS,
+            "ADJUST_PARAMS": PendingActionType.ADJUST_PARAMS,
+            "REBUILD_GRID": PendingActionType.START,
+        }
+        return mapping.get(action, PendingActionType.WAIT)
+
+    def _patch_fields(self, patch: AiOperatorStrategyPatch | None) -> list[str]:
+        if not patch:
+            return []
+        fields: list[str] = []
+        if patch.bias is not None:
+            fields.append("bias")
+        if patch.step_pct is not None:
+            fields.append("step_pct")
+        if patch.range_down_pct is not None:
+            fields.append("range_down_pct")
+        if patch.range_up_pct is not None:
+            fields.append("range_up_pct")
+        if patch.levels is not None:
+            fields.append("levels")
+        if patch.tp_pct is not None:
+            fields.append("tp_pct")
+        if patch.budget is not None:
+            fields.append("budget")
+        if patch.max_active_orders is not None:
+            fields.append("max_active_orders")
+        return fields
+
+    def _apply_ai_patch(self, patch: AiOperatorStrategyPatch, source_label: str) -> bool:
+        if not self._strategy_patch_has_values(patch):
+            self._append_log("[AI] patch empty, nothing to apply", "INFO")
+            return False
+        apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
+        if callable(apply_to_form):
+            apply_to_form(patch)
+        else:
+            self._append_log("[AI] apply patch skipped: form handler missing", "WARN")
+        self._apply_strategy_patch_to_ui(patch)
+        self._append_log("[AI] strategy_patch applied", "INFO")
+        self._append_chat_line("AI", f"Strategy patch applied via {source_label}.")
+        self._last_applied_ai_result_id = self._last_ai_result_id
+        return True
+
+    def _apply_approved_action(self, action: str, pending_action: PendingAction | None) -> None:
+        patch = pending_action.patch if pending_action else self._get_selected_profile_patch()
+        action_upper = action.strip().upper()
+        action_type = self._map_action_type(action_upper).value
+        if action_upper == "REBUILD_GRID":
+            self._handle_stop()
+            self._handle_start()
+        elif action_type == PendingActionType.START.value:
+            if pending_action and "action=REBUILD_GRID" in pending_action.reason:
+                self._handle_stop()
+                self._handle_start()
+            else:
+                self._handle_start()
+        elif action_type == PendingActionType.STOP.value:
+            self._handle_stop()
+        elif action_type == PendingActionType.PAUSE.value:
+            self._handle_pause()
+        elif action_type == PendingActionType.RESUME.value:
+            self._handle_start()
+        elif action_type in {PendingActionType.APPLY_PATCH.value, PendingActionType.ADJUST_PARAMS.value}:
+            if patch is None:
+                raise RuntimeError("patch missing")
+            if not self._apply_ai_patch(patch, source_label="Approve"):
+                raise RuntimeError("patch empty")
+        elif action_type == PendingActionType.CANCEL_ORDERS.value:
+            handle_cancel_all = getattr(self, "_handle_cancel_all", None)
+            if callable(handle_cancel_all):
+                handle_cancel_all()
+            else:
+                raise RuntimeError("cancel action unavailable")
+        elif action_type == PendingActionType.WAIT.value:
+            self._append_log("[AI] approved WAIT (no-op)", "INFO")
+        else:
+            raise RuntimeError(f"unknown action {action_type}")
 
     def _update_user_intent_from_message(self, message: str) -> None:
         lowered = message.lower()
