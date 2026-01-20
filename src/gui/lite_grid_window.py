@@ -1303,6 +1303,9 @@ class LiteGridWindow(QMainWindow):
         self._update_fills_timer()
 
     def _handle_start(self) -> None:
+        if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
+            self._append_log("Start ignored: engine already running.", kind="WARN")
+            return
         dry_run = self._dry_run_toggle.isChecked()
         self._append_log(f"Start pressed (dry-run={dry_run}).", kind="ORDERS")
         self._append_log(
@@ -1455,6 +1458,13 @@ class LiteGridWindow(QMainWindow):
         self._change_state("IDLE")
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
+        self._bot_order_ids.clear()
+        self._bot_order_keys.clear()
+        self._open_orders_map = {}
+        self._bot_session_id = None
+        self._open_orders = []
+        self._open_orders_all = []
+        self._render_open_orders()
         if self._dry_run_toggle.isChecked():
             return
         dialog = QMessageBox(self)
@@ -2151,6 +2161,19 @@ class LiteGridWindow(QMainWindow):
             return fill.commission * fill.price
         return 0.0
 
+    def _effective_fee_rate(self) -> Decimal:
+        maker, taker = self._trade_fees
+        maker_rate = maker if maker is not None else 0.0
+        taker_rate = taker if taker is not None else 0.0
+        fee_rate = max(maker_rate, taker_rate, 0.0)
+        return self.as_decimal(fee_rate)
+
+    def _apply_sell_fee_buffer(self, qty: Decimal, step: Decimal | None) -> Decimal:
+        fee_rate = self._effective_fee_rate()
+        if fee_rate > 0:
+            qty = qty * (Decimal("1") - fee_rate)
+        return self.q_qty(qty, step)
+
     def _record_fill(self, fill: TradeFill) -> None:
         self._fills.append(fill)
         realized_delta = 0.0
@@ -2226,7 +2249,7 @@ class LiteGridWindow(QMainWindow):
         fill_qty = self.as_decimal(fill.qty)
         raw_tp_price = fill_price * (Decimal("1") + tp_dec) if tp_side == "SELL" else fill_price * (Decimal("1") - tp_dec)
         tp_price = self.q_price(raw_tp_price, tick)
-        tp_qty = self.q_qty(fill_qty, step)
+        tp_qty = self._apply_sell_fee_buffer(fill_qty, step) if tp_side == "SELL" else self.q_qty(fill_qty, step)
         if tp_price <= 0 or tp_qty <= 0:
             self._append_log(
                 f"[LIVE] TP skipped: invalid side={tp_side} price={tp_price} qty={tp_qty}",
@@ -2265,10 +2288,22 @@ class LiteGridWindow(QMainWindow):
             restore_price = self.q_price(fill_price - step_abs, tick)
         else:
             restore_price = self.q_price(fill_price + step_abs, tick)
-        restore_qty = self.q_qty(fill_qty, step)
+        restore_qty = (
+            self._apply_sell_fee_buffer(fill_qty, step)
+            if restore_side == "SELL"
+            else self.q_qty(fill_qty, step)
+        )
+        allow_restore = restore_qty > 0
+        if not allow_restore:
+            self._append_log(
+                f"[LIVE] RESTORE skipped: invalid side={restore_side} price={restore_price} qty={restore_qty}",
+                kind="WARN",
+            )
 
         tp_client_order_id = self._next_client_order_id("TP", suffix="M" if existing_tp else "")
-        restore_client_order_id = self._next_client_order_id("GRID") if restore_price > 0 else ""
+        restore_client_order_id = (
+            self._next_client_order_id("GRID") if restore_price > 0 and allow_restore else ""
+        )
 
         def _place() -> dict[str, Any]:
             results: dict[str, Any] = {"tp": None, "restore": None, "errors": []}
@@ -2439,6 +2474,10 @@ class LiteGridWindow(QMainWindow):
                 "WARN",
             )
             return None, None
+        optimistic_added = False
+        if key not in self._bot_order_keys:
+            self._bot_order_keys.add(key)
+            optimistic_added = True
         log_message = (
             f"[LIVE] place {reason} side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
             f"notional={self.fmt_price(notional, None)} tick={self._format_rule(tick)} "
@@ -2455,6 +2494,8 @@ class LiteGridWindow(QMainWindow):
                 new_client_order_id=client_id,
             )
         except Exception as exc:  # noqa: BLE001
+            if optimistic_added:
+                self._bot_order_keys.discard(key)
             status, code, message, response_body = self._parse_binance_exception(exc)
             if code == -2010:
                 self._signals.log_append.emit(
@@ -3057,6 +3098,11 @@ class LiteGridWindow(QMainWindow):
         if base_asset:
             base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
         skip_sells = base_free <= 0
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        fee_rate = self._effective_fee_rate()
+        available_effective = self.as_decimal(base_free)
+        if fee_rate > 0:
+            available_effective = available_effective * (Decimal("1") - fee_rate)
         has_sells = any(order.side == "SELL" for order in planned)
         if skip_sells and has_sells:
             self._append_log(
@@ -3075,6 +3121,22 @@ class LiteGridWindow(QMainWindow):
                 try:
                     price = self.as_decimal(order.price)
                     qty = self.as_decimal(order.qty)
+                    if order.side == "SELL":
+                        if available_effective <= 0:
+                            self._signals.log_append.emit(
+                                "[LIVE] sell skipped: base balance exhausted after fee buffer",
+                                "WARN",
+                            )
+                            continue
+                        qty = min(qty, available_effective)
+                        qty = self.q_qty(qty, step)
+                        if qty <= 0:
+                            self._signals.log_append.emit(
+                                "[LIVE] sell skipped: qty <= 0 after fee/step buffer",
+                                "WARN",
+                            )
+                            continue
+                        available_effective -= qty
                     response, error = self._place_limit(
                         order.side,
                         price,

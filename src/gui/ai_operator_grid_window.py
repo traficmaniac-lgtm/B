@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -33,7 +34,13 @@ from src.core.timeutil import utc_ms
 from src.gui.lite_grid_window import LiteGridWindow, TradeGate
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
-from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED
+from src.services.price_feed_manager import (
+    PriceFeedManager,
+    PriceUpdate,
+    WS_CONNECTED,
+    WS_DEGRADED,
+    WS_DEGRADED_AFTER_MS,
+)
 from src.services.rate_limiter import RateLimiter
 
 
@@ -114,6 +121,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         self.setWindowTitle(f"AI Operator Grid — {symbol}")
         self._last_ai_response: AiOperatorResponse | None = None
         self._last_ai_result_json: str | None = None
+        self._last_ai_result_id: str | None = None
+        self._last_applied_ai_result_id: str | None = None
         self._last_approve_ts: float = 0.0
         self._last_apply_ts: float = 0.0
         self._ai_busy = False
@@ -301,13 +310,10 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         parsed = parse_ai_operator_response(response)
         parsed = self._enforce_action_patch_requirements(parsed)
-        self._last_ai_response = parsed
-        self._last_ai_result_json = response
-        self._last_strategy_patch = parsed.strategy_patch
-        self._last_actions_suggested = list(parsed.actions)
+        self._store_ai_result(parsed, response)
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions)
-        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
+        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
         self._append_log("[AI] response received", "INFO")
 
     def _handle_ai_analyze_error(self, message: str) -> None:
@@ -315,6 +321,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_log(f"[AI] response invalid: {message}", "WARN")
         self._append_chat_line("AI", f"Ошибка AI: {message}")
         self._last_ai_response = None
+        self._last_ai_result_json = None
+        self._last_ai_result_id = None
+        self._last_applied_ai_result_id = None
         self._actions_combo.clear()
         self._apply_plan_button.setEnabled(False)
         self._update_approve_button_state()
@@ -324,6 +333,10 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not patch or not self._strategy_patch_has_values(patch):
             self._append_log("[AI] patch empty, nothing to apply", "INFO")
             self._append_chat_line("AI", "patch empty, nothing to apply")
+            return
+        if self._last_ai_result_id and self._last_ai_result_id == self._last_applied_ai_result_id:
+            self._append_log("[AI] patch already applied for latest result.", "INFO")
+            self._apply_plan_button.setEnabled(False)
             return
         now = time.monotonic()
         if now - self._last_apply_ts < 0.3:
@@ -339,6 +352,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_strategy_patch_to_ui(patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
+        self._last_applied_ai_result_id = self._last_ai_result_id
 
     def _handle_ai_send(self) -> None:
         message = self._chat_input.text().strip()
@@ -401,13 +415,10 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         parsed = parse_ai_operator_response(response)
         parsed = self._enforce_action_patch_requirements(parsed)
-        self._last_ai_response = parsed
-        self._last_ai_result_json = response
-        self._last_strategy_patch = parsed.strategy_patch
-        self._last_actions_suggested = list(parsed.actions)
+        self._store_ai_result(parsed, response)
         self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions)
-        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
+        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
         self._append_log("[AI] chat response received", "INFO")
 
     def _handle_ai_chat_error(self, message: str) -> None:
@@ -476,7 +487,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not hasattr(self, "_apply_plan_button"):
             return
         patch = self._get_selected_profile_patch()
-        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(patch) and not self._ai_busy)
+        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(patch) and not self._ai_busy)
 
     def _set_ai_busy(self, busy: bool) -> None:
         self._ai_busy = busy
@@ -532,7 +543,24 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._chat_history.appendPlainText(line)
 
     def _restore_apply_plan_state(self) -> None:
-        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(self._get_selected_profile_patch()))
+        patch = self._get_selected_profile_patch()
+        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(patch))
+
+    def _can_apply_ai_patch(self, patch: AiOperatorStrategyPatch | None) -> bool:
+        if not self._strategy_patch_has_values(patch):
+            return False
+        if self._last_ai_result_id and self._last_ai_result_id == self._last_applied_ai_result_id:
+            return False
+        return True
+
+    def _store_ai_result(self, response: AiOperatorResponse, raw_json: str) -> None:
+        response_id = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+        self._last_ai_response = response
+        self._last_ai_result_json = raw_json
+        self._last_ai_result_id = response_id
+        self._last_applied_ai_result_id = None
+        self._last_strategy_patch = response.strategy_patch
+        self._last_actions_suggested = list(response.actions)
 
     def _strategy_patch_has_values(self, patch: AiOperatorStrategyPatch | None) -> bool:
         if patch is None:
@@ -885,6 +913,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_ms = (time.perf_counter() - ws_start) * 1000
         ws_ok = bool(ws_snapshot and ws_snapshot.ws_status in {WS_CONNECTED, WS_DEGRADED})
         ws_age_ms = ws_snapshot.price_age_ms if ws_snapshot else None
+        ws_stale = isinstance(ws_age_ms, int) and ws_age_ms > WS_DEGRADED_AFTER_MS
         last_update_ts = None
         now_ms = utc_ms()
         if isinstance(ws_age_ms, int):
@@ -913,13 +942,15 @@ class AiOperatorGridWindow(LiteGridWindow):
         spread_pct = ws_snapshot.spread_pct if ws_snapshot else None
         if not ws_ok:
             ws_reason = "ws unavailable"
+        elif ws_stale:
+            ws_reason = f"ws stale: age={ws_age_ms}ms -> HTTP price"
         else:
             ws_reason = ""
         book_bid, book_ask = self._extract_book_ticker(book_ticker)
-        if not ws_ok or bid is None or ask is None:
+        if not ws_ok or ws_stale or bid is None or ask is None:
             bid = book_bid if book_bid is not None else bid
             ask = book_ask if book_ask is not None else ask
-        if last_price is None:
+        if last_price is None or ws_stale:
             last_price = self._coerce_float(ticker_24h.get("lastPrice")) if isinstance(ticker_24h, dict) else None
         if last_price is None and bid is not None and ask is not None:
             last_price = (bid + ask) / 2
