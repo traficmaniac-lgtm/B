@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import deque
-from collections import deque
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
@@ -126,13 +125,6 @@ class TradeFill:
     commission_asset: str
     time_ms: int
     order_id: str
-    trade_id: str
-
-
-@dataclass
-class BaseLot:
-    qty: float
-    cost_per_unit: float
     trade_id: str
 
 
@@ -766,6 +758,10 @@ class LiteGridWindow(QMainWindow):
         self._apply_engine_state_style(self._engine_state)
         self._trade_status_label = QLabel(tr("trade_status_disabled"))
         self._trade_status_label.setStyleSheet("color: #dc2626; font-size: 11px; font-weight: 600;")
+        for label in (self._engine_state_label, self._trade_status_label):
+            label.setFixedHeight(18)
+            label.setMinimumWidth(160)
+            label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         row_bottom.addWidget(self._feed_indicator)
         row_bottom.addWidget(self._age_label)

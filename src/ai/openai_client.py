@@ -12,6 +12,7 @@ else:
     from openai import AsyncOpenAI
 
 from src.ai.models import AiResponseEnvelope, parse_ai_response_with_fallback
+from src.ai.operator_models import operator_ai_result_to_json, parse_ai_operator_response
 from src.core.logging import get_logger
 
 
@@ -142,89 +143,26 @@ class OpenAIClient:
 
     async def analyze_operator(self, datapack: dict[str, Any], follow_up_note: str | None = None) -> str:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
-        system_prompt = (
-            "Ты торговый оператор. Дай оценку рынка и рекомендации.\n"
-            "Никакой торговли. Только анализ и предложения.\n"
-            "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
-            "Строго следуй схеме:\n"
-            "{\n"
- codex/implement-fullpack-data-fetching-strategy
-            '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
-            '  "reason_short": "<=120 chars",\n'
-            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
-            '  "profiles": {\n'
-            '    "AGGRESSIVE": {\n'
-            '      "strategy_patch": {\n'
-            '        "step_pct": 0,\n'
-            '        "range_down_pct": 0,\n'
-            '        "range_up_pct": 0,\n'
-            '        "levels": 0,\n'
-            '        "tp_pct": 0,\n'
-            '        "bias": "UP|DOWN|FLAT",\n'
-            '        "max_active_orders": 0\n'
-            "      }\n"
-            "    },\n"
-            '    "BALANCED": {\n'
-            '      "strategy_patch": {\n'
-            '        "step_pct": 0,\n'
-            '        "range_down_pct": 0,\n'
-            '        "range_up_pct": 0,\n'
-            '        "levels": 0,\n'
-            '        "tp_pct": 0,\n'
-            '        "bias": "UP|DOWN|FLAT",\n'
-            '        "max_active_orders": 0\n'
-            "      }\n"
-            "    },\n"
-            '    "CONSERVATIVE": {\n'
-            '      "strategy_patch": {\n'
-            '        "step_pct": 0,\n'
-            '        "range_down_pct": 0,\n'
-            '        "range_up_pct": 0,\n'
-            '        "levels": 0,\n'
-            '        "tp_pct": 0,\n'
-            '        "bias": "UP|DOWN|FLAT",\n'
-            '        "max_active_orders": 0\n'
-            "      }\n"
-            "    }\n"
-            "  },\n"
-            '  "forecast": {\n'
-            '    "bias": "UP|DOWN|FLAT",\n'
-            '    "confidence": 0.0,\n'
-            '    "horizon_min": 30,\n'
-            '    "comment": "<=120 chars"\n'
-            "  },\n"
-            '  "risks": ["..."]\n'
-            "}\n"
-            "Всегда возвращай три профиля и recommended_profile.\n"
-            "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
-            "Будь краток."
-
-            '  "state": "TRADE|WAIT|DO_NOT_TRADE",\n'
-            '  "reason_short": "короткая причина",\n'
-            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
-            '  "profiles": {\n'
-            '    "AGGRESSIVE": {"strategy_patch": {...}},\n'
-            '    "BALANCED": {"strategy_patch": {...}},\n'
-            '    "CONSERVATIVE": {"strategy_patch": {...}}\n'
-            "  },\n"
-            '  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],\n'
-            '  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": "..."},\n'
-            '  "risks": ["...", "..."]\n'
-            "}\n"
-            "strategy_patch допускает поля: budget, bias, levels, step_pct, range_down_pct, "
-            "range_up_pct, take_profit_pct, max_exposure. Заполняй null для параметров, которые не нужно менять.\n"
-            "Если action содержит START или REBUILD_GRID — strategy_patch обязателен "
-            "(хотя бы одно поле должно быть задано).\n"
-            "Если datapack.user_intent содержит бюджет/шаг/tp/уровни — включи их в strategy_patch.\n"
-            "Если стакан пустой или нет market depth, state=WAIT и reason_short='нет market depth'.\n"
-            "Не запрашивай дополнительные данные — только вывод или WAIT.\n"
-            "Если is_zero_fee=true, обязательно упомяни это в reason_short или forecast.comment.\n"
-            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
-            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
-            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
-            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_exposure."
- main
-        )
+        system_prompt = """Ты торговый оператор. Дай оценку рынка и рекомендации.
+Никакой торговли. Только анализ и предложения.
+Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).
+Строго следуй схеме:
+{
+  "state": "OK|WAIT|DO_NOT_TRADE",
+  "reason_short": "<=120 chars",
+  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",
+  "profiles": {
+    "AGGRESSIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
+    "BALANCED": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
+    "CONSERVATIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}}
+  },
+  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],
+  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": ""},
+  "risks": ["..."]
+}
+Всегда возвращай три профиля и recommended_profile.
+Никаких REQUEST_MORE_DATA. Данные уже полные.
+Будь краток."""
 
         async def _analyze() -> str:
             messages = [
@@ -238,7 +176,9 @@ class OpenAIClient:
                 max_tokens=520,
                 response_format={"type": "json_object"},
             )
-            return response.choices[0].message.content if response.choices else ""
+            content = response.choices[0].message.content if response.choices else ""
+            parsed = parse_ai_operator_response(content or "")
+            return operator_ai_result_to_json(parsed)
 
         try:
             return await self._run_with_retries(_analyze)
@@ -256,90 +196,26 @@ class OpenAIClient:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         ui_payload = json.dumps(current_ui_params, ensure_ascii=False, indent=2)
         last_json = last_ai_json or ""
-        system_prompt = (
-            "Ты торговый оператор и отвечаешь на уточнения пользователя.\n"
-            "Никакой торговли. Только анализ и предложения.\n"
-            "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
-            "Строго следуй схеме:\n"
-            "{\n"
- codex/implement-fullpack-data-fetching-strategy
-            '  "state": "OK|WAIT|DO_NOT_TRADE",\n'
-            '  "reason_short": "<=120 chars",\n'
-            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
-            '  "profiles": {\n'
-            '    "AGGRESSIVE": {\n'
-            '      "strategy_patch": {\n'
-            '        "step_pct": 0,\n'
-            '        "range_down_pct": 0,\n'
-            '        "range_up_pct": 0,\n'
-            '        "levels": 0,\n'
-            '        "tp_pct": 0,\n'
-            '        "bias": "UP|DOWN|FLAT",\n'
-            '        "max_active_orders": 0\n'
-            "      }\n"
-            "    },\n"
-            '    "BALANCED": {\n'
-            '      "strategy_patch": {\n'
-            '        "step_pct": 0,\n'
-            '        "range_down_pct": 0,\n'
-            '        "range_up_pct": 0,\n'
-            '        "levels": 0,\n'
-            '        "tp_pct": 0,\n'
-            '        "bias": "UP|DOWN|FLAT",\n'
-            '        "max_active_orders": 0\n'
-            "      }\n"
-            "    },\n"
-            '    "CONSERVATIVE": {\n'
-            '      "strategy_patch": {\n'
-            '        "step_pct": 0,\n'
-            '        "range_down_pct": 0,\n'
-            '        "range_up_pct": 0,\n'
-            '        "levels": 0,\n'
-            '        "tp_pct": 0,\n'
-            '        "bias": "UP|DOWN|FLAT",\n'
-            '        "max_active_orders": 0\n'
-            "      }\n"
-            "    }\n"
-            "  },\n"
-            '  "forecast": {\n'
-            '    "bias": "UP|DOWN|FLAT",\n'
-            '    "confidence": 0.0,\n'
-            '    "horizon_min": 30,\n'
-            '    "comment": "<=120 chars"\n'
-            "  },\n"
-            '  "risks": ["..."]\n'
-            "}\n"
-            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
-            "Никаких REQUEST_MORE_DATA. Данные уже полные.\n"
-            "Будь краток."
-
-            '  "state": "TRADE|WAIT|DO_NOT_TRADE",\n'
-            '  "reason_short": "короткая причина",\n'
-            '  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",\n'
-            '  "profiles": {\n'
-            '    "AGGRESSIVE": {"strategy_patch": {...}},\n'
-            '    "BALANCED": {"strategy_patch": {...}},\n'
-            '    "CONSERVATIVE": {"strategy_patch": {...}}\n'
-            "  },\n"
-            '  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],\n'
-            '  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": "..."},\n'
-            '  "risks": ["...", "..."]\n'
-            "}\n"
-            "strategy_patch допускает поля: budget, bias, levels, step_pct, range_down_pct, "
-            "range_up_pct, take_profit_pct, max_exposure. Заполняй null для параметров, которые не нужно менять.\n"
-            "Если action содержит START или REBUILD_GRID — strategy_patch обязателен "
-            "(хотя бы одно поле должно быть задано).\n"
-            "Если datapack.user_intent содержит бюджет/шаг/tp/уровни — включи их в strategy_patch.\n"
-            "Если стакан пустой или нет market depth, state=WAIT и reason_short='нет market depth'.\n"
-            "Не запрашивай дополнительные данные — только вывод или WAIT.\n"
-            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
-            "Если is_zero_fee=true, обязательно упомяни это в reason_short или forecast.comment.\n"
-            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
-            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
-            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
-            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_exposure."
- main
-        )
+        system_prompt = """Ты торговый оператор и отвечаешь на уточнения пользователя.
+Никакой торговли. Только анализ и предложения.
+Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).
+Строго следуй схеме:
+{
+  "state": "OK|WAIT|DO_NOT_TRADE",
+  "reason_short": "<=120 chars",
+  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",
+  "profiles": {
+    "AGGRESSIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
+    "BALANCED": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
+    "CONSERVATIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}}
+  },
+  "actions": ["START", "REBUILD_GRID", "PAUSE", "WAIT"],
+  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": ""},
+  "risks": ["..."]
+}
+Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.
+Никаких REQUEST_MORE_DATA. Данные уже полные.
+Будь краток."""
 
         async def _chat() -> str:
             messages = [
@@ -354,7 +230,9 @@ class OpenAIClient:
                 max_tokens=520,
                 response_format={"type": "json_object"},
             )
-            return response.choices[0].message.content if response.choices else ""
+            content = response.choices[0].message.content if response.choices else ""
+            parsed = parse_ai_operator_response(content or "")
+            return operator_ai_result_to_json(parsed)
 
         try:
             return await self._run_with_retries(_chat)
