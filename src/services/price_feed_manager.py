@@ -14,7 +14,7 @@ import websockets
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
 from src.core.logging import get_logger
-from src.core.symbols import sanitize_symbol
+from src.core.symbols import sanitize_symbol, validate_trade_symbol
 from src.core.timeutil import utc_ms
 
 WS_CONNECTED = "WS_CONNECTED"
@@ -22,10 +22,12 @@ WS_DEGRADED = "WS_DEGRADED"
 WS_LOST = "WS_LOST"
 WS_DISABLED_404 = "WS_DISABLED_404"
 
+WS_GRACE_MS = 4000
 WS_DEGRADED_AFTER_MS = 5000
 WS_LOST_AFTER_MS = 15000
 WS_RECOVER_AFTER_N = 3
 HTTP_DISABLE_GRACE_MS = 3000
+INVALID_SYMBOL_LOG_MS = 60_000
 
 
 def calculate_backoff(attempt: int, base_s: float = 1.0, max_s: float = 30.0) -> float:
@@ -125,12 +127,13 @@ class SymbolSubscriptionRegistry:
         self._counts: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def add(self, symbol: str) -> None:
+    def add(self, symbol: str) -> bool:
         cleaned = sanitize_symbol(symbol)
         if cleaned is None:
-            return
+            return False
         with self._lock:
             self._counts[cleaned] = self._counts.get(cleaned, 0) + 1
+            return self._counts[cleaned] == 1
 
     def remove(self, symbol: str) -> None:
         cleaned = sanitize_symbol(symbol)
@@ -400,7 +403,8 @@ class PriceFeedManager:
         self._exchange_info_lock = threading.Lock()
         self._ws_disabled_until_ms = 0
         self._log_limiter: dict[tuple[str, str], int] = {}
-        self._invalid_symbols_logged: set[str] = set()
+        self._invalid_symbols_logged: dict[str, int] = {}
+        self._exchange_symbols: set[str] = set()
         self._ws_thread = _BinanceBookTickerWsThread(
             ws_url=config.binance.ws_url.rstrip("/"),
             on_message=self._handle_ws_message,
@@ -439,7 +443,23 @@ class PriceFeedManager:
         cleaned = self._sanitize_symbol(symbol)
         if cleaned is None:
             return
-        self._registry.add(cleaned)
+        is_new = self._registry.add(cleaned)
+        if is_new:
+            now_ms = self._now_ms()
+            with self._lock:
+                state = self._symbol_state.setdefault(cleaned, {})
+                state.update(
+                    {
+                        "subscribed_ms": now_ms,
+                        "ws_grace_until_ms": now_ms + WS_GRACE_MS,
+                        "ws_status": WS_CONNECTED,
+                        "ws_recover_streak": 0,
+                        "last_ws_msg_ms": None,
+                        "last_ws_price_ms": None,
+                        "http_fallback_enabled": False,
+                        "http_disable_grace_until_ms": None,
+                    }
+                )
         self._ws_thread.set_symbols(self._registry.active_symbols())
         self._ensure_exchange_info_loaded()
 
@@ -525,12 +545,29 @@ class PriceFeedManager:
     def _sanitize_symbol(self, symbol: object) -> str | None:
         cleaned = sanitize_symbol(symbol)
         if cleaned is None:
-            symbol_text = str(symbol)
-            if symbol_text not in self._invalid_symbols_logged:
-                self._invalid_symbols_logged.add(symbol_text)
-                self._logger.warning("invalid symbol dropped: %s", symbol_text)
+            if self._should_log_invalid_symbol(symbol):
+                self._log_invalid_symbol(symbol)
             return None
+        if self._exchange_info_loaded and self._exchange_symbols:
+            if not validate_trade_symbol(cleaned, self._exchange_symbols):
+                self._log_invalid_symbol(cleaned)
+                return None
         return cleaned
+
+    def _log_invalid_symbol(self, symbol: object) -> None:
+        symbol_text = str(symbol)
+        now_ms = self._now_ms()
+        last_ms = self._invalid_symbols_logged.get(symbol_text, 0)
+        if now_ms - last_ms < INVALID_SYMBOL_LOG_MS:
+            return
+        self._invalid_symbols_logged[symbol_text] = now_ms
+        self._logger.warning("invalid symbol dropped: %s", symbol_text)
+
+    @staticmethod
+    def _should_log_invalid_symbol(symbol: object) -> bool:
+        if not isinstance(symbol, str):
+            return False
+        return len(symbol.strip()) >= 5
 
     def _get_poll_interval_ms(self, symbol: str) -> int:
         with self._lock:
@@ -635,14 +672,21 @@ class PriceFeedManager:
             ws_recover_streak = state.get("ws_recover_streak", 0)
             http_fallback_enabled = state.get("http_fallback_enabled", False)
             http_disable_grace_until = state.get("http_disable_grace_until_ms")
+            subscribed_ms = state.get("subscribed_ms", now_ms)
+            ws_grace_until = state.get("ws_grace_until_ms")
         ws_disabled = now_ms < self._ws_disabled_until_ms
         if ws_disabled:
             desired_status = WS_LOST
-        elif last_ws_msg is None:
-            desired_status = WS_LOST
         else:
-            age_ms = max(now_ms - last_ws_msg, 0)
-            desired_status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
+            if last_ws_msg is None:
+                age_ms = max(now_ms - subscribed_ms, 0)
+                if ws_grace_until is not None and now_ms < ws_grace_until:
+                    desired_status = WS_CONNECTED
+                else:
+                    desired_status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
+            else:
+                age_ms = max(now_ms - last_ws_msg, 0)
+                desired_status = resolve_ws_status(age_ms, self._degraded_after_ms, self._lost_after_ms)
         if desired_status == WS_CONNECTED and current_status != WS_CONNECTED:
             if ws_recover_streak < self._recover_after_n:
                 desired_status = current_status
@@ -656,11 +700,18 @@ class PriceFeedManager:
                 if desired_status != WS_CONNECTED:
                     state["ws_recover_streak"] = 0
             if desired_status == WS_DEGRADED:
-                self._logger.warning("WS деградирован для %s", cleaned)
+                self._log_rate_limited(cleaned, "ws_state", "warning", f"WS деградирован для {cleaned}")
             elif desired_status == WS_LOST:
-                self._logger.warning("WS потерян для %s", cleaned)
+                self._log_rate_limited(cleaned, "ws_state", "warning", f"WS потерян для {cleaned}")
             elif desired_status == WS_CONNECTED:
-                self._logger.info("WS восстановлен для %s", cleaned)
+                last_ws_age_ms = max(now_ms - last_ws_msg, 0) if isinstance(last_ws_msg, int) else None
+                if current_status in {WS_DEGRADED, WS_LOST} and last_ws_age_ms is not None:
+                    message = (
+                        f"WS восстановлен для {cleaned} "
+                        f"(last_ws_age_ms={last_ws_age_ms}, "
+                        f"restore_confirm_count={ws_recover_streak})"
+                    )
+                    self._log_rate_limited(cleaned, "ws_state", "info", message)
             self._publish_status(cleaned, desired_status)
 
         if ws_disabled or desired_status == WS_LOST:
@@ -813,7 +864,7 @@ class PriceFeedManager:
         for item in symbols:
             if not isinstance(item, dict):
                 continue
-            symbol = self._sanitize_symbol(item.get("symbol", ""))
+            symbol = sanitize_symbol(item.get("symbol", ""))
             if symbol is None:
                 continue
             filters = item.get("filters", [])
@@ -838,6 +889,7 @@ class PriceFeedManager:
             mapping[symbol] = (tick_size, step_size)
         with self._lock:
             self._exchange_info = mapping
+            self._exchange_symbols = set(mapping.keys())
         with self._exchange_info_lock:
             self._exchange_info_loaded = True
             self._exchange_info_loading = False

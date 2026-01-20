@@ -4,14 +4,16 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 from src.binance.http_client import BinanceHttpClient
 from src.core.logging import get_logger
 from src.core.models import Pair
-from src.core.symbols import sanitize_symbol
+from src.core.symbols import sanitize_symbol, validate_asset
 
 DEFAULT_BLACKLIST_SUBSTRINGS = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S")
+INVALID_SYMBOL_LOG_MS = 60_000
 
 
 class MarketsService:
@@ -29,7 +31,7 @@ class MarketsService:
         )
         self._cache_dir = cache_dir or self._default_cache_dir()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._invalid_symbols_logged: set[str] = set()
+        self._invalid_symbols_logged: dict[str, int] = {}
 
     def load_pairs(
         self,
@@ -55,13 +57,17 @@ class MarketsService:
                 continue
             if str(item.get("quoteAsset", "")).upper() != quote:
                 continue
-            symbol = sanitize_symbol(item.get("symbol", ""))
+            raw_symbol = item.get("symbol", "")
+            symbol = sanitize_symbol(raw_symbol)
             if not symbol:
-                self._log_invalid_symbol(item.get("symbol", ""))
+                if self._should_log_invalid_symbol(raw_symbol):
+                    self._log_invalid_symbol(raw_symbol)
                 continue
             if any(substring in symbol for substring in blacklist):
                 continue
-            base_asset = str(item.get("baseAsset", ""))
+            base_asset = str(item.get("baseAsset", "")).upper()
+            if not validate_asset(base_asset):
+                continue
             filters = self._map_filters(item.get("filters", []))
             tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
             step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
@@ -99,16 +105,20 @@ class MarketsService:
                 continue
             if str(item.get("status", "")).upper() != status_filter:
                 continue
-            symbol = sanitize_symbol(item.get("symbol", ""))
+            raw_symbol = item.get("symbol", "")
+            symbol = sanitize_symbol(raw_symbol)
             if not symbol:
-                self._log_invalid_symbol(item.get("symbol", ""))
+                if self._should_log_invalid_symbol(raw_symbol):
+                    self._log_invalid_symbol(raw_symbol)
                 continue
             if any(substring in symbol for substring in blacklist):
                 continue
             quote_asset = str(item.get("quoteAsset", "")).upper()
-            if not quote_asset:
+            if not validate_asset(quote_asset):
                 continue
-            base_asset = str(item.get("baseAsset", ""))
+            base_asset = str(item.get("baseAsset", "")).upper()
+            if not validate_asset(base_asset):
+                continue
             filters = self._map_filters(item.get("filters", []))
             tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
             step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
@@ -294,13 +304,22 @@ class MarketsService:
 
     def _validate_cached_symbol(self, symbol: str) -> bool:
         if sanitize_symbol(symbol) is None:
-            self._log_invalid_symbol(symbol)
+            if self._should_log_invalid_symbol(symbol):
+                self._log_invalid_symbol(symbol)
             return False
         return True
 
     def _log_invalid_symbol(self, symbol: object) -> None:
         symbol_text = str(symbol)
-        if symbol_text in self._invalid_symbols_logged:
+        now_ms = int(time.time() * 1000)
+        last_ms = self._invalid_symbols_logged.get(symbol_text, 0)
+        if now_ms - last_ms < INVALID_SYMBOL_LOG_MS:
             return
-        self._invalid_symbols_logged.add(symbol_text)
+        self._invalid_symbols_logged[symbol_text] = now_ms
         self._logger.warning("invalid symbol dropped: %s", symbol_text)
+
+    @staticmethod
+    def _should_log_invalid_symbol(symbol: object) -> bool:
+        if not isinstance(symbol, str):
+            return False
+        return len(symbol.strip()) >= 5
