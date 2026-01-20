@@ -161,8 +161,7 @@ def _normalize_actions(actions: list[str]) -> list[str]:
     normalized: list[str] = []
     for action in actions:
         if action == "REQUEST_MORE_DATA":
-            _LOGGER.warning("[AI] unsupported action REQUEST_MORE_DATA -> WAIT")
-            action = "WAIT"
+            continue
         if action in _ALLOWED_ACTIONS and action not in normalized:
             normalized.append(action)
     return normalized
