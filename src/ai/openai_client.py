@@ -186,6 +186,64 @@ class OpenAIClient:
             self._logger.warning("OpenAI operator analyze failed: %s", exc)
             raise
 
+    async def chat_operator(
+        self,
+        datapack: dict[str, Any],
+        user_message: str,
+        last_ai_json: str | None,
+        current_ui_params: dict[str, Any],
+    ) -> str:
+        payload = json.dumps(datapack, ensure_ascii=False, indent=2)
+        ui_payload = json.dumps(current_ui_params, ensure_ascii=False, indent=2)
+        last_json = last_ai_json or ""
+        system_prompt = (
+            "Ты торговый оператор и отвечаешь на уточнения пользователя.\n"
+            "Никакой торговли. Только анализ и предложения.\n"
+            "Всегда отвечай ТОЛЬКО валидным JSON (без markdown и текста вне JSON).\n"
+            "Строго следуй схеме:\n"
+            "{\n"
+            '  "analysis_result": {\n'
+            '    "state": "TRADE|WAIT|PAUSE",\n'
+            '    "summary": "1–3 коротких предложения",\n'
+            '    "risks": ["..."]\n'
+            "  },\n"
+            '  "strategy_patch": {\n'
+            '    "budget": 0,\n'
+            '    "bias": "NEUTRAL|LONG|SHORT|null",\n'
+            '    "levels": 0,\n'
+            '    "step_pct": 0,\n'
+            '    "range_down_pct": 0,\n'
+            '    "range_up_pct": 0,\n'
+            '    "take_profit_pct": 0,\n'
+            '    "max_exposure": 0\n'
+            "  },\n"
+            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT"]\n'
+            "}\n"
+            "Если изменений нет, ставь null для параметров, которые не нужно менять.\n"
+            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI."
+        )
+
+        async def _chat() -> str:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Datapack:\n{payload}"},
+                {"role": "user", "content": f"Current UI params:\n{ui_payload}"},
+                {"role": "user", "content": f"Last AI JSON:\n{last_json}"},
+                {"role": "user", "content": f"User message:\n{user_message}"},
+            ]
+            response = await self._chat_completion(
+                messages=messages,
+                max_tokens=520,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content if response.choices else ""
+
+        try:
+            return await self._run_with_retries(_chat)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("OpenAI operator chat failed: %s", exc)
+            raise
+
     async def monitor_datapack(self, datapack: dict[str, Any]) -> tuple[AiResponseEnvelope, str]:
         payload = json.dumps(datapack, ensure_ascii=False, indent=2)
         system_prompt = (

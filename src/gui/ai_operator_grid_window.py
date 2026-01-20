@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView,
+    QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -64,7 +65,12 @@ class AiOperatorGridWindow(LiteGridWindow):
         )
         self.setWindowTitle(f"AI Operator Grid — {symbol}")
         self._last_ai_response: AiOperatorResponse | None = None
+        self._last_ai_result_json: str | None = None
         self._last_strategy_patch: AiOperatorStrategyPatch | None = None
+        self._last_actions_suggested: list[str] = []
+        self._last_approve_action: str | None = None
+        self._last_approve_ts: float = 0.0
+        self._max_exposure_warned = False
 
     def _build_body(self) -> QSplitter:
         splitter = QSplitter(Qt.Horizontal)
@@ -103,52 +109,47 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_plan_button.setEnabled(False)
         self._apply_plan_button.clicked.connect(self._apply_ai_plan)
         top_actions.addWidget(self._apply_plan_button)
-
         top_actions.addStretch()
         layout.addLayout(top_actions)
 
-        self._analysis_state_label = QLabel("State: —")
-        self._analysis_state_label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self._analysis_state_label)
+        self._chat_history = QPlainTextEdit()
+        self._chat_history.setReadOnly(True)
+        self._chat_history.setPlaceholderText("AI chat history will appear here.")
+        layout.addWidget(self._chat_history, stretch=1)
 
-        layout.addWidget(QLabel("Summary"))
-        self._analysis_summary = QPlainTextEdit()
-        self._analysis_summary.setReadOnly(True)
-        self._analysis_summary.setPlaceholderText("AI summary will appear here.")
-        layout.addWidget(self._analysis_summary, stretch=1)
+        input_row = QHBoxLayout()
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText("Введите сообщение для AI...")
+        self._chat_input.returnPressed.connect(self._handle_ai_send)
+        input_row.addWidget(self._chat_input, stretch=1)
+        self._send_button = QPushButton("Send")
+        self._send_button.clicked.connect(self._handle_ai_send)
+        input_row.addWidget(self._send_button)
+        layout.addLayout(input_row)
 
-        layout.addWidget(QLabel("Risks"))
-        self._analysis_risks = QPlainTextEdit()
-        self._analysis_risks.setReadOnly(True)
-        self._analysis_risks.setPlaceholderText("AI risks will appear here.")
-        layout.addWidget(self._analysis_risks)
-
-        layout.addWidget(QLabel("Suggested actions"))
-        self._actions_list = QListWidget()
-        self._actions_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._actions_list.itemSelectionChanged.connect(self._update_approve_button_state)
-        layout.addWidget(self._actions_list)
-
-        bottom_actions = QHBoxLayout()
+        actions_row = QHBoxLayout()
+        actions_row.addWidget(QLabel("Action"))
+        self._actions_combo = QComboBox()
+        self._actions_combo.currentIndexChanged.connect(self._update_approve_button_state)
+        actions_row.addWidget(self._actions_combo, stretch=1)
         self._approve_button = QPushButton("Approve")
         self._approve_button.setEnabled(False)
         self._approve_button.clicked.connect(self._approve_ai_action)
-        bottom_actions.addWidget(self._approve_button)
-
+        actions_row.addWidget(self._approve_button)
         pause_button = QPushButton("Pause (AI)")
         pause_button.clicked.connect(self._handle_pause)
-        bottom_actions.addWidget(pause_button)
-        bottom_actions.addStretch()
-        layout.addLayout(bottom_actions)
+        actions_row.addWidget(pause_button)
+        layout.addLayout(actions_row)
 
         return group
 
     def _handle_ai_analyze(self) -> None:
         if not self._app_state.openai_key_present:
             self._append_log("[AI] analyze skipped: missing OpenAI key.", "WARN")
-            self._show_ai_error("Не задан ключ OpenAI.")
+            self._append_chat_line("AI", "Не задан ключ OpenAI.")
             return
         datapack = self._build_ai_datapack()
+        self._append_chat_line("YOU", "AI Analyze")
         self._append_log("[AI] datapack prepared", "INFO")
         self._set_ai_busy(True)
         worker = _AiWorker(lambda: self._run_ai_analyze(datapack))
@@ -177,11 +178,10 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._handle_ai_analyze_error(str(exc))
             return
         self._last_ai_response = parsed
+        self._last_ai_result_json = response
         self._last_strategy_patch = parsed.strategy_patch
-        self._analysis_state_label.setText(f"State: {parsed.analysis_result.state}")
-        self._analysis_summary.setPlainText(parsed.analysis_result.summary or "—")
-        risks_text = "\n".join(parsed.analysis_result.risks) if parsed.analysis_result.risks else "—"
-        self._analysis_risks.setPlainText(risks_text)
+        self._last_actions_suggested = list(parsed.actions_suggested)
+        self._append_ai_response_to_chat(parsed)
         self._render_actions(parsed.actions_suggested)
         self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
         self._append_log("[AI] response received", "INFO")
@@ -189,7 +189,10 @@ class AiOperatorGridWindow(LiteGridWindow):
     def _handle_ai_analyze_error(self, message: str) -> None:
         self._set_ai_busy(False)
         self._append_log(f"[AI] response invalid: {message}", "WARN")
-        self._show_ai_error(message)
+        self._append_chat_line("AI", f"Ошибка AI: {message}")
+        self._actions_combo.clear()
+        self._apply_plan_button.setEnabled(False)
+        self._update_approve_button_state()
 
     def _apply_ai_plan(self) -> None:
         if not self._last_strategy_patch or not self._strategy_patch_has_values(self._last_strategy_patch):
@@ -197,13 +200,91 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         self._apply_strategy_patch_to_form(self._last_strategy_patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
+        self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
+
+    def _handle_ai_send(self) -> None:
+        message = self._chat_input.text().strip()
+        if not message:
+            return
+        if not self._app_state.openai_key_present:
+            self._append_log("[AI] chat skipped: missing OpenAI key.", "WARN")
+            self._append_chat_line("AI", "Не задан ключ OpenAI.")
+            return
+        self._append_chat_line("YOU", message)
+        self._chat_input.clear()
+        datapack = self._build_ai_datapack()
+        current_ui_params = self.dump_settings()
+        self._set_ai_busy(True)
+        worker = _AiWorker(
+            lambda: self._run_ai_chat_adjust(
+                datapack=datapack,
+                message=message,
+                last_ai_json=self._last_ai_result_json,
+                current_ui_params=current_ui_params,
+            )
+        )
+        worker.signals.success.connect(self._handle_ai_chat_success)
+        worker.signals.error.connect(self._handle_ai_chat_error)
+        self._thread_pool.start(worker)
+        self._append_log("[AI] chat request sent", "INFO")
+
+    def _run_ai_chat_adjust(
+        self,
+        datapack: dict[str, Any],
+        message: str,
+        last_ai_json: str | None,
+        current_ui_params: dict[str, Any],
+    ) -> str:
+        client = OpenAIClient(
+            api_key=self._app_state.openai_api_key,
+            model=self._app_state.openai_model,
+            timeout_s=25.0,
+            retries=2,
+        )
+        return asyncio.run(
+            client.chat_operator(
+                datapack=datapack,
+                user_message=message,
+                last_ai_json=last_ai_json,
+                current_ui_params=current_ui_params,
+            )
+        )
+
+    def _handle_ai_chat_success(self, response: object) -> None:
+        self._set_ai_busy(False)
+        if not isinstance(response, str):
+            self._handle_ai_chat_error("AI response invalid or empty.")
+            return
+        try:
+            parsed = parse_ai_operator_response(response)
+        except ValueError as exc:
+            self._handle_ai_chat_error(str(exc))
+            return
+        self._last_ai_response = parsed
+        self._last_ai_result_json = response
+        self._last_strategy_patch = parsed.strategy_patch
+        self._last_actions_suggested = list(parsed.actions_suggested)
+        self._append_ai_response_to_chat(parsed)
+        self._render_actions(parsed.actions_suggested)
+        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(parsed.strategy_patch))
+        self._append_log("[AI] chat response received", "INFO")
+
+    def _handle_ai_chat_error(self, message: str) -> None:
+        self._set_ai_busy(False)
+        self._append_log(f"[AI] chat response invalid: {message}", "WARN")
+        self._append_chat_line("AI", f"Ошибка AI: {message}")
 
     def _approve_ai_action(self) -> None:
-        item = self._actions_list.currentItem()
-        if item is None:
+        action = self._actions_combo.currentText().strip().upper()
+        if not action:
             self._append_log("[AI] approve skipped: no action selected.", "WARN")
             return
-        action = item.text().strip().upper()
+        now = time.monotonic()
+        if action == self._last_approve_action and now - self._last_approve_ts < 1.0:
+            self._append_log(f"[AI] approve ignored: action {action} debounced.", "WARN")
+            return
+        self._last_approve_action = action
+        self._last_approve_ts = now
         if action == "START":
             self._handle_start()
         elif action == "REBUILD_GRID":
@@ -212,35 +293,59 @@ class AiOperatorGridWindow(LiteGridWindow):
         elif action == "PAUSE":
             self._handle_pause()
         elif action == "WAIT":
-            pass
+            self._append_log("[AI] approved WAIT (no-op)", "INFO")
+            self._append_chat_line("AI", "approved WAIT (no-op)")
+            return
         else:
             self._append_log(f"[AI] approve ignored: unknown action {action}.", "WARN")
             return
         self._append_log(f"[AI] approved action: {action}", "INFO")
+        self._append_chat_line("AI", f"approved action: {action}")
 
     def _render_actions(self, actions: list[str]) -> None:
-        self._actions_list.clear()
+        self._actions_combo.clear()
         for action in actions:
             if not action:
                 continue
-            self._actions_list.addItem(action)
-        if self._actions_list.count() > 0:
-            self._actions_list.setCurrentRow(0)
+            self._actions_combo.addItem(action)
+        if self._actions_combo.count() > 0:
+            self._actions_combo.setCurrentIndex(0)
         self._update_approve_button_state()
 
     def _update_approve_button_state(self) -> None:
-        self._approve_button.setEnabled(self._actions_list.currentItem() is not None)
+        self._approve_button.setEnabled(self._actions_combo.count() > 0)
 
     def _set_ai_busy(self, busy: bool) -> None:
         self._analyze_button.setEnabled(not busy)
+        self._chat_input.setEnabled(not busy)
+        self._send_button.setEnabled(not busy)
 
-    def _show_ai_error(self, message: str) -> None:
-        self._analysis_state_label.setText("State: ERROR")
-        self._analysis_summary.setPlainText(message)
-        self._analysis_risks.setPlainText("—")
-        self._actions_list.clear()
-        self._apply_plan_button.setEnabled(False)
-        self._update_approve_button_state()
+    def _append_chat_line(self, author: str, message: str) -> None:
+        if not message:
+            return
+        self._chat_history.appendPlainText(f"[{author}] {message}")
+
+    def _append_ai_response_to_chat(self, response: AiOperatorResponse) -> None:
+        summary = response.analysis_result.summary or "—"
+        self._append_chat_line("AI", summary)
+        if response.analysis_result.risks:
+            risks_text = "; ".join(response.analysis_result.risks)
+            self._append_chat_line("AI", f"Risks: {risks_text}")
+        self._chat_history.appendPlainText(f"[AI][STATE] {response.analysis_result.state}")
+        patch = response.strategy_patch
+        step = f"{patch.step_pct}" if patch and patch.step_pct is not None else "—"
+        levels = f"{patch.levels}" if patch and patch.levels is not None else "—"
+        if patch and (patch.range_down_pct is not None or patch.range_up_pct is not None):
+            range_down = patch.range_down_pct if patch.range_down_pct is not None else "—"
+            range_up = patch.range_up_pct if patch.range_up_pct is not None else "—"
+            range_text = f"{range_down}..{range_up}"
+        else:
+            range_text = "—"
+        self._chat_history.appendPlainText(
+            f"[AI][PATCH] step={step} range={range_text} levels={levels}"
+        )
+        actions = ", ".join(response.actions_suggested) if response.actions_suggested else "—"
+        self._chat_history.appendPlainText(f"[AI][ACTIONS] {actions}")
 
     def _strategy_patch_has_values(self, patch: AiOperatorStrategyPatch | None) -> bool:
         if patch is None:
@@ -284,7 +389,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         if patch.take_profit_pct is not None:
             self._take_profit_input.setValue(patch.take_profit_pct)
         if patch.max_exposure is not None:
-            self._append_log("[AI] max_exposure provided but not applied in Lite UI.", "WARN")
+            if not self._max_exposure_warned:
+                self._append_log("[AI] max_exposure ignored (UI field not present)", "INFO")
+                self._max_exposure_warned = True
 
     def _build_ai_datapack(self) -> dict[str, Any]:
         snapshot = self._price_feed_manager.get_snapshot(self._symbol)
