@@ -91,6 +91,7 @@ class TradeGate(Enum):
     TRADE_DISABLED_AUTH = "auth error"
     TRADE_DISABLED_READONLY = "read-only"
     TRADE_DISABLED_NO_PERMS = "no permissions"
+    TRADE_DISABLED_NO_CONFIRM = "no live confirm"
 
 
 @dataclass
@@ -99,6 +100,23 @@ class GridPlannedOrder:
     price: float
     qty: float
     level_index: int
+
+
+@dataclass
+class GridPlanStats:
+    min_notional_failed: int = 0
+
+
+@dataclass
+class TradeFill:
+    side: str
+    price: float
+    qty: float
+    quote_qty: float
+    commission: float
+    commission_asset: str
+    time_ms: int
+    order_id: str
 
 
 class GridEngine:
@@ -110,6 +128,7 @@ class GridEngine:
         self.state = "IDLE"
         self.mode = "DRY_RUN"
         self._planned_orders: list[GridPlannedOrder] = []
+        self._plan_stats = GridPlanStats()
         self._on_state_change = on_state_change
         self._on_log = on_log
 
@@ -132,6 +151,7 @@ class GridEngine:
             raise ValueError("Grid step must be > 0.")
         if settings.range_low_pct <= 0 or settings.range_high_pct <= 0:
             raise ValueError("Range must be > 0.")
+        self._plan_stats = GridPlanStats()
         plan = self._build_plan(settings, last_price, rules)
         self._planned_orders = plan
         return plan
@@ -290,6 +310,7 @@ class GridEngine:
                 qty = self._quantize(min_notional / price, step, round_up=True)
                 notional = price * qty
                 if notional < min_notional:
+                    self._plan_stats.min_notional_failed += 1
                     self._on_log(
                         (
                             "order skipped: minNotional"
@@ -306,6 +327,7 @@ class GridEngine:
         if qty <= 0:
             return price, 0.0
         if min_notional is not None and price * qty < min_notional:
+            self._plan_stats.min_notional_failed += 1
             self._on_log(
                 (
                     "order skipped: minNotional"
@@ -316,6 +338,9 @@ class GridEngine:
             )
             return price, 0.0
         return price, qty
+
+    def get_plan_stats(self) -> GridPlanStats:
+        return self._plan_stats
 
 
 class LiteGridWindow(QMainWindow):
@@ -391,6 +416,16 @@ class LiteGridWindow(QMainWindow):
         self._auth_error = False
         self._trade_gate = TradeGate.TRADE_DISABLED_NO_KEYS if not self._has_api_keys else TradeGate.TRADE_DISABLED_READONLY
         self._rules_loaded = False
+        self._live_mode_confirmed = False
+        self._first_live_session = True
+        self._live_settings: GridSettingsState | None = None
+        self._open_orders_map: dict[str, dict[str, Any]] = {}
+        self._fills: list[TradeFill] = []
+        self._realized_pnl = 0.0
+        self._fees_total = 0.0
+        self._closed_trades = 0
+        self._win_trades = 0
+        self._replacement_index = len(planned)
         self._balances_tick_count = 0
         self._orders_tick_count = 0
         self._orders_last_count: int | None = None
@@ -601,6 +636,12 @@ class LiteGridWindow(QMainWindow):
         self._grid_step_input.valueChanged.connect(
             lambda value: self._update_setting("grid_step_pct", value)
         )
+        self._manual_override_button = QPushButton(tr("manual_override"))
+        self._manual_override_button.setFixedHeight(24)
+        self._manual_override_button.clicked.connect(self._handle_manual_override)
+        grid_step_row = QHBoxLayout()
+        grid_step_row.addWidget(self._grid_step_input)
+        grid_step_row.addWidget(self._manual_override_button)
 
         self._range_mode_combo = QComboBox()
         self._range_mode_combo.addItem("Авто", "Auto")
@@ -632,6 +673,8 @@ class LiteGridWindow(QMainWindow):
         self._take_profit_input.valueChanged.connect(
             lambda value: self._update_setting("take_profit_pct", value)
         )
+        self._auto_values_label = QLabel(tr("auto_values_line", values="—"))
+        self._auto_values_label.setStyleSheet("color: #6b7280; font-size: 10px;")
 
         stop_loss_row = QHBoxLayout()
         self._stop_loss_toggle = QCheckBox(tr("enable"))
@@ -664,11 +707,12 @@ class LiteGridWindow(QMainWindow):
         form.addRow(tr("direction"), self._direction_combo)
         form.addRow(tr("grid_count"), self._grid_count_input)
         form.addRow(tr("grid_step_mode"), self._grid_step_mode_combo)
-        form.addRow(tr("grid_step"), self._grid_step_input)
+        form.addRow(tr("grid_step"), grid_step_row)
         form.addRow(tr("range_mode"), self._range_mode_combo)
         form.addRow(tr("range_low"), self._range_low_input)
         form.addRow(tr("range_high"), self._range_high_input)
         form.addRow(tr("take_profit"), self._take_profit_input)
+        form.addRow("", self._auto_values_label)
         form.addRow(tr("stop_loss"), stop_loss_row)
         form.addRow(tr("max_active_orders"), self._max_orders_input)
         form.addRow(tr("order_size_mode"), self._order_size_combo)
@@ -945,14 +989,22 @@ class LiteGridWindow(QMainWindow):
         self._apply_grid_step_mode(value)
         self._update_grid_preview()
 
+    def _handle_manual_override(self) -> None:
+        self._grid_step_mode_combo.setCurrentIndex(self._grid_step_mode_combo.findData("MANUAL"))
+
     def _apply_range_mode(self, value: str) -> None:
         manual = value == "Manual"
-        self._range_low_input.setEnabled(manual)
-        self._range_high_input.setEnabled(manual)
+        self._range_low_input.setEnabled(True)
+        self._range_high_input.setEnabled(True)
+        self._range_low_input.setReadOnly(not manual and self._settings_state.grid_step_mode == "AUTO_ATR")
+        self._range_high_input.setReadOnly(not manual and self._settings_state.grid_step_mode == "AUTO_ATR")
 
     def _apply_grid_step_mode(self, value: str) -> None:
         auto = value == "AUTO_ATR"
-        self._grid_step_input.setEnabled(not auto)
+        self._grid_step_input.setEnabled(True)
+        self._grid_step_input.setReadOnly(auto)
+        self._take_profit_input.setReadOnly(auto)
+        self._manual_override_button.setEnabled(auto)
         self._grid_step_mode_combo.setToolTip(tr("grid_step_mode_tip_auto") if auto else "")
         if auto:
             self._manual_grid_step_pct = self._settings_state.grid_step_pct
@@ -963,9 +1015,15 @@ class LiteGridWindow(QMainWindow):
             auto_params = self._auto_grid_params_from_history()
             if auto_params:
                 self._set_grid_step_input(auto_params["grid_step_pct"], update_setting=False)
+            self._take_profit_input.blockSignals(True)
+            if auto_params:
+                self._take_profit_input.setValue(auto_params["take_profit_pct"])
+            self._take_profit_input.blockSignals(False)
         else:
-            self._set_grid_step_input(self._manual_grid_step_pct, update_setting=False)
+            self._manual_grid_step_pct = float(self._grid_step_input.value())
             self._range_mode_combo.setEnabled(True)
+            self._take_profit_input.setReadOnly(False)
+        self._update_auto_values_label(auto)
 
     def _handle_stop_loss_toggle(self, enabled: bool) -> None:
         self._stop_loss_input.setEnabled(enabled)
@@ -992,12 +1050,15 @@ class LiteGridWindow(QMainWindow):
                 self._dry_run_toggle.setChecked(True)
                 self._suppress_dry_run_event = False
                 return
+            self._live_mode_confirmed = True
         state = "enabled" if checked else "disabled"
         self._append_log(f"Dry-run {state}.", kind="INFO")
         self._append_log(
             f"Trade enabled state changed: live={str(not checked).lower()}.",
             kind="INFO",
         )
+        if checked:
+            self._live_mode_confirmed = False
         self._grid_engine.set_mode("DRY_RUN" if checked else "LIVE")
         self._apply_trade_gate()
 
@@ -1005,20 +1066,33 @@ class LiteGridWindow(QMainWindow):
         dry_run = self._dry_run_toggle.isChecked()
         self._append_log(f"Start pressed (dry-run={dry_run}).", kind="ORDERS")
         if not dry_run and self._trade_gate != TradeGate.TRADE_OK:
-            self._append_log("Start blocked: trade permissions missing.", kind="WARN")
-            return
+            reason = self._trade_gate_reason()
+            self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
+            dry_run = True
+            self._suppress_dry_run_event = True
+            self._dry_run_toggle.setChecked(True)
+            self._suppress_dry_run_event = False
         self._grid_engine.set_mode("DRY_RUN" if dry_run else "LIVE")
+        if not dry_run and (not self._rules_loaded or not self._fees_last_fetch_ts):
+            self._append_log("Start blocked: rules/fees not loaded.", kind="WARN")
+            self._refresh_exchange_rules(force=True)
+            self._refresh_trade_fees(force=True)
+            self._change_state("IDLE")
+            return
         try:
             settings = self._resolve_start_settings()
+            if not dry_run and self._first_live_session:
+                settings.grid_count = min(settings.grid_count, 4)
+                settings.max_active_orders = min(settings.max_active_orders, 4)
             planned = self._grid_engine.start(settings, self._last_price, self._exchange_rules)
         except ValueError as exc:
             self._append_log(f"Start failed: {exc}", kind="WARN")
             self._change_state("IDLE")
             return
-        planned = planned[: self._settings_state.max_active_orders]
+        planned = planned[: settings.max_active_orders]
         buy_count = sum(1 for order in planned if order.side == "BUY")
         sell_count = sum(1 for order in planned if order.side == "SELL")
-        if buy_count < 1 or sell_count < 1:
+        if not dry_run and (len(planned) < 2 or buy_count < 1 or sell_count < 1):
             self._append_log(
                 f"Start blocked: insufficient orders after filters (buys={buy_count}, sells={sell_count}).",
                 kind="WARN",
@@ -1026,23 +1100,33 @@ class LiteGridWindow(QMainWindow):
             self._change_state("IDLE")
             return
         self._append_log(
-            f"grid plan: buys={buy_count} sells={sell_count} minNotional ok",
+            f"grid plan: buys={buy_count} sells={sell_count}",
             kind="ORDERS",
         )
         if dry_run:
             self._change_state("RUNNING")
             self._render_sim_orders(planned)
             return
-        max_exposure = sum(order.price * order.qty for order in planned if order.side == "BUY")
+        plan_stats = self._grid_engine.get_plan_stats()
+        min_notional_failed = plan_stats.min_notional_failed
+        min_notional_ok = len(planned)
+        max_exposure = sum(order.price * order.qty for order in planned)
         quote_asset = self._quote_asset or "USDT"
+        first_live_warning = ""
+        if self._first_live_session:
+            first_live_warning = tr("grid_confirm_first_live_warning")
         confirm = QMessageBox.question(
             self,
             tr("grid_confirm_title"),
             tr(
                 "grid_confirm_message",
+                symbol=self._symbol,
                 count=str(len(planned)),
                 exposure=f"{max_exposure:.2f}",
+                min_ok=str(min_notional_ok),
+                min_failed=str(min_notional_failed),
                 quote_asset=quote_asset,
+                warning=first_live_warning,
             ),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1052,6 +1136,18 @@ class LiteGridWindow(QMainWindow):
             self._change_state("IDLE")
             return
         self._bot_session_id = uuid4().hex[:8]
+        self._bot_order_ids.clear()
+        self._open_orders_map = {}
+        self._fills = []
+        self._realized_pnl = 0.0
+        self._fees_total = 0.0
+        self._closed_trades = 0
+        self._win_trades = 0
+        self._replacement_index = 0
+        self._update_pnl(None, None)
+        self._update_trade_summary()
+        self._live_settings = settings
+        self._first_live_session = False
         self._change_state("PLACING_GRID")
         self._place_live_orders(planned)
 
@@ -1066,17 +1162,17 @@ class LiteGridWindow(QMainWindow):
         self._change_state("IDLE")
         if self._dry_run_toggle.isChecked():
             return
-        confirm = QMessageBox.question(
-            self,
-            tr("stop_confirm_title"),
-            tr("stop_confirm_message"),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle(tr("stop_confirm_title"))
+        dialog.setText(tr("stop_confirm_message"))
+        leave_button = dialog.addButton(tr("stop_leave_orders"), QMessageBox.RejectRole)
+        cancel_button = dialog.addButton(tr("stop_cancel_orders"), QMessageBox.AcceptRole)
+        dialog.exec()
+        if dialog.clickedButton() == leave_button:
             self._append_log("Stop: left bot orders open.", kind="INFO")
             return
-        self._cancel_bot_orders()
+        if dialog.clickedButton() == cancel_button:
+            self._cancel_bot_orders()
 
     def _handle_cancel_selected(self) -> None:
         selected_rows = sorted({index.row() for index in self._orders_table.selectionModel().selectedRows()})
@@ -1164,6 +1260,7 @@ class LiteGridWindow(QMainWindow):
             if auto_params:
                 self._set_grid_step_input(auto_params["grid_step_pct"], update_setting=False)
             self._update_grid_preview()
+            self._update_auto_values_label(True)
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -1216,6 +1313,23 @@ class LiteGridWindow(QMainWindow):
             "range_pct": range_pct,
             "take_profit_pct": tp_pct,
         }
+
+    def _update_auto_values_label(self, auto: bool) -> None:
+        if not hasattr(self, "_auto_values_label"):
+            return
+        if not auto:
+            self._auto_values_label.setText(tr("auto_values_line", values="—"))
+            return
+        auto_params = self._auto_grid_params_from_history()
+        if not auto_params:
+            self._auto_values_label.setText(tr("auto_values_line", values="—"))
+            return
+        values = (
+            f"step {auto_params['grid_step_pct']:.2f}% | "
+            f"range {auto_params['range_pct']:.2f}% | "
+            f"tp {auto_params['take_profit_pct']:.2f}%"
+        )
+        self._auto_values_label.setText(tr("auto_values_line", values=values))
 
     def _resolve_start_settings(self) -> GridSettingsState:
         settings = GridSettingsState(**asdict(self._settings_state))
@@ -1351,6 +1465,7 @@ class LiteGridWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._open_orders_all = []
             self._open_orders = []
+            self._open_orders_map = {}
             self._render_open_orders()
             self._apply_trade_gate()
             return
@@ -1365,7 +1480,7 @@ class LiteGridWindow(QMainWindow):
     def _update_orders_timer_interval(self) -> None:
         if not hasattr(self, "_orders_timer"):
             return
-        slow_poll = self._state == "IDLE" and not self._open_orders
+        slow_poll = not self._open_orders
         interval = 10_000 if slow_poll else 3_000
         if self._orders_timer.interval() != interval:
             self._orders_timer.setInterval(interval)
@@ -1375,14 +1490,27 @@ class LiteGridWindow(QMainWindow):
         if not isinstance(result, list):
             self._handle_open_orders_error("Unexpected open orders response")
             return
+        previous_map = dict(self._open_orders_map)
         self._open_orders_all = [item for item in result if isinstance(item, dict)]
         self._open_orders = self._filter_bot_orders(self._open_orders_all)
+        self._open_orders_map = {
+            str(order.get("orderId", "")): order
+            for order in self._open_orders
+            if str(order.get("orderId", ""))
+        }
         for order in self._open_orders:
             order_id = str(order.get("orderId", ""))
             if order_id:
                 self._bot_order_ids.add(order_id)
         self._render_open_orders()
         self._grid_engine.sync_open_orders(self._open_orders)
+        missing = [
+            order
+            for order_id, order in previous_map.items()
+            if order_id not in self._open_orders_map and self._is_bot_order(order)
+        ]
+        if missing and self._account_client and self._state in {"RUNNING", "WAITING_FILLS"}:
+            self._queue_reconcile_missing_orders(missing)
         count = len(self._open_orders)
         if self._orders_last_count is None or count != self._orders_last_count:
             self._append_log(
@@ -1403,23 +1531,247 @@ class LiteGridWindow(QMainWindow):
 
     def _filter_bot_orders(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
-        prefix = self._bot_order_prefix()
         for order in orders:
-            client_order_id = str(order.get("clientOrderId", ""))
-            order_id = str(order.get("orderId", ""))
-            is_bot = False
-            if prefix and client_order_id.startswith(prefix):
-                is_bot = True
-            if order_id and order_id in self._bot_order_ids:
-                is_bot = True
-            if is_bot:
+            if self._is_bot_order(order):
                 filtered.append(order)
         return filtered
+
+    def _is_bot_order(self, order: dict[str, Any]) -> bool:
+        prefix = self._bot_order_prefix()
+        client_order_id = str(order.get("clientOrderId", ""))
+        if prefix and client_order_id.startswith(prefix):
+            return True
+        order_id = str(order.get("orderId", ""))
+        if order_id and order_id in self._bot_order_ids and prefix:
+            return True
+        return False
 
     def _bot_order_prefix(self) -> str:
         if not self._bot_session_id:
             return ""
         return f"BBOT_LITE_{self._symbol}_{self._bot_session_id}_"
+
+    def _queue_reconcile_missing_orders(self, missing: list[dict[str, Any]]) -> None:
+        if not self._account_client:
+            return
+
+        def _reconcile() -> dict[str, Any]:
+            trades = self._account_client.get_my_trades(self._symbol, limit=50)
+            trades_by_order: dict[str, dict[str, Any]] = {}
+            if isinstance(trades, list):
+                for trade in trades:
+                    if not isinstance(trade, dict):
+                        continue
+                    order_id = str(trade.get("orderId", ""))
+                    if order_id:
+                        trades_by_order[order_id] = trade
+            results: list[dict[str, Any]] = []
+            for order in missing:
+                order_id = str(order.get("orderId", ""))
+                if not order_id:
+                    continue
+                trade = trades_by_order.get(order_id)
+                if trade:
+                    results.append({"status": "FILLED", "order": order, "trade": trade})
+                    continue
+                order_info = self._account_client.get_order(self._symbol, order_id)
+                status = str(order_info.get("status", "")).upper() if isinstance(order_info, dict) else "UNKNOWN"
+                results.append({"status": status, "order": order, "trade": None})
+            return {"results": results}
+
+        worker = _Worker(_reconcile)
+        worker.signals.success.connect(self._handle_reconcile_missing_orders)
+        worker.signals.error.connect(self._handle_reconcile_error)
+        self._thread_pool.start(worker)
+
+    def _handle_reconcile_missing_orders(self, result: object, latency_ms: int) -> None:
+        if not isinstance(result, dict):
+            self._handle_reconcile_error("Unexpected reconcile response")
+            return
+        results = result.get("results", [])
+        if not isinstance(results, list):
+            return
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status", "")).upper()
+            order = entry.get("order")
+            trade = entry.get("trade")
+            if not isinstance(order, dict):
+                continue
+            order_id = str(order.get("orderId", ""))
+            if status == "FILLED":
+                fill = self._build_trade_fill(order, trade)
+                if fill:
+                    self._record_fill(fill)
+                    self._append_log(
+                        (
+                            f"[LIVE] fill orderId={fill.order_id} side={fill.side}"
+                            f" price={fill.price:.8f} qty={fill.qty:.8f}"
+                        ),
+                        kind="ORDERS",
+                    )
+                    self._place_replacement_order(fill)
+                continue
+            if status in {"CANCELED", "EXPIRED", "REJECTED"}:
+                self._append_log(
+                    f"[LIVE] order closed orderId={order_id} status={status}",
+                    kind="ORDERS",
+                )
+                continue
+            if order_id:
+                self._append_log(
+                    f"[LIVE] order disappeared orderId={order_id} status={status}",
+                    kind="WARN",
+                )
+
+    def _handle_reconcile_error(self, message: str) -> None:
+        self._append_log(f"Reconcile failed: {message}", kind="WARN")
+
+    def _build_trade_fill(
+        self,
+        order: dict[str, Any],
+        trade: dict[str, Any] | None,
+    ) -> TradeFill | None:
+        if trade:
+            price = self._coerce_float(str(trade.get("price", ""))) or 0.0
+            qty = self._coerce_float(str(trade.get("qty", ""))) or 0.0
+            quote_qty = self._coerce_float(str(trade.get("quoteQty", ""))) or price * qty
+            commission = self._coerce_float(str(trade.get("commission", ""))) or 0.0
+            commission_asset = str(trade.get("commissionAsset", "")).upper()
+            time_ms = int(trade.get("time", 0) or 0)
+        else:
+            price = self._coerce_float(str(order.get("price", ""))) or 0.0
+            qty = self._coerce_float(str(order.get("executedQty", ""))) or 0.0
+            quote_qty = price * qty
+            commission = 0.0
+            commission_asset = ""
+            time_ms = int(order.get("updateTime", 0) or order.get("time", 0) or 0)
+        if price <= 0 or qty <= 0:
+            return None
+        side = str(order.get("side", "")).upper()
+        return TradeFill(
+            side=side,
+            price=price,
+            qty=qty,
+            quote_qty=quote_qty,
+            commission=commission,
+            commission_asset=commission_asset,
+            time_ms=time_ms,
+            order_id=str(order.get("orderId", "")),
+        )
+
+    def _record_fill(self, fill: TradeFill) -> None:
+        self._fills.append(fill)
+        delta = fill.quote_qty if fill.side == "SELL" else -fill.quote_qty
+        self._realized_pnl += delta
+        if fill.commission_asset == self._quote_asset:
+            self._fees_total += fill.commission
+        self._closed_trades += 1
+        if delta > 0:
+            self._win_trades += 1
+        self._update_pnl(None, self._realized_pnl)
+        self._update_trade_summary()
+
+    def _update_trade_summary(self) -> None:
+        if self._closed_trades > 0:
+            win_pct = self._win_trades / self._closed_trades * 100
+            avg = self._realized_pnl / self._closed_trades
+            win_text = f"{win_pct:.0f}%"
+            avg_text = f"{avg:.2f}"
+        else:
+            win_text = "—"
+            avg_text = "—"
+        self._trades_summary_label.setText(
+            tr(
+                "trades_summary",
+                closed=str(self._closed_trades),
+                win=win_text,
+                avg=avg_text,
+                realized=f"{self._realized_pnl:.2f}",
+                fees=f"{self._fees_total:.2f}",
+            )
+        )
+
+    def _place_replacement_order(self, fill: TradeFill) -> None:
+        if not self._account_client or not self._bot_session_id:
+            return
+        if self._state not in {"RUNNING", "WAITING_FILLS"}:
+            return
+        settings = self._live_settings or self._settings_state
+        tp_pct = settings.take_profit_pct or settings.grid_step_pct
+        if tp_pct <= 0:
+            return
+        side = "SELL" if fill.side == "BUY" else "BUY"
+        raw_price = fill.price * (1 + tp_pct / 100.0) if side == "SELL" else fill.price * (1 - tp_pct / 100.0)
+        price = self._quantize_value(raw_price, self._exchange_rules.get("tick"), round_up=False)
+        qty = self._quantize_value(fill.qty, self._exchange_rules.get("step"), round_up=False)
+        price, qty = self._apply_exchange_filters(side, price, qty)
+        if price <= 0 or qty <= 0:
+            self._append_log(
+                f"[LIVE] replace skipped: minNotional side={side} price={price:.8f} qty={qty:.8f}",
+                kind="WARN",
+            )
+            return
+        self._replacement_index += 1
+        client_order_id = f"{self._bot_order_prefix()}{side}_{self._replacement_index}"
+
+        def _place() -> dict[str, Any]:
+            return self._account_client.place_limit_order(
+                symbol=self._symbol,
+                side=side,
+                price=f"{price:.8f}",
+                quantity=f"{qty:.8f}",
+                time_in_force="GTC",
+                new_client_order_id=client_order_id,
+            )
+
+        worker = _Worker(_place)
+        worker.signals.success.connect(self._handle_replacement_order)
+        worker.signals.error.connect(self._handle_live_order_error)
+        self._thread_pool.start(worker)
+
+    def _handle_replacement_order(self, result: object, latency_ms: int) -> None:
+        if not isinstance(result, dict):
+            self._handle_live_order_error("Unexpected replacement response")
+            return
+        order_id = str(result.get("orderId", ""))
+        if order_id:
+            self._bot_order_ids.add(order_id)
+        self._append_log(f"[LIVE] replace orderId={order_id}", kind="ORDERS")
+        self._refresh_open_orders(force=True)
+
+    def _quantize_value(self, value: float, step: float | None, round_up: bool) -> float:
+        if step is None or step <= 0:
+            return value
+        if round_up:
+            return ceil(value / step) * step
+        return floor(value / step) * step
+
+    def _apply_exchange_filters(self, side: str, price: float, qty: float) -> tuple[float, float]:
+        tick = self._exchange_rules.get("tick")
+        step = self._exchange_rules.get("step")
+        min_notional = self._exchange_rules.get("min_notional")
+        min_qty = self._exchange_rules.get("min_qty")
+        max_qty = self._exchange_rules.get("max_qty")
+        price = self._quantize_value(price, tick, round_up=False)
+        qty = self._quantize_value(qty, step, round_up=False)
+        if min_notional is not None and price > 0:
+            notional = price * qty
+            if notional < min_notional:
+                qty = self._quantize_value(min_notional / price, step, round_up=True)
+                notional = price * qty
+                if notional < min_notional:
+                    return price, 0.0
+        if min_qty is not None and qty < min_qty:
+            qty = self._quantize_value(min_qty, step, round_up=True)
+        if max_qty is not None and qty > max_qty:
+            qty = self._quantize_value(max_qty, step, round_up=False)
+        if qty <= 0:
+            return price, 0.0
+        if min_notional is not None and price * qty < min_notional:
+            return price, 0.0
+        return price, qty
 
     def _refresh_exchange_rules(self, force: bool = False) -> None:
         if self._rules_in_flight:
@@ -1550,7 +1902,7 @@ class LiteGridWindow(QMainWindow):
     def _apply_trade_status_label(self) -> None:
         if self._trade_gate != TradeGate.TRADE_OK:
             reason = self._trade_gate_reason()
-            self._trade_status_label.setText(tr("trade_status_disabled"))
+            self._trade_status_label.setText(f"{tr('trade_status_disabled')} ({reason})")
             self._trade_status_label.setStyleSheet(
                 "color: #dc2626; font-size: 11px; font-weight: 600;"
             )
@@ -1586,6 +1938,8 @@ class LiteGridWindow(QMainWindow):
             return TradeGate.TRADE_DISABLED_AUTH
         if self._dry_run_toggle.isChecked():
             return TradeGate.TRADE_DISABLED_READONLY
+        if not self._live_mode_confirmed:
+            return TradeGate.TRADE_DISABLED_NO_CONFIRM
         if not self._can_trade():
             return TradeGate.TRADE_DISABLED_NO_PERMS
         return TradeGate.TRADE_OK
@@ -1596,6 +1950,7 @@ class LiteGridWindow(QMainWindow):
             TradeGate.TRADE_DISABLED_AUTH: "auth error",
             TradeGate.TRADE_DISABLED_READONLY: tr("trade_disabled_reason_spot"),
             TradeGate.TRADE_DISABLED_NO_PERMS: tr("trade_disabled_reason_spot"),
+            TradeGate.TRADE_DISABLED_NO_CONFIRM: tr("trade_disabled_reason_confirm"),
         }
         return mapping.get(self._trade_gate, "unknown")
 
@@ -1620,7 +1975,7 @@ class LiteGridWindow(QMainWindow):
     def _auto_pause_on_api_error(self, message: str) -> None:
         if self._dry_run_toggle.isChecked():
             return
-        if self._state != "RUNNING":
+        if self._state not in {"RUNNING", "WAITING_FILLS"}:
             return
         if not self._is_rate_limit_or_server_error(message):
             return
@@ -1631,7 +1986,7 @@ class LiteGridWindow(QMainWindow):
     def _auto_pause_on_exception(self, message: str) -> None:
         if self._dry_run_toggle.isChecked():
             return
-        if self._state != "RUNNING":
+        if self._state not in {"RUNNING", "WAITING_FILLS"}:
             return
         self._append_log(f"Auto-paused due to exception: {message}", kind="WARN")
         self._grid_engine.pause()
@@ -1769,8 +2124,9 @@ class LiteGridWindow(QMainWindow):
         def _place() -> dict[str, Any]:
             results: list[dict[str, Any]] = []
             errors: list[str] = []
+            last_open_orders: list[dict[str, Any]] | None = None
             for idx, order in enumerate(planned, start=1):
-                client_order_id = f"{prefix}{order.side}_{order.level_index}"
+                client_order_id = f"{prefix}{order.side}_{idx}"
                 try:
                     response = self._account_client.place_limit_order(
                         symbol=self._symbol,
@@ -1784,8 +2140,13 @@ class LiteGridWindow(QMainWindow):
                 except Exception as exc:  # noqa: BLE001
                     errors.append(self._format_binance_error(exc, order))
                 if idx % batch_size == 0:
-                    self._sleep_ms(300)
-            return {"results": results, "errors": errors}
+                    self._sleep_ms(250)
+                    try:
+                        last_open_orders = self._account_client.get_open_orders(self._symbol)
+                    except Exception:
+                        last_open_orders = None
+                    self._sleep_ms(200)
+            return {"results": results, "errors": errors, "open_orders": last_open_orders}
 
         worker = _Worker(_place)
         worker.signals.success.connect(self._handle_live_order_placement)
@@ -1805,15 +2166,26 @@ class LiteGridWindow(QMainWindow):
                 order_id = str(entry.get("orderId", ""))
                 if order_id:
                     self._bot_order_ids.add(order_id)
+                side = str(entry.get("side", "—"))
+                price = str(entry.get("price", "—"))
+                qty = str(entry.get("origQty", "—"))
+                self._append_log(
+                    f"[LIVE] place orderId={order_id} side={side} price={price} qty={qty}",
+                    kind="ORDERS",
+                )
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(message, kind="ERROR")
         self._append_log(f"placed: n={len(results)}", kind="ORDERS")
-        self._refresh_open_orders(force=True)
-        self._change_state("RUNNING")
+        open_orders = result.get("open_orders")
+        if isinstance(open_orders, list):
+            self._handle_open_orders(open_orders, latency_ms)
+        else:
+            self._refresh_open_orders(force=True)
+        self._change_state("WAITING_FILLS")
 
     def _handle_live_order_error(self, message: str) -> None:
-        self._append_log(f"Live order placement failed: {message}", kind="WARN")
+        self._append_log(f"[LIVE] order error: {message}", kind="WARN")
         self._change_state("IDLE")
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
@@ -1829,10 +2201,25 @@ class LiteGridWindow(QMainWindow):
 
         def _cancel() -> list[dict[str, Any]]:
             responses: list[dict[str, Any]] = []
-            for order_id in filtered_ids:
-                response = self._account_client.cancel_order(self._symbol, order_id)
-                responses.append(response)
-                self._sleep_ms(150)
+            batch_size = 4
+            for idx, order_id in enumerate(filtered_ids, start=1):
+                attempts = 3
+                last_exc: Exception | None = None
+                for attempt in range(attempts):
+                    try:
+                        response = self._account_client.cancel_order(self._symbol, order_id)
+                        responses.append(response)
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        message = str(exc)
+                        if not self._is_rate_limit_or_server_error(message) or attempt == attempts - 1:
+                            raise
+                        self._sleep_ms(300)
+                if last_exc:
+                    self._logger.warning("Cancel retry exhausted for %s: %s", order_id, last_exc)
+                if idx % batch_size == 0:
+                    self._sleep_ms(250)
             return responses
 
         worker = _Worker(_cancel)
@@ -1844,6 +2231,9 @@ class LiteGridWindow(QMainWindow):
         if not isinstance(result, list):
             self._handle_cancel_error("Unexpected cancel response")
             return
+        for entry in result:
+            order_id = str(entry.get("orderId", "—")) if isinstance(entry, dict) else "—"
+            self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel selected: {len(result)}", kind="ORDERS")
         self._refresh_open_orders(force=True)
 
@@ -1864,11 +2254,14 @@ class LiteGridWindow(QMainWindow):
         if not isinstance(result, list):
             self._handle_cancel_error("Unexpected cancel all response")
             return
+        for entry in result:
+            order_id = str(entry.get("orderId", "—")) if isinstance(entry, dict) else "—"
+            self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel all: {len(result)}", kind="ORDERS")
         self._refresh_open_orders(force=True)
 
     def _handle_cancel_error(self, message: str) -> None:
-        self._append_log(f"Cancel failed: {message}", kind="WARN")
+        self._append_log(f"[LIVE] cancel failed: {message}", kind="WARN")
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
 
@@ -1995,6 +2388,7 @@ class LiteGridWindow(QMainWindow):
             "IDLE": "#6b7280",
             "PLACING_GRID": "#2563eb",
             "RUNNING": "#16a34a",
+            "WAITING_FILLS": "#16a34a",
             "PAUSED": "#d97706",
             "STOPPING": "#f97316",
             "ERROR": "#dc2626",
@@ -2113,6 +2507,7 @@ class LiteGridWindow(QMainWindow):
         mapping = {
             "IDLE": "IDLE",
             "RUNNING": "RUNNING",
+            "WAITING_FILLS": "WAITING_FILLS",
             "PAUSED": "PAUSED",
             "STOPPING": "STOPPING",
             "PLACING_GRID": "PLACING_GRID",
@@ -2147,6 +2542,7 @@ class LiteGridWindow(QMainWindow):
                 quote_ccy=quote_ccy,
             )
         )
+        self._update_auto_values_label(self._settings_state.grid_step_mode == "AUTO_ATR")
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
         self._balances_timer.stop()

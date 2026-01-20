@@ -27,10 +27,12 @@ TEXT = {
     "grid_step_mode": "Режим шага",
     "grid_step": "Шаг сетки %",
     "grid_step_mode_tip_auto": "AUTO ATR: шаг и диапазон рассчитываются по волатильности.",
+    "manual_override": "Manual Override",
     "range_mode": "Режим диапазона",
     "range_low": "Диапазон вниз %",
     "range_high": "Диапазон вверх %",
     "take_profit": "Тейк-профит %",
+    "auto_values_line": "Auto: {values}",
     "stop_loss": "Стоп-лосс %",
     "enable": "Вкл",
     "max_active_orders": "Макс. активных ордеров",
@@ -68,10 +70,21 @@ TEXT = {
     "trade_confirm_title": "Enable LIVE trading?",
     "trade_confirm_message": "I understand this will place real orders. Continue?",
     "grid_confirm_title": "Запуск LIVE ордеров",
-    "grid_confirm_message": "Will place {count} real LIMIT orders.\nMax exposure ~ {exposure} {quote_asset}\nContinue?",
+    "grid_confirm_message": (
+        "Symbol {symbol}\n"
+        "Will place {count} real LIMIT orders.\n"
+        "Budget used ~ {exposure} {quote_asset}\n"
+        "minNotional ok {min_ok} / failed {min_failed}\n"
+        "{warning}"
+        "Continue?"
+    ),
+    "grid_confirm_first_live_warning": "FIRST LIVE: grid_count/max_active_orders capped at 4.\n",
     "stop_confirm_title": "Остановить бот?",
-    "stop_confirm_message": "Cancel all bot orders?",
+    "stop_confirm_message": "Выберите действие для LIVE ордеров.",
+    "stop_leave_orders": "Оставить ордера",
+    "stop_cancel_orders": "Отменить ордера бота",
     "trade_disabled_reason_spot": "Enable Spot Trading in API key settings",
+    "trade_disabled_reason_confirm": "Confirm LIVE mode to trade",
     "pnl_no_fills": "PnL: — (no fills data yet)",
 }
 
