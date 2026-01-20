@@ -28,7 +28,6 @@ def _load_app_state(config: Config, root_path: Path) -> AppState:
         openai_model="gpt-4o-mini",
         default_period="4h",
         default_quality="Standard",
-        allow_ai_more_data=True,
         price_ttl_ms=price_ttl_ms,
         price_refresh_ms=price_refresh_ms,
         default_quote="USDT",

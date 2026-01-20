@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -42,6 +43,7 @@ from src.core.config import Config
 from src.core.logging import get_logger
 from src.gui.i18n import TEXT, tr
 from src.gui.models.app_state import AppState
+from src.services.data_cache import DataCache
 from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
 
 
@@ -258,6 +260,50 @@ class GridEngine:
         )
         plan = buy_orders + sell_orders
         return plan
+
+    def build_side_plan(
+        self,
+        settings: GridSettingsState,
+        last_price: float,
+        rules: dict[str, float | None],
+        side: str,
+    ) -> list[GridPlannedOrder]:
+        tick = rules.get("tick")
+        step = rules.get("step")
+        min_notional = rules.get("min_notional")
+        min_qty = rules.get("min_qty")
+        max_qty = rules.get("max_qty")
+        levels = int(settings.grid_count)
+        budget = float(settings.budget)
+        step_pct = float(settings.grid_step_pct)
+        range_low = float(settings.range_low_pct)
+        range_high = float(settings.range_high_pct)
+        buys, sells = self._split_levels(levels, settings.direction)
+        buy_budget, sell_budget = self._split_budget(budget, buys, sells, settings.direction)
+        if side == "SELL":
+            count = sells
+            per_order_quote = sell_budget / sells if sells else 0.0
+            price_min = last_price
+            price_max = last_price * (1 + range_high / 100.0)
+        else:
+            count = buys
+            per_order_quote = buy_budget / buys if buys else 0.0
+            price_min = last_price * (1 - range_low / 100.0)
+            price_max = last_price
+        return self._build_side(
+            side=side,
+            count=count,
+            anchor_price=last_price,
+            step_pct=step_pct,
+            price_min=price_min,
+            price_max=price_max,
+            per_order_quote=per_order_quote,
+            tick=tick,
+            step=step,
+            min_notional=min_notional,
+            min_qty=min_qty,
+            max_qty=max_qty,
+        )
 
     def _split_levels(self, total: int, direction: str) -> tuple[int, int]:
         if direction == "Long-biased":
@@ -524,6 +570,8 @@ class LiteGridWindow(QMainWindow):
         self._state = "IDLE"
         self._engine_state = "WAITING"
         self._ws_status = ""
+        self._bootstrap_mode = False
+        self._bootstrap_sell_enabled = False
         self._settings_state = GridSettingsState()
         self._log_entries: list[tuple[str, str]] = []
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
@@ -542,6 +590,12 @@ class LiteGridWindow(QMainWindow):
             backoff_base_s=self._config.http.backoff_base_s,
             backoff_max_s=self._config.http.backoff_max_s,
         )
+        self._http_cache = DataCache()
+        self._http_cache_ttls = {
+            "book_ticker": 2.0,
+            "klines_1h": 60.0,
+            "exchange_info_symbol": 3600.0,
+        }
         if self._has_api_keys:
             self._account_client = BinanceAccountClient(
                 base_url=self._config.binance.base_url,
@@ -703,6 +757,10 @@ class LiteGridWindow(QMainWindow):
         self._age_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         self._latency_label = QLabel(tr("latency", latency="—"))
         self._latency_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        for label in (self._feed_indicator, self._age_label, self._latency_label):
+            label.setFixedHeight(18)
+            label.setMinimumWidth(150)
+            label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self._engine_state_label = QLabel(f"{tr('engine')}: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
@@ -1004,6 +1062,7 @@ class LiteGridWindow(QMainWindow):
     def _build_logs(self) -> QFrame:
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
+        frame.setMinimumHeight(240)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
@@ -1296,10 +1355,25 @@ class LiteGridWindow(QMainWindow):
             self._append_log(f"Start failed: {exc}", kind="WARN")
             self._change_state("IDLE")
             return
+        self._bootstrap_mode = False
+        self._bootstrap_sell_enabled = False
+        if not dry_run:
+            base_free = 0.0
+            if self._base_asset:
+                base_free, _ = self._balances.get(self._base_asset, (0.0, 0.0))
+            if base_free <= 0:
+                self._bootstrap_mode = True
+                planned = [order for order in planned if order.side == "BUY"]
+                self._append_log(
+                    "[ENGINE] bootstrap mode: base=0 -> placing BUY-only grid",
+                    kind="INFO",
+                )
         planned = planned[: settings.max_active_orders]
         buy_count = sum(1 for order in planned if order.side == "BUY")
         sell_count = sum(1 for order in planned if order.side == "SELL")
-        if not dry_run and (len(planned) < 2 or buy_count < 1 or sell_count < 1):
+        if not dry_run and (
+            len(planned) < 1 or buy_count < 1 or (sell_count < 1 and not self._bootstrap_mode)
+        ):
             self._append_log(
                 f"Start blocked: insufficient orders after filters (buys={buy_count}, sells={sell_count}).",
                 kind="WARN",
@@ -1383,6 +1457,8 @@ class LiteGridWindow(QMainWindow):
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("IDLE")
+        self._bootstrap_mode = False
+        self._bootstrap_sell_enabled = False
         if self._dry_run_toggle.isChecked():
             return
         dialog = QMessageBox(self)
@@ -1498,7 +1574,12 @@ class LiteGridWindow(QMainWindow):
 
     def _auto_grid_params_from_http(self) -> dict[str, float] | None:
         try:
-            klines = self._http_client.get_klines(self._symbol, interval="1h", limit=120)
+            cached = self._get_http_cached("klines_1h")
+            if cached is None:
+                klines = self._http_client.get_klines(self._symbol, interval="1h", limit=120)
+                self._set_http_cache("klines_1h", klines)
+            else:
+                klines = cached
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"Auto ATR fallback failed: {exc}", kind="WARN")
             return None
@@ -1580,6 +1661,13 @@ class LiteGridWindow(QMainWindow):
             if snapshot.price_age_ms is None or age_ms <= ttl_ms:
                 self._append_log(f"PRICE: WS age={age_ms}ms", kind="INFO")
                 return snapshot.last_price
+        cached_book = self._get_http_cached("book_ticker")
+        if isinstance(cached_book, dict):
+            bid = self._coerce_float(str(cached_book.get("bidPrice", "")))
+            ask = self._coerce_float(str(cached_book.get("askPrice", "")))
+            if bid and ask:
+                self._append_log("PRICE: HTTP_BOOK age=cached", kind="INFO")
+                return (bid + ask) / 2
         try:
             book = self._http_client.get_book_ticker(symbol)
         except Exception as exc:  # noqa: BLE001
@@ -1588,6 +1676,8 @@ class LiteGridWindow(QMainWindow):
         bid = self._coerce_float(str(book.get("bidPrice", ""))) if isinstance(book, dict) else None
         ask = self._coerce_float(str(book.get("askPrice", ""))) if isinstance(book, dict) else None
         if bid and ask:
+            if isinstance(book, dict):
+                self._set_http_cache("book_ticker", book)
             anchor = (bid + ask) / 2
             self._append_log("PRICE: HTTP_BOOK age=0ms", kind="INFO")
             return anchor
@@ -1599,6 +1689,19 @@ class LiteGridWindow(QMainWindow):
             return None
         self._append_log("PRICE: HTTP_LAST age=0ms", kind="INFO")
         return anchor
+
+    def _get_http_cached(self, key: str) -> Any | None:
+        cached = self._http_cache.get(self._symbol, key)
+        if not cached:
+            return None
+        data, saved_at = cached
+        ttl = self._http_cache_ttls.get(key)
+        if ttl is None or not self._http_cache.is_fresh(saved_at, ttl):
+            return None
+        return data
+
+    def _set_http_cache(self, key: str, payload: Any) -> None:
+        self._http_cache.set(self._symbol, key, payload)
 
     def _apply_auto_clamps(self, settings: GridSettingsState, anchor_price: float) -> None:
         if settings.grid_step_mode != "AUTO_ATR":
@@ -2035,6 +2138,7 @@ class LiteGridWindow(QMainWindow):
             kind="ORDERS",
         )
         self._place_replacement_order(fill)
+        self._maybe_enable_bootstrap_sell_side(fill)
 
     def _fill_key(self, fill: TradeFill) -> str:
         if fill.trade_id:
@@ -2208,6 +2312,33 @@ class LiteGridWindow(QMainWindow):
         worker.signals.success.connect(self._handle_replacement_order)
         worker.signals.error.connect(self._handle_live_order_error)
         self._thread_pool.start(worker)
+
+    def _maybe_enable_bootstrap_sell_side(self, fill: TradeFill) -> None:
+        if not self._bootstrap_mode or self._bootstrap_sell_enabled:
+            return
+        if fill.side != "BUY":
+            return
+        settings = self._live_settings or self._settings_state
+        reference_price = self._last_price or fill.price
+        if not settings or reference_price <= 0:
+            return
+        sell_orders = self._grid_engine.build_side_plan(
+            settings,
+            last_price=reference_price,
+            rules=self._exchange_rules,
+            side="SELL",
+        )
+        sell_orders = sell_orders[: settings.max_active_orders]
+        if not sell_orders:
+            self._append_log("[ENGINE] bootstrap sell activation skipped: no sell orders", kind="WARN")
+            return
+        self._append_log(
+            "[ENGINE] first buy filled -> enabling SELL side + TP + restore",
+            kind="INFO",
+        )
+        self._bootstrap_sell_enabled = True
+        self._bootstrap_mode = False
+        self._place_live_orders(sell_orders)
 
     def _handle_replacement_order(self, result: object, latency_ms: int) -> None:
         if not isinstance(result, dict):
@@ -2536,6 +2667,11 @@ class LiteGridWindow(QMainWindow):
             return
         if self._rules_loaded and not force:
             return
+        if not force:
+            cached = self._get_http_cached("exchange_info_symbol")
+            if isinstance(cached, dict):
+                self._handle_exchange_info(cached, latency_ms=0)
+                return
         self._rules_in_flight = True
         worker = _Worker(lambda: self._http_client.get_exchange_info_symbol(self._symbol))
         worker.signals.success.connect(self._handle_exchange_info)
@@ -2565,6 +2701,7 @@ class LiteGridWindow(QMainWindow):
         if not isinstance(result, dict):
             self._handle_exchange_error("Unexpected exchange info response")
             return
+        self._set_http_cache("exchange_info_symbol", result)
         symbols = result.get("symbols", []) if isinstance(result.get("symbols"), list) else []
         info = symbols[0] if symbols else {}
         if not isinstance(info, dict):
@@ -2924,7 +3061,8 @@ class LiteGridWindow(QMainWindow):
         if base_asset:
             base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
         skip_sells = base_free <= 0
-        if skip_sells:
+        has_sells = any(order.side == "SELL" for order in planned)
+        if skip_sells and has_sells:
             self._append_log(
                 "[LIVE] sell orders skipped: base balance is 0.",
                 kind="INFO",

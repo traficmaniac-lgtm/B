@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Iterable
 
-from src.gui.models.pair_workspace import DataPackSummary, DataRequest, StrategyPatch, StrategyPlan
+from src.gui.models.pair_workspace import DataPackSummary, StrategyPatch, StrategyPlan
 
 
 class AIProvider:
@@ -14,7 +14,7 @@ class AIProvider:
         user_budget: float,
         mode: str,
         chat_context: Iterable[str] | None = None,
-    ) -> StrategyPlan | DataRequest:
+    ) -> StrategyPlan:
         _ = (symbol, chat_context)
         period_hours = _period_to_hours(datapack.period)
         if period_hours >= 24 and datapack.quality == "Deep":
@@ -28,11 +28,15 @@ class AIProvider:
                 refresh_interval_s=30,
                 notes=f"Prepared for {datapack.period} {datapack.quality} datapack.",
             )
-        return DataRequest(
-            reason="Need more candles for long-horizon grid calibration.",
-            required_candles=2000,
-            target_period="24h",
-            target_quality="Deep",
+        return StrategyPlan(
+            budget=max(user_budget, 50.0),
+            mode=mode,
+            grid_count=10,
+            grid_step_pct=0.8,
+            range_low_pct=2.0,
+            range_high_pct=2.6,
+            refresh_interval_s=30,
+            notes="Fallback plan: limited data; verify before execution.",
         )
 
     def chat_adjustment(self, plan: StrategyPlan, message: str) -> StrategyPatch | str:
