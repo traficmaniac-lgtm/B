@@ -331,7 +331,11 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts = now
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
-        self._apply_strategy_patch_to_form(patch)
+        apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
+        if callable(apply_to_form):
+            apply_to_form(patch)
+        else:
+            self._append_log("[AI] apply patch skipped: form handler missing", "WARN")
         self._apply_strategy_patch_to_ui(patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
