@@ -55,3 +55,9 @@
 - Added runtime module with price feed polling, virtual order book, strategy executor, and runtime state machine.
 - Wired Trading Runtime Window to the runtime engine with live orders, PnL, exposure, and observer updates.
 - Extended strategy snapshots for numeric parameters and refreshed AI observer recommendations using live metrics.
+
+### v7.1 Live check (2–4 orders)
+1. Open Lite Grid Terminal for a spot symbol with API keys enabled (e.g., BTCUSDT).
+2. Toggle DRY-RUN off, confirm LIVE mode, keep grid_count/max_active_orders at 2–4, set a small budget.
+3. Press Start and confirm the LIVE dialog; expect [LIVE] place logs and 2–4 open orders in the table.
+4. Wait 10–20 seconds and verify orders remain in Binance Open Orders and the bot table (no auto-cancel).

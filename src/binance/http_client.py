@@ -54,6 +54,12 @@ class BinanceHttpClient:
                 prices[item_symbol] = item_price
         return prices
 
+    def get_book_ticker(self, symbol: str) -> dict[str, str]:
+        data = self._request_json(f"/api/v3/ticker/bookTicker?symbol={symbol}")
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected bookTicker response format")
+        return {str(key): str(value) for key, value in data.items() if isinstance(key, str)}
+
     def get_ticker_prices(self) -> dict[str, str]:
         prices = self.get_ticker_price()
         if not isinstance(prices, dict):
