@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QRunnable, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -70,6 +70,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_actions_suggested: list[str] = []
         self._last_approve_action: str | None = None
         self._last_approve_ts: float = 0.0
+        self._last_apply_ts: float = 0.0
         self._max_exposure_warned = False
 
     def _build_body(self) -> QSplitter:
@@ -196,8 +197,15 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _apply_ai_plan(self) -> None:
         if not self._last_strategy_patch or not self._strategy_patch_has_values(self._last_strategy_patch):
-            self._append_log("[AI] apply plan skipped: no strategy patch.", "WARN")
+            self._append_log("[AI] patch empty, nothing to apply", "INFO")
+            self._append_chat_line("AI", "patch empty, nothing to apply")
             return
+        now = time.monotonic()
+        if now - self._last_apply_ts < 0.3:
+            return
+        self._last_apply_ts = now
+        self._apply_plan_button.setEnabled(False)
+        QTimer.singleShot(400, self._restore_apply_plan_state)
         self._apply_strategy_patch_to_form(self._last_strategy_patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
@@ -280,7 +288,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_log("[AI] approve skipped: no action selected.", "WARN")
             return
         now = time.monotonic()
-        if action == self._last_approve_action and now - self._last_approve_ts < 1.0:
+        if now - self._last_approve_ts < 1.0:
             self._append_log(f"[AI] approve ignored: action {action} debounced.", "WARN")
             return
         self._last_approve_action = action
@@ -294,7 +302,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._handle_pause()
         elif action == "WAIT":
             self._append_log("[AI] approved WAIT (no-op)", "INFO")
-            self._append_chat_line("AI", "approved WAIT (no-op)")
             return
         else:
             self._append_log(f"[AI] approve ignored: unknown action {action}.", "WARN")
@@ -323,29 +330,48 @@ class AiOperatorGridWindow(LiteGridWindow):
     def _append_chat_line(self, author: str, message: str) -> None:
         if not message:
             return
-        self._chat_history.appendPlainText(f"[{author}] {message}")
+        prefix = "Ты" if author.upper() in {"YOU", "USER", "ТЫ"} else "AI"
+        self._append_chat_block([f"{prefix}: {message}"])
 
     def _append_ai_response_to_chat(self, response: AiOperatorResponse) -> None:
         summary = response.analysis_result.summary or "—"
-        self._append_chat_line("AI", summary)
-        if response.analysis_result.risks:
-            risks_text = "; ".join(response.analysis_result.risks)
-            self._append_chat_line("AI", f"Risks: {risks_text}")
-        self._chat_history.appendPlainText(f"[AI][STATE] {response.analysis_result.state}")
+        lines = [f"AI:"]
+        lines.append(f"Summary: {summary}")
+        lines.append(f"State: {response.analysis_result.state}")
+        risks = response.analysis_result.risks[:3]
+        risks_text = "; ".join(risks) if risks else "—"
+        lines.append(f"Risks: {risks_text}")
         patch = response.strategy_patch
-        step = f"{patch.step_pct}" if patch and patch.step_pct is not None else "—"
-        levels = f"{patch.levels}" if patch and patch.levels is not None else "—"
-        if patch and (patch.range_down_pct is not None or patch.range_up_pct is not None):
-            range_down = patch.range_down_pct if patch.range_down_pct is not None else "—"
-            range_up = patch.range_up_pct if patch.range_up_pct is not None else "—"
-            range_text = f"{range_down}..{range_up}"
-        else:
-            range_text = "—"
-        self._chat_history.appendPlainText(
-            f"[AI][PATCH] step={step} range={range_text} levels={levels}"
-        )
+        if patch and self._strategy_patch_has_values(patch):
+            step = f"{patch.step_pct}" if patch.step_pct is not None else "—"
+            levels = f"{patch.levels}" if patch.levels is not None else "—"
+            if patch.range_down_pct is not None or patch.range_up_pct is not None:
+                range_down = patch.range_down_pct if patch.range_down_pct is not None else "—"
+                range_up = patch.range_up_pct if patch.range_up_pct is not None else "—"
+                range_text = f"{range_down}..{range_up}"
+            else:
+                range_text = "—"
+            tp = f"{patch.take_profit_pct}" if patch.take_profit_pct is not None else "—"
+            bias = patch.bias or "—"
+            lines.append(
+                f"Plan: step={step} range={range_text} levels={levels} tp={tp} bias={bias}"
+            )
         actions = ", ".join(response.actions_suggested) if response.actions_suggested else "—"
-        self._chat_history.appendPlainText(f"[AI][ACTIONS] {actions}")
+        lines.append(f"Actions: {actions}")
+        if response.need_data:
+            lines.append(f"Нужно: {', '.join(response.need_data)}")
+        self._append_chat_block(lines)
+
+    def _append_chat_block(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        if self._chat_history.toPlainText().strip():
+            self._chat_history.appendPlainText("")
+        for line in lines:
+            self._chat_history.appendPlainText(line)
+
+    def _restore_apply_plan_state(self) -> None:
+        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(self._last_strategy_patch))
 
     def _strategy_patch_has_values(self, patch: AiOperatorStrategyPatch | None) -> bool:
         if patch is None:
@@ -403,6 +429,12 @@ class AiOperatorGridWindow(LiteGridWindow):
             spread_pct = (best_ask - best_bid) / best_bid * 100
         atr_pct, micro_vol_pct = self._compute_volatility_metrics()
         maker_fee, taker_fee = self._trade_fees
+        is_zero_fee = bool(
+            maker_fee is not None
+            and taker_fee is not None
+            and maker_fee == 0
+            and taker_fee == 0
+        )
         base_asset = self._base_asset or ""
         quote_asset = self._quote_asset or ""
         base_free, base_locked = self._balances.get(base_asset, (0.0, 0.0))
@@ -413,6 +445,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             "depth": 1,
             "source": snapshot.source if snapshot else None,
         }
+        orderbook_top_count = len(orderbook_snapshot["bids"]) + len(orderbook_snapshot["asks"])
         return {
             "symbol": self._symbol,
             "market": {
@@ -452,6 +485,15 @@ class AiOperatorGridWindow(LiteGridWindow):
             "fees": {
                 "maker": maker_fee,
                 "taker": taker_fee,
+                "maker_fee": maker_fee,
+                "taker_fee": taker_fee,
+                "is_zero_fee": is_zero_fee,
+            },
+            "liquidity_hints": {
+                "orderbook_topN_count": orderbook_top_count,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_pct": spread_pct,
             },
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "price_age_ms": snapshot.price_age_ms if snapshot else None,

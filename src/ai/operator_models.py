@@ -33,6 +33,7 @@ class AiOperatorResponse:
     analysis_result: AiOperatorAnalysisResult
     strategy_patch: AiOperatorStrategyPatch | None
     actions_suggested: list[str]
+    need_data: list[str]
 
 
 def parse_ai_operator_response(text: str) -> AiOperatorResponse:
@@ -81,10 +82,18 @@ def parse_ai_operator_response(text: str) -> AiOperatorResponse:
         raise ValueError("Invalid actions_suggested")
     actions = [str(item).strip().upper() for item in actions_payload if item is not None]
 
+    need_data_payload = payload.get("need_data", [])
+    if need_data_payload is None:
+        need_data_payload = []
+    if not isinstance(need_data_payload, list):
+        raise ValueError("Invalid need_data")
+    need_data = [str(item) for item in need_data_payload if item is not None]
+
     return AiOperatorResponse(
         analysis_result=AiOperatorAnalysisResult(state=state, summary=summary, risks=risks),
         strategy_patch=strategy_patch,
         actions_suggested=actions,
+        need_data=need_data,
     )
 
 

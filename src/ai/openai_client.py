@@ -163,9 +163,16 @@ class OpenAIClient:
             '    "take_profit_pct": 0,\n'
             '    "max_exposure": 0\n'
             "  },\n"
-            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT"]\n'
+            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT", "REQUEST_MORE_DATA"],\n'
+            '  "need_data": ["orderbook_depth_50", "recent_trades_1m"]\n'
             "}\n"
-            "Заполняй null для параметров, которые не нужно менять."
+            "Заполняй null для параметров, которые не нужно менять.\n"
+            "Сначала проверь fees.is_zero_fee и fees.maker_fee/taker_fee. Если комиссии не заданы, попроси данные.\n"
+            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
+            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
+            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
+            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_orders.\n"
+            "Если стакан пустой, state=WAIT и запроси orderbook/трейды через REQUEST_MORE_DATA."
         )
 
         async def _analyze() -> str:
@@ -217,10 +224,17 @@ class OpenAIClient:
             '    "take_profit_pct": 0,\n'
             '    "max_exposure": 0\n'
             "  },\n"
-            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT"]\n'
+            '  "actions_suggested": ["START", "REBUILD_GRID", "PAUSE", "WAIT", "REQUEST_MORE_DATA"],\n'
+            '  "need_data": ["orderbook_depth_50", "recent_trades_1m"]\n'
             "}\n"
             "Если изменений нет, ставь null для параметров, которые не нужно менять.\n"
-            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI."
+            "Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.\n"
+            "Сначала проверь fees.is_zero_fee и fees.maker_fee/taker_fee. Если комиссии не заданы, попроси данные.\n"
+            "Если ликвидность низкая, предлагай план 'количеством' только если спред стабилен, "
+            "есть заявки в стакане и min_notional позволяет мелкие ордера.\n"
+            "Для zero-fee дай конкретный micro-grid план: step 0.02–0.10%, levels 6–12, "
+            "range ±0.2–1.0%, tp 0.02–0.08%, укажи budget и max_orders.\n"
+            "Если стакан пустой, state=WAIT и запроси orderbook/трейды через REQUEST_MORE_DATA."
         )
 
         async def _chat() -> str:
