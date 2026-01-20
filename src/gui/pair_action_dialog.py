@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.gui.models.pair_mode import (
+    PAIR_MODE_LITE,
     PAIR_MODE_AI_OPERATOR_GRID,
     PAIR_MODE_TRADE_READY,
     PAIR_MODE_TRADING,
@@ -31,6 +32,12 @@ class PairActionDialog(QDialog):
         self.resize(520, 300)
 
         layout = QVBoxLayout()
+        layout.addWidget(self._build_option_card(
+            title="Lite Mode (Grid Terminal)",
+            description="Быстрый торговый терминал (LIVE grid) — старый родной Lite",
+            button_text="Open Lite Mode",
+            on_click=lambda: self._choose_mode(PAIR_MODE_LITE),
+        ))
         layout.addWidget(self._build_option_card(
             title="Торговля",
             description="Открыть окно торговли с ордерами, позицией и AI-наблюдателем",
