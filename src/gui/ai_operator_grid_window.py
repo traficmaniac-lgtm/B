@@ -685,10 +685,69 @@ class AiOperatorGridWindow(LiteGridWindow):
             fields.append("max_active_orders")
         return fields
 
+    def _sanitize_patch(self, symbol: str, patch: AiOperatorStrategyPatch) -> tuple[AiOperatorStrategyPatch, list[str]]:
+        adjustments: list[str] = []
+        snapshot = self._price_feed_manager.get_snapshot(symbol)
+        last_price = snapshot.last_price if snapshot else None
+        if last_price is None and snapshot:
+            last_price = snapshot.mid_price
+        tick_size = snapshot.tick_size if snapshot else None
+        levels = patch.levels
+        if levels is None and hasattr(self, "_grid_count_input"):
+            levels = int(self._grid_count_input.value())
+        if patch.step_pct is not None:
+            original = patch.step_pct
+            clamped = patch.step_pct
+            reasons: list[str] = []
+            if clamped <= 0:
+                reasons.append("non_positive")
+            if (
+                last_price is not None
+                and tick_size is not None
+                and last_price > 0
+                and tick_size > 0
+            ):
+                min_step_abs = tick_size * 2
+                min_step_pct = (min_step_abs / last_price) * 100
+                if clamped < min_step_pct:
+                    clamped = min_step_pct
+                    reasons.append("min_tick")
+            if clamped <= 0:
+                clamped = 0.01
+                reasons.append("fallback")
+            if clamped != original:
+                patch.step_pct = clamped
+                reason_text = "+".join(reasons) if reasons else "clamped"
+                self._append_log(
+                    f"[PATCH] step_pct clamped from {original:.6f} to {clamped:.6f} (reason={reason_text})",
+                    "INFO",
+                )
+                adjustments.append(f"step_pct {original:.6f}→{clamped:.6f}")
+        if patch.step_pct is not None and levels is not None and levels > 0:
+            min_range = patch.step_pct * (levels / 2)
+            if patch.range_down_pct is not None and patch.range_down_pct < min_range:
+                original = patch.range_down_pct
+                patch.range_down_pct = min_range
+                self._append_log(
+                    f"[PATCH] range_down_pct clamped from {original:.6f} to {min_range:.6f} (reason=min_range)",
+                    "INFO",
+                )
+                adjustments.append(f"range_down_pct {original:.6f}→{min_range:.6f}")
+            if patch.range_up_pct is not None and patch.range_up_pct < min_range:
+                original = patch.range_up_pct
+                patch.range_up_pct = min_range
+                self._append_log(
+                    f"[PATCH] range_up_pct clamped from {original:.6f} to {min_range:.6f} (reason=min_range)",
+                    "INFO",
+                )
+                adjustments.append(f"range_up_pct {original:.6f}→{min_range:.6f}")
+        return patch, adjustments
+
     def _apply_ai_patch(self, patch: AiOperatorStrategyPatch, source_label: str) -> bool:
         if not self._strategy_patch_has_values(patch):
             self._append_log("[AI] patch empty, nothing to apply", "INFO")
             return False
+        patch, adjustments = self._sanitize_patch(self._symbol, patch)
         apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
         if callable(apply_to_form):
             apply_to_form(patch)
@@ -697,6 +756,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_strategy_patch_to_ui(patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", f"Strategy patch applied via {source_label}.")
+        if adjustments:
+            self._append_chat_line("AI", f"Patch adjusted: {', '.join(adjustments)}")
         self._last_applied_ai_result_id = self._last_ai_result_id
         return True
 

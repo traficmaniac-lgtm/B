@@ -194,6 +194,11 @@ class OverviewTab(QWidget):
         self._search_timer.setInterval(400)
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._apply_filters)
+        self._symbol_stream_timer = QTimer(self)
+        self._symbol_stream_timer.setInterval(400)
+        self._symbol_stream_timer.setSingleShot(True)
+        self._symbol_stream_timer.timeout.connect(self._apply_pending_symbol_stream)
+        self._pending_symbol: str | None = None
         self._price_update_in_flight = False
         self._selected_symbol: str | None = None
         self._latest_price_update: PriceUpdate | None = None
@@ -325,14 +330,14 @@ class OverviewTab(QWidget):
     def _update_selected_pair(self) -> None:
         selected = self._table.selectionModel().selectedRows()
         if not selected:
-            self._stop_selected_symbol_stream()
+            self._schedule_selected_symbol(None)
             return
         proxy_index = selected[0]
         source_index = self._proxy_model.mapToSource(proxy_index)
         symbol = self._pairs_model.symbol_for_row(source_index.row())
         if not symbol:
             return
-        self._start_selected_symbol_stream(symbol)
+        self._schedule_selected_symbol(symbol)
 
     def _handle_double_click(self, _: QModelIndex) -> None:
         selected = self._table.selectionModel().selectedRows()
@@ -518,7 +523,7 @@ class OverviewTab(QWidget):
         if filtered_symbols:
             self._table.selectRow(0)
         else:
-            self._stop_selected_symbol_stream()
+            self._schedule_selected_symbol(None)
 
     def _refresh_prices(self) -> None:
         self._update_ws_status_badge()
@@ -540,6 +545,18 @@ class OverviewTab(QWidget):
         if self._selected_symbol != update.symbol:
             return
         self._latest_price_update = update
+
+    def _schedule_selected_symbol(self, symbol: str | None) -> None:
+        self._pending_symbol = symbol
+        self._symbol_stream_timer.start()
+
+    def _apply_pending_symbol_stream(self) -> None:
+        symbol = self._pending_symbol
+        self._pending_symbol = None
+        if symbol:
+            self._start_selected_symbol_stream(symbol)
+        else:
+            self._stop_selected_symbol_stream()
 
     def _start_selected_symbol_stream(self, symbol: str) -> None:
         if self._selected_symbol == symbol:
