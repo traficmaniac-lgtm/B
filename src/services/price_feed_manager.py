@@ -275,10 +275,13 @@ class _BinanceBookTickerWsThread:
             payload = json.loads(message)
         except json.JSONDecodeError:
             return
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict):
+        if not isinstance(payload, dict):
             return
-        self._on_message(data)
+        data = payload.get("data")
+        if isinstance(data, dict):
+            self._on_message(data)
+            return
+        self._on_message(payload)
 
     async def _shutdown(self) -> None:
         if self._websocket is not None:
