@@ -4,7 +4,13 @@ from collections.abc import Callable
 
 from PySide6.QtWidgets import QDialog, QWidget
 
-from src.gui.models.pair_mode import PAIR_MODE_TRADE_READY, PAIR_MODE_TRADING, PairMode
+from src.gui.models.pair_mode import (
+    PAIR_MODE_AI_OPERATOR_GRID,
+    PAIR_MODE_TRADE_READY,
+    PAIR_MODE_TRADING,
+    PairMode,
+)
+from src.gui.ai_operator_grid_window import AiOperatorGridWindow
 from src.gui.pair_action_dialog import PairActionDialog
 from src.gui.trade_ready_mode_window import TradeReadyModeWindow
 from src.services.price_feed_manager import PriceFeedManager
@@ -25,6 +31,7 @@ class PairModeManager:
         self._exchange_name = exchange_name
         self._price_feed_manager = price_feed_manager
         self._trade_ready_windows: list[TradeReadyModeWindow] = []
+        self._ai_operator_grid_windows: list[AiOperatorGridWindow] = []
 
     def open_pair_dialog(
         self,
@@ -62,3 +69,8 @@ class PairModeManager:
             )
             window.show()
             self._trade_ready_windows.append(window)
+            return
+        if mode == PAIR_MODE_AI_OPERATOR_GRID:
+            window = AiOperatorGridWindow(symbol=symbol, parent=window_parent)
+            window.show()
+            self._ai_operator_grid_windows.append(window)

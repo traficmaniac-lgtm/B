@@ -12,7 +12,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.gui.models.pair_mode import PAIR_MODE_TRADE_READY, PAIR_MODE_TRADING, PairMode
+from src.gui.models.pair_mode import (
+    PAIR_MODE_AI_OPERATOR_GRID,
+    PAIR_MODE_TRADE_READY,
+    PAIR_MODE_TRADING,
+    PairMode,
+)
 
 
 class PairActionDialog(QDialog):
@@ -37,6 +42,12 @@ class PairActionDialog(QDialog):
             description="Продвинутый режим подготовки торговли с AI-анализом и диалогом",
             button_text="Открыть Trade Ready Mode",
             on_click=lambda: self._choose_mode(PAIR_MODE_TRADE_READY),
+        ))
+        layout.addWidget(self._build_option_card(
+            title="AI Operator Grid",
+            description="Adaptive Micro-Grid Market Making (AI Operator)",
+            button_text="Open AI Operator Grid",
+            on_click=lambda: self._choose_mode(PAIR_MODE_AI_OPERATOR_GRID),
         ))
         layout.addStretch()
         self.setLayout(layout)
