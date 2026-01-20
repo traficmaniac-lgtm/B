@@ -74,6 +74,14 @@ class MarketSnapshot:
     rules: dict[str, Any]
     balances: dict[str, float]
     open_orders_count: int
+    stale: bool = False
+
+
+@dataclass
+class SnapshotStore:
+    snapshot_analyze: MarketSnapshot | None = None
+    snapshot_fetched: MarketSnapshot | None = None
+    snapshot_active: MarketSnapshot | None = None
 
 
 class AiOperatorGridWindow(LiteGridWindow):
@@ -104,7 +112,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._ai_busy = False
         self._runtime_stopping = False
         self._last_ai_datapack_signature: str | None = None
-        self._market_snapshot: MarketSnapshot | None = None
+        self._snapshot_store = SnapshotStore()
         self._snapshot_sequence = 0
         self._data_request_resolved = False
         self._data_cache = DataCache()
@@ -303,7 +311,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts = now
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
-        self._apply_strategy_patch_to_form(self._last_strategy_patch)
+        self._apply_strategy_patch_to_ui(self._last_strategy_patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
 
@@ -495,35 +503,59 @@ class AiOperatorGridWindow(LiteGridWindow):
         ]
         return any(value is not None for value in values)
 
-    def _apply_strategy_patch_to_form(self, patch: AiOperatorStrategyPatch) -> None:
+    def _apply_strategy_patch_to_ui(self, patch: AiOperatorStrategyPatch) -> None:
         if patch.bias:
-            mapping = {
-                "NEUTRAL": "Neutral",
-                "LONG": "Long-biased",
-                "SHORT": "Short-biased",
-            }
-            direction_value = mapping.get(patch.bias, "Neutral")
-            index = self._direction_combo.findData(direction_value)
-            if index >= 0:
-                self._direction_combo.setCurrentIndex(index)
-        if patch.budget is not None:
-            self._budget_input.setValue(patch.budget)
+            if not hasattr(self, "_direction_combo"):
+                self._append_log("[AI] patch field skipped: bias", "INFO")
+            else:
+                mapping = {
+                    "NEUTRAL": "Neutral",
+                    "LONG": "Long-biased",
+                    "SHORT": "Short-biased",
+                }
+                direction_value = mapping.get(patch.bias, "Neutral")
+                index = self._direction_combo.findData(direction_value)
+                if index >= 0:
+                    self._direction_combo.setCurrentIndex(index)
         if patch.levels is not None:
-            self._grid_count_input.setValue(patch.levels)
+            if not hasattr(self, "_grid_count_input"):
+                self._append_log("[AI] patch field skipped: levels", "INFO")
+            else:
+                self._grid_count_input.setValue(patch.levels)
+        if patch.budget is not None:
+            if not hasattr(self, "_budget_input"):
+                self._append_log("[AI] patch field skipped: budget", "INFO")
+            else:
+                self._budget_input.setValue(patch.budget)
         if patch.step_pct is not None:
-            self._grid_step_mode_combo.setCurrentIndex(self._grid_step_mode_combo.findData("MANUAL"))
-            self._grid_step_input.setValue(patch.step_pct)
+            if not hasattr(self, "_grid_step_mode_combo") or not hasattr(self, "_grid_step_input"):
+                self._append_log("[AI] patch field skipped: step_pct", "INFO")
+            else:
+                self._grid_step_mode_combo.setCurrentIndex(self._grid_step_mode_combo.findData("MANUAL"))
+                self._grid_step_input.setValue(patch.step_pct)
         if patch.range_down_pct is not None or patch.range_up_pct is not None:
-            self._range_mode_combo.setCurrentIndex(self._range_mode_combo.findData("Manual"))
+            if not hasattr(self, "_range_mode_combo"):
+                self._append_log("[AI] patch field skipped: range_mode", "INFO")
+            else:
+                self._range_mode_combo.setCurrentIndex(self._range_mode_combo.findData("Manual"))
         if patch.range_down_pct is not None:
-            self._range_low_input.setValue(patch.range_down_pct)
+            if not hasattr(self, "_range_low_input"):
+                self._append_log("[AI] patch field skipped: range_down_pct", "INFO")
+            else:
+                self._range_low_input.setValue(patch.range_down_pct)
         if patch.range_up_pct is not None:
-            self._range_high_input.setValue(patch.range_up_pct)
+            if not hasattr(self, "_range_high_input"):
+                self._append_log("[AI] patch field skipped: range_up_pct", "INFO")
+            else:
+                self._range_high_input.setValue(patch.range_up_pct)
         if patch.take_profit_pct is not None:
-            self._take_profit_input.setValue(patch.take_profit_pct)
+            if not hasattr(self, "_take_profit_input"):
+                self._append_log("[AI] patch field skipped: take_profit_pct", "INFO")
+            else:
+                self._take_profit_input.setValue(patch.take_profit_pct)
         if patch.max_exposure is not None:
             if not self._max_exposure_warned:
-                self._append_log("[AI] max_exposure ignored (UI field not present)", "INFO")
+                self._append_log("[AI] patch field skipped: max_exposure", "INFO")
                 self._max_exposure_warned = True
 
     def _update_fetch_data_button(self) -> None:
@@ -821,20 +853,38 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _handle_refresh_snapshot(self) -> None:
         snapshot = self._refresh_ai_snapshot(reason="refresh")
-        datapack = self._build_ai_datapack(snapshot)
-        self._update_ai_snapshot_label(datapack)
-        self._append_log("[AI] snapshot refreshed", "INFO")
+        self._update_ai_snapshot_label_from_snapshot(snapshot)
 
     def _get_ai_snapshot(self) -> MarketSnapshot | None:
-        return self._market_snapshot
+        return self._snapshot_store.snapshot_active
 
     def _next_snapshot_id(self) -> str:
         self._snapshot_sequence += 1
         return f"{self._symbol}-{utc_ms()}-{self._snapshot_sequence}"
 
     def _refresh_ai_snapshot(self, reason: str) -> MarketSnapshot:
-        snapshot = self._create_market_snapshot()
-        self._market_snapshot = snapshot
+        if reason == "refresh":
+            return self._refresh_active_snapshot()
+        snapshot = self._create_market_snapshot(
+            prior_snapshot=self._snapshot_store.snapshot_active,
+            reuse_depth_trades=True,
+        )
+        self._register_snapshot(snapshot, reason=reason)
+        self._log_snapshot_refresh(snapshot, reason)
+        return snapshot
+
+    def _register_snapshot(self, snapshot: MarketSnapshot, *, reason: str) -> None:
+        if reason in {"analyze", "chat"}:
+            self._snapshot_store.snapshot_analyze = snapshot
+            self._snapshot_store.snapshot_active = snapshot
+            return
+        if reason == "fetch":
+            self._snapshot_store.snapshot_fetched = snapshot
+            self._snapshot_store.snapshot_active = snapshot
+            return
+        self._snapshot_store.snapshot_active = snapshot
+
+    def _log_snapshot_refresh(self, snapshot: MarketSnapshot, reason: str) -> None:
         bids_count = (
             len(snapshot.orderbook_depth_50.get("bids", []))
             if snapshot.orderbook_depth_50
@@ -852,18 +902,48 @@ class AiOperatorGridWindow(LiteGridWindow):
                 f"id={snapshot.snapshot_id} bids={bids_count} "
                 f"asks={asks_count} trades_1m={trades_count} "
                 f"fee(m/t)={self._format_fee(snapshot.maker_fee_pct, snapshot.taker_fee_pct)} "
-                f"is_zero_fee={snapshot.is_zero_fee} ws_age={snapshot.ws_age_ms}"
+                f"is_zero_fee={snapshot.is_zero_fee} ws_age={snapshot.ws_age_ms} "
+                f"stale={snapshot.stale}"
             ),
             "INFO",
         )
-        return snapshot
 
     def _format_fee(self, maker_fee_pct: float | None, taker_fee_pct: float | None) -> str:
         if isinstance(maker_fee_pct, (int, float)) and isinstance(taker_fee_pct, (int, float)):
             return f"{maker_fee_pct:.4f}%/{taker_fee_pct:.4f}%"
         return "—"
 
-    def _create_market_snapshot(self) -> MarketSnapshot:
+    def _refresh_active_snapshot(self) -> MarketSnapshot:
+        active = self._snapshot_store.snapshot_active
+        depth_ok, _ = self._fetch_orderbook_depth_cached()
+        trades_ok, _ = self._fetch_recent_trades_cached()
+        orderbook = self._get_cached_data("orderbook_depth_50")
+        trades = self._get_cached_data("recent_trades_1m")
+        if active and orderbook is None and trades is None:
+            active.stale = True
+            self._append_log(
+                (
+                    "[AI] snapshot(refresh) reused active snapshot "
+                    f"id={active.snapshot_id} (stale={active.stale})"
+                ),
+                "INFO",
+            )
+            return active
+        snapshot = self._create_market_snapshot(
+            prior_snapshot=active,
+            reuse_depth_trades=True,
+        )
+        snapshot.stale = not (depth_ok and trades_ok)
+        self._snapshot_store.snapshot_active = snapshot
+        self._log_snapshot_refresh(snapshot, "refresh")
+        return snapshot
+
+    def _create_market_snapshot(
+        self,
+        *,
+        prior_snapshot: MarketSnapshot | None = None,
+        reuse_depth_trades: bool = False,
+    ) -> MarketSnapshot:
         snapshot = self._price_feed_manager.get_snapshot(self._symbol)
         last_price = self._last_price or (snapshot.last_price if snapshot else None)
         best_bid = snapshot.best_bid if snapshot else None
@@ -873,6 +953,14 @@ class AiOperatorGridWindow(LiteGridWindow):
             spread_pct = (best_ask - best_bid) / best_bid * 100
         orderbook = self._get_cached_data("orderbook_depth_50")
         trades = self._get_cached_data("recent_trades_1m")
+        stale = False
+        if reuse_depth_trades and prior_snapshot:
+            if orderbook is None and prior_snapshot.orderbook_depth_50:
+                orderbook = prior_snapshot.orderbook_depth_50
+                stale = True
+            if trades is None and prior_snapshot.trades_1m:
+                trades = prior_snapshot.trades_1m
+                stale = True
         maker_fee, taker_fee = self._trade_fees
         maker_fee_pct = maker_fee * 100 if maker_fee is not None else None
         taker_fee_pct = taker_fee * 100 if taker_fee is not None else None
@@ -915,6 +1003,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "base_locked": base_locked,
             },
             open_orders_count=len(self._open_orders),
+            stale=stale,
         )
 
     def _prepare_ai_datapack(
@@ -1121,13 +1210,45 @@ class AiOperatorGridWindow(LiteGridWindow):
             )
         )
 
+    def _update_ai_snapshot_label_from_snapshot(
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        live_update: PriceUpdate | None = None,
+    ) -> None:
+        best_bid = snapshot.best_bid
+        best_ask = snapshot.best_ask
+        ws_age_ms = snapshot.ws_age_ms
+        if live_update:
+            best_bid = live_update.best_bid or best_bid
+            best_ask = live_update.best_ask or best_ask
+            if live_update.price_age_ms is not None:
+                ws_age_ms = live_update.price_age_ms
+        orderbook_summary = self._compute_orderbook_summary(snapshot.orderbook_depth_50, best_bid, best_ask)
+        trades_summary = self._compute_trades_summary(snapshot.trades_1m)
+        fees = {
+            "maker_fee_pct": snapshot.maker_fee_pct,
+            "taker_fee_pct": snapshot.taker_fee_pct,
+        }
+        snapshot_meta = {
+            "ws_age_ms": ws_age_ms,
+            "snapshot_id": snapshot.snapshot_id,
+        }
+        self._update_ai_snapshot_label(
+            {
+                "orderbook_summary": orderbook_summary,
+                "trades_1m_summary": trades_summary,
+                "fees": fees,
+                "snapshot": snapshot_meta,
+            }
+        )
+
     def _apply_price_update(self, update: PriceUpdate) -> None:
         super()._apply_price_update(update)
         snapshot = self._get_ai_snapshot()
         if snapshot is None:
             return
-        datapack = self._build_ai_datapack(snapshot)
-        self._update_ai_snapshot_label(datapack)
+        self._update_ai_snapshot_label_from_snapshot(snapshot, live_update=update)
 
     def _compute_volatility_metrics(self) -> tuple[float | None, float | None]:
         prices = self._price_history[-200:]
