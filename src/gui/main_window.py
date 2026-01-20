@@ -17,6 +17,7 @@ from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
 from src.gui.lite_grid_window import LiteGridWindow
 from src.gui.overview_tab import OverviewTab
+from src.gui.pair_mode_manager import PairModeManager
 from src.gui.settings_dialog import SettingsDialog
 from src.gui.widgets.log_dock import LogDock
 from src.services.price_feed_manager import PriceFeedManager
@@ -33,10 +34,15 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self._price_feed_manager = PriceFeedManager.get_instance(self._config)
+        self._pair_mode_manager = PairModeManager(
+            open_trading_workspace=self.open_lite_grid_window,
+            price_feed_manager=self._price_feed_manager,
+            parent=self,
+        )
         self._overview_tab = OverviewTab(
             self._config,
             app_state=self._app_state,
-            on_open_pair=self.open_lite_grid_window,
+            on_open_pair=self._pair_mode_manager.open_pair_dialog,
             price_feed_manager=self._price_feed_manager,
         )
         self.setCentralWidget(self._overview_tab)
