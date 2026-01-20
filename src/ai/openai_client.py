@@ -171,19 +171,19 @@ class OpenAIClient:
         async def _analyze() -> str:
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f\"Analyze this datapack:\\n{payload}\"},
+                {"role": "user", "content": f"Analyze this datapack:\n{payload}"},
             ]
             response = await self._chat_completion(
                 messages=messages,
                 max_tokens=520,
-                response_format={\"type\": \"json_object\"},
+                response_format={"type": "json_object"},
             )
-            return response.choices[0].message.content if response.choices else \"\"
+            return response.choices[0].message.content if response.choices else ""
 
         try:
             return await self._run_with_retries(_analyze)
         except Exception as exc:  # noqa: BLE001
-            self._logger.warning(\"OpenAI operator analyze failed: %s\", exc)
+            self._logger.warning("OpenAI operator analyze failed: %s", exc)
             raise
 
     async def monitor_datapack(self, datapack: dict[str, Any]) -> tuple[AiResponseEnvelope, str]:
