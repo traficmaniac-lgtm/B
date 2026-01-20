@@ -103,6 +103,9 @@ class LiteGridWindow(QMainWindow):
         self._log_entries: list[tuple[str, str]] = []
         self._thread_pool = QThreadPool.globalInstance()
         self._account_client: BinanceAccountClient | None = None
+        self._has_api_keys = bool(self._config.binance.api_key and self._config.binance.api_secret)
+        self._can_read_account = False
+        self._last_account_status = ""
         self._http_client = BinanceHttpClient(
             base_url=self._config.binance.base_url,
             timeout_s=self._config.http.timeout_s,
@@ -110,7 +113,7 @@ class LiteGridWindow(QMainWindow):
             backoff_base_s=self._config.http.backoff_base_s,
             backoff_max_s=self._config.http.backoff_max_s,
         )
-        if self._config.binance.api_key and self._config.binance.api_secret:
+        if self._has_api_keys:
             self._account_client = BinanceAccountClient(
                 base_url=self._config.binance.base_url,
                 api_key=self._config.binance.api_key,
@@ -133,6 +136,7 @@ class LiteGridWindow(QMainWindow):
         self._trade_fees: tuple[float | None, float | None] = (None, None)
         self._quote_asset, self._base_asset = self._infer_assets_from_symbol(self._symbol)
         self._balances_in_flight = False
+        self._balances_loaded = False
         self._orders_in_flight = False
         self._rules_in_flight = False
         self._fees_in_flight = False
@@ -165,12 +169,13 @@ class LiteGridWindow(QMainWindow):
         self._price_feed_manager.start()
         self._refresh_exchange_rules()
         if self._account_client:
-            self._balances_timer.start()
-            self._orders_timer.start()
+            self._balances_timer.start(10_000)
+            self._orders_timer.start(3_000)
             self._refresh_balances()
             self._refresh_open_orders()
         else:
             self._trade_disabled_reason = "no keys"
+            self._set_account_status("no_keys")
             self._apply_trading_permissions()
         self._append_log("Lite Grid Terminal opened.", kind="INFO")
 
@@ -435,16 +440,28 @@ class LiteGridWindow(QMainWindow):
         self._balance_quote_label = QLabel(
             tr(
                 "runtime_account_line",
-                quote="0.00",
-                base="0.0000",
-                equity="0.00",
+                quote="—",
+                base="—",
+                equity="—",
             )
         )
         self._balance_quote_label.setFont(fixed_font)
         self._balance_bot_label = QLabel(
-            tr("runtime_bot_line", used="0.00", free="0.00", locked="0.00")
+            tr("runtime_bot_line", used="—", free="—", locked="—")
         )
         self._balance_bot_label.setFont(fixed_font)
+
+        account_status = (
+            tr("account_status_checking") if self._has_api_keys else tr("account_status_no_keys")
+        )
+        account_style = (
+            "color: #6b7280; font-size: 11px; font-weight: 600;"
+            if self._has_api_keys
+            else "color: #dc2626; font-size: 11px; font-weight: 600;"
+        )
+        self._account_status_label = QLabel(account_status)
+        self._account_status_label.setStyleSheet(account_style)
+        self._account_status_label.setFont(fixed_font)
 
         self._pnl_label = QLabel(tr("pnl_line", unreal="0.00", real="0.00", total="+0.00"))
         self._pnl_label.setFont(fixed_font)
@@ -454,6 +471,7 @@ class LiteGridWindow(QMainWindow):
         self._orders_count_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         self._orders_count_label.setFont(fixed_font)
 
+        layout.addWidget(self._account_status_label)
         layout.addWidget(self._balance_quote_label)
         layout.addWidget(self._balance_bot_label)
         layout.addWidget(self._pnl_label)
@@ -595,26 +613,41 @@ class LiteGridWindow(QMainWindow):
             label.setStyleSheet("color: #9ca3af; font-size: 10px;")
 
     def _update_runtime_balances(self) -> None:
-        quote_total = self._asset_total(self._quote_asset)
-        base_total = self._asset_total(self._base_asset)
-        equity = quote_total + (base_total * self._last_price if self._last_price else 0.0)
+        if self._balances_loaded:
+            quote_total = self._asset_total(self._quote_asset)
+            base_total = self._asset_total(self._base_asset)
+            equity = quote_total + (base_total * self._last_price if self._last_price else 0.0)
+            quote_text = f"{quote_total:.2f}"
+            base_text = f"{base_total:.8f}"
+            equity_text = f"{equity:.2f}"
+            used = self._open_orders_value()
+            locked = used
+            free = max(quote_total - used, 0.0)
+            used_text = f"{used:.2f}"
+            free_text = f"{free:.2f}"
+            locked_text = f"{locked:.2f}"
+        else:
+            quote_text = "—"
+            base_text = "—"
+            equity_text = "—"
+            used_text = "—"
+            free_text = "—"
+            locked_text = "—"
+
         self._balance_quote_label.setText(
             tr(
                 "runtime_account_line",
-                quote=f"{quote_total:.2f}",
-                base=f"{base_total:.8f}",
-                equity=f"{equity:.2f}",
+                quote=quote_text,
+                base=base_text,
+                equity=equity_text,
             )
         )
-        used = self._open_orders_value()
-        locked = used
-        free = max(quote_total - used, 0.0)
         self._balance_bot_label.setText(
             tr(
                 "runtime_bot_line",
-                used=f"{used:.2f}",
-                free=f"{free:.2f}",
-                locked=f"{locked:.2f}",
+                used=used_text,
+                free=free_text,
+                locked=locked_text,
             )
         )
 
@@ -707,8 +740,8 @@ class LiteGridWindow(QMainWindow):
 
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested.", kind="INFO")
-        self._refresh_balances()
-        self._refresh_open_orders()
+        self._refresh_balances(force=True)
+        self._refresh_open_orders(force=True)
 
     def _change_state(self, new_state: str) -> None:
         self._state = new_state
@@ -748,8 +781,15 @@ class LiteGridWindow(QMainWindow):
         self._append_log("Settings reset to defaults.", kind="INFO")
         self._update_grid_preview()
 
-    def _refresh_balances(self) -> None:
-        if not self._account_client or self._balances_in_flight:
+    def _refresh_balances(self, force: bool = False) -> None:
+        self._append_log("balances refresh tick", kind="INFO")
+        if not self._account_client:
+            self._balances_loaded = False
+            self._set_account_status("no_keys")
+            self._append_log("balances fetch failed: no keys", kind="WARN")
+            self._update_runtime_balances()
+            return
+        if self._balances_in_flight and not force:
             return
         self._balances_in_flight = True
         worker = _Worker(self._account_client.get_account_info)
@@ -775,6 +815,8 @@ class LiteGridWindow(QMainWindow):
                 locked = self._coerce_float(str(entry.get("locked", ""))) or 0.0
                 balances[asset] = (free, locked)
         self._balances = balances
+        self._balances_loaded = True
+        self._set_account_status("ready")
         can_trade = result.get("canTrade")
         permissions = result.get("permissions")
         self._account_can_trade = True
@@ -806,12 +848,20 @@ class LiteGridWindow(QMainWindow):
     def _handle_account_error(self, message: str) -> None:
         self._balances_in_flight = False
         self._account_can_trade = False
+        self._balances_loaded = False
+        self._set_account_status(self._infer_account_status(message))
         self._trade_disabled_reason = self._infer_trade_error_reason(message)
-        self._append_log(f"Balances update error: {message}", kind="ERROR")
+        self._append_log(f"balances fetch failed: {message}", kind="WARN")
         self._apply_trading_permissions()
+        self._update_runtime_balances()
 
-    def _refresh_open_orders(self) -> None:
-        if not self._account_client or self._orders_in_flight:
+    def _refresh_open_orders(self, force: bool = False) -> None:
+        self._append_log("orders refresh tick", kind="INFO")
+        if not self._account_client:
+            self._set_account_status("no_keys")
+            self._append_log("openOrders fetch failed: no keys", kind="WARN")
+            return
+        if self._orders_in_flight and not force:
             return
         self._orders_in_flight = True
         worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol))
@@ -825,6 +875,7 @@ class LiteGridWindow(QMainWindow):
             self._handle_open_orders_error("Unexpected open orders response")
             return
         self._open_orders = [item for item in result if isinstance(item, dict)]
+        self._set_account_status("ready")
         self._render_open_orders()
         self._append_log(
             f"open orders updated (n={len(self._open_orders)}).",
@@ -833,8 +884,9 @@ class LiteGridWindow(QMainWindow):
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
+        self._set_account_status(self._infer_account_status(message))
         self._trade_disabled_reason = self._infer_trade_error_reason(message)
-        self._append_log(f"Open orders update error: {message}", kind="ERROR")
+        self._append_log(f"openOrders fetch failed: {message}", kind="WARN")
         self._apply_trading_permissions()
 
     def _refresh_exchange_rules(self) -> None:
@@ -955,18 +1007,12 @@ class LiteGridWindow(QMainWindow):
                 "color: #dc2626; font-size: 11px; font-weight: 600;"
             )
             self._set_cancel_buttons_enabled(True)
-        elif self._dry_run_toggle.isChecked():
-            self._trade_status_label.setText(tr("trade_status_dry_run"))
-            self._trade_status_label.setStyleSheet(
-                "color: #6b7280; font-size: 11px; font-weight: 600;"
-            )
-            self._set_cancel_buttons_enabled(True)
         else:
-            self._trade_status_label.setText(tr("trade_status_live"))
+            self._trade_status_label.setText(tr("trade_status_enabled"))
             self._trade_status_label.setStyleSheet(
                 "color: #16a34a; font-size: 11px; font-weight: 600;"
             )
-            self._set_cancel_buttons_enabled(False)
+            self._set_cancel_buttons_enabled(self._dry_run_toggle.isChecked())
 
     def _set_cancel_buttons_enabled(self, enabled: bool) -> None:
         if hasattr(self, "_cancel_selected_button"):
@@ -989,6 +1035,38 @@ class LiteGridWindow(QMainWindow):
         if "403" in message_lower or "forbidden" in message_lower:
             return "no permissions"
         return "read-only"
+
+    def _infer_account_status(self, message: str) -> str:
+        message_lower = message.lower()
+        if "401" in message_lower or "unauthorized" in message_lower:
+            return "no_permission"
+        if "403" in message_lower or "forbidden" in message_lower:
+            return "no_permission"
+        return "error"
+
+    def _set_account_status(self, status: str) -> None:
+        if status == "ready":
+            self._can_read_account = True
+            text = tr("account_status_ready")
+            style = "color: #16a34a; font-size: 11px; font-weight: 600;"
+        elif status == "no_keys":
+            self._can_read_account = False
+            text = tr("account_status_no_keys")
+            style = "color: #dc2626; font-size: 11px; font-weight: 600;"
+        elif status == "no_permission":
+            self._can_read_account = False
+            text = tr("account_status_no_permission")
+            style = "color: #dc2626; font-size: 11px; font-weight: 600;"
+        else:
+            self._can_read_account = False
+            text = tr("account_status_error")
+            style = "color: #f97316; font-size: 11px; font-weight: 600;"
+
+        self._account_status_label.setText(text)
+        self._account_status_label.setStyleSheet(style)
+        if status != self._last_account_status:
+            self._append_log(text, kind="WARN" if status != "ready" else "INFO")
+            self._last_account_status = status
 
     def _update_rules_label(self) -> None:
         tick = self._exchange_rules.get("tick")
