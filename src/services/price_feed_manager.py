@@ -907,7 +907,7 @@ class PriceFeedManager:
                     "event_ts": None,
                     "updated_ms": now_ms,
                     "latency_ms": None,
-                    "source": current_source if http_fallback_reason == "STALE" else "HTTP",
+                    "source": "HTTP",
                     "best_bid": None,
                     "best_ask": None,
                     "spread_abs": None,
