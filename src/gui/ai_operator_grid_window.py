@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -116,6 +119,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._ai_busy = False
         self._runtime_stopping = False
         self._last_full_pack: dict[str, Any] | None = None
+        self._last_strategy_patch: AiOperatorStrategyPatch | None = None
+        self._last_actions_suggested: list[str] = []
+        self._max_exposure_warned = False
         self._data_cache = DataCache()
         self._http_client = BinanceHttpClient(
             base_url=self._config.binance.base_url,
@@ -130,9 +136,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._snapshot_store = SnapshotStore()
         self._snapshot_cache = MarketSnapshotCache()
         self._snapshot_sequence = 0
-        self._data_cache = DataCache()
         self._user_intent: dict[str, Any] = {}
-        self._http_client = BinanceHttpClient()
         self._cache_ttls = {
             "exchange_info": 3600.0,
             "book_ticker": 2.0,
@@ -269,9 +273,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_chat_line("AI", "Не задан ключ OpenAI.")
             return
         datapack = self._build_full_market_pack()
-
-        snapshot = self._refresh_ai_snapshot(reason="analyze")
-        datapack = self._build_ai_datapack(snapshot)
         self._append_chat_line("YOU", "AI Analyze")
         self._append_log("[AI] fullpack prepared", "INFO")
         self._log_ai_fullpack_snapshot(datapack)
@@ -298,18 +299,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not isinstance(response, str):
             self._handle_ai_analyze_error("AI response invalid or empty.")
             return
-        try:
-            parsed = parse_ai_operator_response(response)
-        except ValueError as exc:
-            self._handle_ai_analyze_error(str(exc))
-            return
-        self._last_ai_response = parsed
-        self._last_ai_result_json = response
-        self._append_ai_response_to_chat(parsed)
-        self._clear_actions()
-        self._apply_recommended_profile(parsed.recommended_profile)
-        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(self._get_selected_profile_patch()))
-
+        parsed = parse_ai_operator_response(response)
         parsed = self._enforce_action_patch_requirements(parsed)
         self._last_ai_response = parsed
         self._last_ai_result_json = response
@@ -342,8 +332,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
         self._apply_strategy_patch_to_form(patch)
-
-        self._apply_strategy_patch_to_ui(self._last_strategy_patch)
+        self._apply_strategy_patch_to_ui(patch)
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", "Strategy patch applied via Apply Plan.")
 
@@ -357,8 +346,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             return
         self._append_chat_line("YOU", message)
         self._chat_input.clear()
-        datapack = self._build_full_market_pack()
-
         self._update_user_intent_from_message(message)
         snapshot = self._get_ai_snapshot()
         if snapshot is None:
@@ -408,18 +395,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not isinstance(response, str):
             self._handle_ai_chat_error("AI response invalid or empty.")
             return
-        try:
-            parsed = parse_ai_operator_response(response)
-        except ValueError as exc:
-            self._handle_ai_chat_error(str(exc))
-            return
-        self._last_ai_response = parsed
-        self._last_ai_result_json = response
-        self._append_ai_response_to_chat(parsed)
-        self._clear_actions()
-        self._apply_recommended_profile(parsed.recommended_profile)
-        self._apply_plan_button.setEnabled(self._strategy_patch_has_values(self._get_selected_profile_patch()))
-
+        parsed = parse_ai_operator_response(response)
         parsed = self._enforce_action_patch_requirements(parsed)
         self._last_ai_response = parsed
         self._last_ai_result_json = response
@@ -514,23 +490,11 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _append_ai_response_to_chat(self, response: AiOperatorResponse) -> None:
         lines = ["AI:"]
-        lines.append(f"STATE: {response.state} | recommended: {response.recommended_profile}")
-        lines.append(f"Reason: {response.reason_short or '—'}")
-        for key in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE"):
-            profile = response.profiles.get(key)
-            patch = profile.strategy_patch if profile else None
-            step = f"{patch.step_pct}" if patch and patch.step_pct is not None else "—"
-            levels = f"{patch.levels}" if patch and patch.levels is not None else "—"
-            if patch and (patch.range_down_pct is not None or patch.range_up_pct is not None):
-
         lines.append(f"State: {response.state}")
         lines.append(f"Reason: {response.reason_short or '—'}")
         lines.append(f"Profile: {response.recommended_profile}")
-        risks = response.risks[:3]
-        risks_text = "; ".join(risks) if risks else "—"
-        lines.append(f"Risks: {risks_text}")
-        suggested_action = response.actions[0] if response.actions else "—"
-        lines.append(f"Suggested Action: {suggested_action}")
+        actions_text = ", ".join(response.actions) if response.actions else "—"
+        lines.append(f"Actions: {actions_text}")
         patch = response.strategy_patch
         if patch and self._strategy_patch_has_values(patch):
             step = f"{patch.step_pct}" if patch.step_pct is not None else "—"
@@ -541,25 +505,18 @@ class AiOperatorGridWindow(LiteGridWindow):
                 range_text = f"{range_down}..{range_up}"
             else:
                 range_text = "—"
-            tp = f"{patch.tp_pct}" if patch and patch.tp_pct is not None else "—"
-            bias = patch.bias if patch and patch.bias else "—"
-            lines.append(
-                f"{key}: step={step} range={range_text} levels={levels} tp={tp} bias={bias}"
-            )
-        forecast = response.forecast
-        lines.append(
-            f"Forecast: {forecast.bias} {forecast.confidence:.2f} {forecast.horizon_min}m "
-            f"{forecast.comment or '—'}"
-        )
-        risks_text = "; ".join(response.risks[:4]) if response.risks else "—"
-        lines.append(f"Risks: {risks_text}")
-
+            tp = f"{patch.tp_pct}" if patch.tp_pct is not None else "—"
+            bias = patch.bias or "—"
+            lines.append(f"Patch: step={step} range={range_text} levels={levels} tp={tp} bias={bias}")
         else:
             lines.append("Patch: —")
         forecast = response.forecast
         lines.append(
-            f"Forecast: {forecast.bias} {forecast.confidence:.2f} ({forecast.horizon_min}m)"
+            f"Forecast: {forecast.bias} {forecast.confidence:.2f} ({forecast.horizon_min}m) "
+            f"{forecast.comment or '—'}"
         )
+        risks_text = "; ".join(response.risks[:4]) if response.risks else "—"
+        lines.append(f"Risks: {risks_text}")
         self._append_chat_block(lines)
 
     def _append_chat_block(self, lines: list[str]) -> None:
@@ -646,27 +603,17 @@ class AiOperatorGridWindow(LiteGridWindow):
         applied_fields: list[str] = []
         missing_fields: list[str] = []
         if patch.bias:
-            mapping = {
-                "NEUTRAL": "Neutral",
-                "FLAT": "Neutral",
-                "LONG": "Long-biased",
-                "UP": "Long-biased",
-                "SHORT": "Short-biased",
-                "DOWN": "Short-biased",
-            }
-            direction_value = mapping.get(patch.bias, "Neutral")
-            index = self._direction_combo.findData(direction_value)
-            if index >= 0:
-                self._direction_combo.setCurrentIndex(index)
-
             if not hasattr(self, "_direction_combo"):
                 self._append_log("[AI] patch field skipped: bias", "INFO")
                 missing_fields.append("bias")
             else:
                 mapping = {
                     "NEUTRAL": "Neutral",
+                    "FLAT": "Neutral",
                     "LONG": "Long-biased",
+                    "UP": "Long-biased",
                     "SHORT": "Short-biased",
+                    "DOWN": "Short-biased",
                 }
                 direction_value = mapping.get(patch.bias, "Neutral")
                 index = self._direction_combo.findData(direction_value)
@@ -710,31 +657,26 @@ class AiOperatorGridWindow(LiteGridWindow):
                 self._range_low_input.setValue(patch.range_down_pct)
                 applied_fields.append("range_down_pct")
         if patch.range_up_pct is not None:
-            self._range_high_input.setValue(patch.range_up_pct)
-        if patch.tp_pct is not None:
-            self._take_profit_input.setValue(patch.tp_pct)
-        if patch.max_active_orders is not None:
-            self._max_orders_input.setValue(patch.max_active_orders)
-
-
             if not hasattr(self, "_range_high_input"):
                 self._append_log("[AI] patch field skipped: range_up_pct", "INFO")
                 missing_fields.append("range_up_pct")
             else:
                 self._range_high_input.setValue(patch.range_up_pct)
                 applied_fields.append("range_up_pct")
-        if patch.take_profit_pct is not None:
+        if patch.tp_pct is not None:
             if not hasattr(self, "_take_profit_input"):
-                self._append_log("[AI] patch field skipped: take_profit_pct", "INFO")
-                missing_fields.append("take_profit_pct")
+                self._append_log("[AI] patch field skipped: tp_pct", "INFO")
+                missing_fields.append("tp_pct")
             else:
-                self._take_profit_input.setValue(patch.take_profit_pct)
-                applied_fields.append("take_profit_pct")
-        if patch.max_exposure is not None:
-            if not self._max_exposure_warned:
-                self._append_log("[AI] patch field skipped: max_exposure", "INFO")
-                self._max_exposure_warned = True
-            missing_fields.append("max_exposure")
+                self._take_profit_input.setValue(patch.tp_pct)
+                applied_fields.append("tp_pct")
+        if patch.max_active_orders is not None:
+            if not hasattr(self, "_max_orders_input"):
+                self._append_log("[AI] patch field skipped: max_active_orders", "INFO")
+                missing_fields.append("max_active_orders")
+            else:
+                self._max_orders_input.setValue(patch.max_active_orders)
+                applied_fields.append("max_active_orders")
         self._append_log(
             f"[AI] ui_patch_applied fields={applied_fields} missing={missing_fields}",
             "INFO",
@@ -773,12 +715,73 @@ class AiOperatorGridWindow(LiteGridWindow):
                 return value
         return str(value)
 
+    def _get_cached_data(self, data_type: str) -> Any:
+        cached = self._get_cached_entry(data_type)
+        if not cached:
+            return None
+        return cached[0]
+
+    def _fetch_orderbook_depth_cached(self) -> Any:
+        return self._fetch_http_block(
+            "orderbook_depth_50",
+            lambda: self._http_client.get_orderbook_depth(self._symbol, limit=50),
+            2.5,
+        )[0]
+
+    def _fetch_recent_trades_cached(self) -> Any:
+        return self._fetch_http_block(
+            "recent_trades_1m",
+            lambda: self._http_client.get_recent_trades(self._symbol, limit=500),
+            2.5,
+        )[0]
+
+    def _compute_orderbook_summary(
+        self,
+        orderbook: Any,
+        best_bid: float | None,
+        best_ask: float | None,
+    ) -> dict[str, float | int | None]:
+        if not isinstance(orderbook, dict):
+            return {
+                "bid_count": 0,
+                "ask_count": 0,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_pct": self._compute_spread_pct(best_bid, best_ask),
+                "is_valid": False,
+            }
+        bids = self._normalize_depth_side(orderbook.get("bids"))
+        asks = self._normalize_depth_side(orderbook.get("asks"))
+        best_bid_val = best_bid or self._coerce_float(bids[0][0]) if bids else best_bid
+        best_ask_val = best_ask or self._coerce_float(asks[0][0]) if asks else best_ask
+        spread_pct = self._compute_spread_pct(best_bid_val, best_ask_val)
+        is_valid = self._is_good_orderbook(
+            {
+                "bid_count": len(bids),
+                "ask_count": len(asks),
+                "best_bid": best_bid_val,
+                "best_ask": best_ask_val,
+            }
+        )
+        return {
+            "bid_count": len(bids),
+            "ask_count": len(asks),
+            "best_bid": best_bid_val,
+            "best_ask": best_ask_val,
+            "spread_pct": spread_pct,
+            "is_valid": is_valid,
+        }
+
+    @staticmethod
+    def _compute_spread_pct(best_bid: float | None, best_ask: float | None) -> float | None:
+        if not isinstance(best_bid, (int, float)) or not isinstance(best_ask, (int, float)):
+            return None
+        if best_bid <= 0:
+            return None
+        return (best_ask - best_bid) / best_bid * 100
+
     def _log_ai_fullpack_snapshot(self, datapack: dict[str, Any]) -> None:
-        meta = datapack.get("meta") or {}
-        ws_ok = meta.get("ws_ok")
-        ws_age = meta.get("ws_age_ms")
-        liquidity = datapack.get("liquidity") or {}
-        trades = datapack.get("trades_1m") or {}
+        self._log_ai_datapack_snapshot(datapack)
 
     def _datapack_signature(self, datapack: dict[str, Any]) -> str:
         snapshot = datapack.get("snapshot") or {}
@@ -792,6 +795,11 @@ class AiOperatorGridWindow(LiteGridWindow):
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _log_ai_datapack_snapshot(self, datapack: dict[str, Any]) -> None:
+        meta = datapack.get("meta") or {}
+        ws_ok = meta.get("ws_ok")
+        ws_age = meta.get("ws_age_ms")
+        liquidity = datapack.get("liquidity") or {}
+        trades = datapack.get("trades_1m") or {}
         snapshot = datapack.get("snapshot") or {}
         flags = snapshot.get("flags") or {}
         has_orderbook = flags.get("has_orderbook")
@@ -806,14 +814,17 @@ class AiOperatorGridWindow(LiteGridWindow):
         trades_count = trades_summary.get("count") or 0
         source = snapshot.get("source") or "—"
         stale = snapshot.get("stale")
-        fee_text = self._format_fee(fees.get("maker_fee_pct"), fees.get("taker_fee_pct"))
+        fee_text = self._format_fee(
+            fees.get("maker_fee_pct") or fees.get("maker"),
+            fees.get("taker_fee_pct") or fees.get("taker"),
+        )
         spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
         self._append_log(
             (
                 "[AI] fullpack built "
                 f"ws_ok={ws_ok} ws_age={ws_age} "
                 f"depth50(b/a)={liquidity.get('depth_usd_bid')}/{liquidity.get('depth_usd_ask')} "
-                f"trades_1m=n{trades.get('n')}"
+                f"trades_1m=n{trades_summary.get('count') or 0}"
             ),
             "INFO",
         )
@@ -911,6 +922,86 @@ class AiOperatorGridWindow(LiteGridWindow):
 
         snapshot = self._refresh_ai_snapshot(reason="refresh")
         self._update_ai_snapshot_label_from_snapshot(snapshot)
+        base_free = self._balances.get(self._base_asset or "", (0.0, 0.0))[0]
+        quote_free = self._balances.get(self._quote_asset or "", (0.0, 0.0))[0]
+        equity_quote = quote_free + (base_free * last_price) if last_price else None
+        return self._prepare_ai_datapack(
+            snapshot,
+            grid_settings=self.dump_settings(),
+            runtime={
+                "quote_free": quote_free,
+                "base_free": base_free,
+                "equity_quote": equity_quote,
+                "open_orders_count": len(self._open_orders),
+                "engine_state": self._engine_state,
+                "trade_enabled": self._trade_gate == TradeGate.TRADE_OK,
+                "dry_run": bool(self._dry_run_toggle.isChecked()),
+                "current_grid_params": self.dump_settings(),
+            },
+            volatility=self._compute_volatility_metrics(),
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            user_intent=dict(self._user_intent),
+            ws_ok=ws_ok,
+            ws_age_ms=ws_age_ms,
+            last_update_ts=last_update_ts,
+            http_latency_ms=http_latency_ms,
+            ws_ms=ws_ms,
+            http_ok=http_ok,
+            ws_reason=ws_reason,
+            http_timings=http_timings,
+            http_errors=http_errors,
+            stats24h=stats24h,
+            liquidity=liquidity,
+            kline_aggs=kline_aggs,
+            last_ticks=last_ticks,
+            micro_vola_pct=micro_vola_pct,
+            micro_trend=micro_trend,
+            bid=bid,
+            ask=ask,
+            mid=mid,
+            spread_pct=spread_pct,
+        )
+
+    def _build_ai_datapack(self, snapshot: MarketSnapshot) -> dict[str, Any]:
+        base_free = snapshot.balances.get("base_free", 0.0)
+        quote_free = snapshot.balances.get("quote_free", 0.0)
+        equity_quote = snapshot.balances.get("equity_quote")
+        return self._prepare_ai_datapack(
+            snapshot,
+            grid_settings=self.dump_settings(),
+            runtime={
+                "quote_free": quote_free,
+                "base_free": base_free,
+                "equity_quote": equity_quote,
+                "open_orders_count": len(self._open_orders),
+                "engine_state": self._engine_state,
+                "trade_enabled": self._trade_gate == TradeGate.TRADE_OK,
+                "dry_run": bool(self._dry_run_toggle.isChecked()),
+                "current_grid_params": self.dump_settings(),
+            },
+            volatility=self._compute_volatility_metrics(),
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            user_intent=dict(self._user_intent),
+            ws_ok=True,
+            ws_age_ms=snapshot.ws_age_ms,
+            last_update_ts=None,
+            http_latency_ms=0,
+            ws_ms=0.0,
+            http_ok=True,
+            ws_reason="",
+            http_timings={},
+            http_errors={},
+            stats24h={},
+            liquidity=self._compute_liquidity(snapshot.orderbook_depth_50),
+            kline_aggs={},
+            last_ticks=self._price_history[-60:],
+            micro_vola_pct=None,
+            micro_trend=None,
+            bid=snapshot.best_bid,
+            ask=snapshot.best_ask,
+            mid=None,
+            spread_pct=snapshot.spread_pct,
+        )
 
     def _get_ai_snapshot(self) -> MarketSnapshot | None:
         return self._snapshot_store.snapshot_active
@@ -1006,6 +1097,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         trades = self._get_cached_data("recent_trades_1m")
         stale = False
         source = "HTTP" if isinstance(orderbook, dict) or isinstance(trades, dict) else "WS"
+        if isinstance(trades, list):
+            trades = {"items": trades, "count": len(trades)}
         if reuse_depth_trades and prior_snapshot:
             if orderbook is None and prior_snapshot.orderbook_depth_50:
                 orderbook = prior_snapshot.orderbook_depth_50
@@ -1044,16 +1137,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
         quote_free, _ = self._balances.get(quote_asset, (0.0, 0.0))
         equity_quote = quote_free + (base_free * last_price) if last_price else None
-        runtime = {
-            "quote_free": quote_free,
-            "base_free": base_free,
-            "equity_quote": equity_quote,
-            "open_orders_count": len(self._open_orders),
-            "engine_state": self._engine_state,
-            "trade_enabled": self._trade_gate == TradeGate.TRADE_OK,
-            "dry_run": bool(self._dry_run_toggle.isChecked()),
-            "current_grid_params": self.dump_settings(),
-
         base_free, base_locked = self._balances.get(base_asset, (0.0, 0.0))
         quote_free, quote_locked = self._balances.get(quote_asset, (0.0, 0.0))
         market_snapshot = MarketSnapshot(
@@ -1083,6 +1166,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "base_free": base_free,
                 "quote_locked": quote_locked,
                 "base_locked": base_locked,
+                "equity_quote": equity_quote,
             },
             open_orders_count=len(self._open_orders),
             source=source,
@@ -1102,25 +1186,40 @@ class AiOperatorGridWindow(LiteGridWindow):
         volatility: tuple[float | None, float | None],
         timestamp_utc: str,
         user_intent: dict[str, Any],
+        ws_ok: bool,
+        ws_age_ms: int | None,
+        last_update_ts: int | None,
+        http_latency_ms: int,
+        ws_ms: float,
+        http_ok: bool,
+        ws_reason: str,
+        http_timings: dict[str, float],
+        http_errors: dict[str, str],
+        stats24h: dict[str, Any],
+        liquidity: dict[str, Any],
+        kline_aggs: dict[str, Any],
+        last_ticks: list[float],
+        micro_vola_pct: float | None,
+        micro_trend: float | None,
+        bid: float | None,
+        ask: float | None,
+        mid: float | None,
+        spread_pct: float | None,
     ) -> dict[str, Any]:
         last_price = snapshot.last_price
-        best_bid = snapshot.best_bid
-        best_ask = snapshot.best_ask
-        spread_pct = snapshot.spread_pct
         atr_pct, micro_vol_pct = volatility
         maker_fee_pct = snapshot.maker_fee_pct
         taker_fee_pct = snapshot.taker_fee_pct
         is_zero_fee = snapshot.is_zero_fee
         orderbook = snapshot.orderbook_depth_50
         trades_1m = snapshot.trades_1m
-        orderbook_summary = self._compute_orderbook_summary(orderbook, best_bid, best_ask)
+        orderbook_summary = self._compute_orderbook_summary(orderbook, bid, ask)
         trades_summary = self._compute_trades_summary(trades_1m)
         has_orderbook = bool(orderbook_summary.get("is_valid"))
         has_trades_1m = (trades_summary.get("count") or 0) >= 3
         has_fees = maker_fee_pct is not None and taker_fee_pct is not None
         has_balances = bool(snapshot.balances)
         has_rules = bool(snapshot.rules)
-        ws_age_ms = snapshot.ws_age_ms
         datapack_snapshot = {
             "snapshot_id": snapshot.snapshot_id,
             "ts_ms": snapshot.ts_ms,
@@ -1149,6 +1248,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "has_price": last_price is not None,
             },
         }
+        now_ms = utc_ms()
         pack = {
             "meta": {
                 "symbol": self._symbol,
@@ -1158,6 +1258,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "last_update_ts": last_update_ts,
                 "http_latency_ms": http_latency_ms,
                 "pack_source": {"ws": "OK" if ws_ok else "NO", "http": "OK" if http_ok else "WARN"},
+                "timestamp_utc": timestamp_utc,
             },
             "price": {
                 "last": last_price,
@@ -1170,6 +1271,8 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "last_ticks": last_ticks[-60:],
                 "micro_vola_pct": micro_vola_pct,
                 "micro_trend": micro_trend,
+                "atr_pct": atr_pct,
+                "micro_vol_pct": micro_vol_pct,
             },
 
             "orderbook_summary": orderbook_summary,
@@ -1185,14 +1288,13 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "taker": taker_fee_pct,
                 "is_zero_fee": is_zero_fee,
             },
-            "rules": rules,
+            "rules": snapshot.rules,
             "liquidity": liquidity,
-            "trades_1m": trades_1m,
             "stats24h": stats24h,
             "kline_aggs": kline_aggs,
             "account_runtime": runtime,
         }
-        total_ms = (time.perf_counter() - total_start) * 1000
+        total_ms = ws_ms + http_latency_ms
         self._append_log(
             (
                 "[AI] pack_source "
@@ -1261,15 +1363,8 @@ class AiOperatorGridWindow(LiteGridWindow):
             + timings.get("klines_15m", 0)
             + timings.get("klines_1h", 0)
             + timings.get("klines_1d", 0)
-
-        return self._prepare_ai_datapack(
-            snapshot,
-            grid_settings=self.dump_settings(),
-            runtime=runtime,
-            volatility=self._compute_volatility_metrics(),
-            timestamp_utc=datetime.now(timezone.utc).isoformat(),
-            user_intent=dict(self._user_intent),
         )
+
         return results, timings, errors
 
     def _fetch_http_block(
@@ -1430,6 +1525,34 @@ class AiOperatorGridWindow(LiteGridWindow):
         sell_quote = 0.0
         vwap_num = 0.0
         vwap_den = 0.0
+        count = 0
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            trade_ts = trade.get("time")
+            if not isinstance(trade_ts, int) or trade_ts < cutoff:
+                continue
+            price = self._coerce_float(trade.get("price"))
+            qty = self._coerce_float(trade.get("qty"))
+            if price is None or qty is None:
+                continue
+            quote = price * qty
+            if trade.get("isBuyerMaker"):
+                sell_quote += quote
+            else:
+                buy_quote += quote
+            vwap_num += quote
+            vwap_den += qty
+            count += 1
+        volume_quote = buy_quote + sell_quote
+        vwap = vwap_num / vwap_den if vwap_den > 0 else None
+        return {
+            "n": count,
+            "vwap": vwap,
+            "buy_ratio": buy_quote / volume_quote if volume_quote > 0 else None,
+            "sell_ratio": sell_quote / volume_quote if volume_quote > 0 else None,
+            "volume_quote": volume_quote if volume_quote > 0 else None,
+        }
 
     @staticmethod
     def _is_good_orderbook(summary: dict[str, float | int | None]) -> bool:
@@ -1464,36 +1587,22 @@ class AiOperatorGridWindow(LiteGridWindow):
         vwap_denominator = 0.0
         last_ts = None
         count = 0
-        for trade in trades:
+        for trade in items:
             if not isinstance(trade, dict):
                 continue
             trade_ts = trade.get("time")
-            if not isinstance(trade_ts, int) or trade_ts < cutoff:
-                continue
+            if isinstance(trade_ts, int):
+                last_ts = max(last_ts or 0, trade_ts)
             price = self._coerce_float(trade.get("price"))
             qty = self._coerce_float(trade.get("qty"))
             if price is None or qty is None:
                 continue
             quote = price * qty
-            is_buyer_maker = trade.get("isBuyerMaker")
-            if is_buyer_maker:
-                sell_quote += quote
-            else:
-                buy_quote += quote
-            vwap_num += quote
-            vwap_den += qty
+            vwap_numerator += quote
+            vwap_denominator += qty
             count += 1
-        volume_quote = buy_quote + sell_quote
-        buy_ratio = buy_quote / volume_quote if volume_quote > 0 else None
-        sell_ratio = sell_quote / volume_quote if volume_quote > 0 else None
-        vwap = vwap_num / vwap_den if vwap_den > 0 else None
-        return {
-            "n": count,
-            "vwap": vwap,
-            "buy_ratio": buy_ratio,
-            "sell_ratio": sell_ratio,
-            "volume_quote": volume_quote if volume_quote > 0 else None,
-        }
+        vwap = vwap_numerator / vwap_denominator if vwap_denominator > 0 else None
+        return {"count": count, "last_ts": last_ts, "vwap_1m": vwap}
 
     def _extract_ohlc(self, klines: Any) -> list[tuple[float, float, float, float]]:
         if not isinstance(klines, list):
@@ -1593,17 +1702,10 @@ class AiOperatorGridWindow(LiteGridWindow):
         }
 
     def _update_ai_snapshot_label(self, datapack: dict[str, Any]) -> None:
-        price = datapack.get("price") or {}
-        trades = datapack.get("trades_1m") or {}
+        orderbook_summary = datapack.get("orderbook_summary") or {}
+        trades_summary = datapack.get("trades_1m_summary") or {}
         fees = datapack.get("fees") or {}
         meta = datapack.get("meta") or {}
-        bid = price.get("bid")
-        ask = price.get("ask")
-        spread_pct = price.get("spread_pct")
-        trades_count = trades.get("n")
-        maker_fee_pct = fees.get("maker")
-        taker_fee_pct = fees.get("taker")
-
         snapshot_meta = datapack.get("snapshot", {})
         ws_age_ms = snapshot_meta.get("ws_age_ms")
         source = snapshot_meta.get("source", "—")
@@ -1613,8 +1715,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         ask = orderbook_summary.get("best_ask")
         spread_pct = orderbook_summary.get("spread_pct")
         trades_count = trades_summary.get("count")
-        maker_fee_pct = fees.get("maker_fee_pct")
-        taker_fee_pct = fees.get("taker_fee_pct")
+        maker_fee_pct = fees.get("maker_fee_pct") or fees.get("maker")
+        taker_fee_pct = fees.get("taker_fee_pct") or fees.get("taker")
         bid_text = f"{bid:.8f}" if isinstance(bid, (int, float)) else "—"
         ask_text = f"{ask:.8f}" if isinstance(ask, (int, float)) else "—"
         spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
