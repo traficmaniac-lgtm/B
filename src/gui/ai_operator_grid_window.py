@@ -186,6 +186,10 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._ai_snapshot_label.setStyleSheet("color: #374151; font-size: 12px;")
         layout.addWidget(self._ai_snapshot_label)
 
+        market_panel = super()._build_market_panel()
+        market_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        layout.addWidget(market_panel)
+
         self._chat_history = QPlainTextEdit()
         self._chat_history.setReadOnly(True)
         self._chat_history.setPlaceholderText("AI chat history will appear here.")
