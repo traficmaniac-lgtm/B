@@ -138,6 +138,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         price_feed_manager: PriceFeedManager,
         parent: QWidget | None = None,
     ) -> None:
+        self._ai_patch_in_progress = False
+        self._ai_state_machine = AiOperatorStateMachine()
         super().__init__(
             symbol=symbol,
             config=config,
@@ -160,8 +162,6 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_actions_suggested: list[str] = []
         self._pending_action: PendingAction | None = None
         self._max_exposure_warned = False
-        self._ai_state_machine = AiOperatorStateMachine()
-        self._ai_patch_in_progress = False
         self._last_data_quality_state: str | None = None
         self._data_cache = DataCache()
         self._http_client = BinanceHttpClient(
