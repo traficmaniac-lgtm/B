@@ -632,6 +632,7 @@ class LiteGridWindow(QMainWindow):
         self._account_api_error = False
         self._symbol_tradeable = False
         self._suppress_dry_run_event = False
+        self._dry_run_enabled = True
         self._exchange_rules: dict[str, float | None] = {}
         self._trade_fees: tuple[float | None, float | None] = (None, None)
         self._fees_last_fetch_ts: float | None = None
@@ -1314,6 +1315,7 @@ class LiteGridWindow(QMainWindow):
                 self._suppress_dry_run_event = False
                 return
             self._live_mode_confirmed = True
+        self._dry_run_enabled = checked
         state = "enabled" if checked else "disabled"
         self._append_log(f"Dry-run {state}.", kind="INFO")
         self._append_log(
