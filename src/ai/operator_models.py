@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import re
 from typing import Any
 
 from src.core.logging import get_logger
@@ -10,26 +9,22 @@ from src.core.logging import get_logger
 _LOGGER = get_logger("ai.operator_models")
 
 _ALLOWED_STATES = {"SAFE", "WARNING", "DANGER"}
-_ALLOWED_RECOMMENDATIONS = {"WAIT", "TRADE_OK", "DO_NOT_TRADE"}
-_ALLOWED_NEXT_ACTIONS = {"WAIT", "APPLY_PATCH", "START", "STOP", "ADJUST_PARAMS"}
 _ALLOWED_ACTIONS = {
-    "START",
-    "STOP",
-    "PAUSE",
-    "RESUME",
     "WAIT",
+    "DO_NOT_TRADE",
+    "START",
     "APPLY_PATCH",
-    "CANCEL_ORDERS",
+    "REQUEST_DATA",
     "ADJUST_PARAMS",
-    "REBUILD_GRID",
+    "STOP",
 }
 _ALLOWED_PROFILES = {"AGGRESSIVE", "BALANCED", "CONSERVATIVE"}
-_ALLOWED_FORECAST_BIAS = {"UP", "DOWN", "FLAT"}
-_ALLOWED_BIAS = {"NEUTRAL", "LONG", "SHORT", "UP", "DOWN", "FLAT"}
+_ALLOWED_BIAS = {"UP", "DOWN", "FLAT"}
 
 
 @dataclass
 class StrategyPatch:
+    strategy_id: str | None = None
     budget: float | None = None
     step_pct: float | None = None
     range_down_pct: float | None = None
@@ -41,16 +36,25 @@ class StrategyPatch:
 
 
 @dataclass
-class OperatorAIProfile:
-    strategy_patch: StrategyPatch | None
+class OperatorAIRequestDataItem:
+    id: str
+    window: str | None
+    limit: int | None
+    reason: str | None
+    levels: int | None
 
 
 @dataclass
-class OperatorAIForecast:
-    bias: str
-    confidence: float
-    horizon_min: int
-    comment: str
+class OperatorAIRequestData:
+    need_more: bool
+    items: list[OperatorAIRequestDataItem]
+
+
+@dataclass
+class OperatorAIMathCheck:
+    net_edge_pct: float | None
+    break_even_tp_pct: float | None
+    assumptions: dict[str, Any]
 
 
 @dataclass
@@ -58,22 +62,15 @@ class OperatorAIResult:
     state: str
     recommendation: str
     next_action: str
-    reason_short: str
-    recommended_profile: str
-    profiles: dict[str, OperatorAIProfile]
-    actions: list[str]
-    forecast: OperatorAIForecast
-    risks: list[str]
-
-    @property
-    def strategy_patch(self) -> StrategyPatch | None:
-        profile = self.profiles.get(self.recommended_profile)
-        return profile.strategy_patch if profile else None
+    reason: str
+    profile: str
+    actions_allowed: list[str]
+    strategy_patch: StrategyPatch | None
+    request_data: OperatorAIRequestData
+    math_check: OperatorAIMathCheck
 
 
 AiOperatorStrategyPatch = StrategyPatch
-AiOperatorProfile = OperatorAIProfile
-AiOperatorForecast = OperatorAIForecast
 AiOperatorResponse = OperatorAIResult
 
 
@@ -82,12 +79,6 @@ def parse_ai_operator_response(text: str) -> OperatorAIResult:
         _LOGGER.warning("[AI] parse failed: empty response -> fallback WAIT")
         return _fallback_result("AI_PARSE_FAIL")
     payload = _parse_json_payload(text)
-    if payload is None:
-        parsed = _parse_text_protocol(text)
-        if parsed is None:
-            _LOGGER.warning("[AI] parse_failed: no action -> fallback WAIT")
-            return _fallback_result("AI_PARSE_FAIL")
-        return parsed
     if not isinstance(payload, dict):
         _LOGGER.warning("[AI] parse failed: payload not dict -> fallback WAIT")
         return _fallback_result("AI_PARSE_FAIL")
@@ -98,62 +89,38 @@ def parse_ai_operator_response(text: str) -> OperatorAIResult:
 def _parse_payload(payload: dict[str, Any]) -> OperatorAIResult:
     state = _normalize_state(str(payload.get("state", "WARNING")).strip().upper())
 
-    recommendation = str(payload.get("recommendation", "WAIT")).strip().upper()
-    if recommendation not in _ALLOWED_RECOMMENDATIONS:
+    recommendation = _normalize_action(payload.get("recommendation"))
+    next_action = _normalize_action(payload.get("next_action"))
+    if not recommendation:
         recommendation = "WAIT"
-
-    next_action = str(payload.get("next_action", "")).strip().upper()
-    if next_action not in _ALLOWED_NEXT_ACTIONS:
-        next_action = ""
-
-    recommended_profile = str(payload.get("recommended_profile", "BALANCED")).strip().upper()
-    if recommended_profile not in _ALLOWED_PROFILES:
-        recommended_profile = "BALANCED"
-
-    profiles_payload = payload.get("profiles")
-    profiles: dict[str, OperatorAIProfile] = {}
-    normalized_profiles: dict[str, Any] = {}
-    if isinstance(profiles_payload, dict):
-        normalized_profiles = {str(key).upper(): value for key, value in profiles_payload.items()}
-    for profile_name in _ALLOWED_PROFILES:
-        entry = normalized_profiles.get(profile_name)
-        patch = _parse_strategy_patch(entry.get("strategy_patch") if isinstance(entry, dict) else None)
-        profiles[profile_name] = OperatorAIProfile(strategy_patch=patch)
-
-    actions_payload = payload.get("actions")
-    actions: list[str] = []
-    if isinstance(actions_payload, list):
-        actions = [str(item).strip().upper() for item in actions_payload if item]
-    actions = _normalize_actions(actions)
-    if not actions:
-        actions = ["WAIT"]
-
-    reason_short = str(payload.get("reason_short", ""))[:120]
-
-    forecast_payload = payload.get("forecast")
-    forecast = _parse_forecast(forecast_payload)
-
-    risks_payload = payload.get("risks")
-    risks = [str(item) for item in risks_payload if item] if isinstance(risks_payload, list) else []
-
-    strategy_patch = profiles.get(recommended_profile).strategy_patch if recommended_profile in profiles else None
-    if _strategy_patch_has_values(strategy_patch):
-        next_action = "APPLY_PATCH"
     if not next_action:
-        next_action = next((item for item in actions if item != "WAIT"), "WAIT")
-    if next_action not in actions:
-        actions = [next_action] + actions
+        next_action = "WAIT"
+
+    profile = str(payload.get("profile", "BALANCED")).strip().upper()
+    if profile not in _ALLOWED_PROFILES:
+        profile = "BALANCED"
+
+    actions_allowed = _normalize_actions(payload.get("actions_allowed"))
+    if next_action not in actions_allowed:
+        actions_allowed.insert(0, next_action)
+
+    reason = str(payload.get("reason", ""))[:160]
+
+    strategy_patch = _parse_strategy_patch(payload.get("patch"))
+
+    request_data = _parse_request_data(payload.get("request_data"))
+    math_check = _parse_math_check(payload.get("math_check"))
 
     return OperatorAIResult(
         state=state,
         recommendation=recommendation,
         next_action=next_action,
-        reason_short=reason_short,
-        recommended_profile=recommended_profile,
-        profiles=profiles,
-        actions=actions,
-        forecast=forecast,
-        risks=risks,
+        reason=reason,
+        profile=profile,
+        actions_allowed=actions_allowed,
+        strategy_patch=strategy_patch,
+        request_data=request_data,
+        math_check=math_check,
     )
 
 
@@ -162,87 +129,7 @@ def _parse_json_payload(text: str) -> dict[str, Any] | None:
         payload = json.loads(text)
     except json.JSONDecodeError:
         payload = None
-    if isinstance(payload, dict):
-        return payload
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return None
-    try:
-        payload = json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        _LOGGER.warning("[AI] parse failed: %s -> fallback WAIT", exc)
-        return None
     return payload if isinstance(payload, dict) else None
-
-
-def _parse_text_protocol(text: str) -> OperatorAIResult | None:
-    state = _normalize_state(_extract_line_value(text, "State") or "WARNING")
-    recommendation = _extract_line_value(text, "Recommendation") or "WAIT"
-    recommendation = recommendation.strip().upper()
-    if recommendation not in _ALLOWED_RECOMMENDATIONS:
-        recommendation = "WAIT"
-    next_action = _extract_line_value(text, "Next_action") or _extract_line_value(text, "Next Action") or ""
-    next_action = next_action.strip().upper()
-    if next_action not in _ALLOWED_NEXT_ACTIONS:
-        next_action = ""
-    actions_line = _extract_line_value(text, "Actions") or ""
-    actions = _split_actions(actions_line)
-    actions = _normalize_actions(actions)
-    if not actions:
-        return None
-    reason_short = _extract_line_value(text, "Reason") or ""
-    patch_payload = _extract_patch_payload(text)
-    patch = _parse_strategy_patch(patch_payload)
-    profiles = {key: OperatorAIProfile(strategy_patch=None) for key in _ALLOWED_PROFILES}
-    recommended_profile = "BALANCED"
-    profiles[recommended_profile] = OperatorAIProfile(strategy_patch=patch)
-    if _strategy_patch_has_values(patch):
-        next_action = "APPLY_PATCH"
-    if not next_action:
-        next_action = next((item for item in actions if item != "WAIT"), "WAIT")
-    if next_action not in actions:
-        actions = [next_action] + actions
-    return OperatorAIResult(
-        state=state,
-        recommendation=recommendation,
-        next_action=next_action,
-        reason_short=reason_short[:120],
-        recommended_profile=recommended_profile,
-        profiles=profiles,
-        actions=actions,
-        forecast=OperatorAIForecast(bias="FLAT", confidence=0.0, horizon_min=0, comment=""),
-        risks=[],
-    )
-
-
-def _extract_line_value(text: str, key: str) -> str | None:
-    match = re.search(rf"^\\s*{re.escape(key)}\\s*:\\s*(.+)$", text, flags=re.IGNORECASE | re.MULTILINE)
-    if not match:
-        return None
-    return match.group(1).strip()
-
-
-def _split_actions(actions_line: str) -> list[str]:
-    if not actions_line:
-        return []
-    tokens = re.split(r"[,\n;|]+", actions_line)
-    return [token.strip().upper() for token in tokens if token.strip()]
-
-
-def _extract_patch_payload(text: str) -> dict[str, Any] | None:
-    match = re.search(r"^\\s*Patch\\s*:\\s*(.*)$", text, flags=re.IGNORECASE | re.MULTILINE)
-    if not match:
-        return None
-    remainder = match.group(1).strip()
-    if remainder:
-        payload = _parse_json_payload(remainder)
-        if payload is not None:
-            return payload
-    after = text[match.end() :]
-    payload = _parse_json_payload(after)
-    if payload is not None:
-        return payload
-    return None
 
 
 def operator_ai_result_to_dict(result: OperatorAIResult) -> dict[str, Any]:
@@ -250,20 +137,28 @@ def operator_ai_result_to_dict(result: OperatorAIResult) -> dict[str, Any]:
         "state": result.state,
         "recommendation": result.recommendation,
         "next_action": result.next_action,
-        "reason_short": result.reason_short,
-        "recommended_profile": result.recommended_profile,
-        "profiles": {
-            key: {"strategy_patch": _strategy_patch_to_dict(profile.strategy_patch)}
-            for key, profile in result.profiles.items()
+        "reason": result.reason,
+        "profile": result.profile,
+        "actions_allowed": list(result.actions_allowed),
+        "patch": _strategy_patch_to_dict(result.strategy_patch),
+        "request_data": {
+            "need_more": result.request_data.need_more,
+            "items": [
+                {
+                    "id": item.id,
+                    "window": item.window,
+                    "limit": item.limit,
+                    "reason": item.reason,
+                    "levels": item.levels,
+                }
+                for item in result.request_data.items
+            ],
         },
-        "actions": list(result.actions),
-        "forecast": {
-            "bias": result.forecast.bias,
-            "confidence": result.forecast.confidence,
-            "horizon_min": result.forecast.horizon_min,
-            "comment": result.forecast.comment,
+        "math_check": {
+            "net_edge_pct": result.math_check.net_edge_pct,
+            "break_even_tp_pct": result.math_check.break_even_tp_pct,
+            "assumptions": result.math_check.assumptions,
         },
-        "risks": list(result.risks),
     }
 
 
@@ -272,27 +167,36 @@ def operator_ai_result_to_json(result: OperatorAIResult) -> str:
 
 
 def _fallback_result(reason: str) -> OperatorAIResult:
-    profiles = {key: OperatorAIProfile(strategy_patch=None) for key in _ALLOWED_PROFILES}
     return OperatorAIResult(
         state="WARNING",
         recommendation="WAIT",
         next_action="WAIT",
-        reason_short=reason,
-        recommended_profile="BALANCED",
-        profiles=profiles,
-        actions=["WAIT"],
-        forecast=OperatorAIForecast(bias="FLAT", confidence=0.0, horizon_min=0, comment=""),
-        risks=[],
+        reason=reason,
+        profile="BALANCED",
+        actions_allowed=["WAIT"],
+        strategy_patch=None,
+        request_data=OperatorAIRequestData(need_more=False, items=[]),
+        math_check=OperatorAIMathCheck(net_edge_pct=None, break_even_tp_pct=None, assumptions={}),
     )
 
 
-def _normalize_actions(actions: list[str]) -> list[str]:
+def _normalize_action(action: Any) -> str:
+    if not action:
+        return ""
+    normalized = str(action).strip().upper()
+    return normalized if normalized in _ALLOWED_ACTIONS else ""
+
+
+def _normalize_actions(actions: Any) -> list[str]:
+    if not isinstance(actions, list):
+        return ["WAIT"]
     normalized: list[str] = []
     for action in actions:
-        if action == "REQUEST_MORE_DATA":
-            continue
-        if action in _ALLOWED_ACTIONS and action not in normalized:
-            normalized.append(action)
+        action_value = _normalize_action(action)
+        if action_value and action_value not in normalized:
+            normalized.append(action_value)
+    if not normalized:
+        normalized.append("WAIT")
     return normalized
 
 
@@ -311,6 +215,7 @@ def _strategy_patch_has_values(patch: StrategyPatch | None) -> bool:
     if patch is None:
         return False
     values = [
+        patch.strategy_id,
         patch.budget,
         patch.step_pct,
         patch.range_down_pct,
@@ -330,15 +235,10 @@ def _parse_strategy_patch(payload: Any) -> StrategyPatch | None:
     if bias and bias not in _ALLOWED_BIAS:
         bias = None
     tp_value = payload.get("tp_pct")
-    if tp_value is None:
-        tp_value = payload.get("take_profit_pct")
     range_down = payload.get("range_down_pct")
-    if range_down is None:
-        range_down = payload.get("range_low_pct")
     range_up = payload.get("range_up_pct")
-    if range_up is None:
-        range_up = payload.get("range_high_pct")
     return StrategyPatch(
+        strategy_id=str(payload.get("strategy_id")).strip().upper() if payload.get("strategy_id") else None,
         budget=_to_float_or_none(payload.get("budget")),
         step_pct=_to_float_or_none(payload.get("step_pct")),
         range_down_pct=_to_float_or_none(range_down),
@@ -349,25 +249,37 @@ def _parse_strategy_patch(payload: Any) -> StrategyPatch | None:
         max_active_orders=_to_int_or_none(payload.get("max_active_orders")),
     )
 
-
-def _parse_forecast(payload: Any) -> OperatorAIForecast:
+def _parse_request_data(payload: Any) -> OperatorAIRequestData:
     if not isinstance(payload, dict):
-        return OperatorAIForecast(bias="FLAT", confidence=0.0, horizon_min=0, comment="")
-    bias = str(payload.get("bias", "FLAT")).strip().upper()
-    if bias not in _ALLOWED_FORECAST_BIAS:
-        bias = "FLAT"
-    confidence = _to_float_or_none(payload.get("confidence"))
-    if confidence is None:
-        confidence = 0.0
-    horizon_min = _to_int_or_none(payload.get("horizon_min"))
-    if horizon_min is None:
-        horizon_min = 0
-    comment = str(payload.get("comment", ""))[:120]
-    return OperatorAIForecast(
-        bias=bias,
-        confidence=float(confidence),
-        horizon_min=int(horizon_min),
-        comment=comment,
+        return OperatorAIRequestData(need_more=False, items=[])
+    items_payload = payload.get("items")
+    items: list[OperatorAIRequestDataItem] = []
+    if isinstance(items_payload, list):
+        for item in items_payload:
+            if not isinstance(item, dict):
+                continue
+            items.append(
+                OperatorAIRequestDataItem(
+                    id=str(item.get("id", "")),
+                    window=str(item.get("window", "")) if item.get("window") else None,
+                    limit=_to_int_or_none(item.get("limit")),
+                    reason=str(item.get("reason", "")) if item.get("reason") else None,
+                    levels=_to_int_or_none(item.get("levels")),
+                )
+            )
+    return OperatorAIRequestData(need_more=bool(payload.get("need_more")), items=items)
+
+
+def _parse_math_check(payload: Any) -> OperatorAIMathCheck:
+    if not isinstance(payload, dict):
+        return OperatorAIMathCheck(net_edge_pct=None, break_even_tp_pct=None, assumptions={})
+    assumptions = payload.get("assumptions")
+    if not isinstance(assumptions, dict):
+        assumptions = {}
+    return OperatorAIMathCheck(
+        net_edge_pct=_to_float_or_none(payload.get("net_edge_pct")),
+        break_even_tp_pct=_to_float_or_none(payload.get("break_even_tp_pct")),
+        assumptions=assumptions,
     )
 
 
@@ -375,6 +287,7 @@ def _strategy_patch_to_dict(patch: StrategyPatch | None) -> dict[str, Any] | Non
     if patch is None:
         return None
     return {
+        "strategy_id": patch.strategy_id,
         "budget": patch.budget,
         "step_pct": patch.step_pct,
         "range_down_pct": patch.range_down_pct,
