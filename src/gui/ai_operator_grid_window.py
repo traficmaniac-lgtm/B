@@ -74,6 +74,7 @@ class MarketSnapshot:
     best_ask: float | None
     spread_pct: float | None
     ws_age_ms: int | None
+    http_age_ms: int | None
     latency_ms: int | None
     price_source: str | None
     orderbook_depth_50: dict[str, Any] | None
@@ -1122,9 +1123,10 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_snapshot = self._price_feed_manager.get_snapshot(self._symbol)
         ws_health = self._price_feed_manager.get_ws_health(self._symbol)
         ws_ms = (time.perf_counter() - ws_start) * 1000
-        last_price, price_source, price_age_ms = self._price_feed_manager.get_price(self._symbol)
+        last_price, price_source, _ = self._price_feed_manager.get_price(self._symbol)
+        ws_age_ms, _ = self._price_feed_manager.get_source_ages(self._symbol)
         ws_ok = price_source == "WS"
-        ws_age_ms = price_age_ms if ws_ok else None
+        snapshot_source = price_source
         last_update_ts = ws_health.last_update_ts if ws_health else None
         last_ticks = self._price_history[-60:]
         micro_vola_pct, micro_trend = self._compute_micro_metrics(last_ticks)
@@ -1143,11 +1145,11 @@ class AiOperatorGridWindow(LiteGridWindow):
         klines_1h = http_payload.get("klines_1h")
         klines_1d = http_payload.get("klines_1d")
 
-        bid = ws_snapshot.best_bid if ws_snapshot and ws_ok else None
-        ask = ws_snapshot.best_ask if ws_snapshot and ws_ok else None
-        mid = ws_snapshot.mid_price if ws_snapshot and ws_ok else None
-        spread_pct = ws_snapshot.spread_pct if ws_snapshot and ws_ok else None
-        if not ws_ok:
+        bid = ws_snapshot.best_bid if ws_snapshot and snapshot_source == "WS" else None
+        ask = ws_snapshot.best_ask if ws_snapshot and snapshot_source == "WS" else None
+        mid = ws_snapshot.mid_price if ws_snapshot and snapshot_source == "WS" else None
+        spread_pct = ws_snapshot.spread_pct if ws_snapshot and snapshot_source == "WS" else None
+        if snapshot_source != "WS":
             if ws_health and not ws_health.subscribed:
                 ws_reason = "ws not subscribed"
             else:
@@ -1155,10 +1157,10 @@ class AiOperatorGridWindow(LiteGridWindow):
         else:
             ws_reason = ""
         book_bid, book_ask = self._extract_book_ticker(book_ticker)
-        if not ws_ok or bid is None or ask is None:
+        if snapshot_source == "HTTP":
             bid = book_bid if book_bid is not None else bid
             ask = book_ask if book_ask is not None else ask
-        if last_price is None or not ws_ok:
+        if last_price is None and snapshot_source == "HTTP":
             last_price = self._coerce_float(ticker_24h.get("lastPrice")) if isinstance(ticker_24h, dict) else None
         if last_price is None and bid is not None and ask is not None:
             last_price = (bid + ask) / 2
@@ -1239,6 +1241,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         base_free = snapshot.balances.get("base_free", 0.0)
         quote_free = snapshot.balances.get("quote_free", 0.0)
         equity_quote = snapshot.balances.get("equity_quote")
+        ws_ok = snapshot.price_source == "WS"
         return self._prepare_ai_datapack(
             snapshot,
             grid_settings=self.dump_settings(),
@@ -1255,7 +1258,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             volatility=self._compute_volatility_metrics(),
             timestamp_utc=datetime.now(timezone.utc).isoformat(),
             user_intent=dict(self._user_intent),
-            ws_ok=True,
+            ws_ok=ws_ok,
             ws_age_ms=snapshot.ws_age_ms,
             last_update_ts=None,
             http_latency_ms=0,
@@ -1360,6 +1363,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         reuse_depth_trades: bool = False,
     ) -> MarketSnapshot:
         snapshot = self._price_feed_manager.get_snapshot(self._symbol)
+        ws_age_ms, http_age_ms = self._price_feed_manager.get_source_ages(self._symbol)
         last_price = self._last_price or (snapshot.last_price if snapshot else None)
         best_bid = snapshot.best_bid if snapshot else None
         best_ask = snapshot.best_ask if snapshot else None
@@ -1420,7 +1424,8 @@ class AiOperatorGridWindow(LiteGridWindow):
             best_bid=best_bid,
             best_ask=best_ask,
             spread_pct=spread_pct,
-            ws_age_ms=snapshot.price_age_ms if snapshot else None,
+            ws_age_ms=ws_age_ms,
+            http_age_ms=http_age_ms,
             latency_ms=snapshot.ws_latency_ms if snapshot else None,
             price_source=snapshot.source if snapshot else None,
             orderbook_depth_50=orderbook if isinstance(orderbook, dict) else None,
@@ -1498,6 +1503,9 @@ class AiOperatorGridWindow(LiteGridWindow):
             "ts_ms": snapshot.ts_ms,
             "price_last": last_price,
             "price_source": snapshot.price_source,
+            "snapshot_source": snapshot.price_source,
+            "snapshot_ws_age": snapshot.ws_age_ms,
+            "snapshot_http_age": snapshot.http_age_ms,
             "ws_age_ms": ws_age_ms,
             "source": snapshot.source,
             "stale": snapshot.stale,
