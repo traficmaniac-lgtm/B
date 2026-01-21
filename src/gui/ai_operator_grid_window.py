@@ -131,6 +131,11 @@ class PendingAction:
 
 
 class AiOperatorGridWindow(LiteGridWindow):
+    sig_ui_log = Signal(str, str)
+    sig_ai_chat = Signal(str)
+    sig_snapshot_ready = Signal(dict)
+    sig_ai_response_ready = Signal(dict)
+
     def __init__(
         self,
         symbol: str,
@@ -139,6 +144,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         price_feed_manager: PriceFeedManager,
         parent: QWidget | None = None,
     ) -> None:
+        self._ui_log_ready = False
         self._ai_patch_in_progress = False
         self._programmatic_update = False
         self._ai_state_machine = AiOperatorStateMachine()
@@ -195,6 +201,11 @@ class AiOperatorGridWindow(LiteGridWindow):
             "klines_4h": 60.0,
             "klines_1d": 60.0,
         }
+        self.sig_ui_log.connect(self._ui_append_log)
+        self.sig_ai_chat.connect(self._ui_append_chat)
+        self.sig_snapshot_ready.connect(self._ui_snapshot_ready)
+        self.sig_ai_response_ready.connect(self._ui_ai_response_ready)
+        self._ui_log_ready = True
         self._apply_ai_layout_policies()
         self._update_ai_controls()
 
@@ -414,26 +425,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             worker.signals.error.connect(self._handle_ai_lookback_request_error)
             self._thread_pool.start(worker)
             return
-        response_id = self._store_ai_result(parsed, raw_json)
-        self._set_pending_action(parsed, response_id)
-        self._append_ai_response_to_chat(parsed)
-        self._apply_recommended_profile(parsed.strategy_patch.profile)
-        self._render_actions(self._build_actions(parsed))
-        self._transition_ai_state(
-            "analyze",
-            self._ai_state_machine.set_plan_ready,
-            failure_message="state transition blocked",
-        )
-        self._update_apply_plan_state()
-        if self._pending_action:
-            self._append_log(
-                (
-                    "[AI] response received: state="
-                    f"{self._ai_state_machine.state.value} pending_action={self._pending_action.action_type.value}"
-                ),
-                "INFO",
-            )
-        self._append_log("[AI] response status=received", "INFO")
+        self.sig_ai_response_ready.emit({"response": parsed, "raw_json": raw_json})
 
     def _handle_ai_analyze_error(self, message: str) -> None:
         self._set_ai_busy(False)
@@ -657,7 +649,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_ai_datapack = datapack
         data_quality = datapack.get("data_quality", {})
         self._last_data_quality_state = data_quality.get("status") or self._derive_data_quality_state(data_quality)
-        self._update_ai_snapshot_label(datapack)
+        self.sig_snapshot_ready.emit(datapack)
         missing = data_quality.get("missing") or []
         requested_days = datapack.get("meta", {}).get("lookback_days")
         if "klines" in missing:
@@ -679,26 +671,9 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._apply_plan_button.setEnabled(False)
             self._clear_actions()
             return
-        response_id = self._store_ai_result(parsed, raw_json)
-        self._set_pending_action(parsed, response_id)
-        self._append_ai_response_to_chat(parsed)
-        self._apply_recommended_profile(parsed.strategy_patch.profile)
-        self._render_actions(self._build_actions(parsed))
-        self._transition_ai_state(
-            "analyze",
-            self._ai_state_machine.set_plan_ready,
-            failure_message="state transition blocked",
+        self.sig_ai_response_ready.emit(
+            {"response": parsed, "raw_json": raw_json, "context": "request_data"}
         )
-        self._update_apply_plan_state()
-        if self._pending_action:
-            self._append_log(
-                (
-                    "[AI] response received: state="
-                    f"{self._ai_state_machine.state.value} pending_action={self._pending_action.action_type.value}"
-                ),
-                "INFO",
-            )
-        self._append_log("[AI] request_data response received", "INFO")
 
     def _handle_ai_lookback_request_error(self, message: str) -> None:
         self._set_ai_busy(False)
@@ -942,6 +917,62 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._clear_actions()
         self._update_ai_controls()
 
+    def _append_log(self, message: str, kind: str = "INFO") -> None:
+        if not self._ui_log_ready:
+            super()._append_log(message, kind)
+            return
+        self.sig_ui_log.emit(message, kind)
+
+    def _ui_append_log(self, message: str, kind: str = "INFO") -> None:
+        if self._closing:
+            return
+        super()._append_log(message, kind)
+
+    def _ui_append_chat(self, message: str) -> None:
+        if self._closing or not message:
+            return
+        if self._chat_history.toPlainText().strip():
+            self._chat_history.appendPlainText("")
+        for line in message.splitlines():
+            self._chat_history.appendPlainText(line)
+
+    def _ui_snapshot_ready(self, datapack: dict[str, Any]) -> None:
+        if self._closing:
+            return
+        self._update_ai_snapshot_label(datapack)
+
+    def _ui_ai_response_ready(self, payload: dict[str, Any]) -> None:
+        if self._closing:
+            return
+        response = payload.get("response")
+        raw_json = payload.get("raw_json")
+        context = payload.get("context") or "analyze"
+        if not isinstance(response, AiOperatorResponse) or not isinstance(raw_json, str):
+            return
+        response_id = self._store_ai_result(response, raw_json)
+        self._set_pending_action(response, response_id)
+        self._append_ai_response_to_chat(response)
+        self._apply_recommended_profile(response.strategy_patch.profile)
+        self._render_actions(self._build_actions(response))
+        self._transition_ai_state(
+            "analyze",
+            self._ai_state_machine.set_plan_ready,
+            failure_message="state transition blocked",
+        )
+        self._update_apply_plan_state()
+        if self._pending_action:
+            self._append_log(
+                (
+                    "[AI] response received: state="
+                    f"{self._ai_state_machine.state.value} pending_action={self._pending_action.action_type.value}"
+                ),
+                "INFO",
+            )
+        if context == "request_data":
+            self._append_log("[AI] request_data response received", "INFO")
+        else:
+            self._append_log("[AI] response status=received", "INFO")
+
 
     def _append_chat_line(self, author: str, message: str) -> None:
         if not message:
@@ -994,10 +1025,7 @@ class AiOperatorGridWindow(LiteGridWindow):
     def _append_chat_block(self, lines: list[str]) -> None:
         if not lines:
             return
-        if self._chat_history.toPlainText().strip():
-            self._chat_history.appendPlainText("")
-        for line in lines:
-            self._chat_history.appendPlainText(line)
+        self.sig_ai_chat.emit("\n".join(lines))
 
     def _restore_apply_plan_state(self) -> None:
         self._update_apply_plan_state()
@@ -1870,7 +1898,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "open_orders_count": len(self._open_orders),
                 "engine_state": self._engine_state,
                 "trade_enabled": self._trade_gate == TradeGate.TRADE_OK,
-                "dry_run": bool(self._dry_run_toggle.isChecked()),
+                "dry_run": bool(self._dry_run_enabled),
                 "current_grid_params": self.dump_settings(),
             },
             volatility=self._compute_volatility_metrics(),
@@ -1920,7 +1948,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "open_orders_count": len(self._open_orders),
                 "engine_state": self._engine_state,
                 "trade_enabled": self._trade_gate == TradeGate.TRADE_OK,
-                "dry_run": bool(self._dry_run_toggle.isChecked()),
+                "dry_run": bool(self._dry_run_enabled),
                 "current_grid_params": self.dump_settings(),
             },
             volatility=self._compute_volatility_metrics(),
