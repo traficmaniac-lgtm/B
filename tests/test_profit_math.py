@@ -1,29 +1,30 @@
-from src.ai.operator_math import estimate_grid_edge
+from src.ai.operator_math import compute_break_even_tp_pct, compute_fee_total_pct, evaluate_tp_profitability
 
 
 def test_break_even_includes_fees_and_slippage() -> None:
-    result = estimate_grid_edge(
-        step_pct=0.2,
-        tp_pct=0.2,
-        maker_fee_pct=0.05,
-        taker_fee_pct=0.1,
-        slippage_pct=0.02,
-        spread_pct=0.04,
-        profile="CONSERVATIVE",
-    )
-    expected_total = (0.05 * 2) + (0.02 * 2) + (0.04 / 2)
-    assert result["total_cost_pct"] == round(expected_total, 6)
-    assert result["break_even_tp_pct"] == round(expected_total + 0.05, 6)
+    fee_total = compute_fee_total_pct(0.05, 0.1, fill_mode="MAKER")
+    break_even = compute_break_even_tp_pct(fee_total_pct=fee_total, slippage_pct=0.02, safety_edge_pct=0.02)
+    assert break_even == round(0.05 * 2 + 0.02 + 0.02, 6)
 
 
-def test_net_edge_negative_blocks_start() -> None:
-    result = estimate_grid_edge(
-        step_pct=0.05,
+def test_fee_total_maker_maker() -> None:
+    assert compute_fee_total_pct(0.04, 0.06, fill_mode="MAKER") == 0.08
+
+
+def test_fee_total_taker_taker() -> None:
+    assert compute_fee_total_pct(0.04, 0.06, fill_mode="TAKER") == 0.12
+
+
+def test_fee_total_zero_fee_pair() -> None:
+    assert compute_fee_total_pct(0.0, 0.0, fill_mode="UNKNOWN") == 0.0
+
+
+def test_tp_below_break_even_is_not_profitable() -> None:
+    result = evaluate_tp_profitability(
         tp_pct=0.05,
-        maker_fee_pct=0.08,
-        taker_fee_pct=0.1,
-        slippage_pct=0.05,
-        spread_pct=0.05,
-        profile="BALANCED",
+        fee_total_pct=0.08,
+        slippage_pct=0.02,
+        safety_edge_pct=0.02,
+        target_profit_pct=0.05,
     )
-    assert result["net_edge_pct"] < 0
+    assert result["is_profitable"] is False

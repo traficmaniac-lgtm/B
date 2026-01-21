@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class ProfilePreset:
     name: str
     target_net_edge_pct: float
+    target_profit_pct: float
     safety_margin_pct: float
     max_active_orders: int
     levels_min: int
@@ -19,6 +20,7 @@ PROFILE_PRESETS: dict[str, ProfilePreset] = {
     "CONSERVATIVE": ProfilePreset(
         name="CONSERVATIVE",
         target_net_edge_pct=0.08,
+        target_profit_pct=0.08,
         safety_margin_pct=0.05,
         max_active_orders=8,
         levels_min=2,
@@ -29,6 +31,7 @@ PROFILE_PRESETS: dict[str, ProfilePreset] = {
     "BALANCED": ProfilePreset(
         name="BALANCED",
         target_net_edge_pct=0.05,
+        target_profit_pct=0.05,
         safety_margin_pct=0.03,
         max_active_orders=12,
         levels_min=3,
@@ -39,6 +42,7 @@ PROFILE_PRESETS: dict[str, ProfilePreset] = {
     "AGGRESSIVE": ProfilePreset(
         name="AGGRESSIVE",
         target_net_edge_pct=0.03,
+        target_profit_pct=0.03,
         safety_margin_pct=0.01,
         max_active_orders=16,
         levels_min=4,

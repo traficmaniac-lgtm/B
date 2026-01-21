@@ -120,3 +120,12 @@ Verify in GUI:
 1. Open AI Operator Grid → press “AI Analyze”; confirm snapshot shows data quality line with WS/HTTP ages.
 2. Trigger a response with REQUEST_DATA; choose action REQUEST_DATA and approve; confirm AI request loop logs.
 3. Press Pause/Stop; confirm log shows “Canceled n orders” and bot orders are cleared.
+
+### v10.0.3 AI Operator Grid fee-aware AI + always-tradable patch + data quality + lookback loop
+- Updated AI Operator Grid protocol to require analysis_result + strategy_patch + diagnostics with always-tradable patches.
+- Added fee-aware math (maker/taker, slippage, safety edge) used for validation and live TP/restore safety checks.
+- Introduced lookback selector (1/7/30/365) and trades_window aggregation; datapack now reports missing data, pack_source, and timings.
+- Implemented optional request-more-data loop (single pass) and clear missing-data reporting when lookback fetch fails.
+
+Tests:
+- `pytest -q tests/test_profit_math.py tests/test_patch_validation.py tests/test_request_data_loop.py`

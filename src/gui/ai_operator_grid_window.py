@@ -32,7 +32,7 @@ from src.ai.operator_datapack import build_ai_datapack
 from src.ai.operator_models import AiOperatorResponse, AiOperatorStrategyPatch, parse_ai_operator_response
 from src.ai.operator_profiles import get_profile_preset
 from src.ai.operator_runtime import cancel_all_bot_orders, pause_state, stop_state
-from src.ai.operator_validation import validate_strategy_patch
+from src.ai.operator_validation import normalize_strategy_patch, validate_strategy_patch
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
 from src.core.timeutil import utc_ms
@@ -153,6 +153,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts: float = 0.0
         self._ai_busy = False
         self._runtime_stopping = False
+        self._lookback_request_used = False
         self._last_full_pack: dict[str, Any] | None = None
         self._last_strategy_patch: AiOperatorStrategyPatch | None = None
         self._last_actions_suggested: list[str] = []
@@ -256,6 +257,15 @@ class AiOperatorGridWindow(LiteGridWindow):
         profile_row.addWidget(self._profile_combo, stretch=1)
         layout.addLayout(profile_row)
 
+        lookback_row = QHBoxLayout()
+        lookback_row.addWidget(QLabel("Lookback"))
+        self._lookback_combo = QComboBox()
+        for days in (1, 7, 30, 365):
+            self._lookback_combo.addItem(f"{days}d", days)
+        self._lookback_combo.setCurrentIndex(0)
+        lookback_row.addWidget(self._lookback_combo, stretch=1)
+        layout.addLayout(lookback_row)
+
 
         self._ai_snapshot_label = QLabel("snapshot: —")
         self._ai_snapshot_label.setStyleSheet("color: #374151; font-size: 12px;")
@@ -316,6 +326,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_chat_line("AI", "Не задан ключ OpenAI.")
             return
         self._await_ws_warmup()
+        self._lookback_request_used = False
         datapack = self._build_full_market_pack()
         self._append_chat_line("YOU", "AI Analyze")
         self._append_log("[AI] request type=analyze status=prepared", "INFO")
@@ -351,11 +362,32 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._handle_ai_analyze_error("AI response invalid or empty.")
             return
         parsed = self._enforce_action_patch_requirements(parsed)
+        if (
+            parsed.diagnostics.requested_more_data
+            and not self._lookback_request_used
+            and parsed.diagnostics.request
+        ):
+            requested_days = parsed.diagnostics.request.lookback_days
+            self._lookback_request_used = True
+            self._append_log(
+                f"[AI] request-more-data triggered lookback_days={requested_days}",
+                "INFO",
+            )
+            self._append_chat_line(
+                "AI",
+                f"Запрошены дополнительные данные за {requested_days} дней. Повторный анализ...",
+            )
+            self._set_ai_busy(True)
+            worker = _AiWorker(lambda: self._run_ai_lookback_request(requested_days))
+            worker.signals.success.connect(self._handle_ai_lookback_request_success)
+            worker.signals.error.connect(self._handle_ai_lookback_request_error)
+            self._thread_pool.start(worker)
+            return
         response_id = self._store_ai_result(parsed, raw_json)
         self._set_pending_action(parsed, response_id)
         self._append_ai_response_to_chat(parsed)
-        self._apply_recommended_profile(parsed.profile)
-        self._render_actions(parsed.actions_allowed)
+        self._apply_recommended_profile(parsed.strategy_patch.profile)
+        self._render_actions(self._build_actions(parsed))
         self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
         self._append_log("[AI] response status=received", "INFO")
 
@@ -477,8 +509,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         response_id = self._store_ai_result(parsed, raw_json)
         self._set_pending_action(parsed, response_id)
         self._append_ai_response_to_chat(parsed)
-        self._apply_recommended_profile(parsed.profile)
-        self._render_actions(parsed.actions_allowed)
+        self._apply_recommended_profile(parsed.strategy_patch.profile)
+        self._render_actions(self._build_actions(parsed))
         self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
         self._append_log("[AI] chat response received", "INFO")
 
@@ -488,128 +520,67 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_chat_line("AI", f"Ошибка AI: {message}")
 
     def _handle_request_data_action(self) -> None:
-        if not self._last_ai_response or not self._last_full_pack:
-            self._append_log("[AI] request_data skipped: no last response or datapack", "WARN")
+        if not self._last_ai_response:
+            self._append_log("[AI] request_data skipped: no last response", "WARN")
             return
-        request_data = self._last_ai_response.request_data
-        if not request_data.need_more:
-            self._append_log("[AI] request_data skipped: no items requested", "INFO")
+        request = self._last_ai_response.diagnostics.request
+        if not self._last_ai_response.diagnostics.requested_more_data or not request:
+            self._append_log("[AI] request_data skipped: no lookback request", "INFO")
             return
-        datapack = dict(self._last_full_pack)
+        if self._lookback_request_used:
+            self._append_log("[AI] request_data skipped: lookback loop already used", "WARN")
+            return
+        self._lookback_request_used = True
         self._set_ai_busy(True)
-        worker = _AiWorker(lambda: self._run_ai_request_loop(datapack, request_data))
-        worker.signals.success.connect(self._handle_ai_request_loop_success)
-        worker.signals.error.connect(self._handle_ai_request_loop_error)
+        worker = _AiWorker(lambda: self._run_ai_lookback_request(request.lookback_days))
+        worker.signals.success.connect(self._handle_ai_lookback_request_success)
+        worker.signals.error.connect(self._handle_ai_lookback_request_error)
         self._thread_pool.start(worker)
         self._append_log("[AI] request_data action started", "INFO")
 
-    def _run_ai_request_loop(
-        self,
-        datapack: dict[str, Any],
-        request_data: Any,
-    ) -> tuple[AiOperatorResponse, str, bool]:
-        attempts = 0
-        last_raw = ""
-        current_pack = dict(datapack)
-        while attempts < 3:
-            items_payload = [
-                {
-                    "id": item.id,
-                    "window": item.window,
-                    "limit": item.limit,
-                    "reason": item.reason,
-                    "levels": item.levels,
-                }
-                for item in request_data.items
-            ]
-            extra_data = self._fetch_request_data_items(items_payload)
-            current_pack = dict(current_pack)
-            current_pack["extra_data"] = extra_data
-            client = OpenAIClient(
-                api_key=self._app_state.openai_api_key,
-                model=self._app_state.openai_model,
-                timeout_s=25.0,
-                retries=2,
-            )
-            last_raw = asyncio.run(client.analyze_operator(current_pack, follow_up_note="extra_data attached"))
-            parsed = parse_ai_operator_response(last_raw)
-            if not parsed.request_data.need_more:
-                return parsed, last_raw, False
-            request_data = parsed.request_data
-            attempts += 1
-        fallback = parse_ai_operator_response(
-            json.dumps(
-                {
-                    "state": "WARNING",
-                    "recommendation": "WAIT",
-                    "next_action": "WAIT",
-                    "reason": "insufficient data",
-                    "profile": "BALANCED",
-                    "actions_allowed": ["WAIT"],
-                    "patch": {},
-                    "request_data": {"need_more": False, "items": []},
-                    "math_check": {"net_edge_pct": None, "break_even_tp_pct": None, "assumptions": {}},
-                }
-            )
+    def _run_ai_lookback_request(self, lookback_days: int) -> tuple[AiOperatorResponse, str, dict[str, Any]]:
+        datapack = self._build_full_market_pack(lookback_days=lookback_days)
+        client = OpenAIClient(
+            api_key=self._app_state.openai_api_key,
+            model=self._app_state.openai_model,
+            timeout_s=25.0,
+            retries=2,
         )
-        return fallback, last_raw, True
+        raw = asyncio.run(client.analyze_operator(datapack, follow_up_note="requested lookback attached"))
+        parsed = parse_ai_operator_response(raw)
+        return parsed, raw, datapack
 
-    def _handle_ai_request_loop_success(self, response: object) -> None:
+    def _handle_ai_lookback_request_success(self, response: object) -> None:
         self._set_ai_busy(False)
         if not isinstance(response, tuple) or len(response) != 3:
-            self._handle_ai_request_loop_error("AI request loop invalid response")
+            self._handle_ai_lookback_request_error("AI request loop invalid response")
             return
-        parsed, raw_json, exhausted = response
-        if exhausted:
-            self._append_log("[AI] request_data loop exhausted", "WARN")
+        parsed, raw_json, datapack = response
+        data_quality = datapack.get("data_quality", {})
+        missing = data_quality.get("missing") or []
+        requested_days = datapack.get("meta", {}).get("lookback_days")
+        if "klines" in missing:
+            notes = data_quality.get("notes")
+            self._append_chat_line(
+                "AI",
+                (
+                    f"Запрошены данные за {requested_days} дней, не удалось получить klines. "
+                    f"{notes or ''}".strip()
+                ),
+            )
         parsed = self._enforce_action_patch_requirements(parsed)
         response_id = self._store_ai_result(parsed, raw_json)
         self._set_pending_action(parsed, response_id)
         self._append_ai_response_to_chat(parsed)
-        self._apply_recommended_profile(parsed.profile)
-        self._render_actions(parsed.actions_allowed)
+        self._apply_recommended_profile(parsed.strategy_patch.profile)
+        self._render_actions(self._build_actions(parsed))
         self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
         self._append_log("[AI] request_data response received", "INFO")
 
-    def _handle_ai_request_loop_error(self, message: str) -> None:
+    def _handle_ai_lookback_request_error(self, message: str) -> None:
         self._set_ai_busy(False)
         self._append_log(f"[AI] request_data failed: {message}", "WARN")
-
-    def _fetch_request_data_items(self, items: list[dict[str, Any]]) -> dict[str, Any]:
-        results: dict[str, Any] = {"requested_at_ms": utc_ms(), "items": []}
-        for item in items:
-            item_id = str(item.get("id", "")).strip()
-            window = str(item.get("window", "")).strip() if item.get("window") else None
-            limit = item.get("limit")
-            levels = item.get("levels")
-            payload = {"id": item_id, "window": window, "limit": limit, "levels": levels, "data": None}
-            if item_id == "klines_raw" and window:
-                interval = window
-                fetch_limit = int(limit) if isinstance(limit, int) else 500
-                data, _, _ = self._fetch_http_block(
-                    f"ai_request_klines_{interval}_{fetch_limit}",
-                    lambda: self._http_client.get_klines(self._symbol, interval=interval, limit=fetch_limit),
-                    1.0,
-                )
-                payload["data"] = data
-            elif item_id == "orderbook_depth":
-                depth_limit = int(levels) if isinstance(levels, int) else 200
-                data, _, _ = self._fetch_http_block(
-                    f"ai_request_depth_{depth_limit}",
-                    lambda: self._http_client.get_orderbook_depth(self._symbol, limit=depth_limit),
-                    1.0,
-                )
-                payload["data"] = data
-            elif item_id == "trades_raw":
-                trades_limit = int(limit) if isinstance(limit, int) else 1000
-                data, _, _ = self._fetch_http_block(
-                    f"ai_request_trades_{trades_limit}",
-                    lambda: self._http_client.get_recent_trades(self._symbol, limit=trades_limit),
-                    1.0,
-                )
-                payload["data"] = data
-            results["items"].append(payload)
-        return results
+        self._append_chat_line("AI", f"Запрос доп. данных не выполнен: {message}")
     def _approve_ai_action(self) -> None:
         pending_action = self._pending_action
         selected_action = self._actions_combo.currentText().strip().upper()
@@ -643,6 +614,16 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._actions_combo.setCurrentIndex(0)
         self._update_approve_button_state()
 
+    def _build_actions(self, response: AiOperatorResponse) -> list[str]:
+        actions = ["APPLY_PATCH"]
+        if (
+            response.diagnostics.requested_more_data
+            and response.diagnostics.request
+            and not self._lookback_request_used
+        ):
+            actions.insert(0, "REQUEST_DATA")
+        return actions
+
     def _update_approve_button_state(self) -> None:
         self._approve_button.setEnabled(self._actions_combo.count() > 0)
 
@@ -666,6 +647,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         patch = self._get_selected_profile_patch()
         self._apply_plan_button.setEnabled(self._can_apply_ai_patch(patch) and not self._ai_busy)
 
+    def _get_selected_lookback_days(self) -> int:
+        if hasattr(self, "_lookback_combo"):
+            days = self._lookback_combo.currentData()
+            if isinstance(days, int):
+                return days
+        return 1
+
     def _set_ai_busy(self, busy: bool) -> None:
         self._ai_busy = busy
         self._analyze_button.setEnabled(not busy)
@@ -682,37 +670,44 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _append_ai_response_to_chat(self, response: AiOperatorResponse) -> None:
         lines = ["AI:"]
-        lines.append(f"State: {response.state}")
-        lines.append(f"Recommendation: {response.recommendation}")
-        lines.append(f"Next Action: {response.next_action}")
-        lines.append(f"Reason: {response.reason or '—'}")
-        lines.append(f"Profile: {response.profile}")
-        actions_text = ", ".join(response.actions_allowed) if response.actions_allowed else "—"
-        lines.append(f"Actions: {actions_text}")
+        analysis = response.analysis_result
+        lines.append(f"State: {analysis.state}")
+        lines.append(f"Summary: {analysis.summary or '—'}")
+        lines.append(f"Trend: {analysis.trend} | Volatility: {analysis.volatility}")
+        lines.append(f"Confidence: {analysis.confidence:.2f}")
+        risks = ", ".join(analysis.risks) if analysis.risks else "—"
+        lines.append(f"Risks: {risks}")
+        dq = analysis.data_quality
+        lines.append(
+            "Data quality: "
+            f"ws={dq.ws} http={dq.http} klines={dq.klines} trades={dq.trades} "
+            f"orderbook={dq.orderbook}"
+        )
+        if dq.notes:
+            lines.append(f"DQ notes: {dq.notes}")
         patch = response.strategy_patch
-        if patch and self._strategy_patch_has_values(patch):
-            strategy_id = patch.strategy_id or "—"
-            step = f"{patch.step_pct}" if patch.step_pct is not None else "—"
-            levels = f"{patch.levels}" if patch.levels is not None else "—"
-            if patch.range_down_pct is not None or patch.range_up_pct is not None:
-                range_down = patch.range_down_pct if patch.range_down_pct is not None else "—"
-                range_up = patch.range_up_pct if patch.range_up_pct is not None else "—"
-                range_text = f"{range_down}..{range_up}"
-            else:
-                range_text = "—"
-            tp = f"{patch.tp_pct}" if patch.tp_pct is not None else "—"
-            bias = patch.bias or "—"
-            max_orders = patch.max_active_orders if patch.max_active_orders is not None else "—"
+        if self._strategy_patch_has_values(patch):
+            step = f"{patch.step_pct:.6f}"
+            levels = f"{patch.levels}"
+            range_text = f"{patch.range_down_pct:.4f}..{patch.range_up_pct:.4f}"
+            tp = f"{patch.tp_pct:.4f}"
             lines.append(
-                f"Patch: strategy={strategy_id} step={step} range={range_text} levels={levels} "
-                f"tp={tp} bias={bias} max_orders={max_orders}"
+                f"Patch: profile={patch.profile} bias={patch.bias} mode={patch.range_mode} "
+                f"step={step} range={range_text} levels={levels} "
+                f"tp={tp} max_orders={patch.max_active_orders}"
             )
+            if patch.notes:
+                lines.append(f"Patch notes: {patch.notes}")
         else:
             lines.append("Patch: —")
-        if response.request_data.need_more:
-            lines.append("Request Data: need_more=true")
-        if response.math_check.net_edge_pct is not None:
-            lines.append(f"Math: net_edge={response.math_check.net_edge_pct:.4f}%")
+        if response.diagnostics.requested_more_data:
+            request = response.diagnostics.request
+            if request:
+                lines.append(
+                    f"Request more data: lookback_days={request.lookback_days} why={request.why or '—'}"
+                )
+            else:
+                lines.append("Request more data: true")
         self._append_chat_block(lines)
 
     def _append_chat_block(self, lines: list[str]) -> None:
@@ -745,14 +740,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_ai_result_id = response_id
         self._last_applied_ai_result_id = None
         self._last_strategy_patch = response.strategy_patch
-        self._last_actions_suggested = list(response.actions_allowed)
+        self._last_actions_suggested = list(self._build_actions(response))
         return response_id
 
     def _strategy_patch_has_values(self, patch: AiOperatorStrategyPatch | None) -> bool:
         if patch is None:
             return False
         values = [
-            patch.strategy_id,
             patch.bias,
             patch.step_pct,
             patch.range_down_pct,
@@ -766,7 +760,7 @@ class AiOperatorGridWindow(LiteGridWindow):
     def _validate_ai_patch(
         self, patch: AiOperatorStrategyPatch
     ) -> tuple[bool, list[str], dict[str, Any] | None]:
-        profile = self._profile_combo.currentData()
+        profile = patch.profile if isinstance(patch.profile, str) else self._profile_combo.currentData()
         if not isinstance(profile, str):
             profile = "BALANCED"
         pack = self._last_ai_datapack or {}
@@ -783,43 +777,53 @@ class AiOperatorGridWindow(LiteGridWindow):
             taker_fee_pct=self._coerce_float(fees.get("takerFeePct")),
             slippage_pct=self._coerce_float(profit_inputs.get("assumed_slippage_pct")),
             spread_pct=self._coerce_float(price_snapshot.get("spread_pct")),
+            expected_fill_mode=profit_inputs.get("expected_fill_mode"),
+            fee_discount_pct=self._coerce_float(profit_inputs.get("fee_discount_pct")),
+            safety_edge_pct=self._coerce_float(profit_inputs.get("safety_edge_pct")),
         )
         if not is_valid:
             reasons.append(f"profile={preset.name}")
         return is_valid, reasons, profit_estimate
 
     def _enforce_action_patch_requirements(self, response: AiOperatorResponse) -> AiOperatorResponse:
-        actions = [action.upper() for action in response.actions_allowed if action]
         patch = response.strategy_patch
-        has_patch = self._strategy_patch_has_values(patch)
-        if response.request_data.need_more:
-            response.next_action = "REQUEST_DATA"
-            actions = ["REQUEST_DATA", "WAIT"]
-            response.actions_allowed = actions
-            return response
-        if has_patch:
-            is_valid, reasons, profit_estimate = self._validate_ai_patch(patch)
-            if not is_valid:
-                self._append_log(
-                    f"[AI] AI_PATCH_REJECTED reasons={','.join(reasons)}",
-                    "WARN",
-                )
-                response.next_action = "WAIT"
-                response.actions_allowed = ["WAIT"]
-                return response
-            if profit_estimate:
-                response.math_check.net_edge_pct = profit_estimate.get("net_edge_pct")
-                response.math_check.break_even_tp_pct = profit_estimate.get("break_even_tp_pct")
-        else:
+        if not self._strategy_patch_has_values(patch):
             if self._user_intent:
                 self._append_log(
                     f"[AI] user_intent requires patch -> invalid intent={list(self._user_intent.keys())}",
                     "WARN",
                 )
-                actions = ["WAIT"]
-        if response.next_action not in actions:
-            response.next_action = "WAIT"
-        response.actions_allowed = actions
+            return response
+        if self._last_ai_datapack:
+            pack = self._last_ai_datapack
+            rules = pack.get("exchange_rules") or {}
+            price_snapshot = pack.get("price_snapshot") or {}
+            fees = pack.get("fees") or {}
+            profit_inputs = pack.get("profit_model_inputs") or {}
+            normalized, adjustments, _ = normalize_strategy_patch(
+                patch,
+                profile=patch.profile,
+                price=self._coerce_float(price_snapshot.get("mid") or price_snapshot.get("best_bid")),
+                rules=rules,
+                maker_fee_pct=self._coerce_float(fees.get("makerFeePct")),
+                taker_fee_pct=self._coerce_float(fees.get("takerFeePct")),
+                slippage_pct=self._coerce_float(profit_inputs.get("assumed_slippage_pct")),
+                expected_fill_mode=profit_inputs.get("expected_fill_mode"),
+                fee_discount_pct=self._coerce_float(profit_inputs.get("fee_discount_pct")),
+                safety_edge_pct=self._coerce_float(profit_inputs.get("safety_edge_pct")),
+            )
+            response.strategy_patch = normalized
+            if adjustments:
+                self._append_log(
+                    f"[AI] patch normalized adjustments={','.join(adjustments)}",
+                    "INFO",
+                )
+        is_valid, reasons, _ = self._validate_ai_patch(response.strategy_patch)
+        if not is_valid:
+            self._append_log(
+                f"[AI] AI_PATCH_REJECTED reasons={','.join(reasons)}",
+                "WARN",
+            )
         return response
 
     def _set_pending_action(self, response: AiOperatorResponse, source_msg_id: str | None) -> None:
@@ -840,14 +844,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         )
 
     def _select_pending_action(self, response: AiOperatorResponse) -> tuple[PendingActionType, str]:
-        raw_action = response.next_action or next(
-            (item for item in response.actions_allowed if item and item != "WAIT"),
-            "WAIT",
-        )
-        if self._strategy_patch_has_values(response.strategy_patch) and raw_action in {"START", "ADJUST_PARAMS"}:
-            raw_action = "APPLY_PATCH"
-        reason = response.reason or ""
-        action = self._map_action_type(raw_action)
+        action = PendingActionType.APPLY_PATCH if self._strategy_patch_has_values(response.strategy_patch) else PendingActionType.APPLY_PATCH
+        reason = response.analysis_result.summary or ""
         return action, reason
 
     def _map_action_type(self, action: str) -> PendingActionType:
@@ -869,8 +867,12 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not patch:
             return []
         fields: list[str] = []
+        if patch.profile is not None:
+            fields.append("profile")
         if patch.bias is not None:
             fields.append("bias")
+        if patch.range_mode is not None:
+            fields.append("range_mode")
         if patch.step_pct is not None:
             fields.append("step_pct")
         if patch.range_down_pct is not None:
@@ -881,69 +883,42 @@ class AiOperatorGridWindow(LiteGridWindow):
             fields.append("levels")
         if patch.tp_pct is not None:
             fields.append("tp_pct")
-        if patch.budget is not None:
-            fields.append("budget")
         if patch.max_active_orders is not None:
             fields.append("max_active_orders")
+        if patch.notes:
+            fields.append("notes")
         return fields
 
     def _sanitize_patch(self, symbol: str, patch: AiOperatorStrategyPatch) -> tuple[AiOperatorStrategyPatch, list[str]]:
-        adjustments: list[str] = []
         snapshot = self._price_feed_manager.get_snapshot(symbol)
         last_price = snapshot.last_price if snapshot else None
         if last_price is None and snapshot:
             last_price = snapshot.mid_price
-        tick_size = snapshot.tick_size if snapshot else None
-        levels = patch.levels
-        if levels is None and hasattr(self, "_grid_count_input"):
-            levels = int(self._grid_count_input.value())
-        if patch.step_pct is not None:
-            original = patch.step_pct
-            clamped = patch.step_pct
-            reasons: list[str] = []
-            if clamped <= 0:
-                reasons.append("non_positive")
-            if (
-                last_price is not None
-                and tick_size is not None
-                and last_price > 0
-                and tick_size > 0
-            ):
-                min_step_abs = tick_size * 2
-                min_step_pct = (min_step_abs / last_price) * 100
-                if clamped < min_step_pct:
-                    clamped = min_step_pct
-                    reasons.append("min_tick")
-            if clamped <= 0:
-                clamped = 0.01
-                reasons.append("fallback")
-            if clamped != original:
-                patch.step_pct = clamped
-                reason_text = "+".join(reasons) if reasons else "clamped"
-                self._append_log(
-                    f"[PATCH] step_pct clamped from {original:.6f} to {clamped:.6f} (reason={reason_text})",
-                    "INFO",
-                )
-                adjustments.append(f"step_pct {original:.6f}→{clamped:.6f}")
-        if patch.step_pct is not None and levels is not None and levels > 0:
-            min_range = patch.step_pct * (levels / 2)
-            if patch.range_down_pct is not None and patch.range_down_pct < min_range:
-                original = patch.range_down_pct
-                patch.range_down_pct = min_range
-                self._append_log(
-                    f"[PATCH] range_down_pct clamped from {original:.6f} to {min_range:.6f} (reason=min_range)",
-                    "INFO",
-                )
-                adjustments.append(f"range_down_pct {original:.6f}→{min_range:.6f}")
-            if patch.range_up_pct is not None and patch.range_up_pct < min_range:
-                original = patch.range_up_pct
-                patch.range_up_pct = min_range
-                self._append_log(
-                    f"[PATCH] range_up_pct clamped from {original:.6f} to {min_range:.6f} (reason=min_range)",
-                    "INFO",
-                )
-                adjustments.append(f"range_up_pct {original:.6f}→{min_range:.6f}")
-        return patch, adjustments
+        rules = {
+            "tickSize": snapshot.tick_size if snapshot else self._exchange_rules.get("tick"),
+            "stepSize": snapshot.step_size if snapshot else self._exchange_rules.get("step"),
+        }
+        pack = self._last_ai_datapack or {}
+        fees = pack.get("fees") or {}
+        profit_inputs = pack.get("profit_model_inputs") or {}
+        normalized, adjustments, _ = normalize_strategy_patch(
+            patch,
+            profile=patch.profile,
+            price=last_price,
+            rules=rules,
+            maker_fee_pct=self._coerce_float(fees.get("makerFeePct")),
+            taker_fee_pct=self._coerce_float(fees.get("takerFeePct")),
+            slippage_pct=self._coerce_float(profit_inputs.get("assumed_slippage_pct")),
+            expected_fill_mode=profit_inputs.get("expected_fill_mode"),
+            fee_discount_pct=self._coerce_float(profit_inputs.get("fee_discount_pct")),
+            safety_edge_pct=self._coerce_float(profit_inputs.get("safety_edge_pct")),
+        )
+        if adjustments:
+            self._append_log(
+                f"[PATCH] normalized adjustments={','.join(adjustments)}",
+                "INFO",
+            )
+        return normalized, adjustments
 
     def _apply_ai_patch(self, patch: AiOperatorStrategyPatch, source_label: str) -> bool:
         if not self._strategy_patch_has_values(patch):
@@ -1062,13 +1037,6 @@ class AiOperatorGridWindow(LiteGridWindow):
             else:
                 self._grid_count_input.setValue(patch.levels)
                 applied_fields.append("levels")
-        if patch.budget is not None:
-            if not hasattr(self, "_budget_input"):
-                self._append_log("[AI] patch field skipped: budget", "INFO")
-                missing_fields.append("budget")
-            else:
-                self._budget_input.setValue(patch.budget)
-                applied_fields.append("budget")
         if patch.step_pct is not None:
             if not hasattr(self, "_grid_step_mode_combo") or not hasattr(self, "_grid_step_input"):
                 self._append_log("[AI] patch field skipped: step_pct", "INFO")
@@ -1077,12 +1045,13 @@ class AiOperatorGridWindow(LiteGridWindow):
                 self._grid_step_mode_combo.setCurrentIndex(self._grid_step_mode_combo.findData("MANUAL"))
                 self._grid_step_input.setValue(patch.step_pct)
                 applied_fields.append("step_pct")
-        if patch.range_down_pct is not None or patch.range_up_pct is not None:
+        if patch.range_mode:
             if not hasattr(self, "_range_mode_combo"):
                 self._append_log("[AI] patch field skipped: range_mode", "INFO")
                 missing_fields.append("range_mode")
             else:
-                self._range_mode_combo.setCurrentIndex(self._range_mode_combo.findData("Manual"))
+                range_mode = "Auto" if patch.range_mode == "AUTO_ATR" else "Manual"
+                self._range_mode_combo.setCurrentIndex(self._range_mode_combo.findData(range_mode))
                 applied_fields.append("range_mode")
         if patch.range_down_pct is not None:
             if not hasattr(self, "_range_low_input"):
@@ -1131,13 +1100,12 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._update_setting("direction", direction_value)
         if patch.levels is not None:
             self._update_setting("grid_count", patch.levels)
-        if patch.budget is not None:
-            self._update_setting("budget", patch.budget)
         if patch.step_pct is not None:
             self._update_setting("grid_step_mode", "MANUAL")
             self._update_setting("grid_step_pct", patch.step_pct)
-        if patch.range_down_pct is not None or patch.range_up_pct is not None:
-            self._update_setting("range_mode", "Manual")
+        if patch.range_mode:
+            range_mode = "Auto" if patch.range_mode == "AUTO_ATR" else "Manual"
+            self._update_setting("range_mode", range_mode)
         if patch.range_down_pct is not None:
             self._update_setting("range_low_pct", patch.range_down_pct)
         if patch.range_up_pct is not None:
@@ -1146,6 +1114,22 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._update_setting("take_profit_pct", patch.tp_pct)
         if patch.max_active_orders is not None:
             self._update_setting("max_active_orders", patch.max_active_orders)
+
+    def _profit_profile_name(self) -> str:
+        profile = self._profile_combo.currentData()
+        if isinstance(profile, str):
+            return profile
+        return "BALANCED"
+
+    def _runtime_profit_inputs(self) -> dict[str, Any]:
+        pack = self._last_ai_datapack or {}
+        inputs = pack.get("profit_model_inputs") or {}
+        return {
+            "expected_fill_mode": inputs.get("expected_fill_mode") or "MAKER",
+            "slippage_pct": inputs.get("assumed_slippage_pct") or 0.02,
+            "safety_edge_pct": inputs.get("safety_edge_pct") or 0.02,
+            "fee_discount_pct": inputs.get("fee_discount_pct"),
+        }
 
     def _handle_start(self) -> None:
         self._runtime_stopping = False
@@ -1333,12 +1317,13 @@ class AiOperatorGridWindow(LiteGridWindow):
             fees.get("takerFeePct"),
         )
         spread_text = f"{spread_pct:.4f}%" if isinstance(spread_pct, (int, float)) else "—"
+        missing = data_quality.get("missing") or []
         self._append_log(
             (
                 "[AI] fullpack built "
                 f"ws_ok={data_quality.get('ws_ok')} ws_age={data_quality.get('ws_age_ms')} "
                 f"depth50(b/a)={orderbook.get('topN_notional_bid')}/{orderbook.get('topN_notional_ask')} "
-                f"trades_1m=n{trades_count}"
+                f"trades_1m=n{trades_count} missing={','.join(missing) if missing else '—'}"
             ),
             "INFO",
         )
@@ -1359,8 +1344,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._log_ai_fullpack_snapshot(datapack)
         self._append_log("[AI] snapshot refreshed", "INFO")
 
-    def _build_full_market_pack(self) -> dict[str, Any]:
+    def _build_full_market_pack(self, lookback_days: int | None = None) -> dict[str, Any]:
         total_start = time.perf_counter()
+        selected_lookback = lookback_days or self._get_selected_lookback_days()
         ws_start = time.perf_counter()
         ws_snapshot = self._price_feed_manager.get_snapshot(self._symbol)
         ws_health = self._price_feed_manager.get_ws_health(self._symbol)
@@ -1373,7 +1359,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         last_ticks = self._price_history[-60:]
         micro_vola_pct, micro_trend = self._compute_micro_metrics(last_ticks)
 
-        http_payload, http_timings, http_errors = self._fetch_http_market_data()
+        http_payload, http_timings, http_errors, kline_limits = self._fetch_http_market_data(selected_lookback)
         http_latency_ms = int(sum(http_timings.values()))
         http_ok = not any(http_errors.values())
 
@@ -1438,6 +1424,16 @@ class AiOperatorGridWindow(LiteGridWindow):
             klines_1h=klines_1h,
             klines_1d=klines_1d,
         )
+        klines_by_window = {
+            "1m": klines_1m,
+            "5m": klines_5m,
+            "15m": klines_15m,
+            "1h": klines_1h,
+            "4h": klines_4h,
+            "1d": klines_1d,
+        }
+        missing = self._collect_missing_sections(depth50, trades, klines_by_window)
+        trades_window = self._compute_trades_window_summary(klines_by_window, selected_lookback)
 
         snapshot = self._refresh_ai_snapshot(reason="refresh")
         self._update_ai_snapshot_label_from_snapshot(snapshot)
@@ -1469,17 +1465,14 @@ class AiOperatorGridWindow(LiteGridWindow):
             ws_reason=ws_reason,
             http_timings=http_timings,
             http_errors=http_errors,
+            lookback_days=selected_lookback,
+            kline_limits=kline_limits,
+            missing=missing,
             stats24h=stats24h,
             liquidity=liquidity,
             kline_aggs=kline_aggs,
-            klines_by_window={
-                "1m": klines_1m,
-                "5m": klines_5m,
-                "15m": klines_15m,
-                "1h": klines_1h,
-                "4h": klines_4h,
-                "1d": klines_1d,
-            },
+            trades_window=trades_window,
+            klines_by_window=klines_by_window,
             last_ticks=last_ticks,
             micro_vola_pct=micro_vola_pct,
             micro_trend=micro_trend,
@@ -1521,9 +1514,13 @@ class AiOperatorGridWindow(LiteGridWindow):
             ws_reason="",
             http_timings={},
             http_errors={},
+            lookback_days=self._get_selected_lookback_days(),
+            kline_limits={},
+            missing=[],
             stats24h={},
             liquidity=self._compute_liquidity(snapshot.orderbook_depth_50),
             kline_aggs={},
+            trades_window={},
             klines_by_window={},
             last_ticks=self._price_history[-60:],
             micro_vola_pct=None,
@@ -1727,9 +1724,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_reason: str,
         http_timings: dict[str, float],
         http_errors: dict[str, str],
+        lookback_days: int,
+        kline_limits: dict[str, int],
+        missing: list[str],
         stats24h: dict[str, Any],
         liquidity: dict[str, Any],
         kline_aggs: dict[str, Any],
+        trades_window: dict[str, Any],
         klines_by_window: dict[str, Any],
         last_ticks: list[float],
         micro_vola_pct: float | None,
@@ -1769,6 +1770,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         depth_ask = liquidity.get("depth_usd_ask") or 0.0
         top_notional = max(min(depth_bid, depth_ask), 0.0)
         slippage_pct = self._estimate_slippage_pct(top_notional, 10)
+        if slippage_pct is None:
+            slippage_pct = 0.02
+        safety_edge_pct = 0.0 if snapshot.is_zero_fee else 0.02
 
         profile = self._profile_combo.currentData()
         if not isinstance(profile, str):
@@ -1805,9 +1809,21 @@ class AiOperatorGridWindow(LiteGridWindow):
             "klines_latency_ms": http_timings.get("klines"),
             "balances_age_s": balance_age_s,
             "warnings": warnings,
+            "pack_source": {
+                "ws_ok": ws_ok,
+                "http_ok": http_ok,
+                "ws_age_ms": ws_age_ms,
+                "http_age_ms": snapshot.http_age_ms,
+                "stale_flags": warnings,
+            },
+            "missing": missing,
+            "timings_ms": http_timings,
+            "notes": self._build_data_quality_notes(ws_ok, http_ok, missing, http_errors),
         }
         profit_inputs = {
             "assumed_slippage_pct": slippage_pct,
+            "safety_edge_pct": safety_edge_pct,
+            "fee_discount_pct": None,
             "step_pct": grid_settings.get("grid_step_pct"),
             "tp_pct": grid_settings.get("take_profit_pct"),
             "expected_fill_mode": "maker-grid",
@@ -1841,14 +1857,16 @@ class AiOperatorGridWindow(LiteGridWindow):
             },
             "orderbook_depth_50": orderbook,
             "trades_1m": trades_1m,
+            "trades_window": trades_window,
             "klines_by_window": klines_by_window,
+            "lookback_days": lookback_days,
             "data_quality": data_quality,
             "allowed_sides": allowed_sides,
             "risk_constraints": risk_constraints,
             "max_active_orders": grid_settings.get("max_active_orders"),
             "profit_model_inputs": profit_inputs,
         }
-        timeframe_cfg = {"windows": ["1m", "5m", "15m", "1h", "4h", "1d"]}
+        timeframe_cfg = {"windows": ["1m", "5m", "15m", "1h", "4h", "1d"], "kline_limits": kline_limits}
         pack = build_ai_datapack(
             symbol=self._symbol,
             profile=profile,
@@ -1868,6 +1886,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         pack["stats24h"] = stats24h
         pack["kline_aggs"] = kline_aggs
         pack["data_quality"]["profile_target_net_edge_pct"] = preset.target_net_edge_pct
+        pack["data_quality"]["profile_target_profit_pct"] = preset.target_profit_pct
         total_ms = ws_ms + http_latency_ms
         self._append_log(
             (
@@ -1894,22 +1913,34 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_log(f"[AI] ws status: {ws_reason}", "WARN")
         return pack
 
-    def _fetch_http_market_data(self) -> tuple[dict[str, Any], dict[str, float], dict[str, str]]:
+    def _fetch_http_market_data(
+        self, lookback_days: int
+    ) -> tuple[dict[str, Any], dict[str, float], dict[str, str], dict[str, int]]:
         results: dict[str, Any] = {}
         timings: dict[str, float] = {}
         errors: dict[str, str] = {}
+        kline_limits = {
+            "1m": self._kline_limit_for_lookback(1, lookback_days),
+            "5m": self._kline_limit_for_lookback(5, lookback_days),
+            "15m": self._kline_limit_for_lookback(15, lookback_days),
+            "1h": self._kline_limit_for_lookback(60, lookback_days),
+            "4h": self._kline_limit_for_lookback(240, lookback_days),
+            "1d": self._kline_limit_for_lookback(1440, lookback_days),
+        }
         tasks = {
             "exchange_info": lambda: self._http_client.get_exchange_info_symbol(self._symbol),
             "book_ticker": lambda: self._http_client.get_book_ticker(self._symbol),
             "ticker_24h": lambda: self._http_client.get_ticker_24h(self._symbol),
             "orderbook_depth_50": lambda: self._http_client.get_orderbook_depth(self._symbol, limit=50),
             "recent_trades_1m": lambda: self._http_client.get_recent_trades(self._symbol, limit=500),
-            "klines_1m": lambda: self._http_client.get_klines(self._symbol, interval="1m", limit=120),
-            "klines_5m": lambda: self._http_client.get_klines(self._symbol, interval="5m", limit=288),
-            "klines_15m": lambda: self._http_client.get_klines(self._symbol, interval="15m", limit=192),
-            "klines_1h": lambda: self._http_client.get_klines(self._symbol, interval="1h", limit=336),
-            "klines_4h": lambda: self._http_client.get_klines(self._symbol, interval="4h", limit=180),
-            "klines_1d": lambda: self._http_client.get_klines(self._symbol, interval="1d", limit=120),
+            "klines_1m": lambda: self._http_client.get_klines(self._symbol, interval="1m", limit=kline_limits["1m"]),
+            "klines_5m": lambda: self._http_client.get_klines(self._symbol, interval="5m", limit=kline_limits["5m"]),
+            "klines_15m": lambda: self._http_client.get_klines(
+                self._symbol, interval="15m", limit=kline_limits["15m"]
+            ),
+            "klines_1h": lambda: self._http_client.get_klines(self._symbol, interval="1h", limit=kline_limits["1h"]),
+            "klines_4h": lambda: self._http_client.get_klines(self._symbol, interval="4h", limit=kline_limits["4h"]),
+            "klines_1d": lambda: self._http_client.get_klines(self._symbol, interval="1d", limit=kline_limits["1d"]),
         }
         limits = {
             "exchange_info": 600.0,
@@ -1945,7 +1976,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             + timings.get("klines_1d", 0)
         )
 
-        return results, timings, errors
+        return results, timings, errors, kline_limits
 
     def _fetch_http_block(
         self,
@@ -1969,6 +2000,92 @@ class AiOperatorGridWindow(LiteGridWindow):
         duration_ms = (time.perf_counter() - start) * 1000
         self._data_cache.set(self._symbol, name, data)
         return data, duration_ms, None
+
+    @staticmethod
+    def _kline_limit_for_lookback(interval_minutes: int, lookback_days: int) -> int:
+        total_minutes = max(1, lookback_days) * 1440
+        bars = int(total_minutes / interval_minutes)
+        return max(2, min(bars, 1000))
+
+    @staticmethod
+    def _collect_missing_sections(
+        orderbook: Any,
+        trades: Any,
+        klines_by_window: dict[str, Any],
+    ) -> list[str]:
+        missing: list[str] = []
+        if not isinstance(orderbook, dict):
+            missing.append("orderbook")
+        if not isinstance(trades, list):
+            missing.append("trades")
+        if any(not isinstance(value, list) or not value for value in klines_by_window.values()):
+            missing.append("klines")
+        return missing
+
+    @staticmethod
+    def _compute_trades_window_summary(
+        klines_by_window: dict[str, Any],
+        lookback_days: int,
+    ) -> dict[str, Any]:
+        if lookback_days >= 30:
+            window = "1d"
+        elif lookback_days >= 7:
+            window = "4h"
+        else:
+            window = "1h"
+        klines = klines_by_window.get(window)
+        if not isinstance(klines, list):
+            return {
+                "window": window,
+                "lookback_days": lookback_days,
+                "bars": 0,
+                "quote_volume": None,
+                "trade_count": None,
+                "notes": "missing klines for trades_window",
+            }
+        quote_volume = 0.0
+        trade_count = 0
+        bars = 0
+        for entry in klines:
+            if not isinstance(entry, list) or len(entry) < 9:
+                continue
+            quote = entry[7]
+            trades = entry[8]
+            try:
+                quote_volume += float(quote)
+            except (TypeError, ValueError):
+                pass
+            try:
+                trade_count += int(trades)
+            except (TypeError, ValueError):
+                pass
+            bars += 1
+        return {
+            "window": window,
+            "lookback_days": lookback_days,
+            "bars": bars,
+            "quote_volume": round(quote_volume, 6) if quote_volume > 0 else None,
+            "trade_count": trade_count if trade_count > 0 else None,
+            "notes": "",
+        }
+
+    @staticmethod
+    def _build_data_quality_notes(
+        ws_ok: bool,
+        http_ok: bool,
+        missing: list[str],
+        http_errors: dict[str, str],
+    ) -> str:
+        notes: list[str] = []
+        if not ws_ok and http_ok:
+            notes.append("WS down -> HTTP fallback")
+        if missing:
+            notes.append(f"missing: {','.join(missing)}")
+        if http_errors:
+            error_text = ",".join(key for key, err in http_errors.items() if err)
+            if error_text:
+                notes.append(f"http errors: {error_text}")
+        return "; ".join(notes)
 
     def _format_fee(self, maker_fee_pct: float | None, taker_fee_pct: float | None) -> str:
         if isinstance(maker_fee_pct, (int, float)) and isinstance(taker_fee_pct, (int, float)):
@@ -2306,6 +2423,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         fees = datapack.get("fees") or {}
         meta = datapack.get("meta") or {}
         data_quality = datapack.get("data_quality") or {}
+        pack_source = data_quality.get("pack_source") or {}
         bid = price_snapshot.get("best_bid")
         ask = price_snapshot.get("best_ask")
         spread_pct = price_snapshot.get("spread_pct")
@@ -2318,9 +2436,11 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_age_ms = data_quality.get("ws_age_ms")
         ws_age_text = f"{ws_age_ms}ms" if isinstance(ws_age_ms, int) else "—"
         stale_text = "stale" if price_snapshot.get("stale") else "fresh"
+        lookback_days = meta.get("lookback_days", "—")
         self._ai_snapshot_label.setText(
             (
-                f"snapshot={meta.get('timestamp_ms', '—')} src={price_snapshot.get('source', '—')} {stale_text} "
+                f"snapshot={meta.get('timestamp_ms', '—')} lookback={lookback_days}d "
+                f"src={price_snapshot.get('source', '—')} {stale_text} "
                 f"bid={bid_text} ask={ask_text} spread={spread_text} "
                 f"trades1m={trades_text} fee(m/t)={fee_text} ws_age={ws_age_text}"
             )
@@ -2329,12 +2449,16 @@ class AiOperatorGridWindow(LiteGridWindow):
         balances_age = data_quality.get("balances_age_s")
         stale_flag = "stale" if price_snapshot.get("stale") else "fresh"
         warnings = data_quality.get("warnings") or []
+        missing = data_quality.get("missing") or []
+        ws_ok = pack_source.get("ws_ok")
+        http_ok = pack_source.get("http_ok")
         balances_text = f"{balances_age:.2f}s" if isinstance(balances_age, (int, float)) else "—"
         self._ai_data_quality_label.setText(
             (
-                f"data quality: ws_age={ws_age_ms or '—'}ms http_age={http_age_ms or '—'}ms "
-                f"balances_age={balances_text} "
-                f"stale={stale_flag} warnings={','.join(warnings) if warnings else '—'}"
+                f"data quality: ws={ws_ok} http={http_ok} ws_age={ws_age_ms or '—'}ms "
+                f"http_age={http_age_ms or '—'}ms balances_age={balances_text} "
+                f"stale={stale_flag} missing={','.join(missing) if missing else '—'} "
+                f"warnings={','.join(warnings) if warnings else '—'}"
             )
         )
 
@@ -2372,6 +2496,14 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "http_age_ms": snapshot.http_age_ms,
                 "balances_age_s": None,
                 "warnings": [],
+                "pack_source": {
+                    "ws_ok": snapshot.source == "WS",
+                    "http_ok": snapshot.source in {"HTTP", "WS"},
+                    "ws_age_ms": ws_age_ms,
+                    "http_age_ms": snapshot.http_age_ms,
+                    "stale_flags": [],
+                },
+                "missing": [],
             },
         }
         self._update_ai_snapshot_label(datapack)

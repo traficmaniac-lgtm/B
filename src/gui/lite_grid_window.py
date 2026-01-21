@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ai.operator_math import compute_fee_total_pct, evaluate_tp_profitability
+from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
@@ -1359,6 +1361,22 @@ class LiteGridWindow(QMainWindow):
             balance_snapshot = self._balance_snapshot()
             settings = self._resolve_start_settings()
             self._apply_auto_clamps(settings, anchor_price)
+            if settings.take_profit_pct <= 0:
+                raise ValueError("Invalid take_profit_pct")
+            profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
+            if not profitability.get("is_profitable", True):
+                min_tp = profitability.get("min_tp_pct")
+                break_even = profitability.get("break_even_tp_pct")
+                self._append_log(
+                    (
+                        "[START] blocked: tp_pct below break-even "
+                        f"tp_pct={settings.take_profit_pct:.4f}% "
+                        f"min_tp={min_tp:.4f}% break_even={break_even:.4f}%"
+                    ),
+                    kind="WARN",
+                )
+                self._change_state("IDLE")
+                return
             if not dry_run and self._first_live_session:
                 settings.grid_count = min(settings.grid_count, 4)
                 settings.max_active_orders = min(settings.max_active_orders, 4)
@@ -2254,6 +2272,37 @@ class LiteGridWindow(QMainWindow):
         fee_rate = max(maker_rate, taker_rate, 0.0)
         return self.as_decimal(fee_rate)
 
+    def _profit_profile_name(self) -> str:
+        return "BALANCED"
+
+    def _runtime_profit_inputs(self) -> dict[str, Any]:
+        return {
+            "expected_fill_mode": "MAKER",
+            "slippage_pct": 0.02,
+            "safety_edge_pct": 0.02,
+            "fee_discount_pct": None,
+        }
+
+    def _evaluate_tp_profitability(self, tp_pct: float) -> dict[str, float | bool]:
+        profile = get_profile_preset(self._profit_profile_name())
+        inputs = self._runtime_profit_inputs()
+        maker, taker = self._trade_fees
+        maker_fee_pct = (maker * 100) if maker is not None else 0.0
+        taker_fee_pct = (taker * 100) if taker is not None else 0.0
+        fee_total_pct = compute_fee_total_pct(
+            maker_fee_pct,
+            taker_fee_pct,
+            fill_mode=inputs.get("expected_fill_mode") or "MAKER",
+            fee_discount_pct=inputs.get("fee_discount_pct"),
+        )
+        return evaluate_tp_profitability(
+            tp_pct=tp_pct,
+            fee_total_pct=fee_total_pct,
+            slippage_pct=inputs.get("slippage_pct"),
+            safety_edge_pct=inputs.get("safety_edge_pct"),
+            target_profit_pct=profile.target_profit_pct,
+        )
+
     def _apply_sell_fee_buffer(self, qty: Decimal, step: Decimal | None) -> Decimal:
         fee_rate = self._effective_fee_rate()
         if fee_rate > 0:
@@ -2367,6 +2416,18 @@ class LiteGridWindow(QMainWindow):
         settings = self._live_settings or self._settings_state
         tp_pct = settings.take_profit_pct or settings.grid_step_pct
         if tp_pct <= 0:
+            return
+        profitability = self._evaluate_tp_profitability(tp_pct)
+        if not profitability.get("is_profitable", True):
+            min_tp = profitability.get("min_tp_pct")
+            break_even = profitability.get("break_even_tp_pct")
+            self._append_log(
+                (
+                    "[LIVE] TP skipped: tp_pct below break-even "
+                    f"tp_pct={tp_pct:.4f}% min_tp={min_tp:.4f}% break_even={break_even:.4f}%"
+                ),
+                kind="WARN",
+            )
             return
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
