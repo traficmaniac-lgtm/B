@@ -1,4 +1,4 @@
-# AI Protocol (Operator Grid v10)
+# AI Protocol (Operator Grid v10.0.3)
 
 ## Safety rules
 - AI must never place trades, open positions, or execute orders.
@@ -18,7 +18,8 @@ AI Operator Grid sends a deterministic datapack built from WS + HTTP. The respon
     "timestamp_ms": 1716038400000,
     "timezone": "UTC",
     "mode": "SPOT",
-    "profile": "BALANCED"
+    "profile": "BALANCED",
+    "lookback_days": 7
   },
   "exchange_rules": {
     "tickSize": 0.01,
@@ -64,6 +65,14 @@ AI Operator Grid sends a deterministic datapack built from WS + HTTP. The respon
     "vwap_1m": 62000.4,
     "last_price": 62000.7
   },
+  "trades_window": {
+    "window": "4h",
+    "lookback_days": 7,
+    "bars": 42,
+    "quote_volume": 1240000,
+    "trade_count": 4800,
+    "notes": ""
+  },
   "klines_summary": {
     "windows": {
       "1m": {"return_pct": 0.1, "atr_pct": 0.05, "realized_vol_pct": 0.2, "trend_slope": 0.01, "drawdown_pct": 0.2, "range_pct": 0.6},
@@ -85,25 +94,39 @@ AI Operator Grid sends a deterministic datapack built from WS + HTTP. The respon
     "book_latency_ms": 180,
     "klines_latency_ms": 640,
     "balances_age_s": 0.8,
-    "warnings": []
+    "warnings": [],
+    "pack_source": {
+      "ws_ok": true,
+      "http_ok": true,
+      "ws_age_ms": 120,
+      "http_age_ms": 430,
+      "stale_flags": []
+    },
+    "missing": [],
+    "timings_ms": {"orderbook_depth_50": 180, "klines": 640},
+    "notes": ""
   },
   "profit_model_inputs": {
     "maker_fee_pct": 0.02,
     "taker_fee_pct": 0.04,
     "assumed_slippage_pct": 0.02,
+    "safety_edge_pct": 0.02,
+    "fee_discount_pct": null,
     "tickSize": 0.01,
     "stepSize": 0.0001,
     "minNotional": 5,
     "expected_fill_mode": "maker-grid"
   },
   "profit_estimate": {
-    "net_edge_pct": 0.07,
+    "gross_edge_pct": 0.2,
+    "fee_total_pct": 0.04,
+    "net_edge_pct": 0.14,
     "break_even_tp_pct": 0.08,
-    "total_cost_pct": 0.03,
-    "assumptions": {"fees": "maker", "slippage_pct": 0.02}
+    "min_tp_pct": 0.13,
+    "assumptions": {"expected_fill_mode": "MAKER_MAKER", "assumed_slippage_pct": 0.02}
   },
   "profile_presets": {
-    "BALANCED": {"target_net_edge_pct": 0.05, "safety_margin_pct": 0.03, "max_active_orders": 12}
+    "BALANCED": {"target_net_edge_pct": 0.05, "target_profit_pct": 0.05, "safety_margin_pct": 0.03, "max_active_orders": 12}
   }
 }
 ```
@@ -114,30 +137,38 @@ Every AI response must be a JSON object with the following schema:
 
 ```json
 {
-  "state": "SAFE|WARNING|DANGER",
-  "recommendation": "WAIT|DO_NOT_TRADE|START|APPLY_PATCH|REQUEST_DATA|ADJUST_PARAMS|STOP",
-  "next_action": "WAIT|DO_NOT_TRADE|START|APPLY_PATCH|REQUEST_DATA|ADJUST_PARAMS|STOP",
-  "reason": "short text",
-  "profile": "CONSERVATIVE|BALANCED|AGGRESSIVE",
-  "actions_allowed": ["WAIT","APPLY_PATCH","REQUEST_DATA","START","STOP","ADJUST_PARAMS"],
-  "patch": {
-    "strategy_id": "GRID_CLASSIC|GRID_BIASED|RANGE_MR|DO_NOT_TRADE",
+  "analysis_result": {
+    "state": "OK|WARNING|DANGER",
+    "summary": "string",
+    "trend": "UP|DOWN|MIXED",
+    "volatility": "LOW|MED|HIGH",
+    "confidence": 0.0,
+    "risks": ["..."],
+    "data_quality": {
+      "ws": "OK|WARMUP|LOST|NO",
+      "http": "OK|NO",
+      "klines": "OK|NO",
+      "trades": "OK|NO",
+      "orderbook": "OK|NO",
+      "notes": "string"
+    }
+  },
+  "strategy_patch": {
+    "profile": "CONSERVATIVE|BALANCED|AGGRESSIVE",
     "bias": "UP|DOWN|FLAT",
+    "range_mode": "MANUAL|AUTO_ATR",
     "step_pct": 0.3,
     "range_down_pct": 2.0,
     "range_up_pct": 2.5,
     "levels": 6,
     "tp_pct": 0.2,
-    "max_active_orders": 8
+    "max_active_orders": 8,
+    "notes": "string"
   },
-  "request_data": {
-    "need_more": false,
-    "items": []
-  },
-  "math_check": {
-    "net_edge_pct": 0.07,
-    "break_even_tp_pct": 0.08,
-    "assumptions": {"fees": "maker", "slippage_pct": 0.02}
+  "diagnostics": {
+    "lookback_days_used": 1|7|30|365,
+    "requested_more_data": false,
+    "request": { "lookback_days": 7|30|365, "why": "string" } | null
   }
 }
 ```

@@ -27,8 +27,10 @@ def build_ai_datapack(
     price_snapshot = user_constraints.get("price_snapshot") or {}
     orderbook = user_constraints.get("orderbook_depth_50")
     trades = user_constraints.get("trades_1m")
+    trades_window = user_constraints.get("trades_window") or {}
     klines = user_constraints.get("klines_by_window") or {}
     data_quality = user_constraints.get("data_quality") or {}
+    lookback_days = user_constraints.get("lookback_days") or 1
     allowed_sides = user_constraints.get("allowed_sides") or "BOTH"
     risk_constraints = user_constraints.get("risk_constraints") or {}
     max_active_orders = user_constraints.get("max_active_orders")
@@ -42,6 +44,9 @@ def build_ai_datapack(
     maker_fee_pct = _to_float(fees.get("makerFeePct"))
     taker_fee_pct = _to_float(fees.get("takerFeePct"))
     assumed_slippage_pct = _to_float(profit_inputs.get("assumed_slippage_pct"))
+    safety_edge_pct = _to_float(profit_inputs.get("safety_edge_pct"))
+    fee_discount_pct = _to_float(profit_inputs.get("fee_discount_pct"))
+    expected_fill_mode = profit_inputs.get("expected_fill_mode") or "maker-grid"
     spread_pct = _to_float(price_snapshot.get("spread_pct"))
     step_pct = _to_float(profit_inputs.get("step_pct"))
     tp_pct = _to_float(profit_inputs.get("tp_pct"))
@@ -53,6 +58,9 @@ def build_ai_datapack(
         slippage_pct=assumed_slippage_pct,
         spread_pct=spread_pct,
         profile=profile,
+        expected_fill_mode=expected_fill_mode,
+        fee_discount_pct=fee_discount_pct,
+        safety_edge_pct=safety_edge_pct,
     )
     preset = get_profile_preset(profile)
 
@@ -65,6 +73,7 @@ def build_ai_datapack(
             "timezone": timezone,
             "mode": mode,
             "profile": profile,
+            "lookback_days": lookback_days,
         },
         "exchange_rules": {
             "tickSize": rules.get("tickSize"),
@@ -104,6 +113,7 @@ def build_ai_datapack(
             "impact_estimates": orderbook_metrics.get("impact_estimates"),
         },
         "trades_1m": trades_metrics,
+        "trades_window": trades_window,
         "klines_summary": {
             "windows": kline_summary,
             "config": timeframe_cfg,
@@ -119,15 +129,18 @@ def build_ai_datapack(
             "maker_fee_pct": maker_fee_pct,
             "taker_fee_pct": taker_fee_pct,
             "assumed_slippage_pct": assumed_slippage_pct,
+            "safety_edge_pct": safety_edge_pct,
+            "fee_discount_pct": fee_discount_pct,
             "tickSize": rules.get("tickSize"),
             "stepSize": rules.get("stepSize"),
             "minNotional": rules.get("minNotional"),
-            "expected_fill_mode": profit_inputs.get("expected_fill_mode") or "maker-grid",
+            "expected_fill_mode": expected_fill_mode,
         },
         "profit_estimate": profit_estimate,
         "profile_presets": {
             key: {
                 "target_net_edge_pct": preset_item.target_net_edge_pct,
+                "target_profit_pct": preset_item.target_profit_pct,
                 "safety_margin_pct": preset_item.safety_margin_pct,
                 "max_active_orders": preset_item.max_active_orders,
                 "levels_min": preset_item.levels_min,
@@ -139,6 +152,7 @@ def build_ai_datapack(
         },
         "selected_profile": {
             "target_net_edge_pct": preset.target_net_edge_pct,
+            "target_profit_pct": preset.target_profit_pct,
             "safety_margin_pct": preset.safety_margin_pct,
         },
     }
