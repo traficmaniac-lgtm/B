@@ -38,7 +38,6 @@ from src.services.data_cache import DataCache
 from src.services.price_feed_manager import (
     PriceFeedManager,
     PriceUpdate,
-    WS_DEGRADED_AFTER_MS,
     WS_HEALTH_OK,
 )
 from src.services.rate_limiter import RateLimiter
@@ -1123,9 +1122,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_snapshot = self._price_feed_manager.get_snapshot(self._symbol)
         ws_health = self._price_feed_manager.get_ws_health(self._symbol)
         ws_ms = (time.perf_counter() - ws_start) * 1000
-        ws_age_ms = ws_health.age_ms if ws_health else None
-        ws_ok = bool(ws_health and ws_health.state == WS_HEALTH_OK)
-        ws_stale = isinstance(ws_age_ms, int) and ws_age_ms > WS_DEGRADED_AFTER_MS
+        last_price, price_source, price_age_ms = self._price_feed_manager.get_price(self._symbol)
+        ws_ok = price_source == "WS"
+        ws_age_ms = price_age_ms if ws_ok else None
         last_update_ts = ws_health.last_update_ts if ws_health else None
         last_ticks = self._price_history[-60:]
         micro_vola_pct, micro_trend = self._compute_micro_metrics(last_ticks)
@@ -1144,27 +1143,22 @@ class AiOperatorGridWindow(LiteGridWindow):
         klines_1h = http_payload.get("klines_1h")
         klines_1d = http_payload.get("klines_1d")
 
-        last_price = ws_snapshot.last_price if ws_snapshot else None
-        bid = ws_snapshot.best_bid if ws_snapshot else None
-        ask = ws_snapshot.best_ask if ws_snapshot else None
-        mid = ws_snapshot.mid_price if ws_snapshot else None
-        spread_pct = ws_snapshot.spread_pct if ws_snapshot else None
+        bid = ws_snapshot.best_bid if ws_snapshot and ws_ok else None
+        ask = ws_snapshot.best_ask if ws_snapshot and ws_ok else None
+        mid = ws_snapshot.mid_price if ws_snapshot and ws_ok else None
+        spread_pct = ws_snapshot.spread_pct if ws_snapshot and ws_ok else None
         if not ws_ok:
             if ws_health and not ws_health.subscribed:
                 ws_reason = "ws not subscribed"
-            elif ws_stale:
-                ws_reason = f"ws stale: age={ws_age_ms}ms -> HTTP price"
             else:
-                ws_reason = "ws unavailable"
-        elif ws_stale:
-            ws_reason = f"ws stale: age={ws_age_ms}ms -> HTTP price"
+                ws_reason = "router -> HTTP"
         else:
             ws_reason = ""
         book_bid, book_ask = self._extract_book_ticker(book_ticker)
-        if not ws_ok or ws_stale or bid is None or ask is None:
+        if not ws_ok or bid is None or ask is None:
             bid = book_bid if book_bid is not None else bid
             ask = book_ask if book_ask is not None else ask
-        if last_price is None or ws_stale:
+        if last_price is None or not ws_ok:
             last_price = self._coerce_float(ticker_24h.get("lastPrice")) if isinstance(ticker_24h, dict) else None
         if last_price is None and bid is not None and ask is not None:
             last_price = (bid + ask) / 2
