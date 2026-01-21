@@ -129,3 +129,9 @@ Verify in GUI:
 
 Tests:
 - `pytest -q tests/test_profit_math.py tests/test_patch_validation.py tests/test_request_data_loop.py`
+
+### v10.x AI Operator Grid state machine + safety gates
+- Added strict AI Operator Grid state machine with gated controls (refresh/analyze/apply/start/pause/stop).
+- Enforced safety checks before PLAN_READY (fees/step, micro-volatility range, minQty/minNotional) and DO_NOT_TRADE logging.
+- Locked AI confidence on Apply Plan, invalidated on manual parameter edits, and reset on Stop.
+- Added state machine unit tests covering transitions and gating.
