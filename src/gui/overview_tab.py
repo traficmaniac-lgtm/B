@@ -350,11 +350,19 @@ class OverviewTab(QWidget):
             self._on_open_pair(symbol)
 
     def _run_self_check(self) -> None:
-        worker = _Worker(self._http_client.get_time)
+        worker = _Worker(self._run_self_check_tasks)
         worker.signals.success.connect(self._handle_self_check_success)
         worker.signals.error.connect(self._handle_self_check_error)
         self._thread_pool.start(worker)
         self._refresh_account_balances()
+
+    def _run_self_check_tasks(self) -> object:
+        result = self._http_client.get_time()
+        try:
+            self._price_manager.run_transport_test()
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("self-check transport-test failed: %s", exc)
+        return result
 
     def _handle_self_check_success(self, result: object, latency_ms: int) -> None:
         if isinstance(result, dict) and "serverTime" in result:

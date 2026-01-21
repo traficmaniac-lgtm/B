@@ -71,3 +71,24 @@ Manual checks:
 1. Open Overview → select BTCUSDT → confirm WS stream connects without HTTP 404s.
 2. Disconnect network for ~10s → observe clean fallback without rapid log spam.
 3. Close a pair window → ensure symbol polling stops within a few seconds.
+
+### v10 Router warmup + transport-test hardening
+- Added deterministic WS warmup routing with per-symbol grace windows, stale detection, and clearer router logs.
+- Made TRANSPORT-TEST non-invasive by keeping subscriptions alive with keepalive cleanup and waiting for first ticks.
+- Added refcounted subscription checks, self-check transport-test logging, and router decision tests.
+
+Repro before:
+1. Open Overview → load pairs.
+2. Open AI Operator Grid for BTCUSDT; trigger TRANSPORT-TEST.
+3. Observe immediate WS fallback to HTTP and WS=NONE even while WS is recoverable.
+
+Verify after:
+1. Launch app.
+2. Load pairs.
+3. Click BTCUSDT → open AI Operator Grid.
+4. Press “Self-check”.
+
+Expected:
+- WS shows WARMUP then OK within ~3s, without immediate HTTP fallback.
+- TRANSPORT-TEST does not force WS=NONE or remove subscriptions.
+- AI snapshot shows ws=OK (or WARMUP briefly) when WS is connected.
