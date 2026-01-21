@@ -732,30 +732,56 @@ class PriceFeedManager:
     async def _collect_ws_selftest(self, symbols: list[str]) -> dict[str, int]:
         url = f"{self._config.binance.ws_url.rstrip('/')}/ws"
         received: dict[str, int] = {}
-        params = [f"{symbol.lower()}@bookTicker" for symbol in symbols]
         async with websockets.connect(url, ping_interval=None, ping_timeout=None) as websocket:
-            payload = {"method": "SUBSCRIBE", "params": params, "id": int(self._now_ms())}
-            await websocket.send(json.dumps(payload))
-            deadline_ms = self._now_ms() + int(SELFTEST_TIMEOUT_S * 1000)
-            while self._now_ms() < deadline_ms and len(received) < len(symbols):
+            for symbol in symbols:
+                tick_time_ms = await self._wait_for_ws_tick(
+                    websocket,
+                    symbol,
+                    timeout_ms=2000,
+                )
+                if tick_time_ms is not None:
+                    received[symbol] = tick_time_ms
+        return received
+
+    async def _wait_for_ws_tick(
+        self,
+        websocket: websockets.WebSocketClientProtocol,
+        symbol: str,
+        *,
+        timeout_ms: int,
+    ) -> int | None:
+        params = [f"{symbol.lower()}@bookTicker"]
+        payload = {"method": "SUBSCRIBE", "params": params, "id": int(self._now_ms())}
+        await websocket.send(json.dumps(payload))
+        deadline_ms = self._now_ms() + timeout_ms
+        received_ms: int | None = None
+        try:
+            while self._now_ms() < deadline_ms:
                 timeout_s = max((deadline_ms - self._now_ms()) / 1000.0, 0.1)
                 try:
                     message = await asyncio.wait_for(websocket.recv(), timeout=timeout_s)
                 except asyncio.TimeoutError:
-                    continue
+                    break
                 try:
-                    payload = json.loads(message)
+                    data = json.loads(message)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(payload, dict):
-                    continue
-                data = payload.get("data", payload)
                 if not isinstance(data, dict):
                     continue
-                symbol = sanitize_symbol(data.get("s"))
-                if symbol and symbol in symbols and symbol not in received:
-                    received[symbol] = self._now_ms()
-        return received
+                payload = data.get("data", data)
+                if not isinstance(payload, dict):
+                    continue
+                received_symbol = sanitize_symbol(payload.get("s"))
+                if received_symbol == symbol:
+                    received_ms = self._now_ms()
+                    break
+        finally:
+            unsubscribe_payload = {"method": "UNSUBSCRIBE", "params": params, "id": int(self._now_ms())}
+            try:
+                await websocket.send(json.dumps(unsubscribe_payload))
+            except Exception:  # noqa: BLE001
+                pass
+        return received_ms
 
     def shutdown(self) -> None:
         self._stopping = True

@@ -1373,18 +1373,16 @@ class AiOperatorGridWindow(LiteGridWindow):
         orderbook = self._get_cached_data("orderbook_depth_50")
         trades = self._get_cached_data("recent_trades_1m")
         stale = False
-        source = "HTTP" if isinstance(orderbook, dict) or isinstance(trades, dict) else "WS"
+        source = snapshot.source if snapshot else "HTTP"
         if isinstance(trades, list):
             trades = {"items": trades, "count": len(trades)}
         if reuse_depth_trades and prior_snapshot:
             if orderbook is None and prior_snapshot.orderbook_depth_50:
                 orderbook = prior_snapshot.orderbook_depth_50
                 stale = True
-                source = "CACHE"
             if trades is None and prior_snapshot.trades_1m:
                 trades = prior_snapshot.trades_1m
                 stale = True
-                source = "CACHE"
         orderbook_summary = self._compute_orderbook_summary(orderbook, best_bid, best_ask)
         trades_summary = self._compute_trades_summary(trades)
         is_good_snapshot = self._is_snapshot_good(orderbook_summary, trades_summary)
@@ -1394,7 +1392,6 @@ class AiOperatorGridWindow(LiteGridWindow):
                 orderbook = cached.orderbook_depth_50
                 trades = cached.trades_1m
                 stale = True
-                source = "CACHE"
                 orderbook_summary = self._compute_orderbook_summary(orderbook, best_bid, best_ask)
                 trades_summary = self._compute_trades_summary(trades)
                 is_good_snapshot = self._is_snapshot_good(orderbook_summary, trades_summary)
