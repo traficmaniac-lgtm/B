@@ -140,3 +140,11 @@ Tests:
 - Guarded WS loop enqueues on shutdown and ensured stop ordering avoids closed-loop calls.
 - Made AI request-more-data loop UI-safe and kept lookback/UI fields consistent.
 - Normalized AI Operator Grid state/data quality labels and balance freshness checks.
+
+### Hotfix v10.x.x: apply/approve sync + state badge + manual-guard
+- Unified Apply Plan/Approve flow to apply once, clear pending actions, and avoid re-apply warnings.
+- Added response logging for AI analyze/chat/lookback to capture state + pending_action transitions.
+- Guarded programmatic updates (apply patch/reset defaults) from triggering manual invalidation.
+- Logged user-driven parameter changes and kept invalidation only on real edits.
+- Cleared pending actions/confidence on snapshot refresh to return INVALID -> DATA_READY cleanly.
+- Made reset defaults idempotent to avoid duplicate "Settings reset to defaults." events.

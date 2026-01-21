@@ -1809,6 +1809,8 @@ class LiteGridWindow(QMainWindow):
 
     def _reset_defaults(self) -> None:
         defaults = GridSettingsState()
+        if self._settings_state == defaults:
+            return
         self._settings_state = defaults
         self._manual_grid_step_pct = defaults.grid_step_pct
         self._budget_input.setValue(defaults.budget)

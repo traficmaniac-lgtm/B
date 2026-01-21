@@ -140,6 +140,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         parent: QWidget | None = None,
     ) -> None:
         self._ai_patch_in_progress = False
+        self._programmatic_update = False
         self._ai_state_machine = AiOperatorStateMachine()
         super().__init__(
             symbol=symbol,
@@ -424,6 +425,14 @@ class AiOperatorGridWindow(LiteGridWindow):
             failure_message="state transition blocked",
         )
         self._update_apply_plan_state()
+        if self._pending_action:
+            self._append_log(
+                (
+                    "[AI] response received: state="
+                    f"{self._ai_state_machine.state.value} pending_action={self._pending_action.action_type.value}"
+                ),
+                "INFO",
+            )
         self._append_log("[AI] response status=received", "INFO")
 
     def _handle_ai_analyze_error(self, message: str) -> None:
@@ -444,22 +453,39 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_plan_button.setEnabled(False)
         self._update_approve_button_state()
 
-    def _apply_ai_plan(self) -> None:
-        if not self._ai_state_machine.can_apply_plan():
-            self._append_log(
-                f"[AI] apply plan blocked: state={self._ai_state_machine.state.value}",
-                "WARN",
-            )
-            self._append_chat_line("AI", "Применение плана недоступно в текущем состоянии.")
-            return
-        patch = self._get_selected_profile_patch()
+    def _apply_ai_plan(self, source_label: str = "Apply Plan") -> None:
+        self._append_log(
+            f"[AI] apply plan clicked source={source_label} state={self._ai_state_machine.state.value}",
+            "INFO",
+        )
+        pending_action = self._pending_action
+        patch = pending_action.patch if pending_action and pending_action.patch else self._get_selected_profile_patch()
+        self._append_log(
+            f"[AI] apply plan action=APPLY_PATCH fields={self._patch_fields(patch)}",
+            "INFO",
+        )
         if not patch or not self._strategy_patch_has_values(patch):
             self._append_log("[AI] patch empty, nothing to apply", "INFO")
             self._append_chat_line("AI", "patch empty, nothing to apply")
             return
         if self._last_ai_result_id and self._last_ai_result_id == self._last_applied_ai_result_id:
-            self._append_log("[AI] patch already applied for latest result.", "INFO")
+            self._append_log("[AI] apply plan no-op: patch already applied.", "INFO")
+            self._pending_action = None
+            self._clear_actions()
             self._apply_plan_button.setEnabled(False)
+            return
+        if not self._ai_state_machine.can_apply_plan():
+            if self._ai_state_machine.state == AiOperatorState.PLAN_APPLIED:
+                self._append_log("[AI] apply plan no-op: state=PLAN_APPLIED", "INFO")
+                self._pending_action = None
+                self._clear_actions()
+                self._apply_plan_button.setEnabled(False)
+                return
+            self._append_log(
+                f"[AI] apply plan blocked: state={self._ai_state_machine.state.value}",
+                "WARN",
+            )
+            self._append_chat_line("AI", "Применение плана недоступно в текущем состоянии.")
             return
         now = time.monotonic()
         if now - self._last_apply_ts < 0.3:
@@ -468,7 +494,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
         complete_patch = self._ensure_complete_patch(patch)
-        if self._apply_ai_patch(complete_patch, source_label="Apply Plan"):
+        if self._apply_ai_patch(complete_patch, source_label=source_label):
             transitioned = self._transition_ai_state(
                 "apply_plan",
                 self._ai_state_machine.apply_plan,
@@ -476,6 +502,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             )
             if transitioned:
                 self._pending_action = None
+                self._clear_actions()
                 self._append_log("[AI] strategy_patch applied; state=PLAN_APPLIED", "INFO")
 
     def _handle_ai_send(self) -> None:
@@ -568,6 +595,20 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._apply_recommended_profile(parsed.strategy_patch.profile)
         self._render_actions(self._build_actions(parsed))
         self._update_apply_plan_state()
+        if self._ai_state_machine.state == AiOperatorState.ANALYZING:
+            self._transition_ai_state(
+                "chat",
+                self._ai_state_machine.set_plan_ready,
+                failure_message="state transition blocked",
+            )
+        if self._pending_action:
+            self._append_log(
+                (
+                    "[AI] response received: state="
+                    f"{self._ai_state_machine.state.value} pending_action={self._pending_action.action_type.value}"
+                ),
+                "INFO",
+            )
         self._append_log("[AI] chat response received", "INFO")
 
     def _handle_ai_chat_error(self, message: str) -> None:
@@ -649,6 +690,14 @@ class AiOperatorGridWindow(LiteGridWindow):
             failure_message="state transition blocked",
         )
         self._update_apply_plan_state()
+        if self._pending_action:
+            self._append_log(
+                (
+                    "[AI] response received: state="
+                    f"{self._ai_state_machine.state.value} pending_action={self._pending_action.action_type.value}"
+                ),
+                "INFO",
+            )
         self._append_log("[AI] request_data response received", "INFO")
 
     def _handle_ai_lookback_request_error(self, message: str) -> None:
@@ -1213,6 +1262,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             return False
         patch, adjustments = self._sanitize_patch(self._symbol, patch)
         self._ai_patch_in_progress = True
+        self._programmatic_update = True
         try:
             apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
             if callable(apply_to_form):
@@ -1221,6 +1271,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 self._append_log("[AI] apply patch skipped: form handler missing", "WARN")
             self._apply_strategy_patch_to_ui(patch)
         finally:
+            self._programmatic_update = False
             self._ai_patch_in_progress = False
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", f"Strategy patch applied via {source_label}.")
@@ -1255,7 +1306,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         elif action_type in {PendingActionType.APPLY_PATCH.value, PendingActionType.ADJUST_PARAMS.value}:
             if patch is None:
                 raise RuntimeError("patch missing")
-            self._apply_ai_plan()
+            self._apply_ai_plan(source_label="Approve")
         elif action_type == PendingActionType.CANCEL_ORDERS.value:
             handle_cancel_all = getattr(self, "_handle_cancel_all", None)
             if callable(handle_cancel_all):
@@ -1404,7 +1455,7 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _update_setting(self, key: str, value: Any) -> None:
         super()._update_setting(key, value)
-        if self._ai_patch_in_progress:
+        if self._ai_patch_in_progress or self._programmatic_update:
             return
         if self._ai_state_machine.ai_confidence_locked or self._ai_state_machine.state in {
             AiOperatorState.PLAN_READY,
@@ -1412,6 +1463,11 @@ class AiOperatorGridWindow(LiteGridWindow):
             AiOperatorState.RUNNING,
             AiOperatorState.WATCHING,
         }:
+            if self._ai_state_machine.state != AiOperatorState.INVALID:
+                self._append_log(
+                    f"[AI] manual param changed key={key} value={value}",
+                    "INFO",
+                )
             self._invalidate_ai_confidence("Параметры изменены вручную. AI-гарантия снята.")
 
     def _profit_profile_name(self) -> str:
@@ -1684,11 +1740,22 @@ class AiOperatorGridWindow(LiteGridWindow):
             ),
             "INFO",
         )
+        self._pending_action = None
+        self._last_actions_suggested = []
+        self._ai_state_machine.ai_confidence_locked = False
+        self._clear_actions()
         self._transition_ai_state(
             "refresh_snapshot",
             self._ai_state_machine.set_data_ready,
             failure_message="state transition blocked",
         )
+
+    def _reset_defaults(self) -> None:
+        self._programmatic_update = True
+        try:
+            super()._reset_defaults()
+        finally:
+            self._programmatic_update = False
 
     def _build_full_market_pack(
         self,
