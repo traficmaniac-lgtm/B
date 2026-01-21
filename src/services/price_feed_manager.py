@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import websockets
 
@@ -32,13 +32,18 @@ WS_LOST_AFTER_MS = 10000
 WS_RECOVER_AFTER_N = 5
 WS_OK_AFTER_MS = 2000
 WS_STATE_CONNECTED = "CONNECTED"
+WS_STATE_CONNECTING = "CONNECTING"
 WS_STATE_DEGRADED = "DEGRADED"
 WS_STATE_LOST = "LOST"
-WS_STATE_RECONNECTING = "RECONNECTING"
+WS_STATE_STOPPING = "STOPPING"
 WS_STATE_STOPPED = "STOPPED"
 HTTP_DISABLE_GRACE_MS = 3000
 INVALID_SYMBOL_LOG_MS = 60_000
-SYMBOL_UPDATE_DEBOUNCE_MS = 400
+SYMBOL_UPDATE_DEBOUNCE_MS = 250
+SELFTEST_TIMEOUT_S = 3.0
+SELFTEST_SYMBOLS = ("BTCUSDT", "USDCUSDT", "EURIUSDT")
+
+PriceSource = Literal["WS", "HTTP"]
 
 
 def calculate_backoff(attempt: int) -> float:
@@ -85,7 +90,7 @@ class MicrostructureSnapshot:
     step_size: float | None
     price_age_ms: int | None
     ws_latency_ms: int | None
-    source: str
+    source: PriceSource
     ws_status: str
     ws_health_state: str
 
@@ -108,7 +113,7 @@ class PriceUpdate:
     exchange_timestamp_ms: int | None
     local_timestamp_ms: int
     latency_ms: int | None
-    source: str
+    source: PriceSource
     ws_status: str
     price_age_ms: int | None
     microstructure: MicrostructureSnapshot
@@ -225,6 +230,7 @@ class _BinanceBookTickerWsThread:
         self._state_lock = threading.Lock()
         self._state = WS_STATE_STOPPED
         self._stopping = False
+        self._has_received_message = False
 
     def start(self) -> None:
         if self._thread.is_alive():
@@ -236,8 +242,9 @@ class _BinanceBookTickerWsThread:
         if self._stopping:
             return
         self._stopping = True
+        self._set_state(WS_STATE_STOPPING, "stopping")
         self._stop_event.set()
-        if self._loop and self._loop.is_running():
+        if self._loop and self._loop.is_running() and not self._loop.is_closed():
             try:
                 if self._connect_task:
                     self._loop.call_soon_threadsafe(self._connect_task.cancel)
@@ -247,12 +254,15 @@ class _BinanceBookTickerWsThread:
             except Exception:  # noqa: BLE001
                 self._logger.warning("WS shutdown error", exc_info=True)
             finally:
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                if not self._loop.is_closed():
+                    self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
         self._set_state(WS_STATE_STOPPED, "stopped")
 
     def set_symbols(self, symbols: list[str]) -> None:
+        if self._stopping:
+            return
         cleaned = {symbol.strip().lower() for symbol in symbols if symbol.strip()}
         with self._symbols_lock:
             if cleaned == self._symbols:
@@ -261,7 +271,9 @@ class _BinanceBookTickerWsThread:
         self._enqueue_command({"type": "sync_symbols"})
 
     def _enqueue_command(self, command: dict[str, Any]) -> None:
-        if self._loop and self._command_queue:
+        if self._stopping:
+            return
+        if self._loop and self._command_queue and not self._loop.is_closed():
             try:
                 self._loop.call_soon_threadsafe(self._command_queue.put_nowait, command)
             except RuntimeError:
@@ -270,7 +282,8 @@ class _BinanceBookTickerWsThread:
                 self._logger.debug("WS loop closed; dropping command")
                 return
         else:
-            self._pending_commands.append(command)
+            if not self._stopping:
+                self._pending_commands.append(command)
 
     def is_running(self) -> bool:
         return bool(self._loop and self._loop.is_running() and not self._stopping)
@@ -321,14 +334,14 @@ class _BinanceBookTickerWsThread:
                 continue
             if self._get_state() == WS_STATE_STOPPED:
                 self._set_state(WS_STATE_LOST, "ready")
-            if self._get_state() != WS_STATE_LOST:
+            if self._get_state() not in {WS_STATE_LOST, WS_STATE_CONNECTING}:
                 await asyncio.sleep(0.1)
                 continue
             if attempt > 0:
                 delay = calculate_backoff(attempt)
-                self._set_state(WS_STATE_RECONNECTING, f"backoff={delay:.1f}s")
+                self._set_state(WS_STATE_CONNECTING, f"backoff={delay:.1f}s")
                 await asyncio.sleep(delay)
-            self._set_state(WS_STATE_RECONNECTING, "connecting")
+            self._set_state(WS_STATE_CONNECTING, "connecting")
             url = self._build_url()
             if self._reconnect_in_progress:
                 await asyncio.sleep(0.1)
@@ -366,7 +379,8 @@ class _BinanceBookTickerWsThread:
                 self._closing = False
             self._subscribed_symbols = set()
             self._last_message_ms = self._now_ms()
-            self._set_state(WS_STATE_CONNECTED, "WS подключен")
+            self._has_received_message = False
+            self._set_state(WS_STATE_CONNECTING, "WS подключен, ждем данные")
             await self._sync_subscriptions(websocket, force=True)
             next_ping_ms = self._last_message_ms + int(self._heartbeat_interval_s * 1000)
             while not self._stop_event.is_set():
@@ -398,6 +412,9 @@ class _BinanceBookTickerWsThread:
             return
         if not isinstance(payload, dict):
             return
+        if not self._has_received_message:
+            self._has_received_message = True
+            self._set_state(WS_STATE_CONNECTED, "first message")
         data = payload.get("data")
         if isinstance(data, dict):
             self._on_message(data)
@@ -529,6 +546,9 @@ class PriceFeedManager:
         self._exchange_symbols: set[str] = set()
         self._symbols_update_timer: threading.Timer | None = None
         self._symbols_update_lock = threading.Lock()
+        self._self_test_lock = threading.Lock()
+        self._self_test_started = False
+        self._self_test_completed = False
         self._ws_thread = _BinanceBookTickerWsThread(
             ws_url=config.binance.ws_url.rstrip("/"),
             on_message=self._handle_ws_message,
@@ -539,6 +559,7 @@ class PriceFeedManager:
             dead_after_ms=self._lost_after_ms,
         )
         self._stopping = False
+        self._shutting_down = False
 
     @classmethod
     def get_instance(cls, config: Config) -> PriceFeedManager:
@@ -567,9 +588,93 @@ class PriceFeedManager:
         self._stop_event.clear()
         self._ws_thread.start()
         self._monitor_thread.start()
+        self._start_selftest_once()
+
+    def _start_selftest_once(self) -> None:
+        if self._shutting_down:
+            return
+        with self._self_test_lock:
+            if self._self_test_started or self._self_test_completed:
+                return
+            self._self_test_started = True
+        thread = threading.Thread(target=self._run_startup_selftest, name="price-feed-selftest", daemon=True)
+        thread.start()
+
+    def _run_startup_selftest(self) -> None:
+        try:
+            symbols = []
+            for symbol in SELFTEST_SYMBOLS:
+                cleaned = sanitize_symbol(symbol)
+                if cleaned is not None:
+                    symbols.append(cleaned)
+            if not symbols:
+                return
+            ws_received: dict[str, int] = {}
+            try:
+                ws_received = asyncio.run(self._collect_ws_selftest(symbols))
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("SELFTEST WS error: %s", exc)
+            http_latencies: dict[str, int | None] = {}
+            for symbol in symbols:
+                latency_ms: int | None = None
+                start = time.perf_counter()
+                try:
+                    self._http_client.get_ticker_price(symbol)
+                    latency_ms = int((time.perf_counter() - start) * 1000)
+                except Exception as exc:  # noqa: BLE001
+                    self._logger.warning("SELFTEST HTTP error for %s: %s", symbol, exc)
+                http_latencies[symbol] = latency_ms
+            now_ms = self._now_ms()
+            self._logger.info("[SELFTEST]")
+            for symbol in symbols:
+                last_seen = ws_received.get(symbol)
+                ws_ok = last_seen is not None
+                ws_age_ms = max(now_ms - last_seen, 0) if isinstance(last_seen, int) else None
+                http_latency_ms = http_latencies.get(symbol)
+                final_source: PriceSource = "WS" if ws_ok else "HTTP"
+                if ws_ok and ws_age_ms is not None:
+                    line = (
+                        f"{symbol}  WS=OK   age={ws_age_ms}ms   "
+                        f"HTTP={http_latency_ms}ms   SOURCE={final_source}"
+                    )
+                else:
+                    line = f"{symbol}  WS=NO   HTTP={http_latency_ms}ms   SOURCE={final_source}"
+                self._logger.info("[SELFTEST] %s", line)
+        finally:
+            with self._self_test_lock:
+                self._self_test_completed = True
+
+    async def _collect_ws_selftest(self, symbols: list[str]) -> dict[str, int]:
+        url = f"{self._config.binance.ws_url.rstrip('/')}/ws"
+        received: dict[str, int] = {}
+        params = [f"{symbol.lower()}@bookTicker" for symbol in symbols]
+        async with websockets.connect(url, ping_interval=None, ping_timeout=None) as websocket:
+            payload = {"method": "SUBSCRIBE", "params": params, "id": int(self._now_ms())}
+            await websocket.send(json.dumps(payload))
+            deadline_ms = self._now_ms() + int(SELFTEST_TIMEOUT_S * 1000)
+            while self._now_ms() < deadline_ms and len(received) < len(symbols):
+                timeout_s = max((deadline_ms - self._now_ms()) / 1000.0, 0.1)
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=timeout_s)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                data = payload.get("data", payload)
+                if not isinstance(data, dict):
+                    continue
+                symbol = sanitize_symbol(data.get("s"))
+                if symbol and symbol in symbols and symbol not in received:
+                    received[symbol] = self._now_ms()
+        return received
 
     def shutdown(self) -> None:
         self._stopping = True
+        self._shutting_down = True
         self._stop_event.set()
         with self._symbols_update_lock:
             if self._symbols_update_timer and self._symbols_update_timer.is_alive():
@@ -627,7 +732,7 @@ class PriceFeedManager:
         now_ms = self._now_ms()
         if now_ms < self._ws_disabled_until_ms:
             return WS_LOST
-        if self._get_ws_state() in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
+        if self._get_ws_state() in {WS_STATE_LOST, WS_STATE_CONNECTING, WS_STATE_STOPPED, WS_STATE_STOPPING}:
             return WS_LOST
         active_symbols = self._registry.active_symbols()
         if not active_symbols:
@@ -646,7 +751,7 @@ class PriceFeedManager:
 
     def _schedule_symbol_update(self) -> None:
         def _flush() -> None:
-            if self._stopping:
+            if self._stopping or self._shutting_down:
                 return
             if not self._ws_thread or not self._ws_thread.is_running():
                 return
@@ -656,7 +761,7 @@ class PriceFeedManager:
         with self._symbols_update_lock:
             if self._symbols_update_timer and self._symbols_update_timer.is_alive():
                 self._symbols_update_timer.cancel()
-            if self._stopping:
+            if self._stopping or self._shutting_down:
                 return
             self._symbols_update_timer = threading.Timer(SYMBOL_UPDATE_DEBOUNCE_MS / 1000.0, _flush)
             self._symbols_update_timer.daemon = True
@@ -773,6 +878,46 @@ class PriceFeedManager:
         self._log_limiter[key] = now_ms
         getattr(self._logger, level)(message)
 
+    def _resolve_price_source(self, symbol: str, state: dict[str, Any]) -> PriceSource:
+        subscribed_symbols = self._ws_thread.get_subscribed_symbols() if self._ws_thread else set()
+        ws_state = self._get_ws_state()
+        if ws_state in {WS_STATE_LOST, WS_STATE_STOPPED, WS_STATE_STOPPING, WS_STATE_CONNECTING}:
+            return "HTTP"
+        if symbol.lower() not in subscribed_symbols:
+            return "HTTP"
+        if state.get("http_fallback_enabled"):
+            return "HTTP"
+        if state.get("ws_status") != WS_CONNECTED:
+            return "HTTP"
+        return "WS"
+
+    def _log_price_source(self, symbol: str, source: PriceSource) -> None:
+        self._log_rate_limited(symbol, "price_source", "info", f"Price source {symbol} = {source}")
+
+    def _set_http_fallback(
+        self,
+        symbol: str,
+        *,
+        enabled: bool,
+        reason: str | None,
+    ) -> None:
+        with self._lock:
+            state = self._symbol_state.setdefault(symbol, {})
+            current_enabled = state.get("http_fallback_enabled", False)
+            current_reason = state.get("http_fallback_reason")
+            if enabled:
+                state["http_fallback_enabled"] = True
+                state["http_fallback_reason"] = reason
+                state["http_disable_grace_until_ms"] = None
+            else:
+                state["http_fallback_enabled"] = False
+                state["http_fallback_reason"] = None
+                state["http_disable_grace_until_ms"] = None
+        if enabled and (not current_enabled or current_reason != reason):
+            self._log_rate_limited(symbol, "http_fallback", "info", f"HTTP fallback for {symbol}: {reason}")
+        if not enabled and current_enabled:
+            self._log_rate_limited(symbol, "http_fallback", "info", f"HTTP fallback cleared for {symbol}")
+
     def _sanitize_symbol(self, symbol: object) -> str | None:
         cleaned = sanitize_symbol(symbol)
         if cleaned is None:
@@ -822,25 +967,24 @@ class PriceFeedManager:
                 for symbol, symbol_state in self._symbol_state.items():
                     symbol_state["ws_status"] = WS_LOST
                     symbol_state["ws_health_state"] = resolve_health_state(WS_LOST)
-                    symbol_state["http_fallback_enabled"] = True
-                    symbol_state["http_fallback_reason"] = "LOST"
-                    symbol_state["http_disable_grace_until_ms"] = None
                     symbols_to_notify.append(symbol)
             for symbol in symbols_to_notify:
+                self._set_http_fallback(symbol, enabled=True, reason="LOST")
                 self._publish_status(symbol, WS_LOST)
             return
         if status in {
             WS_STATE_CONNECTED,
-            WS_STATE_RECONNECTING,
+            WS_STATE_CONNECTING,
             WS_STATE_LOST,
             WS_STATE_STOPPED,
+            WS_STATE_STOPPING,
         }:
             self._set_ws_state(status, details)
             if status == WS_STATE_CONNECTED:
                 with self._lock:
                     for symbol_state in self._symbol_state.values():
                         symbol_state["ws_grace_until_ms"] = now_ms + WS_GRACE_MS
-            if status in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
+            if status in {WS_STATE_LOST, WS_STATE_CONNECTING, WS_STATE_STOPPED, WS_STATE_STOPPING}:
                 symbols_to_notify = []
                 with self._lock:
                     for symbol, symbol_state in self._symbol_state.items():
@@ -909,8 +1053,26 @@ class PriceFeedManager:
                 subscribed = symbol.lower() in subscribed_symbols
                 self._heartbeat_symbol(symbol, now_ms, subscribed=subscribed)
                 self._maybe_poll_http(symbol, now_ms)
+            self._update_ws_overall_state(active_symbols)
             time.sleep(self._heartbeat_interval_s)
         self._logger.info("Price feed монитор остановлен")
+
+    def _update_ws_overall_state(self, active_symbols: list[str]) -> None:
+        ws_state = self._get_ws_state()
+        if ws_state in {WS_STATE_CONNECTING, WS_STATE_STOPPING, WS_STATE_STOPPED}:
+            return
+        if not active_symbols:
+            self._set_ws_state(WS_STATE_LOST, "no active symbols")
+            return
+        with self._lock:
+            statuses = [self._symbol_state.get(symbol, {}).get("ws_status", WS_LOST) for symbol in active_symbols]
+        if any(status == WS_DEGRADED for status in statuses):
+            self._set_ws_state(WS_STATE_DEGRADED, "symbol degraded")
+            return
+        if any(status == WS_CONNECTED for status in statuses):
+            self._set_ws_state(WS_STATE_CONNECTED, "symbols connected")
+            return
+        self._set_ws_state(WS_STATE_LOST, "symbols lost")
 
     def _heartbeat_symbol(self, symbol: str, now_ms: int, *, subscribed: bool) -> None:
         cleaned = self._sanitize_symbol(symbol)
@@ -931,7 +1093,7 @@ class PriceFeedManager:
         age_ms = None
         if not subscribed:
             desired_status = WS_LOST
-        elif ws_disabled or ws_state in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
+        elif ws_disabled or ws_state in {WS_STATE_LOST, WS_STATE_CONNECTING, WS_STATE_STOPPED, WS_STATE_STOPPING}:
             desired_status = WS_LOST
         else:
             if last_ws_msg is None:
@@ -984,21 +1146,11 @@ class PriceFeedManager:
             self._publish_status(cleaned, desired_status)
 
         if ws_disabled or desired_status == WS_LOST:
-            if not http_fallback_enabled:
-                with self._lock:
-                    state = self._symbol_state.setdefault(cleaned, {})
-                    state["http_fallback_enabled"] = True
-                    state["http_fallback_reason"] = "LOST"
-                    state["http_disable_grace_until_ms"] = None
-                self._logger.debug("HTTP фолбэк включен для %s", cleaned)
+            if not http_fallback_enabled or http_fallback_reason != "LOST":
+                self._set_http_fallback(cleaned, enabled=True, reason="LOST")
         elif desired_status == WS_DEGRADED:
             if not http_fallback_enabled or http_fallback_reason != "STALE":
-                with self._lock:
-                    state = self._symbol_state.setdefault(cleaned, {})
-                    state["http_fallback_enabled"] = True
-                    state["http_fallback_reason"] = "STALE"
-                    state["http_disable_grace_until_ms"] = None
-                self._logger.debug("HTTP фолбэк (stale) включен для %s", cleaned)
+                self._set_http_fallback(cleaned, enabled=True, reason="STALE")
         elif desired_status == WS_CONNECTED:
             if http_fallback_enabled:
                 if http_disable_grace_until is None:
@@ -1007,12 +1159,7 @@ class PriceFeedManager:
                         state["http_disable_grace_until_ms"] = now_ms + self._http_disable_grace_ms
                         http_disable_grace_until = state["http_disable_grace_until_ms"]
                 if http_disable_grace_until is not None and now_ms >= http_disable_grace_until:
-                    with self._lock:
-                        state = self._symbol_state.setdefault(cleaned, {})
-                        state["http_fallback_enabled"] = False
-                        state["http_fallback_reason"] = None
-                        state["http_disable_grace_until_ms"] = None
-                    self._logger.debug("HTTP фолбэк выключен для %s", cleaned)
+                    self._set_http_fallback(cleaned, enabled=False, reason=None)
 
     def _maybe_poll_http(self, symbol: str, now_ms: int) -> None:
         cleaned = self._sanitize_symbol(symbol)
@@ -1062,6 +1209,7 @@ class PriceFeedManager:
         update = self._build_update(symbol)
         if update is None:
             return
+        self._log_price_source(symbol, update.source)
         with self._lock:
             subscribers = list(self._tick_subscribers.get(symbol, {}).values())
         for worker in subscribers:
@@ -1103,7 +1251,7 @@ class PriceFeedManager:
         mid_price = state.get("mid_price")
         updated_ms = state.get("updated_ms")
         ws_latency_ms = state.get("latency_ms")
-        source = state.get("source", "WS")
+        source = self._resolve_price_source(symbol, state)
         ws_status = state.get("ws_status", WS_LOST)
         ws_health_state = state.get("ws_health_state", resolve_health_state(ws_status))
         price_age_ms = None
