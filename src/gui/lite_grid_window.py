@@ -41,6 +41,7 @@ from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
 from src.core.logging import get_logger
 from src.gui.i18n import TEXT, tr
+from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
 from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
@@ -619,6 +620,8 @@ class LiteGridWindow(QMainWindow):
         self._bot_order_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
         self._fill_keys: set[str] = set()
+        self._fill_accumulator = FillAccumulator()
+        self._active_action_keys: set[str] = set()
         self._bot_session_id: str | None = None
         self._last_price: float | None = None
         self._price_history: list[float] = []
@@ -634,6 +637,7 @@ class LiteGridWindow(QMainWindow):
         self._base_asset = ""
         self._balances_in_flight = False
         self._balances_loaded = False
+        self._balance_ready_ts: float | None = None
         self._orders_in_flight = False
         self._rules_in_flight = False
         self._fees_in_flight = False
@@ -1324,6 +1328,10 @@ class LiteGridWindow(QMainWindow):
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
+        if not self._engine_ready():
+            reason = self._engine_ready_reason()
+            self._append_log(f"Start blocked: engine not ready ({reason}).", kind="WARN")
+            return
         dry_run = self._dry_run_toggle.isChecked()
         self._append_log(f"Start pressed (dry-run={dry_run}).", kind="ORDERS")
         self._append_log(
@@ -1348,6 +1356,7 @@ class LiteGridWindow(QMainWindow):
             anchor_price = self.get_anchor_price(self._symbol)
             if anchor_price is None:
                 raise ValueError("No price available.")
+            balance_snapshot = self._balance_snapshot()
             settings = self._resolve_start_settings()
             self._apply_auto_clamps(settings, anchor_price)
             if not dry_run and self._first_live_session:
@@ -1375,9 +1384,7 @@ class LiteGridWindow(QMainWindow):
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
         if not dry_run:
-            base_free = 0.0
-            if self._base_asset:
-                base_free, _ = self._balances.get(self._base_asset, (0.0, 0.0))
+            base_free = float(balance_snapshot.get("base_free", Decimal("0")))
             if base_free <= 0:
                 self._bootstrap_mode = True
                 planned = [order for order in planned if order.side == "BUY"]
@@ -1449,6 +1456,8 @@ class LiteGridWindow(QMainWindow):
         self._bot_order_ids.clear()
         self._bot_order_keys.clear()
         self._fill_keys.clear()
+        self._fill_accumulator = FillAccumulator()
+        self._active_action_keys.clear()
         self._open_orders_map = {}
         self._fills = []
         self._base_lots.clear()
@@ -1478,6 +1487,9 @@ class LiteGridWindow(QMainWindow):
         self._bootstrap_sell_enabled = False
         self._bot_order_ids.clear()
         self._bot_order_keys.clear()
+        self._fill_keys.clear()
+        self._fill_accumulator = FillAccumulator()
+        self._active_action_keys.clear()
         self._open_orders_map = {}
         self._bot_session_id = None
         self._open_orders = []
@@ -1738,6 +1750,37 @@ class LiteGridWindow(QMainWindow):
         if settings.take_profit_pct < settings.grid_step_pct:
             settings.take_profit_pct = settings.grid_step_pct
 
+    def _balance_snapshot(self) -> dict[str, Decimal]:
+        balances = dict(self._balances)
+        base_free = Decimal("0")
+        quote_free = Decimal("0")
+        if self._base_asset:
+            base_free = self.as_decimal(balances.get(self._base_asset, (0.0, 0.0))[0])
+        if self._quote_asset:
+            quote_free = self.as_decimal(balances.get(self._quote_asset, (0.0, 0.0))[0])
+        return {"base_free": base_free, "quote_free": quote_free}
+
+    def _engine_ready(self) -> bool:
+        if not self._rules_loaded:
+            return False
+        if self._trade_gate != TradeGate.TRADE_OK:
+            return False
+        if self._balance_ready_ts is None:
+            return False
+        return time() - self._balance_ready_ts <= 2
+
+    def _engine_ready_reason(self) -> str:
+        if not self._rules_loaded:
+            return "rules_not_loaded"
+        if self._trade_gate != TradeGate.TRADE_OK:
+            return f"trade_gate={self._trade_gate.value}"
+        if self._balance_ready_ts is None:
+            return "balances_not_ready"
+        age = time() - self._balance_ready_ts
+        if age > 2:
+            return f"balances_stale age={age:.2f}s"
+        return "ok"
+
     def _reset_defaults(self) -> None:
         defaults = GridSettingsState()
         self._settings_state = defaults
@@ -1804,6 +1847,8 @@ class LiteGridWindow(QMainWindow):
                 balances[asset] = (free, locked)
         self._balances = balances
         self._balances_loaded = True
+        if self._rules_loaded:
+            self._balance_ready_ts = time()
         self._set_account_status("ready")
         self._account_api_error = False
         status = self._account_client.get_account_status(result) if self._account_client else AccountStatus(False, [], None)
@@ -1837,6 +1882,7 @@ class LiteGridWindow(QMainWindow):
         self._balances_in_flight = False
         self._account_can_trade = False
         self._balances_loaded = False
+        self._balance_ready_ts = None
         self._account_api_error = True
         self._account_permissions = []
         self._last_account_trade_snapshot = None
@@ -2158,19 +2204,32 @@ class LiteGridWindow(QMainWindow):
         self._fill_keys.add(fill_key)
         if fill.trade_id:
             self._seen_trade_ids.add(fill.trade_id)
+        total_filled = self.as_decimal(fill.qty)
+        delta = total_filled
+        if fill.order_id:
+            total_filled, delta = self._fill_accumulator.record(
+                fill.order_id,
+                self.as_decimal(fill.qty),
+                is_total=False,
+            )
+        if delta <= 0:
+            return
         self._record_fill(fill)
         self._apply_local_balance_fill(fill)
         self._bot_order_keys.discard(
             self._order_key(fill.side, self.as_decimal(fill.price), self.as_decimal(fill.qty))
         )
+        step = self._rule_decimal(self._exchange_rules.get("step"))
         self._append_log(
             (
                 f"[LIVE] FILLED orderId={fill.order_id} side={fill.side}"
-                f" price={fill.price:.8f} qty={fill.qty:.8f}"
+                f" total={self.fmt_qty(total_filled, step)} delta={self.fmt_qty(delta, step)}"
             ),
             kind="ORDERS",
         )
-        self._place_replacement_order(fill, attempt=0)
+        self._place_replacement_order(fill, delta_qty=delta)
+        if fill.order_id:
+            self._fill_accumulator.mark_handled(fill.order_id, total_filled)
         self._maybe_enable_bootstrap_sell_side(fill)
 
     def _fill_key(self, fill: TradeFill) -> str:
@@ -2300,7 +2359,7 @@ class LiteGridWindow(QMainWindow):
             )
         )
 
-    def _place_replacement_order(self, fill: TradeFill, *, attempt: int = 0) -> None:
+    def _place_replacement_order(self, fill: TradeFill, *, delta_qty: Decimal) -> None:
         if not self._account_client or not self._bot_session_id:
             return
         if self._state not in {"RUNNING", "WAITING_FILLS"}:
@@ -2314,37 +2373,34 @@ class LiteGridWindow(QMainWindow):
         tp_side = "SELL" if fill.side == "BUY" else "BUY"
         tp_dec = self.as_decimal(tp_pct) / Decimal("100")
         fill_price = self.as_decimal(fill.price)
-        fill_qty = self.as_decimal(fill.qty)
+        fill_qty = delta_qty
         raw_tp_price = fill_price * (Decimal("1") + tp_dec) if tp_side == "SELL" else fill_price * (Decimal("1") - tp_dec)
         tp_price = self.q_price(raw_tp_price, tick)
-        tp_qty = self._apply_sell_fee_buffer(fill_qty, step) if tp_side == "SELL" else self.q_qty(fill_qty, step)
+        balances_snapshot = self._balance_snapshot()
+        desired_tp_notional = tp_price * fill_qty
+        tp_qty, tp_notional, tp_reason = compute_order_qty(
+            tp_side,
+            tp_price,
+            desired_tp_notional,
+            balances_snapshot,
+            self._exchange_rules,
+            self._effective_fee_rate(),
+            None,
+        )
         if tp_price <= 0 or tp_qty <= 0:
             self._append_log(
-                f"[LIVE] TP skipped: invalid side={tp_side} price={tp_price} qty={tp_qty}",
+                f"[LIVE] TP planned qty={tp_qty} skip reason={tp_reason}",
                 kind="WARN",
             )
             return
-        if tp_side == "SELL" and not self._has_base_balance(tp_qty, step):
-            if attempt >= self._sell_retry_limit:
-                self._append_log(
-                    (
-                        "[LIVE] TP delayed: insufficient base balance "
-                        f"qty={self.fmt_qty(tp_qty, step)} attempts={attempt}"
-                    ),
-                    kind="WARN",
-                )
-                return
-            delay_ms = min(300 + attempt * 150, 800)
-            self._append_log(
-                (
-                    "[LIVE] TP delayed: waiting for base balance "
-                    f"qty={self.fmt_qty(tp_qty, step)} retry_in={delay_ms}ms"
-                ),
-                kind="INFO",
-            )
-            self._refresh_balances()
-            QTimer.singleShot(delay_ms, lambda: self._place_replacement_order(fill, attempt=attempt + 1))
+        tp_action_key = build_action_key("TP", fill.order_id, tp_price, tp_qty, step)
+        if tp_action_key in self._active_action_keys:
             return
+        self._active_action_keys.add(tp_action_key)
+        self._append_log(
+            f"[LIVE] TP planned qty={self.fmt_qty(tp_qty, step)} ok notional={self.fmt_price(tp_notional, None)}",
+            kind="ORDERS",
+        )
         existing_tp = self.find_matching_order(tp_side, tp_price, tp_qty, tolerance_ticks=0)
         existing_qty = Decimal("0")
         existing_order_id = ""
@@ -2377,17 +2433,33 @@ class LiteGridWindow(QMainWindow):
             restore_price = self.q_price(fill_price - step_abs, tick)
         else:
             restore_price = self.q_price(fill_price + step_abs, tick)
-        restore_qty = (
-            self._apply_sell_fee_buffer(fill_qty, step)
-            if restore_side == "SELL"
-            else self.q_qty(fill_qty, step)
+        desired_restore_notional = restore_price * fill_qty
+        restore_qty, restore_notional, restore_reason = compute_order_qty(
+            restore_side,
+            restore_price,
+            desired_restore_notional,
+            balances_snapshot,
+            self._exchange_rules,
+            self._effective_fee_rate(),
+            None,
         )
         allow_restore = restore_qty > 0
         if not allow_restore:
             self._append_log(
-                f"[LIVE] RESTORE skipped: invalid side={restore_side} price={restore_price} qty={restore_qty}",
+                f"[LIVE] RESTORE planned qty={restore_qty} skip reason={restore_reason}",
                 kind="WARN",
             )
+        else:
+            restore_action_key = build_action_key("RESTORE", fill.order_id, restore_price, restore_qty, step)
+            if restore_action_key in self._active_action_keys:
+                allow_restore = False
+            else:
+                self._active_action_keys.add(restore_action_key)
+                self._append_log(
+                    f"[LIVE] RESTORE planned qty={self.fmt_qty(restore_qty, step)} ok "
+                    f"notional={self.fmt_price(restore_notional, None)}",
+                    kind="ORDERS",
+                )
 
         tp_client_order_id = self._next_client_order_id("TP", suffix="M" if existing_tp else "")
         restore_client_order_id = (
@@ -2855,6 +2927,7 @@ class LiteGridWindow(QMainWindow):
             "max_qty": max_qty,
         }
         self._rules_loaded = True
+        self._balance_ready_ts = None
         self._apply_trade_gate()
         self._update_rules_label()
         self._update_grid_preview()
@@ -3185,13 +3258,10 @@ class LiteGridWindow(QMainWindow):
         if not self._bot_session_id:
             self._bot_session_id = uuid4().hex[:8]
         batch_size = 5
-        base_asset = self._base_asset
-        base_free = 0.0
-        if base_asset:
-            base_free, _ = self._balances.get(base_asset, (0.0, 0.0))
+        balance_snapshot = self._balance_snapshot()
+        base_free = float(balance_snapshot.get("base_free", Decimal("0")))
         skip_sells = base_free <= 0
         step = self._rule_decimal(self._exchange_rules.get("step"))
-        fee_rate = self._effective_fee_rate()
         has_sells = any(order.side == "SELL" for order in planned)
         if skip_sells and has_sells:
             self._append_log(
@@ -3203,32 +3273,37 @@ class LiteGridWindow(QMainWindow):
             results: list[dict[str, Any]] = []
             errors: list[str] = []
             last_open_orders: list[dict[str, Any]] | None = None
-            available_effective = self.as_decimal(base_free)
-            if fee_rate > 0:
-                available_effective = available_effective * (Decimal("1") - fee_rate)
+            working_balances = {
+                "base_free": self.as_decimal(balance_snapshot.get("base_free", Decimal("0"))),
+                "quote_free": self.as_decimal(balance_snapshot.get("quote_free", Decimal("0"))),
+            }
             for idx, order in enumerate(planned, start=1):
                 if skip_sells and order.side == "SELL":
                     continue
                 client_order_id = self._make_client_order_id("GRID", idx)
                 try:
                     price = self.as_decimal(order.price)
-                    qty = self.as_decimal(order.qty)
-                    if order.side == "SELL":
-                        if available_effective <= 0:
-                            self._signals.log_append.emit(
-                                "[LIVE] sell skipped: base balance exhausted after fee buffer",
-                                "WARN",
-                            )
-                            continue
-                        qty = min(qty, available_effective)
-                        qty = self.q_qty(qty, step)
-                        if qty <= 0:
-                            self._signals.log_append.emit(
-                                "[LIVE] sell skipped: qty <= 0 after fee/step buffer",
-                                "WARN",
-                            )
-                            continue
-                        available_effective -= qty
+                    desired_notional = price * self.as_decimal(order.qty)
+                    qty, notional, reason = compute_order_qty(
+                        order.side,
+                        price,
+                        desired_notional,
+                        working_balances,
+                        self._exchange_rules,
+                        self._effective_fee_rate(),
+                        None,
+                    )
+                    if qty <= 0:
+                        self._signals.log_append.emit(
+                            (
+                                "[LIVE] grid skipped: insufficient balance "
+                                f"side={order.side} price={self.fmt_price(price, None)} "
+                                f"reason={reason} base_free={working_balances['base_free']} "
+                                f"quote_free={working_balances['quote_free']}"
+                            ),
+                            "WARN",
+                        )
+                        continue
                     response, error = self._place_limit(
                         order.side,
                         price,
@@ -3240,6 +3315,16 @@ class LiteGridWindow(QMainWindow):
                         results.append(response)
                     if error:
                         errors.append(error)
+                    if order.side == "BUY":
+                        working_balances["quote_free"] = max(
+                            Decimal("0"),
+                            working_balances["quote_free"] - notional,
+                        )
+                    else:
+                        working_balances["base_free"] = max(
+                            Decimal("0"),
+                            working_balances["base_free"] - qty,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     errors.append(self._format_binance_error(exc, order))
                 self._sleep_ms(200)

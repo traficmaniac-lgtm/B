@@ -92,3 +92,20 @@ Expected:
 - WS shows WARMUP then OK within ~3s, without immediate HTTP fallback.
 - TRANSPORT-TEST does not force WS=NONE or remove subscriptions.
 - AI snapshot shows ws=OK (or WARMUP briefly) when WS is connected.
+
+### Engine hotfix balances/fills
+- Added strict engine readiness gating to require rules, fresh balances, and trade gate before start.
+- Centralized BUY/SELL qty calculation with buffers, step rounding, and minNotional enforcement.
+- Added fill accumulation with delta processing and idempotent TP/RESTORE actions on partial fills.
+- Ensured TP/RESTORE placement re-checks balances and skips when unaffordable (no retry loops).
+- Improved fill/placement logging with compact delta and plan summaries.
+
+Repro (before):
+1. Open AI Operator Grid with low USDT free balance and press Start.
+2. Trigger a partial fill for an order (simulated or via small size).
+3. Observe repeated INSUFFICIENT_BALANCE logs and multiple TP/RESTORE placements.
+
+Verify (after):
+1. Launch AI Operator Grid, confirm Start is blocked until rules + fresh balances are loaded.
+2. Place grid, then trigger partial fills; verify logs show single FILLED with total/delta.
+3. Confirm only one TP/RESTORE per delta is placed, and restore is skipped when quote free is insufficient.
