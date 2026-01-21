@@ -31,7 +31,8 @@ from src.ai.openai_client import OpenAIClient
 from src.ai.operator_datapack import build_ai_datapack
 from src.ai.operator_models import AiOperatorResponse, AiOperatorStrategyPatch, parse_ai_operator_response
 from src.ai.operator_profiles import get_profile_preset
-from src.ai.operator_runtime import cancel_all_bot_orders, pause_state, stop_state
+from src.ai.operator_runtime import cancel_all_bot_orders, stop_state
+from src.ai.operator_state_machine import AiOperatorState, AiOperatorStateMachine
 from src.ai.operator_validation import normalize_strategy_patch, validate_strategy_patch
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
@@ -159,6 +160,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_actions_suggested: list[str] = []
         self._pending_action: PendingAction | None = None
         self._max_exposure_warned = False
+        self._ai_state_machine = AiOperatorStateMachine()
+        self._ai_patch_in_progress = False
+        self._last_data_quality_state: str | None = None
         self._data_cache = DataCache()
         self._http_client = BinanceHttpClient(
             base_url=self._config.binance.base_url,
@@ -190,6 +194,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             "klines_1d": 60.0,
         }
         self._apply_ai_layout_policies()
+        self._update_ai_controls()
 
     def _apply_ai_layout_policies(self) -> None:
         central = self.centralWidget()
@@ -303,9 +308,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._approve_button.setEnabled(False)
         self._approve_button.clicked.connect(self._approve_ai_action)
         actions_row.addWidget(self._approve_button)
-        pause_button = QPushButton("Pause (AI)")
-        pause_button.clicked.connect(self._handle_pause)
-        actions_row.addWidget(pause_button)
+        self._pause_ai_button = QPushButton("Pause (AI)")
+        self._pause_ai_button.clicked.connect(self._handle_pause)
+        actions_row.addWidget(self._pause_ai_button)
         layout.addLayout(actions_row)
 
         return group
@@ -321,10 +326,22 @@ class AiOperatorGridWindow(LiteGridWindow):
         return frame
 
     def _handle_ai_analyze(self) -> None:
+        if not self._ai_state_machine.can_analyze():
+            self._append_log(
+                f"[AI] analyze blocked: state={self._ai_state_machine.state.value}",
+                "WARN",
+            )
+            self._append_chat_line("AI", "Анализ недоступен в текущем состоянии.")
+            return
         if not self._app_state.openai_key_present:
             self._append_log("[AI] analyze skipped: missing OpenAI key.", "WARN")
             self._append_chat_line("AI", "Не задан ключ OpenAI.")
             return
+        self._transition_ai_state(
+            "analyze",
+            self._ai_state_machine.start_analyzing,
+            failure_message="state transition blocked",
+        )
         self._await_ws_warmup()
         self._lookback_request_used = False
         datapack = self._build_full_market_pack()
@@ -362,6 +379,15 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._handle_ai_analyze_error("AI response invalid or empty.")
             return
         parsed = self._enforce_action_patch_requirements(parsed)
+        if not self._enforce_ai_safety(parsed):
+            self._transition_ai_state(
+                "analyze",
+                self._ai_state_machine.set_invalid,
+                failure_message="safety rejected",
+            )
+            self._apply_plan_button.setEnabled(False)
+            self._clear_actions()
+            return
         if (
             parsed.diagnostics.requested_more_data
             and not self._lookback_request_used
@@ -388,13 +414,23 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_ai_response_to_chat(parsed)
         self._apply_recommended_profile(parsed.strategy_patch.profile)
         self._render_actions(self._build_actions(parsed))
-        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
+        self._transition_ai_state(
+            "analyze",
+            self._ai_state_machine.set_plan_ready,
+            failure_message="state transition blocked",
+        )
+        self._update_apply_plan_state()
         self._append_log("[AI] response status=received", "INFO")
 
     def _handle_ai_analyze_error(self, message: str) -> None:
         self._set_ai_busy(False)
         self._append_log(f"[AI] response invalid: {message}", "WARN")
         self._append_chat_line("AI", f"Ошибка AI: {message}")
+        self._transition_ai_state(
+            "analyze",
+            self._ai_state_machine.set_invalid,
+            failure_message="state transition blocked",
+        )
         self._last_ai_response = None
         self._last_ai_result_json = None
         self._last_ai_result_id = None
@@ -405,6 +441,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._update_approve_button_state()
 
     def _apply_ai_plan(self) -> None:
+        if not self._ai_state_machine.can_apply_plan():
+            self._append_log(
+                f"[AI] apply plan blocked: state={self._ai_state_machine.state.value}",
+                "WARN",
+            )
+            self._append_chat_line("AI", "Применение плана недоступно в текущем состоянии.")
+            return
         patch = self._get_selected_profile_patch()
         if not patch or not self._strategy_patch_has_values(patch):
             self._append_log("[AI] patch empty, nothing to apply", "INFO")
@@ -420,7 +463,13 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_apply_ts = now
         self._apply_plan_button.setEnabled(False)
         QTimer.singleShot(400, self._restore_apply_plan_state)
-        self._apply_ai_patch(patch, source_label="Apply Plan")
+        complete_patch = self._ensure_complete_patch(patch)
+        if self._apply_ai_patch(complete_patch, source_label="Apply Plan"):
+            self._transition_ai_state(
+                "apply_plan",
+                self._ai_state_machine.apply_plan,
+                failure_message="state transition blocked",
+            )
 
     def _handle_ai_send(self) -> None:
         message = self._chat_input.text().strip()
@@ -511,7 +560,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_ai_response_to_chat(parsed)
         self._apply_recommended_profile(parsed.strategy_patch.profile)
         self._render_actions(self._build_actions(parsed))
-        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
+        self._update_apply_plan_state()
         self._append_log("[AI] chat response received", "INFO")
 
     def _handle_ai_chat_error(self, message: str) -> None:
@@ -556,6 +605,8 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._handle_ai_lookback_request_error("AI request loop invalid response")
             return
         parsed, raw_json, datapack = response
+        self._last_full_pack = datapack
+        self._last_ai_datapack = datapack
         data_quality = datapack.get("data_quality", {})
         missing = data_quality.get("missing") or []
         requested_days = datapack.get("meta", {}).get("lookback_days")
@@ -569,18 +620,37 @@ class AiOperatorGridWindow(LiteGridWindow):
                 ),
             )
         parsed = self._enforce_action_patch_requirements(parsed)
+        if not self._enforce_ai_safety(parsed):
+            self._transition_ai_state(
+                "analyze",
+                self._ai_state_machine.set_invalid,
+                failure_message="safety rejected",
+            )
+            self._apply_plan_button.setEnabled(False)
+            self._clear_actions()
+            return
         response_id = self._store_ai_result(parsed, raw_json)
         self._set_pending_action(parsed, response_id)
         self._append_ai_response_to_chat(parsed)
         self._apply_recommended_profile(parsed.strategy_patch.profile)
         self._render_actions(self._build_actions(parsed))
-        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(parsed.strategy_patch))
+        self._transition_ai_state(
+            "analyze",
+            self._ai_state_machine.set_plan_ready,
+            failure_message="state transition blocked",
+        )
+        self._update_apply_plan_state()
         self._append_log("[AI] request_data response received", "INFO")
 
     def _handle_ai_lookback_request_error(self, message: str) -> None:
         self._set_ai_busy(False)
         self._append_log(f"[AI] request_data failed: {message}", "WARN")
         self._append_chat_line("AI", f"Запрос доп. данных не выполнен: {message}")
+        self._transition_ai_state(
+            "analyze",
+            self._ai_state_machine.set_invalid,
+            failure_message="state transition blocked",
+        )
     def _approve_ai_action(self) -> None:
         pending_action = self._pending_action
         selected_action = self._actions_combo.currentText().strip().upper()
@@ -645,7 +715,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not hasattr(self, "_apply_plan_button"):
             return
         patch = self._get_selected_profile_patch()
-        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(patch) and not self._ai_busy)
+        self._apply_plan_button.setEnabled(
+            self._can_apply_ai_patch(patch) and not self._ai_busy and self._ai_state_machine.can_apply_plan()
+        )
 
     def _get_selected_lookback_days(self) -> int:
         if hasattr(self, "_lookback_combo"):
@@ -656,10 +728,154 @@ class AiOperatorGridWindow(LiteGridWindow):
 
     def _set_ai_busy(self, busy: bool) -> None:
         self._ai_busy = busy
-        self._analyze_button.setEnabled(not busy)
         self._chat_input.setEnabled(not busy)
         self._send_button.setEnabled(not busy)
-        self._update_apply_plan_state()
+        self._update_ai_controls()
+
+    def _update_ai_controls(self) -> None:
+        if hasattr(self, "_refresh_snapshot_button"):
+            self._refresh_snapshot_button.setEnabled(self._ai_state_machine.can_refresh() and not self._ai_busy)
+        if hasattr(self, "_analyze_button"):
+            self._analyze_button.setEnabled(self._ai_state_machine.can_analyze() and not self._ai_busy)
+        if hasattr(self, "_apply_plan_button"):
+            self._update_apply_plan_state()
+        runtime_ready = self._engine_ready()
+        account_ready = self._dry_run_toggle.isChecked() or self._trade_gate == TradeGate.TRADE_OK
+        start_enabled = self._ai_state_machine.can_start() and runtime_ready and account_ready
+        if hasattr(self, "_start_button"):
+            self._start_button.setEnabled(start_enabled)
+        pause_enabled = self._ai_state_machine.can_pause()
+        if hasattr(self, "_pause_button"):
+            self._pause_button.setEnabled(pause_enabled)
+        if hasattr(self, "_pause_ai_button"):
+            self._pause_ai_button.setEnabled(pause_enabled)
+        stop_enabled = self._ai_state_machine.can_stop()
+        if hasattr(self, "_stop_button"):
+            self._stop_button.setEnabled(stop_enabled)
+
+    def _transition_ai_state(
+        self,
+        action: str,
+        transition_fn: Callable[[], bool],
+        *,
+        failure_message: str,
+    ) -> bool:
+        before = self._ai_state_machine.state
+        ok = transition_fn()
+        if not ok:
+            self._append_log(
+                f"[AI] {action} blocked: {failure_message} state={before.value}",
+                "WARN",
+            )
+        else:
+            after = self._ai_state_machine.state
+            if after != before:
+                self._append_log(
+                    f"[AI] state {before.value} -> {after.value}",
+                    "INFO",
+                )
+        self._update_ai_controls()
+        return ok
+
+    def _invalidate_ai_confidence(self, message: str) -> None:
+        if self._ai_state_machine.state == AiOperatorState.INVALID:
+            return
+        self._ai_state_machine.invalidate_manual()
+        self._append_log("[AI] manual change invalidated AI confidence", "WARN")
+        self._append_chat_line("AI", message)
+        self._update_ai_controls()
+
+    def _ensure_complete_patch(self, patch: AiOperatorStrategyPatch) -> AiOperatorStrategyPatch:
+        settings = self.dump_settings()
+        profile = patch.profile or self._profile_combo.currentData() or "BALANCED"
+        direction = settings.get("direction") or self._settings_state.direction
+        bias = patch.bias or self._bias_from_direction(direction)
+        range_mode = patch.range_mode or self._range_mode_from_settings(settings)
+        step_pct = patch.step_pct if patch.step_pct is not None else settings.get("grid_step_pct")
+        range_down = (
+            patch.range_down_pct
+            if patch.range_down_pct is not None
+            else settings.get("range_low_pct")
+        )
+        range_up = (
+            patch.range_up_pct
+            if patch.range_up_pct is not None
+            else settings.get("range_high_pct")
+        )
+        levels = patch.levels if patch.levels is not None else settings.get("grid_count")
+        tp_pct = patch.tp_pct if patch.tp_pct is not None else settings.get("take_profit_pct")
+        max_orders = (
+            patch.max_active_orders
+            if patch.max_active_orders is not None
+            else settings.get("max_active_orders")
+        )
+        notes = patch.notes or ""
+        return AiOperatorStrategyPatch(
+            profile=profile,
+            bias=bias or "FLAT",
+            range_mode=range_mode or "MANUAL",
+            step_pct=float(step_pct or 0.0),
+            range_down_pct=float(range_down or 0.0),
+            range_up_pct=float(range_up or 0.0),
+            levels=int(levels or 0),
+            tp_pct=float(tp_pct or 0.0),
+            max_active_orders=int(max_orders or 0),
+            notes=notes,
+        )
+
+    @staticmethod
+    def _bias_from_direction(direction: str | None) -> str:
+        mapping = {
+            "Long-biased": "UP",
+            "Short-biased": "DOWN",
+            "Neutral": "FLAT",
+        }
+        return mapping.get(direction or "", "FLAT")
+
+    @staticmethod
+    def _range_mode_from_settings(settings: dict[str, Any]) -> str:
+        range_mode = settings.get("range_mode")
+        return "AUTO_ATR" if range_mode == "Auto" else "MANUAL"
+
+    @staticmethod
+    def _compute_micro_vol_p95(prices: list[float]) -> float | None:
+        if len(prices) < 2:
+            return None
+        returns: list[float] = []
+        for idx in range(1, len(prices)):
+            prev = prices[idx - 1]
+            if prev <= 0:
+                continue
+            returns.append(abs(prices[idx] / prev - 1) * 100)
+        if not returns:
+            return None
+        returns.sort()
+        index = int(round((len(returns) - 1) * 0.95))
+        return round(returns[index], 6)
+
+    def _derive_data_quality_state(self, data_quality: dict[str, Any]) -> str:
+        missing = data_quality.get("missing") or []
+        warnings = data_quality.get("warnings") or []
+        ws_ok = data_quality.get("ws_ok")
+        http_ok = data_quality.get("http_ok")
+        if missing:
+            return "INCOMPLETE"
+        if not ws_ok or not http_ok or warnings:
+            return "DEGRADED"
+        return "OK"
+
+    def _reset_ai_plan(self) -> None:
+        self._pending_action = None
+        self._last_ai_response = None
+        self._last_ai_result_json = None
+        self._last_ai_result_id = None
+        self._last_applied_ai_result_id = None
+        self._last_strategy_patch = None
+        self._last_actions_suggested = []
+        self._ai_state_machine.ai_confidence_locked = False
+        self._apply_plan_button.setEnabled(False)
+        self._clear_actions()
+        self._update_ai_controls()
 
 
     def _append_chat_line(self, author: str, message: str) -> None:
@@ -719,10 +935,11 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._chat_history.appendPlainText(line)
 
     def _restore_apply_plan_state(self) -> None:
-        patch = self._get_selected_profile_patch()
-        self._apply_plan_button.setEnabled(self._can_apply_ai_patch(patch))
+        self._update_apply_plan_state()
 
     def _can_apply_ai_patch(self, patch: AiOperatorStrategyPatch | None) -> bool:
+        if not self._ai_state_machine.can_apply_plan():
+            return False
         if not self._strategy_patch_has_values(patch):
             return False
         if self._last_ai_result_id and self._last_ai_result_id == self._last_applied_ai_result_id:
@@ -784,6 +1001,55 @@ class AiOperatorGridWindow(LiteGridWindow):
         if not is_valid:
             reasons.append(f"profile={preset.name}")
         return is_valid, reasons, profit_estimate
+
+    def _enforce_ai_safety(self, response: AiOperatorResponse) -> bool:
+        patch = response.strategy_patch
+        reasons: list[str] = []
+        if not self._strategy_patch_has_values(patch):
+            reasons.append("patch_missing")
+        else:
+            is_valid, validation_reasons, _ = self._validate_ai_patch(patch)
+            if not is_valid:
+                reasons.extend(validation_reasons)
+        pack = self._last_ai_datapack or {}
+        rules = pack.get("exchange_rules") or {}
+        price_snapshot = pack.get("price_snapshot") or {}
+        grid_settings = pack.get("grid_settings") or {}
+        micro = pack.get("micro") or {}
+        micro_vol_p95 = self._coerce_float(micro.get("micro_vol_p95"))
+        if (
+            micro_vol_p95 is not None
+            and patch.range_down_pct is not None
+            and patch.range_up_pct is not None
+        ):
+            range_min = min(patch.range_down_pct, patch.range_up_pct)
+            if range_min < micro_vol_p95:
+                reasons.append("range_below_micro_vol_p95")
+        min_notional = self._coerce_float(rules.get("minNotional"))
+        min_qty = self._coerce_float(rules.get("minQty"))
+        budget = self._coerce_float(grid_settings.get("budget"))
+        price = self._coerce_float(price_snapshot.get("mid") or price_snapshot.get("best_bid"))
+        if budget and patch.levels and patch.levels > 0 and price:
+            per_order_notional = budget / patch.levels
+            if min_notional and per_order_notional < min_notional:
+                reasons.append("min_notional")
+            per_order_qty = per_order_notional / price
+            if min_qty and per_order_qty < min_qty:
+                reasons.append("min_qty")
+        if not reasons:
+            return True
+        reason_map = {
+            "patch_missing": "Нет параметров стратегии.",
+            "step_below_min": "Шаг меньше комиссий/слиппеджа.",
+            "range_below_micro_vol_p95": "Диапазон меньше микроволатильности.",
+            "min_notional": "Notional на ордер ниже minNotional.",
+            "min_qty": "Количество на ордер ниже minQty.",
+        }
+        readable = [reason_map.get(item, item) for item in reasons]
+        summary = "; ".join(readable[:3])
+        self._append_log(f"[AI] safety rejected: {summary}", "WARN")
+        self._append_chat_line("AI", f"DO_NOT_TRADE: {summary}")
+        return False
 
     def _enforce_action_patch_requirements(self, response: AiOperatorResponse) -> AiOperatorResponse:
         patch = response.strategy_patch
@@ -930,17 +1196,23 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_chat_line("AI", "AI_PATCH_REJECTED: invalid patch")
             return False
         patch, adjustments = self._sanitize_patch(self._symbol, patch)
-        apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
-        if callable(apply_to_form):
-            apply_to_form(patch)
-        else:
-            self._append_log("[AI] apply patch skipped: form handler missing", "WARN")
-        self._apply_strategy_patch_to_ui(patch)
+        self._ai_patch_in_progress = True
+        try:
+            apply_to_form = getattr(self, "_apply_strategy_patch_to_form", None)
+            if callable(apply_to_form):
+                apply_to_form(patch)
+            else:
+                self._append_log("[AI] apply patch skipped: form handler missing", "WARN")
+            self._apply_strategy_patch_to_ui(patch)
+        finally:
+            self._ai_patch_in_progress = False
         self._append_log("[AI] strategy_patch applied", "INFO")
         self._append_chat_line("AI", f"Strategy patch applied via {source_label}.")
         if adjustments:
             self._append_chat_line("AI", f"Patch adjusted: {', '.join(adjustments)}")
         self._last_applied_ai_result_id = self._last_ai_result_id
+        if source_label == "Apply Plan":
+            self._ai_state_machine.ai_confidence_locked = True
         return True
 
     def _apply_approved_action(self, action: str, pending_action: PendingAction | None) -> None:
@@ -967,8 +1239,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         elif action_type in {PendingActionType.APPLY_PATCH.value, PendingActionType.ADJUST_PARAMS.value}:
             if patch is None:
                 raise RuntimeError("patch missing")
-            if not self._apply_ai_patch(patch, source_label="Approve"):
-                raise RuntimeError("patch empty")
+            self._apply_ai_plan()
         elif action_type == PendingActionType.CANCEL_ORDERS.value:
             handle_cancel_all = getattr(self, "_handle_cancel_all", None)
             if callable(handle_cancel_all):
@@ -1115,6 +1386,18 @@ class AiOperatorGridWindow(LiteGridWindow):
         if patch.max_active_orders is not None:
             self._update_setting("max_active_orders", patch.max_active_orders)
 
+    def _update_setting(self, key: str, value: Any) -> None:
+        super()._update_setting(key, value)
+        if self._ai_patch_in_progress:
+            return
+        if self._ai_state_machine.ai_confidence_locked or self._ai_state_machine.state in {
+            AiOperatorState.PLAN_READY,
+            AiOperatorState.PLAN_APPLIED,
+            AiOperatorState.RUNNING,
+            AiOperatorState.WATCHING,
+        }:
+            self._invalidate_ai_confidence("Параметры изменены вручную. AI-гарантия снята.")
+
     def _profit_profile_name(self) -> str:
         profile = self._profile_combo.currentData()
         if isinstance(profile, str):
@@ -1132,33 +1415,50 @@ class AiOperatorGridWindow(LiteGridWindow):
         }
 
     def _handle_start(self) -> None:
+        if not self._ai_state_machine.can_start():
+            self._append_log(
+                f"[AI] start blocked: state={self._ai_state_machine.state.value}",
+                kind="WARN",
+            )
+            return
+        if not self._engine_ready():
+            reason = self._engine_ready_reason()
+            self._append_log(f"[AI] start blocked: runtime not ready ({reason}).", kind="WARN")
+            return
+        if not self._dry_run_toggle.isChecked() and self._trade_gate != TradeGate.TRADE_OK:
+            reason = self._trade_gate_reason()
+            self._append_log(f"[AI] start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
+            return
         self._runtime_stopping = False
         super()._handle_start()
-
-    def _handle_pause(self) -> None:
-        self._append_log("Pause pressed.", kind="ORDERS")
-        self._grid_engine.pause()
-        self._change_state("PAUSING")
-        if self._dry_run_toggle.isChecked() or not self._account_client:
-            self._change_state("PAUSED")
-            return
-        prefix = self._bot_order_prefix()
-
-        def _cancel() -> Any:
-            return cancel_all_bot_orders(
-                symbol=self._symbol,
-                account_client=self._account_client,
-                order_ids=self._bot_order_ids,
-                client_order_id_prefix=prefix,
-                timeout_s=3.0,
+        if self._state in {"RUNNING", "PLACING_GRID", "WAITING_FILLS"}:
+            self._transition_ai_state(
+                "start",
+                self._ai_state_machine.start,
+                failure_message="state transition blocked",
             )
 
-        state, result = pause_state(_cancel)
-        self._append_log(f"Canceled {result.canceled_count} orders.", kind="ORDERS")
-        self._change_state(state)
-        self._refresh_open_orders(force=True)
+    def _handle_pause(self) -> None:
+        if not self._ai_state_machine.can_pause():
+            self._append_log(
+                f"[AI] pause blocked: state={self._ai_state_machine.state.value}",
+                kind="WARN",
+            )
+            return
+        super()._handle_pause()
+        self._transition_ai_state(
+            "pause",
+            self._ai_state_machine.pause,
+            failure_message="state transition blocked",
+        )
 
     def _handle_stop(self) -> None:
+        if not self._ai_state_machine.can_stop():
+            self._append_log(
+                f"[AI] stop blocked: state={self._ai_state_machine.state.value}",
+                kind="WARN",
+            )
+            return
         self._append_log("Stop pressed.", kind="ORDERS")
         self._runtime_stopping = True
         self._grid_engine.stop(cancel_all=False)
@@ -1193,6 +1493,12 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._render_open_orders()
         self._change_state(state)
         self._refresh_open_orders(force=True)
+        self._reset_ai_plan()
+        self._transition_ai_state(
+            "stop",
+            self._ai_state_machine.stop,
+            failure_message="state transition blocked",
+        )
 
     def _get_cached_entry(self, data_type: str) -> tuple[Any, float] | None:
         return self._data_cache.get(self._symbol, data_type)
@@ -1337,12 +1643,35 @@ class AiOperatorGridWindow(LiteGridWindow):
         )
 
     def _handle_refresh_snapshot(self) -> None:
+        if not self._ai_state_machine.can_refresh():
+            self._append_log(
+                f"[AI] refresh blocked: state={self._ai_state_machine.state.value}",
+                "WARN",
+            )
+            return
         datapack = self._build_full_market_pack()
+        data_quality = datapack.get("data_quality") or {}
+        dq_state = self._derive_data_quality_state(data_quality)
+        data_quality["status"] = dq_state
         self._last_full_pack = datapack
         self._last_ai_datapack = datapack
         self._update_ai_snapshot_label(datapack)
         self._log_ai_fullpack_snapshot(datapack)
-        self._append_log("[AI] snapshot refreshed", "INFO")
+        price_snapshot = datapack.get("price_snapshot") or {}
+        self._last_data_quality_state = dq_state
+        self._append_log(
+            (
+                "[AI] snapshot refreshed "
+                f"quality={dq_state} source={price_snapshot.get('source')} "
+                f"ws_age={data_quality.get('ws_age_ms')} http_age={data_quality.get('http_age_ms')}"
+            ),
+            "INFO",
+        )
+        self._transition_ai_state(
+            "refresh_snapshot",
+            self._ai_state_machine.set_data_ready,
+            failure_message="state transition blocked",
+        )
 
     def _build_full_market_pack(self, lookback_days: int | None = None) -> dict[str, Any]:
         total_start = time.perf_counter()
@@ -1358,6 +1687,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         last_update_ts = ws_health.last_update_ts if ws_health else None
         last_ticks = self._price_history[-60:]
         micro_vola_pct, micro_trend = self._compute_micro_metrics(last_ticks)
+        micro_vol_p95 = self._compute_micro_vol_p95(last_ticks)
 
         http_payload, http_timings, http_errors, kline_limits = self._fetch_http_market_data(selected_lookback)
         http_latency_ms = int(sum(http_timings.values()))
@@ -1476,6 +1806,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             last_ticks=last_ticks,
             micro_vola_pct=micro_vola_pct,
             micro_trend=micro_trend,
+            micro_vol_p95=micro_vol_p95,
             bid=bid,
             ask=ask,
             mid=mid,
@@ -1525,6 +1856,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             last_ticks=self._price_history[-60:],
             micro_vola_pct=None,
             micro_trend=None,
+            micro_vol_p95=self._compute_micro_vol_p95(self._price_history[-60:]),
             bid=snapshot.best_bid,
             ask=snapshot.best_ask,
             mid=None,
@@ -1735,6 +2067,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         last_ticks: list[float],
         micro_vola_pct: float | None,
         micro_trend: float | None,
+        micro_vol_p95: float | None,
         bid: float | None,
         ask: float | None,
         mid: float | None,
@@ -1820,6 +2153,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             "timings_ms": http_timings,
             "notes": self._build_data_quality_notes(ws_ok, http_ok, missing, http_errors),
         }
+        data_quality["status"] = self._derive_data_quality_state(data_quality)
         profit_inputs = {
             "assumed_slippage_pct": slippage_pct,
             "safety_edge_pct": safety_edge_pct,
@@ -1880,6 +2214,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             "micro_trend": micro_trend,
             "atr_pct": atr_pct,
             "micro_vol_pct": micro_vol_pct,
+            "micro_vol_p95": micro_vol_p95,
         }
         pack["runtime"] = runtime
         pack["grid_settings"] = grid_settings
@@ -2423,6 +2758,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         fees = datapack.get("fees") or {}
         meta = datapack.get("meta") or {}
         data_quality = datapack.get("data_quality") or {}
+        dq_status = data_quality.get("status")
         pack_source = data_quality.get("pack_source") or {}
         bid = price_snapshot.get("best_bid")
         ask = price_snapshot.get("best_ask")
@@ -2455,7 +2791,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         balances_text = f"{balances_age:.2f}s" if isinstance(balances_age, (int, float)) else "—"
         self._ai_data_quality_label.setText(
             (
-                f"data quality: ws={ws_ok} http={http_ok} ws_age={ws_age_ms or '—'}ms "
+                f"data quality: status={dq_status or '—'} ws={ws_ok} http={http_ok} ws_age={ws_age_ms or '—'}ms "
                 f"http_age={http_age_ms or '—'}ms balances_age={balances_text} "
                 f"stale={stale_flag} missing={','.join(missing) if missing else '—'} "
                 f"warnings={','.join(warnings) if warnings else '—'}"
@@ -2492,6 +2828,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 "takerFeePct": snapshot.taker_fee_pct,
             },
             "data_quality": {
+                "status": self._last_data_quality_state,
                 "ws_age_ms": ws_age_ms,
                 "http_age_ms": snapshot.http_age_ms,
                 "balances_age_s": None,
