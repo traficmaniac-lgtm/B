@@ -31,6 +31,9 @@ WS_DEGRADED_AFTER_MS = 3000
 WS_LOST_AFTER_MS = 10000
 WS_RECOVER_AFTER_N = 5
 WS_OK_AFTER_MS = 2000
+WS_STALE_THRESHOLD_MS = 2000
+MIN_SOURCE_HOLD_MS = 1500
+WS_RECOVER_TICKS = 3
 WS_STATE_CONNECTED = "CONNECTED"
 WS_STATE_CONNECTING = "CONNECTING"
 WS_STATE_DEGRADED = "DEGRADED"
@@ -102,6 +105,56 @@ class SymbolWsHealth:
     last_update_ts: int | None
     age_ms: int | None
     state: str
+
+
+@dataclass
+class SymbolDataRouter:
+    symbol: str
+    ws_active: bool = False
+    ws_last_tick_ts: int | None = None
+    http_last_tick_ts: int | None = None
+    active_source: PriceSource = "HTTP"
+    last_switch_ms: int = 0
+    ws_recover_ticks: int = 0
+
+    def update_ws_tick(self, now_ms: int) -> None:
+        self.ws_last_tick_ts = now_ms
+        self.ws_recover_ticks += 1
+
+    def update_http_tick(self, now_ms: int) -> None:
+        self.http_last_tick_ts = now_ms
+
+    def evaluate(
+        self,
+        now_ms: int,
+        *,
+        subscribed: bool,
+        stale_threshold_ms: int,
+        min_hold_ms: int,
+        recover_ticks: int,
+    ) -> tuple[bool, bool]:
+        ws_active = (
+            subscribed
+            and self.ws_last_tick_ts is not None
+            and (now_ms - self.ws_last_tick_ts) < stale_threshold_ms
+        )
+        ws_active_changed = ws_active != self.ws_active
+        if not ws_active:
+            self.ws_recover_ticks = 0
+        self.ws_active = ws_active
+        source_changed = False
+        if not ws_active:
+            if self.active_source != "HTTP":
+                self.active_source = "HTTP"
+                self.last_switch_ms = now_ms
+                source_changed = True
+        else:
+            if self.active_source == "HTTP":
+                if self.ws_recover_ticks >= recover_ticks and now_ms - self.last_switch_ms >= min_hold_ms:
+                    self.active_source = "WS"
+                    self.last_switch_ms = now_ms
+                    source_changed = True
+        return ws_active_changed, source_changed
 
 
 @dataclass(frozen=True)
@@ -634,11 +687,11 @@ class PriceFeedManager:
                 final_source: PriceSource = "WS" if ws_ok else "HTTP"
                 if ws_ok and ws_age_ms is not None:
                     line = (
-                        f"{symbol}  WS=OK   age={ws_age_ms}ms   "
+                        f"{symbol}  WS=TICK  age={ws_age_ms}ms   "
                         f"HTTP={http_latency_ms}ms   SOURCE={final_source}"
                     )
                 else:
-                    line = f"{symbol}  WS=NO   HTTP={http_latency_ms}ms   SOURCE={final_source}"
+                    line = f"{symbol}  WS=NONE  HTTP={http_latency_ms}ms   SOURCE={final_source}"
                 self._logger.info("[SELFTEST] %s", line)
         finally:
             with self._self_test_lock:
@@ -702,6 +755,9 @@ class PriceFeedManager:
             initial_status = WS_CONNECTED if self._get_ws_state() == WS_STATE_CONNECTED else WS_LOST
             with self._lock:
                 state = self._symbol_state.setdefault(cleaned, {})
+                router = state.get("router")
+                if not isinstance(router, SymbolDataRouter):
+                    router = SymbolDataRouter(symbol=cleaned)
                 state.update(
                     {
                         "subscribed_ms": now_ms,
@@ -714,6 +770,10 @@ class PriceFeedManager:
                         "http_fallback_enabled": False,
                         "http_fallback_reason": None,
                         "http_disable_grace_until_ms": None,
+                        "router": router,
+                        "ws_symbol_active": False,
+                        "ws_symbol_age_ms": None,
+                        "active_source": router.active_source,
                     }
                 )
         self._schedule_symbol_update()
@@ -837,10 +897,17 @@ class PriceFeedManager:
         now_ms = self._now_ms()
         subscribed_symbols = self._ws_thread.get_subscribed_symbols() if self._ws_thread else set()
         subscribed = cleaned.lower() in subscribed_symbols
-        ws_state = self._get_ws_state()
         with self._lock:
             state = self._symbol_state.get(cleaned, {})
-            last_ws_msg = state.get("last_ws_msg_ms")
+            router = state.get("router")
+        if not isinstance(router, SymbolDataRouter):
+            return SymbolWsHealth(
+                symbol=cleaned,
+                subscribed=subscribed,
+                last_update_ts=None,
+                age_ms=None,
+                state=WS_HEALTH_NO if not subscribed else WS_HEALTH_DEAD,
+            )
         if not subscribed:
             return SymbolWsHealth(
                 symbol=cleaned,
@@ -849,18 +916,9 @@ class PriceFeedManager:
                 age_ms=None,
                 state=WS_HEALTH_NO,
             )
-        age_ms = max(now_ms - last_ws_msg, 0) if isinstance(last_ws_msg, int) else None
-        last_update_ts = now_ms - age_ms if isinstance(age_ms, int) else None
-        if ws_state != WS_STATE_CONNECTED:
-            health_state = WS_HEALTH_DEAD
-        elif age_ms is None:
-            health_state = WS_HEALTH_DEAD
-        elif age_ms <= self._ws_ok_after_ms:
-            health_state = WS_HEALTH_OK
-        elif age_ms <= self._degraded_after_ms:
-            health_state = WS_HEALTH_DEGRADED
-        else:
-            health_state = WS_HEALTH_DEAD
+        age_ms = max(now_ms - router.ws_last_tick_ts, 0) if router.ws_last_tick_ts is not None else None
+        last_update_ts = router.ws_last_tick_ts
+        health_state = WS_HEALTH_OK if router.ws_active else WS_HEALTH_DEAD
         return SymbolWsHealth(
             symbol=cleaned,
             subscribed=subscribed,
@@ -868,6 +926,21 @@ class PriceFeedManager:
             age_ms=age_ms,
             state=health_state,
         )
+
+    def get_price(self, symbol: str) -> tuple[float | None, PriceSource, int | None]:
+        snapshot = self.get_snapshot(symbol)
+        if snapshot is None:
+            return None, "HTTP", None
+        age_ms = None
+        with self._lock:
+            state = self._symbol_state.get(snapshot.symbol, {})
+            router = state.get("router")
+            if isinstance(router, SymbolDataRouter):
+                if snapshot.source == "WS" and router.ws_last_tick_ts is not None:
+                    age_ms = max(self._now_ms() - router.ws_last_tick_ts, 0)
+                elif snapshot.source == "HTTP" and router.http_last_tick_ts is not None:
+                    age_ms = max(self._now_ms() - router.http_last_tick_ts, 0)
+        return snapshot.last_price, snapshot.source, age_ms
 
     def _log_rate_limited(self, symbol: str, kind: str, level: str, message: str) -> None:
         now_ms = self._now_ms()
@@ -878,18 +951,97 @@ class PriceFeedManager:
         self._log_limiter[key] = now_ms
         getattr(self._logger, level)(message)
 
+    def _resubscribe_active_symbols(self) -> None:
+        if not self._ws_thread or not self._ws_thread.is_running():
+            return
+        symbols = self._registry.active_symbols()
+        if symbols:
+            self._ws_thread.set_symbols(symbols)
+
+    def _update_router_state(
+        self,
+        symbol: str,
+        now_ms: int,
+        *,
+        subscribed: bool,
+        ws_tick: bool = False,
+        http_tick: bool = False,
+    ) -> tuple[SymbolDataRouter, bool, bool, int | None]:
+        with self._lock:
+            state = self._symbol_state.setdefault(symbol, {})
+            router = state.get("router")
+            if not isinstance(router, SymbolDataRouter):
+                router = SymbolDataRouter(symbol=symbol)
+                state["router"] = router
+            if ws_tick:
+                router.update_ws_tick(now_ms)
+                state["last_ws_msg_ms"] = now_ms
+            if http_tick:
+                router.update_http_tick(now_ms)
+                state["last_http_price_ms"] = now_ms
+            ws_active_changed, source_changed = router.evaluate(
+                now_ms,
+                subscribed=subscribed,
+                stale_threshold_ms=WS_STALE_THRESHOLD_MS,
+                min_hold_ms=MIN_SOURCE_HOLD_MS,
+                recover_ticks=WS_RECOVER_TICKS,
+            )
+            ws_age_ms = max(now_ms - router.ws_last_tick_ts, 0) if router.ws_last_tick_ts is not None else None
+            state["ws_symbol_active"] = router.ws_active
+            state["ws_symbol_age_ms"] = ws_age_ms
+            state["active_source"] = router.active_source
+            ws_status = WS_CONNECTED if router.ws_active else WS_LOST
+            state["ws_status"] = ws_status
+            state["ws_health_state"] = resolve_health_state(ws_status)
+            subscribed_ms = state.get("subscribed_ms")
+        return router, ws_active_changed, source_changed, subscribed_ms
+
+    def _log_router_events(
+        self,
+        symbol: str,
+        router: SymbolDataRouter,
+        *,
+        ws_active_changed: bool,
+        source_changed: bool,
+        now_ms: int,
+        subscribed_ms: int | None,
+    ) -> None:
+        if ws_active_changed and router.ws_active:
+            age_ms = max(now_ms - router.ws_last_tick_ts, 0) if router.ws_last_tick_ts is not None else None
+            if isinstance(age_ms, int):
+                self._log_rate_limited(
+                    symbol,
+                    "router_active",
+                    "info",
+                    f"[ROUTER] {symbol} WS active (last_tick={age_ms}ms)",
+                )
+        if source_changed and router.active_source == "HTTP":
+            if router.ws_last_tick_ts is not None:
+                age_ms = max(now_ms - router.ws_last_tick_ts, 0)
+            elif isinstance(subscribed_ms, int):
+                age_ms = max(now_ms - subscribed_ms, 0)
+            else:
+                age_ms = None
+            age_text = f"{age_ms}ms" if isinstance(age_ms, int) else "unknown"
+            self._log_rate_limited(
+                symbol,
+                "router_fallback",
+                "warning",
+                f"[ROUTER] {symbol} fallback to HTTP (no WS ticks {age_text})",
+            )
+        if source_changed and router.active_source == "WS":
+            self._log_rate_limited(
+                symbol,
+                "router_recovered",
+                "info",
+                f"[ROUTER] {symbol} WS recovered, switching source",
+            )
+
     def _resolve_price_source(self, symbol: str, state: dict[str, Any]) -> PriceSource:
-        subscribed_symbols = self._ws_thread.get_subscribed_symbols() if self._ws_thread else set()
-        ws_state = self._get_ws_state()
-        if ws_state in {WS_STATE_LOST, WS_STATE_STOPPED, WS_STATE_STOPPING, WS_STATE_CONNECTING}:
-            return "HTTP"
-        if symbol.lower() not in subscribed_symbols:
-            return "HTTP"
-        if state.get("http_fallback_enabled"):
-            return "HTTP"
-        if state.get("ws_status") != WS_CONNECTED:
-            return "HTTP"
-        return "WS"
+        router = state.get("router")
+        if isinstance(router, SymbolDataRouter):
+            return router.active_source
+        return "HTTP"
 
     def _log_price_source(self, symbol: str, source: PriceSource) -> None:
         self._log_rate_limited(symbol, "price_source", "info", f"Price source {symbol} = {source}")
@@ -984,6 +1136,7 @@ class PriceFeedManager:
                 with self._lock:
                     for symbol_state in self._symbol_state.values():
                         symbol_state["ws_grace_until_ms"] = now_ms + WS_GRACE_MS
+                self._resubscribe_active_symbols()
             if status in {WS_STATE_LOST, WS_STATE_CONNECTING, WS_STATE_STOPPED, WS_STATE_STOPPING}:
                 symbols_to_notify = []
                 with self._lock:
@@ -1038,6 +1191,22 @@ class PriceFeedManager:
                     "last_ws_price_ms": now_ms,
                 }
             )
+        router, ws_active_changed, source_changed, subscribed_ms = self._update_router_state(
+            symbol,
+            now_ms,
+            subscribed=True,
+            ws_tick=True,
+        )
+        self._log_router_events(
+            symbol,
+            router,
+            ws_active_changed=ws_active_changed,
+            source_changed=source_changed,
+            now_ms=now_ms,
+            subscribed_ms=subscribed_ms,
+        )
+        if source_changed and router.active_source == "WS":
+            self._resubscribe_active_symbols()
         self._publish_update(symbol)
 
     def _monitor_loop(self) -> None:
@@ -1052,7 +1221,7 @@ class PriceFeedManager:
             for symbol in active_symbols:
                 subscribed = symbol.lower() in subscribed_symbols
                 self._heartbeat_symbol(symbol, now_ms, subscribed=subscribed)
-                self._maybe_poll_http(symbol, now_ms)
+                self._maybe_poll_http(symbol, now_ms, subscribed=subscribed)
             self._update_ws_overall_state(active_symbols)
             time.sleep(self._heartbeat_interval_s)
         self._logger.info("Price feed монитор остановлен")
@@ -1079,98 +1248,42 @@ class PriceFeedManager:
         if cleaned is None:
             return
         with self._lock:
-            state = self._symbol_state.setdefault(cleaned, {})
-            last_ws_msg = state.get("last_ws_msg_ms")
-            current_status = state.get("ws_status", WS_LOST)
-            ws_recover_streak = state.get("ws_recover_streak", 0)
-            http_fallback_enabled = state.get("http_fallback_enabled", False)
-            http_fallback_reason = state.get("http_fallback_reason")
-            http_disable_grace_until = state.get("http_disable_grace_until_ms")
-            subscribed_ms = state.get("subscribed_ms", now_ms)
-            ws_grace_until = state.get("ws_grace_until_ms")
-        ws_disabled = now_ms < self._ws_disabled_until_ms
-        ws_state = self._get_ws_state()
-        age_ms = None
-        if not subscribed:
-            desired_status = WS_LOST
-        elif ws_disabled or ws_state in {WS_STATE_LOST, WS_STATE_CONNECTING, WS_STATE_STOPPED, WS_STATE_STOPPING}:
-            desired_status = WS_LOST
-        else:
-            if last_ws_msg is None:
-                age_ms = max(now_ms - subscribed_ms, 0)
-                if ws_grace_until is not None and now_ms < ws_grace_until:
-                    age_ms = 0
-            else:
-                age_ms = max(now_ms - last_ws_msg, 0)
-            if age_ms is None:
-                desired_status = WS_LOST
-            elif age_ms >= self._lost_after_ms:
-                desired_status = WS_LOST
-            elif age_ms >= self._degraded_after_ms:
-                desired_status = WS_DEGRADED
-            else:
-                desired_status = WS_CONNECTED
-        if desired_status == WS_CONNECTED and current_status != WS_CONNECTED:
-            if ws_recover_streak < self._recover_after_n:
-                desired_status = current_status
-        with self._lock:
-            state = self._symbol_state.setdefault(cleaned, {})
-            state["ws_status"] = desired_status
-            state["ws_health_state"] = resolve_health_state(desired_status)
-            state["ws_ok"] = (
-                desired_status == WS_CONNECTED
-                and subscribed
-                and age_ms is not None
-                and age_ms < self._ws_ok_after_ms
-            )
-            state["ws_degraded"] = desired_status == WS_DEGRADED
-            state["ws_lost"] = desired_status == WS_LOST
-            state["ws_subscribed"] = subscribed
-            state["ws_age_ms"] = age_ms
-            if desired_status != WS_CONNECTED:
-                state["ws_recover_streak"] = 0
+            current_status = self._symbol_state.setdefault(cleaned, {}).get("ws_status", WS_LOST)
+        router, ws_active_changed, source_changed, subscribed_ms = self._update_router_state(
+            cleaned,
+            now_ms,
+            subscribed=subscribed,
+        )
+        desired_status = WS_CONNECTED if router.ws_active else WS_LOST
         if desired_status != current_status:
-            if desired_status == WS_DEGRADED:
-                self._log_rate_limited(cleaned, "ws_state", "info", f"WS деградирован для {cleaned}")
-            elif desired_status == WS_LOST:
+            if desired_status == WS_LOST:
                 self._log_rate_limited(cleaned, "ws_state", "warning", f"WS потерян для {cleaned}")
             elif desired_status == WS_CONNECTED:
-                last_ws_age_ms = max(now_ms - last_ws_msg, 0) if isinstance(last_ws_msg, int) else None
-                if current_status in {WS_DEGRADED, WS_LOST} and last_ws_age_ms is not None:
-                    message = (
-                        f"WS восстановлен для {cleaned} "
-                        f"(last_ws_age_ms={last_ws_age_ms}, "
-                        f"restore_confirm_count={ws_recover_streak})"
-                    )
-                    self._log_rate_limited(cleaned, "ws_state", "info", message)
+                self._log_rate_limited(cleaned, "ws_state", "info", f"WS восстановлен для {cleaned}")
             self._publish_status(cleaned, desired_status)
+        self._log_router_events(
+            cleaned,
+            router,
+            ws_active_changed=ws_active_changed,
+            source_changed=source_changed,
+            now_ms=now_ms,
+            subscribed_ms=subscribed_ms,
+        )
+        if router.active_source == "HTTP":
+            self._set_http_fallback(cleaned, enabled=True, reason="ROUTER")
+        else:
+            self._set_http_fallback(cleaned, enabled=False, reason=None)
+        if source_changed and router.active_source == "WS":
+            self._resubscribe_active_symbols()
 
-        if ws_disabled or desired_status == WS_LOST:
-            if not http_fallback_enabled or http_fallback_reason != "LOST":
-                self._set_http_fallback(cleaned, enabled=True, reason="LOST")
-        elif desired_status == WS_DEGRADED:
-            if not http_fallback_enabled or http_fallback_reason != "STALE":
-                self._set_http_fallback(cleaned, enabled=True, reason="STALE")
-        elif desired_status == WS_CONNECTED:
-            if http_fallback_enabled:
-                if http_disable_grace_until is None:
-                    with self._lock:
-                        state = self._symbol_state.setdefault(cleaned, {})
-                        state["http_disable_grace_until_ms"] = now_ms + self._http_disable_grace_ms
-                        http_disable_grace_until = state["http_disable_grace_until_ms"]
-                if http_disable_grace_until is not None and now_ms >= http_disable_grace_until:
-                    self._set_http_fallback(cleaned, enabled=False, reason=None)
-
-    def _maybe_poll_http(self, symbol: str, now_ms: int) -> None:
+    def _maybe_poll_http(self, symbol: str, now_ms: int, *, subscribed: bool) -> None:
         cleaned = self._sanitize_symbol(symbol)
         if cleaned is None:
             return
         with self._lock:
             state = self._symbol_state.setdefault(cleaned, {})
             http_fallback_enabled = state.get("http_fallback_enabled", False)
-            http_fallback_reason = state.get("http_fallback_reason")
             last_poll = state.get("http_poll_ms", 0)
-            current_source = state.get("source", "WS")
         if not http_fallback_enabled:
             return
         poll_interval_ms = self._get_poll_interval_ms(cleaned)
@@ -1203,6 +1316,20 @@ class PriceFeedManager:
                     "last_http_price_ms": now_ms,
                 }
             )
+        router, ws_active_changed, source_changed, subscribed_ms = self._update_router_state(
+            cleaned,
+            now_ms,
+            subscribed=subscribed,
+            http_tick=True,
+        )
+        self._log_router_events(
+            cleaned,
+            router,
+            ws_active_changed=ws_active_changed,
+            source_changed=source_changed,
+            now_ms=now_ms,
+            subscribed_ms=subscribed_ms,
+        )
         self._publish_update(cleaned)
 
     def _publish_update(self, symbol: str) -> None:
