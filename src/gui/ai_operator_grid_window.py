@@ -38,10 +38,8 @@ from src.services.data_cache import DataCache
 from src.services.price_feed_manager import (
     PriceFeedManager,
     PriceUpdate,
-    WS_CONNECTED,
-    WS_DEGRADED,
     WS_DEGRADED_AFTER_MS,
-    WS_OK_AFTER_MS,
+    WS_HEALTH_OK,
 )
 from src.services.rate_limiter import RateLimiter
 
@@ -304,6 +302,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._append_log("[AI] analyze skipped: missing OpenAI key.", "WARN")
             self._append_chat_line("AI", "Не задан ключ OpenAI.")
             return
+        self._await_ws_warmup()
         datapack = self._build_full_market_pack()
         self._append_chat_line("YOU", "AI Analyze")
         self._append_log("[AI] fullpack prepared", "INFO")
@@ -402,6 +401,23 @@ class AiOperatorGridWindow(LiteGridWindow):
         worker.signals.error.connect(self._handle_ai_chat_error)
         self._thread_pool.start(worker)
         self._append_log("[AI] chat request sent", "INFO")
+
+    def _await_ws_warmup(self, timeout_s: float = 1.2) -> None:
+        deadline = time.monotonic() + timeout_s
+        last_health = self._price_feed_manager.get_ws_health(self._symbol)
+        while time.monotonic() < deadline:
+            if last_health and last_health.state == WS_HEALTH_OK:
+                return
+            time.sleep(0.1)
+            last_health = self._price_feed_manager.get_ws_health(self._symbol)
+        if last_health and last_health.state != WS_HEALTH_OK:
+            self._append_log(
+                (
+                    "[AI] WS warmup timeout "
+                    f"state={last_health.state} age={last_health.age_ms} subscribed={last_health.subscribed}"
+                ),
+                "WARN",
+            )
 
     def _run_ai_chat_adjust(
         self,
@@ -1105,19 +1121,12 @@ class AiOperatorGridWindow(LiteGridWindow):
         total_start = time.perf_counter()
         ws_start = time.perf_counter()
         ws_snapshot = self._price_feed_manager.get_snapshot(self._symbol)
+        ws_health = self._price_feed_manager.get_ws_health(self._symbol)
         ws_ms = (time.perf_counter() - ws_start) * 1000
-        ws_age_ms = ws_snapshot.price_age_ms if ws_snapshot else None
-        ws_ok = bool(
-            ws_snapshot
-            and ws_snapshot.ws_status == WS_CONNECTED
-            and isinstance(ws_age_ms, int)
-            and ws_age_ms < WS_OK_AFTER_MS
-        )
+        ws_age_ms = ws_health.age_ms if ws_health else None
+        ws_ok = bool(ws_health and ws_health.state == WS_HEALTH_OK)
         ws_stale = isinstance(ws_age_ms, int) and ws_age_ms > WS_DEGRADED_AFTER_MS
-        last_update_ts = None
-        now_ms = utc_ms()
-        if isinstance(ws_age_ms, int):
-            last_update_ts = now_ms - ws_age_ms
+        last_update_ts = ws_health.last_update_ts if ws_health else None
         last_ticks = self._price_history[-60:]
         micro_vola_pct, micro_trend = self._compute_micro_metrics(last_ticks)
 
@@ -1141,7 +1150,12 @@ class AiOperatorGridWindow(LiteGridWindow):
         mid = ws_snapshot.mid_price if ws_snapshot else None
         spread_pct = ws_snapshot.spread_pct if ws_snapshot else None
         if not ws_ok:
-            ws_reason = "ws unavailable"
+            if ws_health and not ws_health.subscribed:
+                ws_reason = "ws not subscribed"
+            elif ws_stale:
+                ws_reason = f"ws stale: age={ws_age_ms}ms -> HTTP price"
+            else:
+                ws_reason = "ws unavailable"
         elif ws_stale:
             ws_reason = f"ws stale: age={ws_age_ms}ms -> HTTP price"
         else:

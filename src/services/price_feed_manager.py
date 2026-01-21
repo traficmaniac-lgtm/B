@@ -23,7 +23,8 @@ WS_LOST = "WS_LOST"
 WS_DISABLED_404 = "WS_DISABLED_404"
 WS_HEALTH_OK = "OK"
 WS_HEALTH_DEGRADED = "DEGRADED"
-WS_HEALTH_DEAD = "DEAD"
+WS_HEALTH_DEAD = "LOST"
+WS_HEALTH_NO = "NO"
 
 WS_GRACE_MS = 4000
 WS_DEGRADED_AFTER_MS = 3000
@@ -87,6 +88,15 @@ class MicrostructureSnapshot:
     source: str
     ws_status: str
     ws_health_state: str
+
+
+@dataclass(frozen=True)
+class SymbolWsHealth:
+    symbol: str
+    subscribed: bool
+    last_update_ts: int | None
+    age_ms: int | None
+    state: str
 
 
 @dataclass(frozen=True)
@@ -252,9 +262,22 @@ class _BinanceBookTickerWsThread:
 
     def _enqueue_command(self, command: dict[str, Any]) -> None:
         if self._loop and self._command_queue:
-            self._loop.call_soon_threadsafe(self._command_queue.put_nowait, command)
+            try:
+                self._loop.call_soon_threadsafe(self._command_queue.put_nowait, command)
+            except RuntimeError:
+                if self._stopping:
+                    return
+                self._logger.debug("WS loop closed; dropping command")
+                return
         else:
             self._pending_commands.append(command)
+
+    def is_running(self) -> bool:
+        return bool(self._loop and self._loop.is_running() and not self._stopping)
+
+    def get_subscribed_symbols(self) -> set[str]:
+        with self._symbols_lock:
+            return set(self._subscribed_symbols)
 
     def set_disabled_until(self, disabled_until_ms: int) -> None:
         self._disabled_until_ms = disabled_until_ms
@@ -515,6 +538,7 @@ class PriceFeedManager:
             heartbeat_timeout_s=5.0,
             dead_after_ms=self._lost_after_ms,
         )
+        self._stopping = False
 
     @classmethod
     def get_instance(cls, config: Config) -> PriceFeedManager:
@@ -545,10 +569,12 @@ class PriceFeedManager:
         self._monitor_thread.start()
 
     def shutdown(self) -> None:
+        self._stopping = True
         self._stop_event.set()
         with self._symbols_update_lock:
             if self._symbols_update_timer and self._symbols_update_timer.is_alive():
                 self._symbols_update_timer.cancel()
+                self._symbols_update_timer = None
         self._ws_thread.stop()
         if self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=5.0)
@@ -620,12 +646,18 @@ class PriceFeedManager:
 
     def _schedule_symbol_update(self) -> None:
         def _flush() -> None:
+            if self._stopping:
+                return
+            if not self._ws_thread or not self._ws_thread.is_running():
+                return
             symbols = self._registry.active_symbols()
             self._ws_thread.set_symbols(symbols)
 
         with self._symbols_update_lock:
             if self._symbols_update_timer and self._symbols_update_timer.is_alive():
                 self._symbols_update_timer.cancel()
+            if self._stopping:
+                return
             self._symbols_update_timer = threading.Timer(SYMBOL_UPDATE_DEBOUNCE_MS / 1000.0, _flush)
             self._symbols_update_timer.daemon = True
             self._symbols_update_timer.start()
@@ -692,6 +724,45 @@ class PriceFeedManager:
         if not state:
             return None
         return self._build_snapshot(cleaned, state)
+
+    def get_ws_health(self, symbol: str) -> SymbolWsHealth | None:
+        cleaned = self._sanitize_symbol(symbol)
+        if cleaned is None:
+            return None
+        now_ms = self._now_ms()
+        subscribed_symbols = self._ws_thread.get_subscribed_symbols() if self._ws_thread else set()
+        subscribed = cleaned.lower() in subscribed_symbols
+        ws_state = self._get_ws_state()
+        with self._lock:
+            state = self._symbol_state.get(cleaned, {})
+            last_ws_msg = state.get("last_ws_msg_ms")
+        if not subscribed:
+            return SymbolWsHealth(
+                symbol=cleaned,
+                subscribed=False,
+                last_update_ts=None,
+                age_ms=None,
+                state=WS_HEALTH_NO,
+            )
+        age_ms = max(now_ms - last_ws_msg, 0) if isinstance(last_ws_msg, int) else None
+        last_update_ts = now_ms - age_ms if isinstance(age_ms, int) else None
+        if ws_state != WS_STATE_CONNECTED:
+            health_state = WS_HEALTH_DEAD
+        elif age_ms is None:
+            health_state = WS_HEALTH_DEAD
+        elif age_ms <= self._ws_ok_after_ms:
+            health_state = WS_HEALTH_OK
+        elif age_ms <= self._degraded_after_ms:
+            health_state = WS_HEALTH_DEGRADED
+        else:
+            health_state = WS_HEALTH_DEAD
+        return SymbolWsHealth(
+            symbol=cleaned,
+            subscribed=subscribed,
+            last_update_ts=last_update_ts,
+            age_ms=age_ms,
+            state=health_state,
+        )
 
     def _log_rate_limited(self, symbol: str, kind: str, level: str, message: str) -> None:
         now_ms = self._now_ms()
@@ -833,13 +904,15 @@ class PriceFeedManager:
                 time.sleep(self._heartbeat_interval_s)
                 continue
             now_ms = self._now_ms()
+            subscribed_symbols = self._ws_thread.get_subscribed_symbols() if self._ws_thread else set()
             for symbol in active_symbols:
-                self._heartbeat_symbol(symbol, now_ms)
+                subscribed = symbol.lower() in subscribed_symbols
+                self._heartbeat_symbol(symbol, now_ms, subscribed=subscribed)
                 self._maybe_poll_http(symbol, now_ms)
             time.sleep(self._heartbeat_interval_s)
         self._logger.info("Price feed монитор остановлен")
 
-    def _heartbeat_symbol(self, symbol: str, now_ms: int) -> None:
+    def _heartbeat_symbol(self, symbol: str, now_ms: int, *, subscribed: bool) -> None:
         cleaned = self._sanitize_symbol(symbol)
         if cleaned is None:
             return
@@ -856,7 +929,9 @@ class PriceFeedManager:
         ws_disabled = now_ms < self._ws_disabled_until_ms
         ws_state = self._get_ws_state()
         age_ms = None
-        if ws_disabled or ws_state in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
+        if not subscribed:
+            desired_status = WS_LOST
+        elif ws_disabled or ws_state in {WS_STATE_LOST, WS_STATE_RECONNECTING, WS_STATE_STOPPED}:
             desired_status = WS_LOST
         else:
             if last_ws_msg is None:
@@ -876,18 +951,23 @@ class PriceFeedManager:
         if desired_status == WS_CONNECTED and current_status != WS_CONNECTED:
             if ws_recover_streak < self._recover_after_n:
                 desired_status = current_status
+        with self._lock:
+            state = self._symbol_state.setdefault(cleaned, {})
+            state["ws_status"] = desired_status
+            state["ws_health_state"] = resolve_health_state(desired_status)
+            state["ws_ok"] = (
+                desired_status == WS_CONNECTED
+                and subscribed
+                and age_ms is not None
+                and age_ms < self._ws_ok_after_ms
+            )
+            state["ws_degraded"] = desired_status == WS_DEGRADED
+            state["ws_lost"] = desired_status == WS_LOST
+            state["ws_subscribed"] = subscribed
+            state["ws_age_ms"] = age_ms
+            if desired_status != WS_CONNECTED:
+                state["ws_recover_streak"] = 0
         if desired_status != current_status:
-            with self._lock:
-                state = self._symbol_state.setdefault(cleaned, {})
-                state["ws_status"] = desired_status
-                state["ws_health_state"] = resolve_health_state(desired_status)
-                state["ws_ok"] = desired_status == WS_CONNECTED and (
-                    age_ms is None or age_ms < self._ws_ok_after_ms
-                )
-                state["ws_degraded"] = desired_status == WS_DEGRADED
-                state["ws_lost"] = desired_status == WS_LOST
-                if desired_status != WS_CONNECTED:
-                    state["ws_recover_streak"] = 0
             if desired_status == WS_DEGRADED:
                 self._log_rate_limited(cleaned, "ws_state", "info", f"WS деградирован для {cleaned}")
             elif desired_status == WS_LOST:
