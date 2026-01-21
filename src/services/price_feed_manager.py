@@ -584,6 +584,7 @@ class PriceFeedManager:
         self._ws_state_details = ""
         self._registry = SymbolSubscriptionRegistry()
         self._lock = threading.Lock()
+        self._ws_tick_condition = threading.Condition(self._lock)
         self._symbol_state: dict[str, dict[str, Any]] = {}
         self._tick_subscribers: dict[str, dict[Callable[[PriceUpdate], None], _SubscriberWorker]] = {}
         self._status_subscribers: dict[str, dict[Callable[[str, str], None], _SubscriberWorker]] = {}
@@ -688,13 +689,7 @@ class PriceFeedManager:
                     symbols.append(cleaned)
             if not symbols:
                 return
-            ws_received: dict[str, int] = {}
             ws_symbols = [symbol for symbol in symbols if self._is_ws_capable(symbol)]
-            try:
-                if ws_symbols:
-                    ws_received = asyncio.run(self._collect_ws_selftest(ws_symbols))
-            except Exception as exc:  # noqa: BLE001
-                self._logger.warning("SELFTEST WS error: %s", exc)
             http_latencies: dict[str, int | None] = {}
             for symbol in symbols:
                 latency_ms: int | None = None
@@ -708,80 +703,52 @@ class PriceFeedManager:
             now_ms = self._now_ms()
             self._logger.info("[TRANSPORT-TEST]")
             for symbol in symbols:
-                last_seen = ws_received.get(symbol)
+                registered_before = symbol in self._registry.active_symbols()
+                subscribed_for_test = False
+                if symbol in ws_symbols:
+                    self.register_symbol(symbol)
+                    subscribed_for_test = True
+                    last_seen = self._wait_for_ws_tick(symbol, timeout_ms=2000)
+                else:
+                    last_seen = None
+                if subscribed_for_test and not registered_before:
+                    self.unregister_symbol(symbol)
                 ws_ok = last_seen is not None
                 ws_age_ms = max(now_ms - last_seen, 0) if isinstance(last_seen, int) else None
                 self._set_symbol_capability(symbol, ws_available=ws_ok)
                 http_latency_ms = http_latencies.get(symbol)
-                final_source: PriceSource = (
-                    "WS" if ws_ok and ws_age_ms is not None and ws_age_ms < WS_STABLE_MS else "HTTP"
-                )
+                final_source = self.active_source(symbol)
                 if ws_ok and ws_age_ms is not None:
                     line = (
-                        f"{symbol}  WS=OK age={ws_age_ms}ms   "
+                        f"PRICE: {symbol} WS=OK age={ws_age_ms}ms   "
                         f"HTTP={http_latency_ms}ms   SOURCE={final_source}"
                     )
                 else:
-                    line = f"{symbol}  WS=NONE          HTTP={http_latency_ms}ms   SOURCE={final_source}"
+                    line = (
+                        f"PRICE: {symbol} WS=NONE          "
+                        f"HTTP={http_latency_ms}ms   SOURCE={final_source}"
+                    )
                 self._logger.info("[TRANSPORT-TEST] %s", line)
             self._schedule_symbol_update()
         finally:
             with self._self_test_lock:
                 self._self_test_completed = True
 
-    async def _collect_ws_selftest(self, symbols: list[str]) -> dict[str, int]:
-        url = f"{self._config.binance.ws_url.rstrip('/')}/ws"
-        received: dict[str, int] = {}
-        async with websockets.connect(url, ping_interval=None, ping_timeout=None) as websocket:
-            for symbol in symbols:
-                tick_time_ms = await self._wait_for_ws_tick(
-                    websocket,
-                    symbol,
-                    timeout_ms=2000,
-                )
-                if tick_time_ms is not None:
-                    received[symbol] = tick_time_ms
-        return received
-
-    async def _wait_for_ws_tick(
-        self,
-        websocket: websockets.WebSocketClientProtocol,
-        symbol: str,
-        *,
-        timeout_ms: int,
-    ) -> int | None:
-        params = [f"{symbol.lower()}@bookTicker"]
-        payload = {"method": "SUBSCRIBE", "params": params, "id": int(self._now_ms())}
-        await websocket.send(json.dumps(payload))
-        deadline_ms = self._now_ms() + timeout_ms
-        received_ms: int | None = None
-        try:
-            while self._now_ms() < deadline_ms:
-                timeout_s = max((deadline_ms - self._now_ms()) / 1000.0, 0.1)
-                try:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=timeout_s)
-                except asyncio.TimeoutError:
-                    break
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                payload = data.get("data", data)
-                if not isinstance(payload, dict):
-                    continue
-                received_symbol = sanitize_symbol(payload.get("s"))
-                if received_symbol == symbol:
-                    received_ms = self._now_ms()
-                    break
-        finally:
-            unsubscribe_payload = {"method": "UNSUBSCRIBE", "params": params, "id": int(self._now_ms())}
-            try:
-                await websocket.send(json.dumps(unsubscribe_payload))
-            except Exception:  # noqa: BLE001
-                pass
-        return received_ms
+    def _wait_for_ws_tick(self, symbol: str, *, timeout_ms: int) -> int | None:
+        cleaned = self._sanitize_symbol(symbol)
+        if cleaned is None:
+            return None
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
+        with self._ws_tick_condition:
+            initial_tick = self._get_last_ws_tick(cleaned)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._ws_tick_condition.wait(timeout=remaining)
+                latest_tick = self._get_last_ws_tick(cleaned)
+                if latest_tick is not None and latest_tick != initial_tick:
+                    return latest_tick
 
     def shutdown(self) -> None:
         self._stopping = True
@@ -1024,6 +991,17 @@ class PriceFeedManager:
             state=health_state,
         )
 
+    def active_source(self, symbol: str) -> PriceSource:
+        cleaned = self._sanitize_symbol(symbol)
+        if cleaned is None:
+            return "HTTP"
+        with self._lock:
+            state = self._symbol_state.get(cleaned, {})
+            router = state.get("router")
+            if isinstance(router, SymbolDataRouter):
+                return router.active_source
+        return "HTTP"
+
     def get_price(self, symbol: str) -> tuple[float | None, PriceSource, int | None]:
         snapshot = self.get_snapshot(symbol)
         if snapshot is None:
@@ -1052,6 +1030,13 @@ class PriceFeedManager:
             ws_age_ms = max(now_ms - router.ws_last_tick_ts, 0) if router.ws_last_tick_ts else None
             http_age_ms = max(now_ms - router.http_last_tick_ts, 0) if router.http_last_tick_ts else None
             return ws_age_ms, http_age_ms
+
+    def _get_last_ws_tick(self, symbol: str) -> int | None:
+        state = self._symbol_state.get(symbol, {})
+        router = state.get("router")
+        if isinstance(router, SymbolDataRouter):
+            return router.ws_last_tick_ts
+        return None
 
     def _log_rate_limited(self, symbol: str, kind: str, level: str, message: str) -> None:
         now_ms = self._now_ms()
@@ -1098,6 +1083,7 @@ class PriceFeedManager:
             if ws_tick:
                 router.update_ws_tick(now_ms)
                 state["last_ws_msg_ms"] = now_ms
+                self._ws_tick_condition.notify_all()
             if http_tick:
                 router.update_http_tick(now_ms)
                 state["last_http_price_ms"] = now_ms
