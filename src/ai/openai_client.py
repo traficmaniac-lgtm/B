@@ -153,22 +153,33 @@ class OpenAIClient:
 Строго следуй схеме:
 {
   "state": "SAFE|WARNING|DANGER",
-  "recommendation": "WAIT|TRADE_OK|DO_NOT_TRADE",
-  "next_action": "WAIT|APPLY_PATCH|START|STOP|ADJUST_PARAMS",
-  "reason_short": "<=120 chars",
-  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",
-  "profiles": {
-    "AGGRESSIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
-    "BALANCED": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
-    "CONSERVATIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}}
+  "recommendation": "WAIT|DO_NOT_TRADE|START|APPLY_PATCH|REQUEST_DATA|ADJUST_PARAMS|STOP",
+  "next_action": "WAIT|DO_NOT_TRADE|START|APPLY_PATCH|REQUEST_DATA|ADJUST_PARAMS|STOP",
+  "reason": "short text",
+  "profile": "CONSERVATIVE|BALANCED|AGGRESSIVE",
+  "actions_allowed": ["WAIT","APPLY_PATCH","REQUEST_DATA","START","STOP","ADJUST_PARAMS"],
+  "patch": {
+     "strategy_id": "GRID_CLASSIC|GRID_BIASED|RANGE_MR|DO_NOT_TRADE",
+     "bias": "UP|DOWN|FLAT",
+     "step_pct": 0.0,
+     "range_down_pct": 0.0,
+     "range_up_pct": 0.0,
+     "levels": 0,
+     "tp_pct": 0.0,
+     "max_active_orders": 0
   },
-  "actions": ["WAIT", "APPLY_PATCH", "START", "STOP", "ADJUST_PARAMS"],
-  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": ""},
-  "risks": ["..."]
+  "request_data": {
+     "need_more": false,
+     "items": []
+  },
+  "math_check": {
+     "net_edge_pct": 0.0,
+     "break_even_tp_pct": 0.0,
+     "assumptions": {"fees":"maker", "slippage_pct": 0.0}
+  }
 }
-Если есть strategy_patch с любыми изменениями, next_action должен быть APPLY_PATCH.
-Всегда возвращай три профиля и recommended_profile.
-Никаких REQUEST_MORE_DATA. Данные уже полные.
+Если net_edge_pct <= 0, то recommendation=WAIT или DO_NOT_TRADE.
+Если требуется дополнительная информация, выставляй request_data.need_more=true.
 Будь краток."""
 
         async def _analyze() -> str:
@@ -211,22 +222,34 @@ class OpenAIClient:
 Строго следуй схеме:
 {
   "state": "SAFE|WARNING|DANGER",
-  "recommendation": "WAIT|TRADE_OK|DO_NOT_TRADE",
-  "next_action": "WAIT|APPLY_PATCH|START|STOP|ADJUST_PARAMS",
-  "reason_short": "<=120 chars",
-  "recommended_profile": "AGGRESSIVE|BALANCED|CONSERVATIVE",
-  "profiles": {
-    "AGGRESSIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
-    "BALANCED": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}},
-    "CONSERVATIVE": {"strategy_patch": {"step_pct": 0, "range_down_pct": 0, "range_up_pct": 0, "levels": 0, "tp_pct": 0, "bias": "UP|DOWN|FLAT", "max_active_orders": 0}}
+  "recommendation": "WAIT|DO_NOT_TRADE|START|APPLY_PATCH|REQUEST_DATA|ADJUST_PARAMS|STOP",
+  "next_action": "WAIT|DO_NOT_TRADE|START|APPLY_PATCH|REQUEST_DATA|ADJUST_PARAMS|STOP",
+  "reason": "short text",
+  "profile": "CONSERVATIVE|BALANCED|AGGRESSIVE",
+  "actions_allowed": ["WAIT","APPLY_PATCH","REQUEST_DATA","START","STOP","ADJUST_PARAMS"],
+  "patch": {
+     "strategy_id": "GRID_CLASSIC|GRID_BIASED|RANGE_MR|DO_NOT_TRADE",
+     "bias": "UP|DOWN|FLAT",
+     "step_pct": 0.0,
+     "range_down_pct": 0.0,
+     "range_up_pct": 0.0,
+     "levels": 0,
+     "tp_pct": 0.0,
+     "max_active_orders": 0
   },
-  "actions": ["WAIT", "APPLY_PATCH", "START", "STOP", "ADJUST_PARAMS"],
-  "forecast": {"bias": "UP|DOWN|FLAT", "confidence": 0.0, "horizon_min": 30, "comment": ""},
-  "risks": ["..."]
+  "request_data": {
+     "need_more": false,
+     "items": []
+  },
+  "math_check": {
+     "net_edge_pct": 0.0,
+     "break_even_tp_pct": 0.0,
+     "assumptions": {"fees":"maker", "slippage_pct": 0.0}
+  }
 }
-Если есть strategy_patch с любыми изменениями, next_action должен быть APPLY_PATCH.
 Ответ учитывает datapack, сообщение пользователя, последний JSON AI и текущие параметры UI.
-Никаких REQUEST_MORE_DATA. Данные уже полные.
+Если net_edge_pct <= 0, то recommendation=WAIT или DO_NOT_TRADE.
+Если требуется дополнительная информация, выставляй request_data.need_more=true.
 Будь краток."""
 
         async def _chat() -> str:

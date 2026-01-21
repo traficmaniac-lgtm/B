@@ -109,3 +109,14 @@ Verify (after):
 1. Launch AI Operator Grid, confirm Start is blocked until rules + fresh balances are loaded.
 2. Place grid, then trigger partial fills; verify logs show single FILLED with total/delta.
 3. Confirm only one TP/RESTORE per delta is placed, and restore is skipped when quote free is insufficient.
+
+### v10.0.7 AI Operator Grid datapack + validation + cancel-on-pause/stop
+- Added deterministic AI datapack builder with exchange rules, fees, account snapshot, WS/HTTP data quality, and multi-window kline summaries.
+- Added explicit profit math (fees + slippage + spread) and profile presets for validation.
+- Enforced strict JSON AI responses with action-driven REQUEST_DATA loop and patch validation.
+- Implemented reliable Pause/Stop cancellation using bot order registry + prefix matching.
+
+Verify in GUI:
+1. Open AI Operator Grid → press “AI Analyze”; confirm snapshot shows data quality line with WS/HTTP ages.
+2. Trigger a response with REQUEST_DATA; choose action REQUEST_DATA and approve; confirm AI request loop logs.
+3. Press Pause/Stop; confirm log shows “Canceled n orders” and bot orders are cleared.
