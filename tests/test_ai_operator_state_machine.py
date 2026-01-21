@@ -52,6 +52,25 @@ def test_apply_plan_requires_plan_ready() -> None:
     assert machine.state == AiOperatorState.ANALYZING
 
 
+def test_analyze_blocked_while_analyzing() -> None:
+    machine = AiOperatorStateMachine()
+    machine.set_data_ready()
+    assert machine.start_analyzing()
+    assert not machine.can_analyze()
+    assert not machine.start_analyzing()
+
+
+def test_can_apply_plan_only_in_plan_ready() -> None:
+    machine = AiOperatorStateMachine()
+    assert not machine.can_apply_plan()
+    machine.set_data_ready()
+    assert not machine.can_apply_plan()
+    machine.start_analyzing()
+    assert not machine.can_apply_plan()
+    machine.set_plan_ready()
+    assert machine.can_apply_plan()
+
+
 def test_manual_invalidate_clears_confidence() -> None:
     machine = AiOperatorStateMachine()
     machine.set_data_ready()

@@ -326,11 +326,14 @@ class _BinanceBookTickerWsThread:
         self._state = WS_STATE_STOPPED
         self._stopping = False
         self._has_received_message = False
+        self._closed = False
 
     def start(self) -> None:
         if self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._stopping = False
+        self._closed = False
         self._thread.start()
 
     def stop(self) -> None:
@@ -342,18 +345,18 @@ class _BinanceBookTickerWsThread:
         if self._loop and self._loop.is_running() and not self._loop.is_closed():
             try:
                 if self._connect_task:
-                    self._loop.call_soon_threadsafe(self._connect_task.cancel)
+                    self._safe_call(self._connect_task.cancel)
                 asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop).result(timeout=5.0)
             except TimeoutError:
                 self._logger.warning("WS shutdown timeout; continuing stop.")
             except Exception:  # noqa: BLE001
                 self._logger.warning("WS shutdown error", exc_info=True)
             finally:
-                if not self._loop.is_closed():
-                    self._loop.call_soon_threadsafe(self._loop.stop)
+                self._safe_call(self._loop.stop)
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
         self._set_state(WS_STATE_STOPPED, "stopped")
+        self._closed = True
 
     def set_symbols(self, symbols: list[str]) -> None:
         if self._stopping:
@@ -370,11 +373,11 @@ class _BinanceBookTickerWsThread:
             return
         if self._loop and self._command_queue and not self._loop.is_closed():
             try:
-                self._loop.call_soon_threadsafe(self._command_queue.put_nowait, command)
+                self._safe_call(self._command_queue.put_nowait, command)
             except RuntimeError:
                 if self._stopping:
                     return
-                self._logger.debug("WS loop closed; dropping command")
+                self._logger.info("[WS] skip enqueue: loop closed")
                 return
         else:
             if not self._stopping:
@@ -418,6 +421,7 @@ class _BinanceBookTickerWsThread:
             if pending:
                 self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
+            self._closed = True
 
     async def _connect_loop(self) -> None:
         attempt = 0
@@ -587,6 +591,15 @@ class _BinanceBookTickerWsThread:
                 return
             sleep_s = max((self._disabled_until_ms - now_ms) / 1000.0, 0.5)
             await asyncio.sleep(min(sleep_s, 5.0))
+
+    def _safe_call(self, fn: Callable[..., Any], *args: Any) -> None:
+        if not self._loop or self._loop.is_closed() or self._stopping:
+            self._logger.info("[WS] skip enqueue: loop closed")
+            return
+        try:
+            self._loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            self._logger.info("[WS] skip enqueue: loop closed")
 
 
 class PriceFeedManager:

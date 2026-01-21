@@ -18,27 +18,47 @@ class WsManager:
         self._thread: threading.Thread | None = None
         self._main_coro_factory: Callable[[], Coroutine[Any, Any, None]] | None = None
         self._shutdown_lock = threading.Lock()
+        self._is_stopping = False
+        self._is_closed = False
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop | None:
         return self._loop
 
+    @property
+    def is_stopping(self) -> bool:
+        return self._is_stopping
+
+    @property
+    def is_closed(self) -> bool:
+        return self._is_closed
+
     def start(self, main_coro_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._main_coro_factory = main_coro_factory
+        self._is_stopping = False
+        self._is_closed = False
         self._thread = threading.Thread(target=self._run_loop, name="binance-ws", daemon=True)
         self._thread.start()
 
     def stop(self, shutdown_coro: Callable[[], Coroutine[Any, Any, None]] | None = None) -> None:
         with self._shutdown_lock:
+            self._is_stopping = True
             if self._loop and self._loop.is_running():
-                if shutdown_coro is not None:
-                    future = asyncio.run_coroutine_threadsafe(shutdown_coro(), self._loop)
-                    future.result(timeout=5.0)
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                if not self._loop.is_closed():
+                    if shutdown_coro is not None:
+                        future = asyncio.run_coroutine_threadsafe(shutdown_coro(), self._loop)
+                        future.result(timeout=5.0)
+                    try:
+                        self._loop.call_soon_threadsafe(self._loop.stop)
+                    except RuntimeError:
+                        self._logger.info("[WS] skip enqueue: loop closed")
+                else:
+                    self._logger.info("[WS] skip enqueue: loop closed")
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
+        self._is_closed = True
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -55,6 +75,7 @@ class WsManager:
             if pending:
                 self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
+            self._is_closed = True
             self._logger.info("STOP_LOOP")
 
 

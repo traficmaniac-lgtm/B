@@ -45,6 +45,7 @@ from src.services.price_feed_manager import (
     PriceFeedManager,
     PriceUpdate,
     WS_HEALTH_OK,
+    WS_STALE_MS,
 )
 from src.services.rate_limiter import RateLimiter
 
@@ -271,6 +272,9 @@ class AiOperatorGridWindow(LiteGridWindow):
         lookback_row.addWidget(self._lookback_combo, stretch=1)
         layout.addLayout(lookback_row)
 
+        self._ai_state_label = QLabel(f"state: {self._ai_state_machine.state.value}")
+        self._ai_state_label.setStyleSheet("color: #111827; font-size: 12px; font-weight: 600;")
+        layout.addWidget(self._ai_state_label)
 
         self._ai_snapshot_label = QLabel("snapshot: —")
         self._ai_snapshot_label.setStyleSheet("color: #374151; font-size: 12px;")
@@ -465,11 +469,14 @@ class AiOperatorGridWindow(LiteGridWindow):
         QTimer.singleShot(400, self._restore_apply_plan_state)
         complete_patch = self._ensure_complete_patch(patch)
         if self._apply_ai_patch(complete_patch, source_label="Apply Plan"):
-            self._transition_ai_state(
+            transitioned = self._transition_ai_state(
                 "apply_plan",
                 self._ai_state_machine.apply_plan,
                 failure_message="state transition blocked",
             )
+            if transitioned:
+                self._pending_action = None
+                self._append_log("[AI] strategy_patch applied; state=PLAN_APPLIED", "INFO")
 
     def _handle_ai_send(self) -> None:
         message = self._chat_input.text().strip()
@@ -588,7 +595,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._append_log("[AI] request_data action started", "INFO")
 
     def _run_ai_lookback_request(self, lookback_days: int) -> tuple[AiOperatorResponse, str, dict[str, Any]]:
-        datapack = self._build_full_market_pack(lookback_days=lookback_days)
+        datapack = self._build_full_market_pack(lookback_days=lookback_days, update_ui=False)
         client = OpenAIClient(
             api_key=self._app_state.openai_api_key,
             model=self._app_state.openai_model,
@@ -608,6 +615,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         self._last_full_pack = datapack
         self._last_ai_datapack = datapack
         data_quality = datapack.get("data_quality", {})
+        self._last_data_quality_state = data_quality.get("status") or self._derive_data_quality_state(data_quality)
+        self._update_ai_snapshot_label(datapack)
         missing = data_quality.get("missing") or []
         requested_days = datapack.get("meta", {}).get("lookback_days")
         if "klines" in missing:
@@ -651,6 +660,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._ai_state_machine.set_invalid,
             failure_message="state transition blocked",
         )
+
     def _approve_ai_action(self) -> None:
         pending_action = self._pending_action
         selected_action = self._actions_combo.currentText().strip().upper()
@@ -739,6 +749,7 @@ class AiOperatorGridWindow(LiteGridWindow):
             self._analyze_button.setEnabled(self._ai_state_machine.can_analyze() and not self._ai_busy)
         if hasattr(self, "_apply_plan_button"):
             self._update_apply_plan_state()
+        self._update_ai_state_label()
         runtime_ready = self._engine_ready()
         account_ready = self._dry_run_toggle.isChecked() or self._trade_gate == TradeGate.TRADE_OK
         start_enabled = self._ai_state_machine.can_start() and runtime_ready and account_ready
@@ -776,6 +787,11 @@ class AiOperatorGridWindow(LiteGridWindow):
                 )
         self._update_ai_controls()
         return ok
+
+    def _update_ai_state_label(self) -> None:
+        if not hasattr(self, "_ai_state_label"):
+            return
+        self._ai_state_label.setText(f"state: {self._ai_state_machine.state.value}")
 
     def _invalidate_ai_confidence(self, message: str) -> None:
         if self._ai_state_machine.state == AiOperatorState.INVALID:
@@ -1421,6 +1437,7 @@ class AiOperatorGridWindow(LiteGridWindow):
                 kind="WARN",
             )
             return
+        self._refresh_balances(force=True)
         if not self._engine_ready():
             reason = self._engine_ready_reason()
             self._append_log(f"[AI] start blocked: runtime not ready ({reason}).", kind="WARN")
@@ -1673,7 +1690,12 @@ class AiOperatorGridWindow(LiteGridWindow):
             failure_message="state transition blocked",
         )
 
-    def _build_full_market_pack(self, lookback_days: int | None = None) -> dict[str, Any]:
+    def _build_full_market_pack(
+        self,
+        lookback_days: int | None = None,
+        *,
+        update_ui: bool = True,
+    ) -> dict[str, Any]:
         total_start = time.perf_counter()
         selected_lookback = lookback_days or self._get_selected_lookback_days()
         ws_start = time.perf_counter()
@@ -1766,7 +1788,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         trades_window = self._compute_trades_window_summary(klines_by_window, selected_lookback)
 
         snapshot = self._refresh_ai_snapshot(reason="refresh")
-        self._update_ai_snapshot_label_from_snapshot(snapshot)
+        if update_ui:
+            self._update_ai_snapshot_label_from_snapshot(snapshot)
         base_free = self._balances.get(self._base_asset or "", (0.0, 0.0))[0]
         quote_free = self._balances.get(self._quote_asset or "", (0.0, 0.0))[0]
         equity_quote = quote_free + (base_free * last_price) if last_price else None
@@ -2086,9 +2109,7 @@ class AiOperatorGridWindow(LiteGridWindow):
         if mid_price is None and best_bid and best_ask:
             mid_price = (best_bid + best_ask) / 2
 
-        balance_age_s = None
-        if self._balance_ready_ts is not None:
-            balance_age_s = time.time() - self._balance_ready_ts
+        balance_age_s = self._balance_age_s()
         warnings: list[str] = []
         if not ws_ok:
             warnings.append("ws_not_ok")
@@ -2771,6 +2792,8 @@ class AiOperatorGridWindow(LiteGridWindow):
         fee_text = self._format_fee(fees.get("makerFeePct"), fees.get("takerFeePct"))
         ws_age_ms = data_quality.get("ws_age_ms")
         ws_age_text = f"{ws_age_ms}ms" if isinstance(ws_age_ms, int) else "—"
+        http_age_ms = data_quality.get("http_age_ms")
+        http_age_text = f"{http_age_ms}ms" if isinstance(http_age_ms, int) else "—"
         stale_text = "stale" if price_snapshot.get("stale") else "fresh"
         lookback_days = meta.get("lookback_days", "—")
         self._ai_snapshot_label.setText(
@@ -2778,10 +2801,10 @@ class AiOperatorGridWindow(LiteGridWindow):
                 f"snapshot={meta.get('timestamp_ms', '—')} lookback={lookback_days}d "
                 f"src={price_snapshot.get('source', '—')} {stale_text} "
                 f"bid={bid_text} ask={ask_text} spread={spread_text} "
-                f"trades1m={trades_text} fee(m/t)={fee_text} ws_age={ws_age_text}"
+                f"trades1m={trades_text} fee(m/t)={fee_text} "
+                f"ws_age={ws_age_text} http_age={http_age_text}"
             )
         )
-        http_age_ms = data_quality.get("http_age_ms")
         balances_age = data_quality.get("balances_age_s")
         stale_flag = "stale" if price_snapshot.get("stale") else "fresh"
         warnings = data_quality.get("warnings") or []
@@ -2789,14 +2812,30 @@ class AiOperatorGridWindow(LiteGridWindow):
         ws_ok = pack_source.get("ws_ok")
         http_ok = pack_source.get("http_ok")
         balances_text = f"{balances_age:.2f}s" if isinstance(balances_age, (int, float)) else "—"
+        reason_text = self._format_data_quality_reason(data_quality)
         self._ai_data_quality_label.setText(
             (
-                f"data quality: status={dq_status or '—'} ws={ws_ok} http={http_ok} ws_age={ws_age_ms or '—'}ms "
-                f"http_age={http_age_ms or '—'}ms balances_age={balances_text} "
-                f"stale={stale_flag} missing={','.join(missing) if missing else '—'} "
+                f"data quality: status={dq_status or '—'} ws={ws_ok} http={http_ok} "
+                f"ws_age={ws_age_ms or '—'}ms http_age={http_age_ms or '—'}ms "
+                f"balances_age={balances_text} stale={stale_flag} reason={reason_text} "
+                f"missing={','.join(missing) if missing else '—'} "
                 f"warnings={','.join(warnings) if warnings else '—'}"
             )
         )
+
+    @staticmethod
+    def _format_data_quality_reason(data_quality: dict[str, Any]) -> str:
+        missing = data_quality.get("missing") or []
+        warnings = data_quality.get("warnings") or []
+        ws_age_ms = data_quality.get("ws_age_ms")
+        reasons: list[str] = []
+        if missing:
+            reasons.append(f"missing={','.join(missing)}")
+        if isinstance(ws_age_ms, int) and ws_age_ms > WS_STALE_MS:
+            reasons.append("ws_age>stale_ms")
+        if warnings:
+            reasons.append(f"warn={','.join(warnings)}")
+        return "; ".join(reasons) if reasons else "—"
 
     def _update_ai_snapshot_label_from_snapshot(
         self,

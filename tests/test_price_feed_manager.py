@@ -54,11 +54,11 @@ def test_ws_state_machine_hysteresis() -> None:
         manager._handle_ws_message({"s": symbol, "b": "1.0", "a": "1.1", "E": tick})
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     assert manager._symbol_state[symbol]["ws_status"] == WS_CONNECTED
-    assert manager._symbol_state[symbol]["http_fallback_enabled"] is True
+    assert manager._symbol_state[symbol]["http_fallback_enabled"] is False
 
     now_ms = 16300 + 6000
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
-    assert manager._symbol_state[symbol]["http_fallback_enabled"] is False
+    assert manager._symbol_state[symbol]["http_fallback_enabled"] is True
 
 
 def test_ws_health_requires_subscription_and_fresh_age() -> None:
@@ -79,7 +79,8 @@ def test_ws_health_requires_subscription_and_fresh_age() -> None:
     manager._ws_thread._subscribed_symbols = {symbol.lower()}
     now_ms = 1000
     manager._handle_ws_message({"s": symbol, "b": "1.0", "a": "1.1", "E": now_ms})
-    now_ms = manager._router_config.ws_stale_ms + 1000
+    now_ms = manager._router_config.ws_stale_ms + 1001
+    manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     health = manager.get_ws_health(symbol)
     assert health is not None
     assert health.state != "OK"
@@ -98,3 +99,21 @@ def test_ws_thread_enqueue_command_loop_closed() -> None:
     thread._command_queue = asyncio.Queue()
     thread._stopping = True
     thread._enqueue_command({"type": "sync_symbols"})
+
+
+def test_ws_thread_stop_skips_commands_after_stop() -> None:
+    thread = _BinanceBookTickerWsThread(
+        ws_url="wss://example.test",
+        on_message=lambda _: None,
+        on_status=lambda *_: None,
+        now_ms_fn=lambda: 0,
+    )
+    thread.stop()
+    thread.set_symbols(["BTCUSDT"])
+
+
+def test_manager_register_ignored_after_shutdown() -> None:
+    manager = PriceFeedManager(Config())
+    manager.shutdown()
+    manager.register_symbol("BTCUSDT")
+    manager.unregister_symbol("BTCUSDT")
