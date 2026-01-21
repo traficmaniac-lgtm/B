@@ -129,8 +129,11 @@ class MainWindow(QMainWindow):
             self._lite_grid_windows.remove(window)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
+        self._logger.info("main window closing: stopping UI timers and subscriptions")
         self._overview_tab.shutdown()
         for window in list(self._lite_grid_windows):
             window.close()
+        self._logger.info("main window closing: stopping price feed manager")
         self._price_feed_manager.shutdown()
+        self._logger.info("main window closed: shutdown complete")
         super().closeEvent(event)

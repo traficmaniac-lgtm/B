@@ -135,3 +135,8 @@ Tests:
 - Enforced safety checks before PLAN_READY (fees/step, micro-volatility range, minQty/minNotional) and DO_NOT_TRADE logging.
 - Locked AI confidence on Apply Plan, invalidated on manual parameter edits, and reset on Stop.
 - Added state machine unit tests covering transitions and gating.
+
+### Hotfix v10.x.x: WS safe stop, request loop safe, AI Operator Grid UI normalized
+- Guarded WS loop enqueues on shutdown and ensured stop ordering avoids closed-loop calls.
+- Made AI request-more-data loop UI-safe and kept lookback/UI fields consistent.
+- Normalized AI Operator Grid state/data quality labels and balance freshness checks.

@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
 from math import ceil, floor
-from time import perf_counter, sleep, time
+from time import monotonic, perf_counter, sleep, time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -639,7 +639,7 @@ class LiteGridWindow(QMainWindow):
         self._base_asset = ""
         self._balances_in_flight = False
         self._balances_loaded = False
-        self._balance_ready_ts: float | None = None
+        self._balance_ready_ts_monotonic_ms: int | None = None
         self._orders_in_flight = False
         self._rules_in_flight = False
         self._fees_in_flight = False
@@ -1330,6 +1330,7 @@ class LiteGridWindow(QMainWindow):
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
+        self._refresh_balances(force=True)
         if not self._engine_ready():
             reason = self._engine_ready_reason()
             self._append_log(f"Start blocked: engine not ready ({reason}).", kind="WARN")
@@ -1783,21 +1784,28 @@ class LiteGridWindow(QMainWindow):
             return False
         if self._trade_gate != TradeGate.TRADE_OK:
             return False
-        if self._balance_ready_ts is None:
+        balance_age_s = self._balance_age_s()
+        if balance_age_s is None:
             return False
-        return time() - self._balance_ready_ts <= 2
+        return balance_age_s <= 2
 
     def _engine_ready_reason(self) -> str:
         if not self._rules_loaded:
             return "rules_not_loaded"
         if self._trade_gate != TradeGate.TRADE_OK:
             return f"trade_gate={self._trade_gate.value}"
-        if self._balance_ready_ts is None:
+        balance_age_s = self._balance_age_s()
+        if balance_age_s is None:
             return "balances_not_ready"
-        age = time() - self._balance_ready_ts
-        if age > 2:
-            return f"balances_stale age={age:.2f}s"
+        if balance_age_s > 2:
+            return f"balances_stale age={balance_age_s:.2f}s"
         return "ok"
+
+    def _balance_age_s(self) -> float | None:
+        if self._balance_ready_ts_monotonic_ms is None:
+            return None
+        age_ms = int(monotonic() * 1000) - self._balance_ready_ts_monotonic_ms
+        return max(age_ms / 1000.0, 0.0)
 
     def _reset_defaults(self) -> None:
         defaults = GridSettingsState()
@@ -1866,7 +1874,7 @@ class LiteGridWindow(QMainWindow):
         self._balances = balances
         self._balances_loaded = True
         if self._rules_loaded:
-            self._balance_ready_ts = time()
+            self._balance_ready_ts_monotonic_ms = int(monotonic() * 1000)
         self._set_account_status("ready")
         self._account_api_error = False
         status = self._account_client.get_account_status(result) if self._account_client else AccountStatus(False, [], None)
@@ -1900,7 +1908,7 @@ class LiteGridWindow(QMainWindow):
         self._balances_in_flight = False
         self._account_can_trade = False
         self._balances_loaded = False
-        self._balance_ready_ts = None
+        self._balance_ready_ts_monotonic_ms = None
         self._account_api_error = True
         self._account_permissions = []
         self._last_account_trade_snapshot = None
@@ -2988,7 +2996,7 @@ class LiteGridWindow(QMainWindow):
             "max_qty": max_qty,
         }
         self._rules_loaded = True
-        self._balance_ready_ts = None
+        self._balance_ready_ts_monotonic_ms = None
         self._apply_trade_gate()
         self._update_rules_label()
         self._update_grid_preview()
