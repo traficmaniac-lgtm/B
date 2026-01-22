@@ -52,6 +52,7 @@ TEXT = {
     "orders_columns": ["ID", "Side", "Price", "Qty", "Filled", "Age"],
     "cancel_selected": "Отменить выбранные",
     "cancel_all": "Отменить все",
+    "cancel_all_on_stop": "Отменять все при Stop",
     "refresh": "Обновить",
     "context_cancel": "Отменить",
     "context_copy_id": "Копировать ID",
