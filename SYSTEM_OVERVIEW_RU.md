@@ -2,7 +2,19 @@
 
 Этот файл описывает архитектуру, расположение модулей, назначение каждого элемента и то, как они взаимодействуют. Он предназначен как единая «карта системы» для быстрого ввода в контекст.
 
-## 1. Точки входа и общий запуск
+## 1. План работы программы (кратко)
+
+1. **Старт приложения**: запускается `src.app.main`, читается `config.json`, поднимается логирование, загружается `AppState` из `config.user.yaml`.
+2. **Инициализация GUI**: создаётся `QApplication`, затем `MainWindow`, подключается GUI‑лог‑хендлер и общий exception hook.
+3. **Запуск сервисов**: `MainWindow` поднимает ключевые сервисы цен/рынков (PriceFeed/Markets) и менеджер режимов пары.
+4. **Экран обзора**: `OverviewTab` загружает список пар через `MarketsService` и подписывается на цены через `PriceFeedManager`.
+5. **Выбор режима**: при выборе пары `PairModeManager` открывает нужное окно (Lite Grid, Trade Ready, AI Operator).
+6. **Потоки данных**: цены приходят через WS/HTTP, кэшируются `PriceService` и транслируются в UI через `PriceHub`.
+7. **AI‑контуры** (опционально): окна с AI собирают datapack, отправляют в `OpenAIClient`, валидируют и применяют ответ.
+8. **Runtime** (опционально): торговый runtime запускает `RuntimeEngine`, используя цены и виртуальные ордера.
+9. **Завершение**: при закрытии окна останавливаются активные сервисы и освобождаются подписки.
+
+## 2. Точки входа и общий запуск
 
 - **Запуск GUI**: `python -m src.app.main` (см. README/PROJECT_STRUCTURE). Главный путь: `src/app/main.py`.
 - **Назначение**: загрузить конфигурацию и пользовательское состояние, поднять главное окно, связать логирование и GUI.
@@ -17,12 +29,12 @@
    - подключает лог‑хендлер GUI и exception hook.
 2. `MainWindow` формирует весь интерфейс и создаёт системные сервисы (PriceFeedManager, PairModeManager).
 
-## 2. Общая структура директорий
+## 3. Общая структура директорий
 
 ```
 src/
   app/        — точка входа GUI
-  core/       — конфигурация, модели, утилиты времени, логирование
+  core/       — конфигурация, модели, утилиты времени, логирование, стратегии
   binance/    — HTTP/WS клиенты + account client
   services/   — сервисы: рынки, цены, кэш, rate limit, price feed
   gui/        — окна/вкладки интерфейса, диалоги, модели состояния UI
@@ -30,7 +42,7 @@ src/
   runtime/    — локальный runtime‑движок и виртуальные ордера
 ```
 
-## 3. Core: конфигурация, модели и утилиты
+## 4. Core: конфигурация, модели и утилиты
 
 ### `src/core/config.py`
 - **Dataclasses**:
@@ -59,7 +71,12 @@ src/
 ### `src/core/symbols.py`
 - `sanitize_symbol()`, `validate_trade_symbol()`, `validate_asset()` — нормализация и валидация тикеров.
 
-## 4. Binance клиенты
+### `src/core/strategies/*`
+- `manual_strategies.py` — ручные стратегии и параметры.
+- `manual_runtime.py` — runtime‑логика ручных стратегий.
+- `registry.py` — регистрация/поиск стратегий.
+
+## 5. Binance клиенты
 
 ### `src/binance/http_client.py`
 - `BinanceHttpClient` — HTTP обёртка на httpx.
@@ -77,7 +94,7 @@ src/
   - синхронизация времени (`sync_time_offset`).
 - `AccountStatus` — результат проверки торговых прав.
 
-## 5. Services: рынки, цены, кэш
+## 6. Services: рынки, цены, кэш
 
 ### `src/services/markets_service.py`
 - `MarketsService` — загрузка списка торговых пар:
@@ -117,7 +134,7 @@ src/
 ### `src/services/ai_provider.py`
 - Простой stub‑AI: генерирует `StrategyPlan`, умеет `chat_adjustment` + `apply_patch`.
 
-## 6. AI модуль
+## 7. AI модуль
 
 ### `src/ai/models.py`
 - Модели аналитики: `AiAnalysisResult`, `AiTradeOption`, `AiActionSuggestion`, `AiStrategyPatch`, `AiResponseEnvelope`.
@@ -153,7 +170,10 @@ src/
 ### `src/ai/operator_runtime.py`
 - `cancel_all_bot_orders()` + helper‑обвязки `pause_state` / `stop_state`.
 
-## 7. Runtime (локальная симуляция)
+### `src/ai/operator_state_machine.py`
+- Логика состояний AI оператора (переходы/решения).
+
+## 8. Runtime (локальная симуляция)
 
 ### `src/runtime/virtual_orders.py`
 - `VirtualOrder`, `VirtualOrderBook` — создание/отмена/фиксация виртуальных ордеров.
@@ -171,7 +191,7 @@ src/
 ### `src/runtime/runtime_state.py`
 - `RuntimeState` — IDLE/RUNNING/PAUSED/STOPPED.
 
-## 8. GUI: окна, диалоги, вкладки
+## 9. GUI: окна, диалоги, вкладки
 
 ### Главный контейнер
 
@@ -260,6 +280,12 @@ src/
 #### `src/gui/settings_dialog.py`
 - Модальный диалог настроек: ключи Binance/OpenAI, периоды, TTL, quote и т.д.
 
+#### `src/gui/i18n.py`
+- Помощники локализации и текстовых ресурсов.
+
+#### `src/gui/models/*`
+- `AppState`, `PairState`, `PairWorkspaceState`, `MarketState`, `PairMode` — контейнеры UI‑состояний.
+
 ### GUI Widgets и legacy‑вкладки
 
 #### `src/gui/widgets/*`
@@ -268,7 +294,7 @@ src/
 - `PairLogsPanel` — простая панель логов.
 - `DashboardTab`, `MarketsTab`, `BotTab`, `SettingsTab` — исторические вкладки (плейсхолдеры/демо), сейчас используются как reference.
 
-## 9. Взаимодействия и потоки данных
+## 10. Взаимодействия и потоки данных
 
 ### Основные потоки
 
@@ -292,13 +318,13 @@ src/
 - Все компоненты используют `get_logger()`.
 - `MainWindow` подключает `LogDock.handler` к root‑логгеру.
 
-## 10. Тесты
+## 11. Тесты
 
 - `tests/test_app_state.py` — проверка сохранения/загрузки AppState.
 - `tests/test_imports.py` — smoke‑imports GUI.
 - `tests/test_markets_service.py` — тесты MarketsService.
 
-## 11. Примечания
+## 12. Примечания
 
 - В проекте есть несколько UI‑веток (Lite Grid, Pair Workspace, Trade Ready, AI Operator). Это связано со стадиями развития и экспериментами.
 - Реальные сделки не запускаются автоматически: многие режимы содержат confirm/approve шаги и работают в dry‑run.
