@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -660,6 +661,7 @@ class PriceFeedManager:
         self._transport_test_timers: list[threading.Timer] = []
         self._symbol_capabilities: dict[str, dict[str, bool]] = {}
         self._recent_unsubscribe_ms: dict[str, int] = {}
+        self._transport_test_enabled = self._resolve_transport_test_enabled()
         self._ws_thread = _BinanceBookTickerWsThread(
             ws_url=config.binance.ws_url.rstrip("/"),
             on_message=self._handle_ws_message,
@@ -704,7 +706,13 @@ class PriceFeedManager:
         self._stop_event.clear()
         self._ws_thread.start()
         self._monitor_thread.start()
-        self._start_selftest_once()
+        if self._transport_test_enabled:
+            self._start_selftest_once()
+
+    def _resolve_transport_test_enabled(self) -> bool:
+        env_flag = os.getenv("BBOT_TRANSPORT_TEST", "").strip()
+        debug_flag = os.getenv("DEBUG", "").strip().lower()
+        return env_flag == "1" or debug_flag in {"1", "true", "yes"}
 
     def _is_ws_capable(self, symbol: str) -> bool:
         with self._lock:
@@ -748,6 +756,8 @@ class PriceFeedManager:
                 self._self_test_completed = True
 
     def run_transport_test(self, symbols: Iterable[str] | None = None) -> list[dict[str, object]]:
+        if not self._transport_test_enabled:
+            return []
         if self._stopping or self._shutting_down:
             return []
         cleaned_symbols: list[str] = []

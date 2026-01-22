@@ -667,7 +667,13 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._sell_retry_limit = 5
         self._start_in_progress = False
         self._start_in_progress_logged = False
+        self._start_token = 0
+        self._last_preflight_hash: str | None = None
+        self._last_preflight_blocked = False
+        self._start_locked_until_change = False
+        self._start_locked_logged = False
         self._tp_fix_target: float | None = None
+        self._auto_fix_tp_enabled = True
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -1402,28 +1408,41 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
+        if self._start_locked_until_change:
+            if not self._start_locked_logged:
+                self._append_log("[START] blocked: fix required (TP)", kind="WARN")
+                self._start_locked_logged = True
+            return
         if self._start_in_progress:
             if not self._start_in_progress_logged:
                 self._append_log("[START] ignored: in_progress", kind="WARN")
                 self._start_in_progress_logged = True
             return
+        snapshot = self._collect_strategy_snapshot()
+        snapshot_hash = self._hash_snapshot(snapshot)
+        if snapshot_hash == self._last_preflight_hash and self._last_preflight_blocked:
+            return
         self._start_in_progress = True
         self._start_in_progress_logged = False
+        self._start_token += 1
+        self._last_preflight_hash = snapshot_hash
+        self._last_preflight_blocked = False
         self._start_button.setEnabled(False)
         self._set_strategy_controls_enabled(False)
         started = False
         try:
-            snapshot = self._collect_strategy_snapshot()
             balances_ok = self._force_refresh_balances_and_wait(timeout_ms=2_000)
             if not balances_ok or not self._balances_ready_for_start():
                 self._append_log(
                     "[START] blocked: balances_not_ready (force_refresh_failed)",
                     kind="WARN",
                 )
+                self._mark_preflight_blocked()
                 return
             if not self._engine_ready():
                 reason = self._engine_ready_reason()
                 self._append_log(f"Start blocked: engine not ready ({reason}).", kind="WARN")
+                self._mark_preflight_blocked()
                 return
             dry_run = self._dry_run_toggle.isChecked()
             self._append_log(f"Start pressed (dry-run={dry_run}).", kind="ORDERS")
@@ -1444,6 +1463,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 self._refresh_exchange_rules(force=True)
                 self._refresh_trade_fees(force=True)
                 self._change_state("IDLE")
+                self._mark_preflight_blocked()
                 return
             try:
                 anchor_price = self.get_anchor_price(self._symbol)
@@ -1458,18 +1478,26 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 if not profitability.get("is_profitable", True):
                     min_tp = profitability.get("min_tp_pct")
                     break_even = profitability.get("break_even_tp_pct")
-                    self._append_log(
-                        (
-                            "[START] blocked: tp below break-even "
-                            f"tp={settings.take_profit_pct:.4f}% "
-                            f"min_tp={min_tp:.4f}% (click to auto-fix)"
-                        ),
-                        kind="WARN",
-                    )
-                    if isinstance(min_tp, float) and isinstance(break_even, float):
-                        self._show_tp_break_even_helper(min_tp, break_even)
-                    self._change_state("IDLE")
-                    return
+                    fix_target = None
+                    if isinstance(min_tp, float):
+                        fix_target = min_tp + 0.02
+                    if self._auto_fix_tp_enabled and isinstance(fix_target, float):
+                        self._apply_tp_fix(fix_target, min_tp, auto_fix=True)
+                        settings.take_profit_pct = fix_target
+                    else:
+                        should_fix = False
+                        if isinstance(fix_target, float):
+                            should_fix = self._confirm_tp_fix(fix_target, min_tp)
+                        if should_fix and isinstance(fix_target, float):
+                            self._apply_tp_fix(fix_target, min_tp, auto_fix=False)
+                            settings.take_profit_pct = fix_target
+                        else:
+                            self._append_log("[START] blocked: fix required (TP)", kind="WARN")
+                            if isinstance(min_tp, float) and isinstance(break_even, float):
+                                self._show_tp_break_even_helper(min_tp, break_even)
+                            self._lock_start_for_tp()
+                            self._change_state("IDLE")
+                            return
                 self._clear_tp_break_even_helper()
                 if not dry_run and self._first_live_session:
                     settings.grid_count = min(settings.grid_count, 4)
@@ -1492,6 +1520,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             except ValueError as exc:
                 self._append_log(f"Start failed: {exc}", kind="WARN")
                 self._change_state("IDLE")
+                self._mark_preflight_blocked()
                 return
             self._bootstrap_mode = False
             self._bootstrap_sell_enabled = False
@@ -1515,6 +1544,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     kind="WARN",
                 )
                 self._change_state("IDLE")
+                self._mark_preflight_blocked()
                 return
             self._append_log(
                 f"grid plan: buys={buy_count} sells={sell_count}",
@@ -1557,6 +1587,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 self._change_state("IDLE")
                 return
             started = True
+            self._last_preflight_blocked = False
             self._bot_session_id = uuid4().hex[:8]
             self._bot_order_ids.clear()
             self._bot_order_keys.clear()
@@ -1696,7 +1727,55 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._clear_tp_break_even_helper()
         if key == "budget":
             self._refresh_orders_metrics()
+        self._on_strategy_changed()
         self._update_grid_preview()
+
+    def _on_strategy_changed(self) -> None:
+        if self._start_locked_until_change or self._last_preflight_blocked:
+            self._start_locked_until_change = False
+            self._start_locked_logged = False
+            self._last_preflight_hash = None
+            self._last_preflight_blocked = False
+
+    def _hash_snapshot(self, snapshot: dict[str, Any]) -> str:
+        items = tuple(sorted(snapshot.items()))
+        preflight_state = (
+            self._balances_ready_for_start(),
+            self._engine_ready(),
+            bool(self._rules_loaded),
+            bool(self._fees_last_fetch_ts),
+        )
+        return str(hash((items, preflight_state)))
+
+    def _mark_preflight_blocked(self) -> None:
+        self._last_preflight_blocked = True
+
+    def _lock_start_for_tp(self) -> None:
+        self._start_locked_until_change = True
+        self._start_locked_logged = True
+        self._last_preflight_blocked = True
+
+    def _confirm_tp_fix(self, fix_target: float, min_tp: float | None) -> bool:
+        min_tp_text = f"{min_tp:.4f}%" if isinstance(min_tp, float) else "—"
+        message = f"TP too low. Apply fix?\nmin_tp={min_tp_text}\nnew_tp={fix_target:.4f}%"
+        response = QMessageBox.question(
+            self,
+            "TP too low",
+            message,
+            QMessageBox.Apply | QMessageBox.Cancel,
+            QMessageBox.Apply,
+        )
+        return response == QMessageBox.Apply
+
+    def _apply_tp_fix(self, fix_target: float, min_tp: float | None, *, auto_fix: bool) -> None:
+        self._take_profit_input.setValue(fix_target)
+        self._clear_tp_break_even_helper()
+        min_tp_text = f"{min_tp:.4f}%" if isinstance(min_tp, float) else "—"
+        auto_label = "auto-fixed" if auto_fix else "fixed"
+        self._append_log(
+            f"[TP] {auto_label} to {fix_target:.4f}% (min_tp={min_tp_text})",
+            kind="INFO",
+        )
 
     def _set_grid_step_input(self, value: float, update_setting: bool) -> None:
         self._grid_step_input.blockSignals(True)
@@ -2081,6 +2160,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._balances_snapshot = snapshot
         self._refresh_trade_fees()
         self._signals.balances_refresh.emit(True)
+        if self._balances_ready_for_start() and not self._start_locked_until_change:
+            self._last_preflight_blocked = False
+            self._last_preflight_hash = None
 
     def _handle_account_error(self, message: str) -> None:
         self._balances_in_flight = False
