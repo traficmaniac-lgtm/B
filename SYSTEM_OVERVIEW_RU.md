@@ -8,10 +8,10 @@
 2. **Инициализация GUI**: создаётся `QApplication`, затем `MainWindow`, подключается GUI‑лог‑хендлер и общий exception hook.
 3. **Запуск сервисов**: `MainWindow` поднимает ключевые сервисы цен/рынков (PriceFeed/Markets) и менеджер режимов пары.
 4. **Экран обзора**: `OverviewTab` загружает список пар через `MarketsService` и подписывается на цены через `PriceFeedManager`.
-5. **Выбор режима**: при выборе пары `PairModeManager` открывает нужное окно (Lite Grid, Trade Ready, AI Operator).
+5. **Выбор режима**: при выборе пары `PairModeManager` открывает нужное окно (Lite Grid или Lite All Strategy Terminal).
 6. **Потоки данных**: цены приходят через WS/HTTP, кэшируются `PriceService` и транслируются в UI через `PriceHub`.
-7. **AI‑контуры** (опционально): окна с AI собирают datapack, отправляют в `OpenAIClient`, валидируют и применяют ответ.
-8. **Runtime** (опционально): торговый runtime запускает `RuntimeEngine`, используя цены и виртуальные ордера.
+7. **AI‑контуры** (опционально/legacy): окна с AI собирают datapack, отправляют в `OpenAIClient`, валидируют и применяют ответ.
+8. **Runtime** (опционально/legacy): торговый runtime запускает `RuntimeEngine`, используя цены и виртуальные ордера.
 9. **Завершение**: при закрытии окна останавливаются активные сервисы и освобождаются подписки.
 
 ## 2. Точки входа и общий запуск
@@ -38,6 +38,7 @@ src/
   binance/    — HTTP/WS клиенты + account client
   services/   — сервисы: рынки, цены, кэш, rate limit, price feed
   gui/        — окна/вкладки интерфейса, диалоги, модели состояния UI
+    modes/    — экспериментальные режимы (AI full strategy v2)
   ai/         — схемы и логика AI/оператора
   runtime/    — локальный runtime‑движок и виртуальные ордера
 ```
@@ -75,6 +76,7 @@ src/
 - `manual_strategies.py` — ручные стратегии и параметры.
 - `manual_runtime.py` — runtime‑логика ручных стратегий.
 - `registry.py` — регистрация/поиск стратегий.
+- `defs/` — встроенные определения стратегий (например, grid classic) для UI‑режимов.
 
 ## 5. Binance клиенты
 
@@ -216,12 +218,12 @@ src/
 #### `src/gui/pair_mode_manager.py`
 - `PairModeManager` — шлюз открытия окон:
   - `open_pair_dialog()` → `PairActionDialog`.
-  - `open_pair_mode()` → окно Lite Grid / Trade Ready / AI Operator Grid.
+  - `open_pair_mode()` → окно Lite Grid или Lite All Strategy Terminal.
 
 #### `src/gui/pair_action_dialog.py`
-- Диалог выбора режима работы с парой (Lite Mode / AI Operator Grid).
+- Диалог выбора режима работы с парой (Lite Grid Terminal / Lite All Strategy Terminal v1.0).
 
-### Lite Grid Terminal
+### Lite Grid Terminal (основной)
 
 #### `src/gui/lite_grid_window.py`
 - Главное окно Lite Grid (базовый grid‑бот):
@@ -234,6 +236,25 @@ src/
 #### `src/gui/lite_grid_math.py`
 - Математика лота и расчетов для grid (используется в LiteGridWindow).
 
+### Lite All Strategy Terminal (v1.0) — особый режим
+
+#### `src/gui/lite_all_strategy_terminal_window.py`
+- Экспериментальный терминал для «Lite all strategy»:
+  - визуально и по механикам близок к Lite Grid, но расширен под тест разных сеточных режимов;
+  - использует отдельный `GridEngine` и состояние `GridSettingsState` с параметрами:
+    - бюджет, направление, шаг/кол-во уровней, режим шага (AUTO_ATR/MANUAL),
+    - режим диапазона (Auto/Manual), `range_low_pct`/`range_high_pct`,
+    - take‑profit/stop‑loss, лимит активных ордеров, режим размера ордера.
+  - получает live‑цены через `PriceFeedManager` и обновляет UI по сигналам;
+  - использует Binance HTTP/Account клиентов для правил/балансов/ордеров;
+  - есть `TradeGate` для проверки возможности живой торговли (ключи, canTrade, read‑only);
+  - поддерживает dry‑run/live режимы, подтверждение live‑запуска и отмену ордеров;
+  - хранит локальные кэши (`DataCache`), рассчитывает план/профит‑метрики;
+  - применяет авто‑шаг (AUTO ATR) на основе истории цен с fallback на HTTP;
+  - использует профили прибыльности из `ai.operator_profiles` и математику комиссий
+    (`compute_fee_total_pct` + `evaluate_tp_profitability`) для подсказок по TP.
+- Важная роль: точка для экспериментов с расширенными стратегиями, не ломая основной Lite‑терминал.
+
 ### AI Operator Grid
 
 #### `src/gui/ai_operator_grid_window.py`
@@ -242,6 +263,17 @@ src/
   - общается с OpenAI (`OpenAIClient`), валидирует patch,
   - поддерживает apply patch / request data / start/stop/pause,
   - хранит историю AI ответов и использует `RateLimiter`/`DataCache`.
+
+### AI Full Strategy V2 (эксперимент)
+
+#### `src/gui/modes/ai_full_strateg_v2/window.py`
+- Экспериментальный режим «полной стратегии»:
+  - расширяет AI Operator Grid, добавляя переключатель стратегий;
+  - использует `core/strategies` (manual стратегии) для валидации и сборки ордеров;
+  - поддерживает MANUAL/Dry‑Run поток, сбор параметров под разные типы стратегий.
+
+#### `src/gui/modes/ai_full_strateg_v2/controller.py`
+- Вспомогательная логика/контроллер для окна AI Full Strategy V2.
 
 ### Trade Ready Mode + Runtime
 
@@ -306,7 +338,7 @@ src/
    - все окна подписываются на `PriceFeedManager` (WS + HTTP fallback).
    - `OverviewTab` и `TradeReadyMode` слушают обновления для UI.
 4. **Запуск режима**:
-   - `OverviewTab` (двойной клик) → `PairModeManager` → окно режима (Lite Grid / AI Operator / Trade Ready).
+   - `OverviewTab` (двойной клик) → `PairModeManager` → окно режима (Lite Grid / Lite All Strategy).
 5. **AI анализ**:
    - Pair Workspace / AI Operator Grid собирает datapack → `OpenAIClient` → парсинг JSON → UI.
 6. **Runtime**:
@@ -326,7 +358,7 @@ src/
 
 ## 12. Примечания
 
-- В проекте есть несколько UI‑веток (Lite Grid, Pair Workspace, Trade Ready, AI Operator). Это связано со стадиями развития и экспериментами.
+- В проекте есть несколько UI‑веток (Lite Grid, Lite All Strategy Terminal, Pair Workspace, Trade Ready, AI Operator). Это связано со стадиями развития и экспериментами.
 - Реальные сделки не запускаются автоматически: многие режимы содержат confirm/approve шаги и работают в dry‑run.
 
 ---
