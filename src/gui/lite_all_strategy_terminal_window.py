@@ -625,6 +625,11 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._fill_keys: set[str] = set()
         self._fill_accumulator = FillAccumulator()
         self._active_action_keys: set[str] = set()
+        self._active_order_keys: set[str] = set()
+        self._recent_order_keys: dict[str, float] = {}
+        self._order_id_to_registry_key: dict[str, str] = {}
+        self._recent_key_ttl_s = 8.0
+        self._recent_key_insufficient_ttl_s = 2.0
         self._bot_session_id: str | None = None
         self._last_price: float | None = None
         self._price_history: list[float] = []
@@ -1594,6 +1599,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._fill_keys.clear()
             self._fill_accumulator = FillAccumulator()
             self._active_action_keys.clear()
+            self._active_order_keys.clear()
+            self._recent_order_keys.clear()
+            self._order_id_to_registry_key.clear()
             self._open_orders_map = {}
             self._fills = []
             self._base_lots.clear()
@@ -1636,6 +1644,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._fill_keys.clear()
         self._fill_accumulator = FillAccumulator()
         self._active_action_keys.clear()
+        self._active_order_keys.clear()
+        self._recent_order_keys.clear()
+        self._order_id_to_registry_key.clear()
         self._open_orders_map = {}
         self._bot_session_id = None
         self._open_orders = []
@@ -2190,6 +2201,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._open_orders = []
             self._open_orders_map = {}
             self._bot_order_keys = set()
+            self._active_order_keys.clear()
+            self._recent_order_keys.clear()
+            self._order_id_to_registry_key.clear()
             self._render_open_orders()
             self._apply_trade_gate()
             return
@@ -2275,6 +2289,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         if not isinstance(result, list):
             self._handle_open_orders_error("Unexpected open orders response")
             return
+        self._purge_recent_order_keys()
         previous_map = dict(self._open_orders_map)
         self._open_orders_all = [item for item in result if isinstance(item, dict)]
         self._open_orders = self._filter_bot_orders(self._open_orders_all)
@@ -2292,6 +2307,13 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             order_id = str(order.get("orderId", ""))
             if order_id:
                 self._bot_order_ids.add(order_id)
+        closed_order_ids = [
+            order_id
+            for order_id in list(self._order_id_to_registry_key)
+            if order_id and order_id not in self._open_orders_map
+        ]
+        for order_id in closed_order_ids:
+            self._discard_registry_for_order_id(order_id)
         self._render_open_orders()
         self._grid_engine.sync_open_orders(self._open_orders)
         missing = [
@@ -2335,6 +2357,74 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         if not self._bot_session_id:
             return ""
         return f"BBOT_LITE_{self._symbol}_{self._bot_session_id}_"
+
+    @staticmethod
+    def _order_registry_type(reason: str) -> str:
+        reason_upper = reason.upper()
+        if reason_upper.startswith("TP"):
+            return "TP"
+        if reason_upper == "RESTORE":
+            return "RESTORE"
+        return "GRID"
+
+    def _order_registry_key(self, side: str, price_str: str, qty_str: str, order_type: str) -> str:
+        return f"{self._symbol}:{side}:{price_str}:{qty_str}:{order_type}"
+
+    def _purge_recent_order_keys(self) -> None:
+        if not self._recent_order_keys:
+            return
+        now = monotonic()
+        expired = [key for key, expiry in self._recent_order_keys.items() if expiry <= now]
+        for key in expired:
+            self._recent_order_keys.pop(key, None)
+
+    def _mark_recent_order_key(self, key: str, ttl_s: float) -> None:
+        self._recent_order_keys[key] = monotonic() + ttl_s
+
+    def _register_order_key(self, key: str, ttl_s: float | None = None) -> None:
+        self._active_order_keys.add(key)
+        self._mark_recent_order_key(key, ttl_s or self._recent_key_ttl_s)
+
+    def _discard_order_registry_key(self, key: str, *, drop_recent: bool = False) -> None:
+        self._active_order_keys.discard(key)
+        if drop_recent:
+            self._recent_order_keys.pop(key, None)
+
+    def _discard_registry_for_order_id(self, order_id: str) -> None:
+        key = self._order_id_to_registry_key.pop(order_id, None)
+        if key:
+            self._discard_order_registry_key(key, drop_recent=True)
+
+    def _discard_registry_for_values(self, side: str, price: Decimal, qty: Decimal) -> None:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        price_key = self._format_decimal(self.q_price(price, tick), tick)
+        qty_key = self._format_decimal(self.q_qty(qty, step), step)
+        prefix = f"{self._symbol}:{side}:{price_key}:{qty_key}:"
+        keys = [key for key in self._active_order_keys if key.startswith(prefix)]
+        for key in keys:
+            self._discard_order_registry_key(key, drop_recent=True)
+
+    def _discard_registry_for_order(self, order: dict[str, Any]) -> None:
+        order_id = str(order.get("orderId", ""))
+        if order_id:
+            self._discard_registry_for_order_id(order_id)
+        side = str(order.get("side", "")).upper()
+        if not side:
+            return
+        price = self._coerce_float(str(order.get("price", ""))) or 0.0
+        qty = self._coerce_float(str(order.get("origQty", ""))) or 0.0
+        if price > 0 and qty > 0:
+            self._discard_registry_for_values(side, self.as_decimal(price), self.as_decimal(qty))
+
+    @staticmethod
+    def _classify_2010_reason(message: str) -> str:
+        lower_message = message.lower()
+        if "duplicate order sent" in lower_message:
+            return "DUPLICATE"
+        if "insufficient balance" in lower_message or "not enough balance" in lower_message:
+            return "INSUFFICIENT_BALANCE"
+        return "UNKNOWN"
 
     def _order_key(self, side: str, price: Decimal, qty: Decimal) -> str:
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
@@ -2432,8 +2522,11 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 fill = self._build_trade_fill(order, trade)
                 if fill:
                     self._process_fill(fill)
+                if order_id:
+                    self._discard_registry_for_order_id(order_id)
                 continue
             if status in {"CANCELED", "EXPIRED", "REJECTED"}:
+                self._discard_registry_for_order(order)
                 self._append_log(
                     f"[LIVE] order closed orderId={order_id} status={status}",
                     kind="ORDERS",
@@ -2489,6 +2582,14 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         if fill_key in self._fill_keys:
             return
         self._fill_keys.add(fill_key)
+        if fill.order_id:
+            self._discard_registry_for_order_id(fill.order_id)
+        else:
+            self._discard_registry_for_values(
+                fill.side,
+                self.as_decimal(fill.price),
+                self.as_decimal(fill.qty),
+            )
         if fill.trade_id:
             self._seen_trade_ids.add(fill.trade_id)
         total_filled = self.as_decimal(fill.qty)
@@ -2948,29 +3049,44 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 "WARN",
             )
             return None, None
-        key = self._order_key(side, price, qty)
+        self._purge_recent_order_keys()
+        price_str = self.fmt_price(price, tick)
+        qty_str = self.fmt_qty(qty, step)
+        order_type = self._order_registry_type(reason)
+        registry_key = self._order_registry_key(side, price_str, qty_str, order_type)
+        if registry_key in self._active_order_keys or registry_key in self._recent_order_keys:
+            self._signals.log_append.emit(
+                (
+                    f"[LIVE] skip duplicate key={registry_key} reason=registry "
+                    f"side={side} price={price_str} qty={qty_str}"
+                ),
+                "WARN",
+            )
+            return None, None
         if self._has_duplicate_order(
             side,
             price,
             qty,
-            tolerance_ticks=0,
+            tolerance_ticks=1,
             ignore_order_id=ignore_order_id,
             ignore_keys=ignore_keys,
         ):
             self._signals.log_append.emit(
                 (
-                    f"[LIVE] SKIP duplicate key {key} "
-                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                    "[LIVE] skipped: duplicate reason=open_orders "
+                    f"side={side} price={price_str} qty={qty_str}"
                 ),
                 "WARN",
             )
             return None, None
+        self._register_order_key(registry_key)
         optimistic_added = False
-        if key not in self._bot_order_keys:
-            self._bot_order_keys.add(key)
+        open_key = self._order_key(side, price, qty)
+        if open_key not in self._bot_order_keys:
+            self._bot_order_keys.add(open_key)
             optimistic_added = True
         log_message = (
-            f"[LIVE] place {reason} side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)} "
+            f"[LIVE] place {reason} side={side} price={price_str} qty={qty_str} "
             f"notional={self.fmt_price(notional, None)} tick={self._format_rule(tick)} "
             f"step={self._format_rule(step)} minNotional={self._format_rule(min_notional)}"
         )
@@ -2986,20 +3102,46 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             )
         except Exception as exc:  # noqa: BLE001
             if optimistic_added:
-                self._bot_order_keys.discard(key)
+                self._bot_order_keys.discard(open_key)
             status, code, message, response_body = self._parse_binance_exception(exc)
             if code == -2010:
-                if optimistic_added:
-                    self._bot_order_keys.add(key)
+                reason_tag = self._classify_2010_reason(message)
+                if reason_tag == "DUPLICATE":
+                    self._discard_order_registry_key(registry_key)
+                    self._mark_recent_order_key(registry_key, self._recent_key_ttl_s)
+                    self._signals.log_append.emit(
+                        (
+                            "[LIVE] skipped: duplicate reason=exchange "
+                            f"side={side} price={price_str} qty={qty_str} "
+                            f"status={status} code={code} msg={message} response={response_body}"
+                        ),
+                        "WARN",
+                    )
+                    QTimer.singleShot(0, self, lambda: self._refresh_open_orders(force=True))
+                    return None, None
+                if reason_tag == "INSUFFICIENT_BALANCE":
+                    self._discard_order_registry_key(registry_key)
+                    self._mark_recent_order_key(registry_key, self._recent_key_insufficient_ttl_s)
+                    self._signals.log_append.emit(
+                        (
+                            "[LIVE] skipped: insufficient_balance "
+                            f"side={side} price={price_str} qty={qty_str} "
+                            f"status={status} code={code} msg={message} response={response_body}"
+                        ),
+                        "WARN",
+                    )
+                    return None, None
+                self._discard_order_registry_key(registry_key, drop_recent=True)
                 self._signals.log_append.emit(
                     (
-                        "[LIVE] duplicate order skipped "
+                        "[LIVE] place failed: unknown_2010 "
+                        f"side={side} price={price_str} qty={qty_str} "
                         f"status={status} code={code} msg={message} response={response_body}"
                     ),
-                    "WARN",
+                    "ERROR",
                 )
-                QTimer.singleShot(0, self, lambda: self._refresh_open_orders(force=True))
                 return None, None
+            self._discard_order_registry_key(registry_key, drop_recent=True)
             message = self._format_binance_exception(
                 exc,
                 context=f"place {reason}",
@@ -3009,6 +3151,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 notional=notional,
             )
             return None, message
+        order_id = str(response.get("orderId", "")) if isinstance(response, dict) else ""
+        if order_id:
+            self._order_id_to_registry_key[order_id] = registry_key
         return response, None
 
     @staticmethod
@@ -3780,6 +3925,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             order_id = str(entry.get("orderId", "—")) if isinstance(entry, dict) else "—"
             if isinstance(entry, dict):
                 self._discard_order_key_from_order(entry)
+                self._discard_registry_for_order(entry)
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel selected: {len(result)}", kind="ORDERS")
         self._refresh_open_orders(force=True)
@@ -3795,6 +3941,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             order_id = str(entry.get("orderId", "—")) if isinstance(entry, dict) else "—"
             if isinstance(entry, dict):
                 self._discard_order_key_from_order(entry)
+                self._discard_registry_for_order(entry)
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel all: {len(result)}", kind="ORDERS")
         self._refresh_open_orders(force=True)
