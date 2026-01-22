@@ -12,12 +12,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.gui.models.pair_mode import (
-    PAIR_MODE_LITE,
-    PAIR_MODE_AI_OPERATOR_GRID,
-    PAIR_MODE_AI_FULL_STRATEG_V2,
-    PairMode,
-)
+from src.core.logging import get_logger
+from src.gui.models.pair_mode import PAIR_MODE_LITE, PAIR_MODE_LITE_ALL_STRATEGY, PairMode
 
 
 class PairActionDialog(QDialog):
@@ -25,29 +21,24 @@ class PairActionDialog(QDialog):
         super().__init__(parent)
         self._symbol = symbol
         self.selected_mode: PairMode | None = None
+        self._logger = get_logger("gui.pair_action_dialog")
 
         self.setWindowTitle(f"Работа с парой: {symbol}")
         self.setModal(True)
-        self.resize(520, 220)
+        self.resize(520, 180)
 
         layout = QVBoxLayout()
         layout.addWidget(self._build_option_card(
-            title="Lite Mode (Grid Terminal)",
+            title="Lite Grid Terminal",
             description="старый родной Lite (LIVE grid)",
-            button_text="Open Lite Mode",
+            button_text="Open Lite Grid Terminal",
             on_click=lambda: self._choose_mode(PAIR_MODE_LITE),
         ))
         layout.addWidget(self._build_option_card(
-            title="AI Operator Grid",
-            description="Adaptive Micro-Grid Market Making (AI Operator)",
-            button_text="Open AI Operator Grid",
-            on_click=lambda: self._choose_mode(PAIR_MODE_AI_OPERATOR_GRID),
-        ))
-        layout.addWidget(self._build_option_card(
-            title="AI Full Strateg v2.0",
-            description="Advanced multi-strategy grid workspace (AI/Manual)",
-            button_text="Open AI Full Strateg v2.0",
-            on_click=lambda: self._choose_mode(PAIR_MODE_AI_FULL_STRATEG_V2),
+            title="Lite All Strategy Terminal (v1.0)",
+            description="клон Lite для экспериментов со стратегиями",
+            button_text="Open Lite All Strategy",
+            on_click=lambda: self._choose_mode(PAIR_MODE_LITE_ALL_STRATEGY),
         ))
         layout.addStretch()
         self.setLayout(layout)
@@ -84,4 +75,5 @@ class PairActionDialog(QDialog):
 
     def _choose_mode(self, mode: PairMode) -> None:
         self.selected_mode = mode
+        self._logger.info("[MODE] selected=%s symbol=%s", mode.name, self._symbol)
         self.accept()

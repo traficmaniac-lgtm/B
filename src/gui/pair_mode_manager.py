@@ -6,19 +6,10 @@ from PySide6.QtWidgets import QDialog, QWidget
 
 from src.core.config import Config
 from src.core.logging import get_logger
-from src.gui.models.pair_mode import (
-    PAIR_MODE_LITE,
-    PAIR_MODE_AI_OPERATOR_GRID,
-    PAIR_MODE_AI_FULL_STRATEG_V2,
-    PAIR_MODE_TRADE_READY,
-    PAIR_MODE_TRADING,
-    PairMode,
-)
-from src.gui.ai_operator_grid_window import AiOperatorGridWindow
-from src.gui.modes.ai_full_strateg_v2.controller import AiFullStrategV2Controller
+from src.gui.lite_all_strategy_terminal_window import LiteAllStrategyTerminalWindow
+from src.gui.models.pair_mode import PAIR_MODE_LITE, PAIR_MODE_LITE_ALL_STRATEGY, PairMode
 from src.gui.models.app_state import AppState
 from src.gui.pair_action_dialog import PairActionDialog
-from src.gui.trade_ready_mode_window import TradeReadyModeWindow
 from src.services.price_feed_manager import PriceFeedManager
 
 
@@ -41,9 +32,7 @@ class PairModeManager:
         self._exchange_name = exchange_name
         self._price_feed_manager = price_feed_manager
         self._logger = get_logger("gui.pair_mode_manager")
-        self._trade_ready_windows: list[TradeReadyModeWindow] = []
-        self._ai_operator_grid_windows: list[AiOperatorGridWindow] = []
-        self._ai_full_strateg_v2_windows: list[QWidget] = []
+        self._lite_all_strategy_windows: list[LiteAllStrategyTerminalWindow] = []
 
     def open_pair_dialog(
         self,
@@ -76,29 +65,12 @@ class PairModeManager:
             self._logger.info("[MODE] open window=LiteGridWindow symbol=%s", symbol)
             self._open_trading_workspace(symbol)
             return
-        if mode == PAIR_MODE_TRADING:
-            self._logger.info("[MODE] open window=LiteGridWindow symbol=%s", symbol)
-            self._open_trading_workspace(symbol)
-            return
-        if mode == PAIR_MODE_TRADE_READY:
-            self._logger.info("[MODE] open window=TradeReadyModeWindow symbol=%s", symbol)
-            window = TradeReadyModeWindow(
-                symbol=symbol,
-                exchange=self._exchange_name,
-                last_price=last_price,
-                market_state=self._market_state,
-                price_feed_manager=self._price_feed_manager,
-                parent=window_parent,
-            )
-            window.show()
-            self._trade_ready_windows.append(window)
-            return
-        if mode == PAIR_MODE_AI_OPERATOR_GRID:
-            self._logger.info("[MODE] open window=AiOperatorGridWindow symbol=%s", symbol)
+        if mode == PAIR_MODE_LITE_ALL_STRATEGY:
+            self._logger.info("[MODE] open window=LiteAllStrategyTerminalWindow symbol=%s", symbol)
             if self._config is None or self._app_state is None or self._price_feed_manager is None:
-                self._logger.error("AI Operator Grid unavailable: missing runtime dependencies.")
+                self._logger.error("Lite All Strategy Terminal unavailable: missing runtime dependencies.")
                 return
-            window = AiOperatorGridWindow(
+            window = LiteAllStrategyTerminalWindow(
                 symbol=symbol,
                 config=self._config,
                 app_state=self._app_state,
@@ -106,16 +78,6 @@ class PairModeManager:
                 parent=window_parent,
             )
             window.show()
-            self._ai_operator_grid_windows.append(window)
+            self._lite_all_strategy_windows.append(window)
             return
-        if mode == PAIR_MODE_AI_FULL_STRATEG_V2:
-            self._logger.info("[MODE] open window=AiFullStrategV2Window symbol=%s", symbol)
-            controller = AiFullStrategV2Controller(
-                config=self._config,
-                app_state=self._app_state,
-                price_feed_manager=self._price_feed_manager,
-                parent=window_parent,
-            )
-            window = controller.open(symbol)
-            if window is not None:
-                self._ai_full_strateg_v2_windows.append(window)
+        self._logger.warning("[MODE] unsupported mode=%s symbol=%s", mode.name, symbol)
