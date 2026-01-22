@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core.strategies.defs.grid_classic import get_definition as grid_classic_definition
+from src.core.strategies.manual_strategies import BUILTIN_STRATEGIES, ManualStrategy
 
 
 @dataclass(frozen=True)
@@ -11,8 +11,21 @@ class StrategyDefinition:
     label: str
 
 
+_STRATEGY_REGISTRY: dict[str, ManualStrategy] = {
+    strategy.id: strategy for strategy in BUILTIN_STRATEGIES
+}
+
+
+def register_strategy(strategy: ManualStrategy) -> None:
+    _STRATEGY_REGISTRY[strategy.id] = strategy
+
+
+def get_strategy(strategy_id: str) -> ManualStrategy | None:
+    return _STRATEGY_REGISTRY.get(strategy_id)
+
+
 def get_strategy_definitions() -> tuple[StrategyDefinition, ...]:
-    grid_classic = grid_classic_definition()
-    return (
-        StrategyDefinition(strategy_id=grid_classic.strategy_id, label=grid_classic.label),
+    return tuple(
+        StrategyDefinition(strategy_id=strategy.id, label=strategy.label)
+        for strategy in _STRATEGY_REGISTRY.values()
     )
