@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.logging import get_logger
-from src.core.strategies.manual_runtime import check_manual_start
+from src.core.strategies.manual_runtime import ManualRuntime, manual_start_gating
 from src.core.strategies.manual_strategies import (
     BreakoutPullbackParams,
     MeanReversionBandsParams,
@@ -59,9 +59,20 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
         self._manual_session_id: str | None = None
         self._strategy_stack_map: dict[str, int] = {}
         self._manual_fields: dict[str, dict[str, QWidget]] = {}
+        self._manual_runtime = ManualRuntime(
+            on_start=self._execute_manual_start,
+            on_pause=self._execute_manual_pause,
+            on_stop=self._execute_manual_stop,
+            on_cancel_all=self._execute_manual_cancel_all,
+        )
+        self._last_start_enabled: bool | None = None
+        self._last_start_reason: str | None = None
         super().__init__(*args, **kwargs)
         self.setWindowTitle(f"AI Full Strateg v2.0 — {self._symbol}")
         self._logger.info("[MODE] selected=AI_FULL_STRATEG_V2 symbol=%s", self._symbol)
+        self._wire_manual_param_updates()
+        self.update_manual_controls()
+        self._log_start_diagnostics()
 
     def _build_body(self) -> QSplitter:
         splitter = QSplitter(Qt.Horizontal)
@@ -502,9 +513,11 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
             self._strategy_stack.setCurrentIndex(index)
         else:
             self._strategy_stack.setCurrentIndex(0)
+        self.update_manual_controls()
 
     def _handle_mode_change(self) -> None:
         self._manual_mode = bool(self._mode_combo.currentData())
+        self.update_manual_controls()
 
     def _handle_start(self) -> None:
         strategy_id = self._strategy_combo.currentData()
@@ -518,21 +531,6 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
         if not self._manual_mode:
             super()._handle_start()
             return
-        self._handle_manual_start(strategy_id, dry_run)
-
-    def _handle_pause(self) -> None:
-        if not self._manual_mode:
-            super()._handle_pause()
-            return
-        self._handle_manual_pause()
-
-    def _handle_stop(self) -> None:
-        if not self._manual_mode:
-            super()._handle_stop()
-            return
-        self._handle_manual_stop()
-
-    def _handle_manual_start(self, strategy_id: str, dry_run: bool) -> None:
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
@@ -541,80 +539,60 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
             self._append_log("Start blocked: rules not loaded.", kind="WARN")
             self._refresh_exchange_rules(force=True)
             return
-        decision = check_manual_start(dry_run=dry_run, trade_gate=self._trade_gate.value)
+        ctx, reason = self._build_strategy_ctx(strategy_id, allow_fetch=True)
+        if not ctx:
+            self._append_log(f"Start blocked: {reason}.", kind="WARN")
+            return
+        decision = manual_start_gating(ctx)
         if not decision.ok:
-            reason = decision.reason
-            self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
+            self._append_log(f"Start blocked: {decision.reason}.", kind="WARN")
             return
-        if not dry_run and self._trade_gate == TradeGate.TRADE_DISABLED_READONLY:
-            reason = self._trade_gate_reason()
-            self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
-            return
-
         strategy = get_strategy(strategy_id)
         if not strategy:
             self._append_log(f"[STRAT] validate ok=false reason=unknown_strategy {strategy_id}", kind="WARN")
             return
-        anchor_price = self.get_anchor_price(self._symbol)
-        if anchor_price is None:
-            self._append_log("Start blocked: no price available.", kind="WARN")
-            return
-        snapshot = self._price_feed_manager.get_snapshot(self._symbol)
-        best_bid = snapshot.best_bid if snapshot else None
-        best_ask = snapshot.best_ask if snapshot else None
-        cached_book = self._get_http_cached("book_ticker")
-        if best_bid is None and isinstance(cached_book, dict):
-            best_bid = self._coerce_float(str(cached_book.get("bidPrice", "")))
-        if best_ask is None and isinstance(cached_book, dict):
-            best_ask = self._coerce_float(str(cached_book.get("askPrice", "")))
-        if best_bid is None or best_ask is None:
-            try:
-                book = self._http_client.get_book_ticker(self._symbol)
-            except Exception as exc:  # noqa: BLE001
-                self._append_log(f"BOOK: HTTP failed ({exc})", kind="WARN")
-                book = {}
-            if isinstance(book, dict):
-                best_bid = best_bid or self._coerce_float(str(book.get("bidPrice", "")))
-                best_ask = best_ask or self._coerce_float(str(book.get("askPrice", "")))
-                self._set_http_cache("book_ticker", book)
-
-        params, budget, max_active_orders, tp_pct = self._collect_manual_params(strategy_id)
-        self._append_log(
-            (
-                f"[STRAT] start strategy={strategy_id} mode=MANUAL dry_run={str(dry_run).lower()} "
-                f"budget={budget:.2f}"
-            ),
-            kind="ORDERS",
-        )
-        ctx = StrategyContext(
-            symbol=self._symbol,
-            budget_usdt=budget,
-            rules=self._exchange_rules,
-            current_price=anchor_price,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            fee_maker=self._trade_fees[0],
-            fee_taker=self._trade_fees[1],
-            dry_run=dry_run,
-            balances={
-                "base_free": float(self._balance_snapshot().get("base_free", 0)),
-                "quote_free": float(self._balance_snapshot().get("quote_free", 0)),
-            },
-            max_active_orders=max_active_orders,
-            params=params,
-            klines=self._resolve_klines(strategy_id, params),
-            klines_by_tf=self._resolve_klines_by_tf(strategy_id),
-        )
         ok, reason = strategy.validate(ctx)
         self._append_log(f"[STRAT] validate ok={str(ok).lower()} reason={reason}", kind="INFO")
         if not ok:
             self._append_log(f"Start blocked: {reason}.", kind="WARN")
             return
+        self._manual_runtime.start(strategy_id, ctx)
+
+    def _handle_pause(self) -> None:
+        if not self._manual_mode:
+            super()._handle_pause()
+            return
+        self._manual_runtime.pause()
+        self._manual_runtime.cancel_all()
+
+    def _handle_stop(self) -> None:
+        if not self._manual_mode:
+            super()._handle_stop()
+            return
+        self._manual_runtime.stop()
+        self._manual_runtime.cancel_all()
+
+    def _execute_manual_start(self, strategy_id: str, ctx: StrategyContext) -> None:
+        strategy = get_strategy(strategy_id)
+        if not strategy:
+            self._append_log(f"[STRAT] validate ok=false reason=unknown_strategy {strategy_id}", kind="WARN")
+            return
+        params = ctx.params
+        budget = ctx.budget_usdt
+        tp_pct = float(params.get("tp_pct", 0.0)) if isinstance(params, dict) else 0.0
+        self._append_log(
+            (
+                f"[STRAT] start strategy={strategy_id} mode=MANUAL dry_run={str(ctx.dry_run).lower()} "
+                f"budget={budget:.2f}"
+            ),
+            kind="ORDERS",
+        )
         intents = strategy.build_orders(ctx)
         if not intents:
             self._append_log("Start blocked: no orders built.", kind="WARN")
             return
         prices = [intent.price for intent in intents]
+        anchor_price = ctx.current_price
         low_price = min(prices) if prices else anchor_price
         high_price = max(prices) if prices else anchor_price
         step_hint = self._resolve_step_hint(params)
@@ -625,7 +603,7 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
             ),
             kind="INFO",
         )
-        if not dry_run and not self._account_client:
+        if not ctx.dry_run and not self._account_client:
             self._append_log("Start blocked: no account client.", kind="WARN")
             return
         self._manual_order_keys.clear()
@@ -644,7 +622,7 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
                 )
             )
         self._manual_intents_sent = planned
-        if dry_run:
+        if ctx.dry_run:
             for intent in intents:
                 self._append_log(
                     (
@@ -691,44 +669,20 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
         self._change_state("RUNNING")
         self._refresh_open_orders(force=True)
 
-    def _handle_manual_pause(self) -> None:
+    def _execute_manual_pause(self) -> None:
         self._append_log("Pause pressed.", kind="ORDERS")
-        if self._dry_run_toggle.isChecked() or not self._account_client:
-            self._append_log(
-                f"[ORDERS] cancel_all strategy={self._strategy_combo.currentData()} n={len(self._manual_intents_sent)}",
-                kind="ORDERS",
-            )
-            self._clear_manual_registry()
-            self._change_state("PAUSED")
-            return
-        prefix = self._manual_order_prefix()
 
-        def _cancel() -> Any:
-            return cancel_all_bot_orders(
-                symbol=self._symbol,
-                account_client=self._account_client,
-                order_ids=self._manual_order_ids,
-                client_order_id_prefix=prefix,
-                timeout_s=3.0,
-            )
-
-        state, result = pause_state(_cancel)
-        self._append_log(
-            f"[ORDERS] cancel_all strategy={self._strategy_combo.currentData()} n={result.canceled_count}",
-            kind="ORDERS",
-        )
-        self._clear_manual_registry()
-        self._change_state(state)
-
-    def _handle_manual_stop(self) -> None:
+    def _execute_manual_stop(self) -> None:
         self._append_log("Stop pressed.", kind="ORDERS")
+
+    def _execute_manual_cancel_all(self, target_state: str) -> None:
         if self._dry_run_toggle.isChecked() or not self._account_client:
             self._append_log(
                 f"[ORDERS] cancel_all strategy={self._strategy_combo.currentData()} n={len(self._manual_intents_sent)}",
                 kind="ORDERS",
             )
             self._clear_manual_registry()
-            self._change_state("IDLE")
+            self._change_state(target_state)
             return
         prefix = self._manual_order_prefix()
 
@@ -740,6 +694,16 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
                 client_order_id_prefix=prefix,
                 timeout_s=3.0,
             )
+
+        if target_state == "PAUSED":
+            state, result = pause_state(_cancel)
+            self._append_log(
+                f"[ORDERS] cancel_all strategy={self._strategy_combo.currentData()} n={result.canceled_count}",
+                kind="ORDERS",
+            )
+            self._clear_manual_registry()
+            self._change_state(state)
+            return
 
         state, result = stop_state(_cancel)
         self._append_log(
@@ -748,6 +712,190 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
         )
         self._clear_manual_registry()
         self._change_state("IDLE" if state == "STOPPED" else state)
+
+    def _wire_manual_param_updates(self) -> None:
+        def _connect(widget: QWidget | None) -> None:
+            if isinstance(widget, QSpinBox):
+                widget.valueChanged.connect(self.update_manual_controls)
+            elif isinstance(widget, QDoubleSpinBox):
+                widget.valueChanged.connect(self.update_manual_controls)
+            elif isinstance(widget, QCheckBox):
+                widget.toggled.connect(self.update_manual_controls)
+            elif isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self.update_manual_controls)
+            elif isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self.update_manual_controls)
+
+        for widget in (
+            getattr(self, "_budget_input", None),
+            getattr(self, "_grid_count_input", None),
+            getattr(self, "_grid_step_input", None),
+            getattr(self, "_range_low_input", None),
+            getattr(self, "_range_high_input", None),
+            getattr(self, "_take_profit_input", None),
+            getattr(self, "_stop_loss_toggle", None),
+            getattr(self, "_stop_loss_input", None),
+            getattr(self, "_max_orders_input", None),
+            getattr(self, "_order_size_combo", None),
+            getattr(self, "_direction_combo", None),
+            getattr(self, "_grid_step_mode_combo", None),
+            getattr(self, "_range_mode_combo", None),
+        ):
+            _connect(widget)
+        for fields in self._manual_fields.values():
+            for widget in fields.values():
+                _connect(widget)
+
+    def _log_start_diagnostics(self) -> None:
+        trade_gate_readonly = self._trade_gate == TradeGate.TRADE_DISABLED_READONLY
+        spot_enabled = self._spot_trading_enabled()
+        balance = self._balance_snapshot()
+        strategy_id = self._strategy_combo.currentData()
+        self._append_log(
+            (
+                "[START-DIAG] "
+                f"mode={'Manual' if self._manual_mode else 'AI'} "
+                f"dry_run={str(self._dry_run_toggle.isChecked()).lower()} "
+                f"trade_gate_readonly={str(trade_gate_readonly).lower()} "
+                f"spot_enabled={str(spot_enabled).lower()} "
+                f"rules_loaded={str(self._rules_loaded).lower()} "
+                f"balance=quote:{float(balance.get('quote_free', 0)):.2f},"
+                f"base:{float(balance.get('base_free', 0)):.8f} "
+                f"strategy={strategy_id}"
+            ),
+            kind="INFO",
+        )
+
+    def _spot_trading_enabled(self) -> bool:
+        return "SPOT" in {perm.upper() for perm in self._account_permissions}
+
+    def _build_strategy_ctx(self, strategy_id: str, allow_fetch: bool) -> tuple[StrategyContext | None, str | None]:
+        if not strategy_id:
+            return None, "no_strategy"
+        anchor_price = self.get_anchor_price(self._symbol)
+        if anchor_price is None:
+            return None, "no price available"
+        snapshot = self._price_feed_manager.get_snapshot(self._symbol)
+        best_bid = snapshot.best_bid if snapshot else None
+        best_ask = snapshot.best_ask if snapshot else None
+        cached_book = self._get_http_cached("book_ticker")
+        if best_bid is None and isinstance(cached_book, dict):
+            best_bid = self._coerce_float(str(cached_book.get("bidPrice", "")))
+        if best_ask is None and isinstance(cached_book, dict):
+            best_ask = self._coerce_float(str(cached_book.get("askPrice", "")))
+        if allow_fetch and (best_bid is None or best_ask is None):
+            try:
+                book = self._http_client.get_book_ticker(self._symbol)
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"BOOK: HTTP failed ({exc})", kind="WARN")
+                book = {}
+            if isinstance(book, dict):
+                best_bid = best_bid or self._coerce_float(str(book.get("bidPrice", "")))
+                best_ask = best_ask or self._coerce_float(str(book.get("askPrice", "")))
+                self._set_http_cache("book_ticker", book)
+
+        params, budget, max_active_orders, _ = self._collect_manual_params(strategy_id)
+        balance_snapshot = self._balance_snapshot()
+        balance_age_s = self._balance_age_s()
+        balances_ready = balance_age_s is not None and balance_age_s <= 2
+        ctx = StrategyContext(
+            symbol=self._symbol,
+            budget_usdt=budget,
+            rules=self._exchange_rules,
+            current_price=anchor_price,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            fee_maker=self._trade_fees[0],
+            fee_taker=self._trade_fees[1],
+            dry_run=self._dry_run_toggle.isChecked(),
+            balances={
+                "base_free": float(balance_snapshot.get("base_free", 0)),
+                "quote_free": float(balance_snapshot.get("quote_free", 0)),
+            },
+            max_active_orders=max_active_orders,
+            params=params,
+            klines=self._resolve_klines(strategy_id, params, allow_fetch=allow_fetch),
+            klines_by_tf=self._resolve_klines_by_tf(strategy_id, allow_fetch=allow_fetch),
+            trade_gate=self._trade_gate.value,
+            spot_enabled=self._spot_trading_enabled(),
+            rules_loaded=self._rules_loaded,
+            balances_ready=balances_ready,
+            balance_age_s=balance_age_s,
+        )
+        return ctx, None
+
+    def update_manual_controls(self) -> None:
+        if not hasattr(self, "_start_button"):
+            return
+        if not self._manual_mode:
+            self._start_button.setEnabled(False)
+            self._pause_button.setEnabled(False)
+            self._stop_button.setEnabled(False)
+            reason = "manual_mode_required"
+            self._start_button.setToolTip(reason)
+            self._log_start_state(False, reason)
+            return
+        self._pause_button.setEnabled(True)
+        self._stop_button.setEnabled(True)
+        strategy_id = self._strategy_combo.currentData()
+        ctx, reason = self._build_strategy_ctx(strategy_id, allow_fetch=False)
+        if not ctx:
+            self._start_button.setEnabled(False)
+            self._start_button.setToolTip(reason or "")
+            self._log_start_state(False, reason or "")
+            return
+        decision = manual_start_gating(ctx)
+        if not decision.ok:
+            self._start_button.setEnabled(False)
+            self._start_button.setToolTip(decision.reason)
+            self._log_start_state(False, decision.reason)
+            return
+        strategy = get_strategy(strategy_id)
+        if not strategy:
+            self._start_button.setEnabled(False)
+            self._start_button.setToolTip("unknown_strategy")
+            self._log_start_state(False, "unknown_strategy")
+            return
+        ok, reason = strategy.validate(ctx)
+        enabled = decision.ok and ok
+        self._start_button.setEnabled(enabled)
+        tooltip = "" if enabled else reason
+        self._start_button.setToolTip(tooltip)
+        self._log_start_state(enabled, tooltip or "ok")
+
+    def _log_start_state(self, enabled: bool, reason: str) -> None:
+        if self._last_start_enabled == enabled and self._last_start_reason == reason:
+            return
+        self._last_start_enabled = enabled
+        self._last_start_reason = reason
+        self._append_log(
+            f"[START] enabled={str(enabled).lower()} reason={reason}",
+            kind="INFO",
+        )
+
+    def _apply_trade_gate(self) -> None:
+        super()._apply_trade_gate()
+        self.update_manual_controls()
+
+    def _handle_dry_run_toggle(self, checked: bool) -> None:
+        super()._handle_dry_run_toggle(checked)
+        self.update_manual_controls()
+
+    def _handle_account_info(self, result: object, latency_ms: int) -> None:
+        super()._handle_account_info(result, latency_ms)
+        self.update_manual_controls()
+
+    def _handle_account_error(self, message: str) -> None:
+        super()._handle_account_error(message)
+        self.update_manual_controls()
+
+    def _handle_exchange_info(self, result: object, latency_ms: int) -> None:
+        super()._handle_exchange_info(result, latency_ms)
+        self.update_manual_controls()
+
+    def _handle_exchange_error(self, message: str) -> None:
+        super()._handle_exchange_error(message)
+        self.update_manual_controls()
 
     def _manual_order_prefix(self) -> str:
         if not self._manual_session_id:
@@ -818,13 +966,19 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
             params = TrendFollowGridParams(**params).__dict__
         return params, budget, max_active, tp_pct
 
-    def _resolve_klines(self, strategy_id: str, params: dict[str, Any]) -> list[Any] | None:
+    def _resolve_klines(
+        self,
+        strategy_id: str,
+        params: dict[str, Any],
+        *,
+        allow_fetch: bool = True,
+    ) -> list[Any] | None:
         if strategy_id not in {"MEAN_REVERSION_BANDS", "BREAKOUT_PULLBACK"}:
             return None
         interval = "1m" if strategy_id == "MEAN_REVERSION_BANDS" else "5m"
         name = f"klines_{interval}"
         data = self._get_cached_data(name)
-        if data is None:
+        if allow_fetch and data is None:
             data, _, _ = self._fetch_http_block(
                 name,
                 lambda: self._http_client.get_klines(self._symbol, interval=interval, limit=200),
@@ -834,7 +988,12 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
             return data
         return None
 
-    def _resolve_klines_by_tf(self, strategy_id: str) -> dict[str, list[Any]] | None:
+    def _resolve_klines_by_tf(
+        self,
+        strategy_id: str,
+        *,
+        allow_fetch: bool = True,
+    ) -> dict[str, list[Any]] | None:
         if strategy_id != "TREND_FOLLOW_GRID":
             return None
         fields = self._manual_fields.get(strategy_id, {})
@@ -842,7 +1001,7 @@ class AiFullStrategV2Window(AiOperatorGridWindow):
         interval = tf_widget.currentData() if isinstance(tf_widget, QComboBox) else "1m"
         name = f"klines_{interval}"
         data = self._get_cached_data(name)
-        if data is None:
+        if allow_fetch and data is None:
             data, _, _ = self._fetch_http_block(
                 name,
                 lambda: self._http_client.get_klines(self._symbol, interval=interval, limit=200),
