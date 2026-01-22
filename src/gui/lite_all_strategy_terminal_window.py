@@ -9,7 +9,7 @@ from time import monotonic, perf_counter, sleep, time
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QEventLoop, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -104,6 +104,7 @@ class _LiteGridSignals(QObject):
     status_update = Signal(str, str)
     log_append = Signal(str, str)
     api_error = Signal(str)
+    balances_refresh = Signal(bool)
 
 
 class TradeGate(Enum):
@@ -664,6 +665,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._orders_last_count: int | None = None
         self._balances_snapshot: tuple[float, float] | None = None
         self._sell_retry_limit = 5
+        self._start_in_progress = False
+        self._start_in_progress_logged = False
+        self._tp_fix_target: float | None = None
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -925,6 +929,16 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._take_profit_input.valueChanged.connect(
             lambda value: self._update_setting("take_profit_pct", value)
         )
+        self._tp_fix_button = QPushButton("Fix TP")
+        self._tp_fix_button.setFixedHeight(24)
+        self._tp_fix_button.setEnabled(False)
+        self._tp_fix_button.clicked.connect(self._handle_fix_tp)
+        self._tp_helper_label = QLabel("")
+        self._tp_helper_label.setStyleSheet("color: #dc2626; font-size: 10px;")
+        self._tp_helper_label.setVisible(False)
+        tp_row = QHBoxLayout()
+        tp_row.addWidget(self._take_profit_input)
+        tp_row.addWidget(self._tp_fix_button)
         self._auto_values_label = QLabel(tr("auto_values_line", values="—"))
         self._auto_values_label.setStyleSheet("color: #6b7280; font-size: 10px;")
 
@@ -963,7 +977,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         form.addRow(tr("range_mode"), self._range_mode_combo)
         form.addRow(tr("range_low"), self._range_low_input)
         form.addRow(tr("range_high"), self._range_high_input)
-        form.addRow(tr("take_profit"), self._take_profit_input)
+        form.addRow(tr("take_profit"), tp_row)
+        form.addRow("", self._tp_helper_label)
         form.addRow("", self._auto_values_label)
         form.addRow(tr("stop_loss"), stop_loss_row)
         form.addRow(tr("max_active_orders"), self._max_orders_input)
@@ -985,6 +1000,25 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._apply_range_mode(self._settings_state.range_mode)
         self._apply_grid_step_mode(self._settings_state.grid_step_mode)
         self._update_grid_preview()
+        self._strategy_controls = [
+            self._budget_input,
+            self._direction_combo,
+            self._grid_count_input,
+            self._grid_step_mode_combo,
+            self._grid_step_input,
+            self._manual_override_button,
+            self._range_mode_combo,
+            self._range_low_input,
+            self._range_high_input,
+            self._take_profit_input,
+            self._tp_fix_button,
+            self._stop_loss_toggle,
+            self._stop_loss_input,
+            self._max_orders_input,
+            self._order_size_combo,
+            self._reset_button,
+            self._dry_run_toggle,
+        ]
         return group
 
     def _build_runtime_panel(self) -> QWidget:
@@ -1272,6 +1306,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._grid_step_input.setEnabled(True)
         self._grid_step_input.setReadOnly(auto)
         self._take_profit_input.setReadOnly(auto)
+        if hasattr(self, "_tp_fix_button"):
+            self._tp_fix_button.setEnabled(not auto and self._tp_fix_target is not None)
         self._manual_override_button.setEnabled(auto)
         self._grid_step_mode_combo.setToolTip(tr("grid_step_mode_tip_auto") if auto else "")
         if auto:
@@ -1296,6 +1332,12 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
     def _handle_stop_loss_toggle(self, enabled: bool) -> None:
         self._stop_loss_input.setEnabled(enabled)
         self._update_setting("stop_loss_enabled", enabled)
+
+    def _handle_fix_tp(self) -> None:
+        if self._tp_fix_target is None:
+            return
+        self._take_profit_input.setValue(self._tp_fix_target)
+        self._clear_tp_break_even_helper()
 
     def _handle_dry_run_toggle(self, checked: bool) -> None:
         if self._suppress_dry_run_event:
@@ -1332,172 +1374,217 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._apply_trade_gate()
         self._update_fills_timer()
 
+    def _set_strategy_controls_enabled(self, enabled: bool) -> None:
+        if not hasattr(self, "_strategy_controls"):
+            return
+        for widget in self._strategy_controls:
+            widget.setEnabled(enabled)
+
+    def _show_tp_break_even_helper(self, min_tp: float, break_even: float) -> None:
+        safety_tp = min_tp + 0.02
+        self._tp_fix_target = safety_tp
+        self._tp_helper_label.setText(
+            f"min TP: {min_tp:.2f}% (break-even {break_even:.2f}%)"
+        )
+        self._tp_helper_label.setVisible(True)
+        if not self._take_profit_input.isReadOnly():
+            self._tp_fix_button.setEnabled(True)
+
+    def _clear_tp_break_even_helper(self) -> None:
+        self._tp_fix_target = None
+        if hasattr(self, "_tp_helper_label"):
+            self._tp_helper_label.setText("")
+            self._tp_helper_label.setVisible(False)
+        if hasattr(self, "_tp_fix_button"):
+            self._tp_fix_button.setEnabled(False)
+
     def _handle_start(self) -> None:
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
-        self._refresh_balances(force=True)
-        if not self._engine_ready():
-            reason = self._engine_ready_reason()
-            self._append_log(f"Start blocked: engine not ready ({reason}).", kind="WARN")
+        if self._start_in_progress:
+            if not self._start_in_progress_logged:
+                self._append_log("[START] ignored: in_progress", kind="WARN")
+                self._start_in_progress_logged = True
             return
-        dry_run = self._dry_run_toggle.isChecked()
-        self._append_log(f"Start pressed (dry-run={dry_run}).", kind="ORDERS")
-        self._append_log(
-            f"account.canTrade={str(self._account_can_trade).lower()} permissions={self._account_permissions}",
-            kind="INFO",
-        )
-        if not dry_run and self._trade_gate != TradeGate.TRADE_OK:
-            reason = self._trade_gate_reason()
-            self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
-            dry_run = True
-            self._suppress_dry_run_event = True
-            self._dry_run_toggle.setChecked(True)
-            self._suppress_dry_run_event = False
-        self._grid_engine.set_mode("DRY_RUN" if dry_run else "LIVE")
-        if not dry_run and (not self._rules_loaded or not self._fees_last_fetch_ts):
-            self._append_log("Start blocked: rules/fees not loaded.", kind="WARN")
-            self._refresh_exchange_rules(force=True)
-            self._refresh_trade_fees(force=True)
-            self._change_state("IDLE")
-            return
+        self._start_in_progress = True
+        self._start_in_progress_logged = False
+        self._start_button.setEnabled(False)
+        self._set_strategy_controls_enabled(False)
+        started = False
         try:
-            anchor_price = self.get_anchor_price(self._symbol)
-            if anchor_price is None:
-                raise ValueError("No price available.")
-            balance_snapshot = self._balance_snapshot()
-            settings = self._resolve_start_settings()
-            self._apply_auto_clamps(settings, anchor_price)
-            if settings.take_profit_pct <= 0:
-                raise ValueError("Invalid take_profit_pct")
-            profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
-            if not profitability.get("is_profitable", True):
-                min_tp = profitability.get("min_tp_pct")
-                break_even = profitability.get("break_even_tp_pct")
+            snapshot = self._collect_strategy_snapshot()
+            balances_ok = self._force_refresh_balances_and_wait(timeout_ms=2_000)
+            if not balances_ok or not self._balances_ready_for_start():
+                self._append_log(
+                    "[START] blocked: balances_not_ready (force_refresh_failed)",
+                    kind="WARN",
+                )
+                return
+            if not self._engine_ready():
+                reason = self._engine_ready_reason()
+                self._append_log(f"Start blocked: engine not ready ({reason}).", kind="WARN")
+                return
+            dry_run = self._dry_run_toggle.isChecked()
+            self._append_log(f"Start pressed (dry-run={dry_run}).", kind="ORDERS")
+            self._append_log(
+                f"account.canTrade={str(self._account_can_trade).lower()} permissions={self._account_permissions}",
+                kind="INFO",
+            )
+            if not dry_run and self._trade_gate != TradeGate.TRADE_OK:
+                reason = self._trade_gate_reason()
+                self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
+                dry_run = True
+                self._suppress_dry_run_event = True
+                self._dry_run_toggle.setChecked(True)
+                self._suppress_dry_run_event = False
+            self._grid_engine.set_mode("DRY_RUN" if dry_run else "LIVE")
+            if not dry_run and (not self._rules_loaded or not self._fees_last_fetch_ts):
+                self._append_log("Start blocked: rules/fees not loaded.", kind="WARN")
+                self._refresh_exchange_rules(force=True)
+                self._refresh_trade_fees(force=True)
+                self._change_state("IDLE")
+                return
+            try:
+                anchor_price = self.get_anchor_price(self._symbol)
+                if anchor_price is None:
+                    raise ValueError("No price available.")
+                balance_snapshot = self._balance_snapshot()
+                settings = self._resolve_start_settings(snapshot)
+                self._apply_auto_clamps(settings, anchor_price)
+                if settings.take_profit_pct <= 0:
+                    raise ValueError("Invalid take_profit_pct")
+                profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
+                if not profitability.get("is_profitable", True):
+                    min_tp = profitability.get("min_tp_pct")
+                    break_even = profitability.get("break_even_tp_pct")
+                    self._append_log(
+                        (
+                            "[START] blocked: tp below break-even "
+                            f"tp={settings.take_profit_pct:.4f}% "
+                            f"min_tp={min_tp:.4f}% (click to auto-fix)"
+                        ),
+                        kind="WARN",
+                    )
+                    if isinstance(min_tp, float) and isinstance(break_even, float):
+                        self._show_tp_break_even_helper(min_tp, break_even)
+                    self._change_state("IDLE")
+                    return
+                self._clear_tp_break_even_helper()
+                if not dry_run and self._first_live_session:
+                    settings.grid_count = min(settings.grid_count, 4)
+                    settings.max_active_orders = min(settings.max_active_orders, 4)
+                tick = self._exchange_rules.get("tick")
+                step = self._exchange_rules.get("step")
                 self._append_log(
                     (
-                        "[START] blocked: tp_pct below break-even "
-                        f"tp_pct={settings.take_profit_pct:.4f}% "
-                        f"min_tp={min_tp:.4f}% break_even={break_even:.4f}%"
+                        f"[START] mode={settings.grid_step_mode} range={settings.range_mode} "
+                        f"step_pct={settings.grid_step_pct:.6f} tp_pct={settings.take_profit_pct:.6f} "
+                        f"tick={tick} step={step}"
                     ),
+                    kind="INFO",
+                )
+                self._last_price = anchor_price
+                self._last_price_label.setText(tr("last_price", price=f"{anchor_price:.8f}"))
+                self._market_price.setText(f"{tr('price')}: {anchor_price:.8f}")
+                self._set_market_label_state(self._market_price, active=True)
+                planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
+            except ValueError as exc:
+                self._append_log(f"Start failed: {exc}", kind="WARN")
+                self._change_state("IDLE")
+                return
+            self._bootstrap_mode = False
+            self._bootstrap_sell_enabled = False
+            if not dry_run:
+                base_free = float(balance_snapshot.get("base_free", Decimal("0")))
+                if base_free <= 0:
+                    self._bootstrap_mode = True
+                    planned = [order for order in planned if order.side == "BUY"]
+                    self._append_log(
+                        "[ENGINE] bootstrap mode: base=0 -> placing BUY-only grid",
+                        kind="INFO",
+                    )
+            planned = planned[: settings.max_active_orders]
+            buy_count = sum(1 for order in planned if order.side == "BUY")
+            sell_count = sum(1 for order in planned if order.side == "SELL")
+            if not dry_run and (
+                len(planned) < 1 or buy_count < 1 or (sell_count < 1 and not self._bootstrap_mode)
+            ):
+                self._append_log(
+                    f"Start blocked: insufficient orders after filters (buys={buy_count}, sells={sell_count}).",
                     kind="WARN",
                 )
                 self._change_state("IDLE")
                 return
-            if not dry_run and self._first_live_session:
-                settings.grid_count = min(settings.grid_count, 4)
-                settings.max_active_orders = min(settings.max_active_orders, 4)
-            tick = self._exchange_rules.get("tick")
-            step = self._exchange_rules.get("step")
             self._append_log(
+                f"grid plan: buys={buy_count} sells={sell_count}",
+                kind="ORDERS",
+            )
+            if dry_run:
+                started = True
+                self._change_state("RUNNING")
+                self._render_sim_orders(planned)
+                return
+            plan_stats = self._grid_engine.get_plan_stats()
+            min_notional_failed = plan_stats.min_notional_failed
+            min_notional_ok = len(planned)
+            max_exposure = sum(order.price * order.qty for order in planned)
+            quote_asset = self._quote_asset or "USDT"
+            first_live_warning = ""
+            if self._first_live_session:
+                first_live_warning = tr("grid_confirm_first_live_warning")
+            confirm = QMessageBox.question(
+                self,
+                tr("grid_confirm_title"),
                 (
-                    f"[START] mode={settings.grid_step_mode} range={settings.range_mode} "
-                    f"step_pct={settings.grid_step_pct:.6f} tp_pct={settings.take_profit_pct:.6f} "
-                    f"tick={tick} step={step}"
+                    tr(
+                        "grid_confirm_message",
+                        symbol=self._symbol,
+                        count=str(len(planned)),
+                        exposure=f"{max_exposure:.2f}",
+                        min_ok=str(min_notional_ok),
+                        min_failed=str(min_notional_failed),
+                        quote_asset=quote_asset,
+                        warning=first_live_warning,
+                    )
+                    + f"\nBudget {settings.budget:.2f} {quote_asset}\nMode LIVE"
                 ),
-                kind="INFO",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
             )
-            self._last_price = anchor_price
-            self._last_price_label.setText(tr("last_price", price=f"{anchor_price:.8f}"))
-            self._market_price.setText(f"{tr('price')}: {anchor_price:.8f}")
-            self._set_market_label_state(self._market_price, active=True)
-            planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
-        except ValueError as exc:
-            self._append_log(f"Start failed: {exc}", kind="WARN")
-            self._change_state("IDLE")
-            return
-        self._bootstrap_mode = False
-        self._bootstrap_sell_enabled = False
-        if not dry_run:
-            base_free = float(balance_snapshot.get("base_free", Decimal("0")))
-            if base_free <= 0:
-                self._bootstrap_mode = True
-                planned = [order for order in planned if order.side == "BUY"]
-                self._append_log(
-                    "[ENGINE] bootstrap mode: base=0 -> placing BUY-only grid",
-                    kind="INFO",
-                )
-        planned = planned[: settings.max_active_orders]
-        buy_count = sum(1 for order in planned if order.side == "BUY")
-        sell_count = sum(1 for order in planned if order.side == "SELL")
-        if not dry_run and (
-            len(planned) < 1 or buy_count < 1 or (sell_count < 1 and not self._bootstrap_mode)
-        ):
-            self._append_log(
-                f"Start blocked: insufficient orders after filters (buys={buy_count}, sells={sell_count}).",
-                kind="WARN",
-            )
-            self._change_state("IDLE")
-            return
-        if not dry_run:
-            self._append_log(
-                (
-                    "[LIVE] TEST: MANUAL step_pct=0.01 tp_pct=0.10 levels=2 budget=100 "
-                    "(EURIUSDT/USDCUSDT) -> expect 4 orders; after FILLED SELL expect TP BUY + restore SELL; "
-                    "no -2010; Realized PnL grows on sell->buy."
-                ),
-                kind="INFO",
-            )
-        self._append_log(
-            f"grid plan: buys={buy_count} sells={sell_count}",
-            kind="ORDERS",
-        )
-        if dry_run:
-            self._change_state("RUNNING")
-            self._render_sim_orders(planned)
-            return
-        plan_stats = self._grid_engine.get_plan_stats()
-        min_notional_failed = plan_stats.min_notional_failed
-        min_notional_ok = len(planned)
-        max_exposure = sum(order.price * order.qty for order in planned)
-        quote_asset = self._quote_asset or "USDT"
-        first_live_warning = ""
-        if self._first_live_session:
-            first_live_warning = tr("grid_confirm_first_live_warning")
-        confirm = QMessageBox.question(
-            self,
-            tr("grid_confirm_title"),
-            (
-                tr(
-                    "grid_confirm_message",
-                    symbol=self._symbol,
-                    count=str(len(planned)),
-                    exposure=f"{max_exposure:.2f}",
-                    min_ok=str(min_notional_ok),
-                    min_failed=str(min_notional_failed),
-                    quote_asset=quote_asset,
-                    warning=first_live_warning,
-                )
-                + f"\nBudget {settings.budget:.2f} {quote_asset}\nMode LIVE"
-            ),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
-            self._append_log("Start cancelled by user.", kind="INFO")
-            self._change_state("IDLE")
-            return
-        self._bot_session_id = uuid4().hex[:8]
-        self._bot_order_ids.clear()
-        self._bot_order_keys.clear()
-        self._fill_keys.clear()
-        self._fill_accumulator = FillAccumulator()
-        self._active_action_keys.clear()
-        self._open_orders_map = {}
-        self._fills = []
-        self._base_lots.clear()
-        self._seen_trade_ids.clear()
-        self._realized_pnl = 0.0
-        self._fees_total = 0.0
-        self._closed_trades = 0
-        self._win_trades = 0
-        self._replacement_counter = 0
-        self._update_pnl(None, None)
-        self._update_trade_summary()
-        self._live_settings = settings
-        self._first_live_session = False
-        self._change_state("PLACING_GRID")
-        self._place_live_orders(planned)
+            if confirm != QMessageBox.Yes:
+                self._append_log("Start cancelled by user.", kind="INFO")
+                self._change_state("IDLE")
+                return
+            started = True
+            self._bot_session_id = uuid4().hex[:8]
+            self._bot_order_ids.clear()
+            self._bot_order_keys.clear()
+            self._fill_keys.clear()
+            self._fill_accumulator = FillAccumulator()
+            self._active_action_keys.clear()
+            self._open_orders_map = {}
+            self._fills = []
+            self._base_lots.clear()
+            self._seen_trade_ids.clear()
+            self._realized_pnl = 0.0
+            self._fees_total = 0.0
+            self._closed_trades = 0
+            self._win_trades = 0
+            self._replacement_counter = 0
+            self._update_pnl(None, None)
+            self._update_trade_summary()
+            self._live_settings = settings
+            self._first_live_session = False
+            self._change_state("PLACING_GRID")
+            self._place_live_orders(planned)
+        finally:
+            self._set_strategy_controls_enabled(True)
+            if not started:
+                self._start_in_progress = False
+                self._start_in_progress_logged = False
+                if self._state == "IDLE":
+                    self._start_button.setEnabled(True)
 
     def _handle_pause(self) -> None:
         self._append_log("Pause pressed.", kind="ORDERS")
@@ -1508,6 +1595,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("IDLE")
+        self._start_in_progress = False
+        self._start_in_progress_logged = False
+        self._start_button.setEnabled(True)
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
         self._bot_order_ids.clear()
@@ -1593,12 +1683,17 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._apply_engine_state_style(self._engine_state)
         self._update_orders_timer_interval()
         self._update_fills_timer()
+        if new_state == "IDLE" and not self._start_in_progress:
+            self._start_in_progress_logged = False
+            self._start_button.setEnabled(True)
 
     def _update_setting(self, key: str, value: Any) -> None:
         if hasattr(self._settings_state, key):
             setattr(self._settings_state, key, value)
         if key == "grid_step_pct" and self._settings_state.grid_step_mode == "MANUAL":
             self._manual_grid_step_pct = float(value)
+        if key == "take_profit_pct":
+            self._clear_tp_break_even_helper()
         if key == "budget":
             self._refresh_orders_metrics()
         self._update_grid_preview()
@@ -1627,13 +1722,13 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(value, high))
 
-    def _auto_grid_params_from_history(self) -> dict[str, float] | None:
+    def _auto_grid_params_from_history(self, grid_count: int | None = None) -> dict[str, float] | None:
         if len(self._price_history) < 2:
             return None
         prices = self._price_history[-300:]
-        return self._compute_auto_grid_params(prices)
+        return self._compute_auto_grid_params(prices, grid_count=grid_count)
 
-    def _auto_grid_params_from_http(self) -> dict[str, float] | None:
+    def _auto_grid_params_from_http(self, grid_count: int | None = None) -> dict[str, float] | None:
         try:
             cached = self._get_http_cached("klines_1h")
             if cached is None:
@@ -1655,9 +1750,14 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 continue
             if close > 0:
                 closes.append(close)
-        return self._compute_auto_grid_params(closes)
+        return self._compute_auto_grid_params(closes, grid_count=grid_count)
 
-    def _compute_auto_grid_params(self, prices: list[float]) -> dict[str, float] | None:
+    def _compute_auto_grid_params(
+        self,
+        prices: list[float],
+        *,
+        grid_count: int | None = None,
+    ) -> dict[str, float] | None:
         if len(prices) < 2:
             return None
         returns: list[float] = []
@@ -1670,7 +1770,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             return None
         avg_abs_return = sum(returns) / len(returns)
         grid_step_pct = self._clamp(avg_abs_return * 1.5 * 100, 0.05, 0.8)
-        range_pct = self._clamp(grid_step_pct * self._settings_state.grid_count / 2, 0.5, 6.0)
+        grid_count = grid_count or self._settings_state.grid_count
+        range_pct = self._clamp(grid_step_pct * grid_count / 2, 0.5, 6.0)
         fee_candidates = [fee for fee in self._trade_fees if fee is not None]
         fee_pct = max(fee_candidates) * 100 if fee_candidates else 0.0
         tp_pct = max(grid_step_pct * 1.1, fee_pct * 2 + 0.01)
@@ -1697,13 +1798,45 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         )
         self._auto_values_label.setText(tr("auto_values_line", values=values))
 
-    def _resolve_start_settings(self) -> GridSettingsState:
-        settings = GridSettingsState(**asdict(self._settings_state))
+    def _collect_strategy_snapshot(self) -> dict[str, Any]:
+        state = self._settings_state
+        return {
+            "budget_usdt": state.budget,
+            "levels": state.grid_count,
+            "step_mode": state.grid_step_mode,
+            "step_pct": state.grid_step_pct,
+            "range_mode": state.range_mode,
+            "range_low_pct": state.range_low_pct,
+            "range_high_pct": state.range_high_pct,
+            "tp_pct": state.take_profit_pct,
+            "stoploss_enabled": state.stop_loss_enabled,
+            "stoploss_pct": state.stop_loss_pct,
+            "max_orders": state.max_active_orders,
+            "order_size_mode": state.order_size_mode,
+            "direction": state.direction,
+        }
+
+    def _resolve_start_settings(self, snapshot: dict[str, Any]) -> GridSettingsState:
+        settings = GridSettingsState(
+            budget=snapshot["budget_usdt"],
+            direction=snapshot["direction"],
+            grid_count=snapshot["levels"],
+            grid_step_pct=snapshot["step_pct"],
+            grid_step_mode=snapshot["step_mode"],
+            range_mode=snapshot["range_mode"],
+            range_low_pct=snapshot["range_low_pct"],
+            range_high_pct=snapshot["range_high_pct"],
+            take_profit_pct=snapshot["tp_pct"],
+            stop_loss_enabled=snapshot["stoploss_enabled"],
+            stop_loss_pct=snapshot["stoploss_pct"],
+            max_active_orders=snapshot["max_orders"],
+            order_size_mode=snapshot["order_size_mode"],
+        )
         if settings.grid_step_mode != "AUTO_ATR":
             return settings
-        auto_params = self._auto_grid_params_from_history()
+        auto_params = self._auto_grid_params_from_history(grid_count=settings.grid_count)
         if not auto_params:
-            auto_params = self._auto_grid_params_from_http()
+            auto_params = self._auto_grid_params_from_http(grid_count=settings.grid_count)
         if not auto_params:
             self._append_log("Auto ATR unavailable: fallback to manual grid values.", kind="WARN")
             return settings
@@ -1784,6 +1917,42 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         if self._quote_asset:
             quote_free = self.as_decimal(balances.get(self._quote_asset, (0.0, 0.0))[0])
         return {"base_free": base_free, "quote_free": quote_free}
+
+    def _balances_ready_for_start(self) -> bool:
+        if not self._balances_loaded:
+            return False
+        if not self._quote_asset or not self._base_asset:
+            return False
+        if self._quote_asset not in self._balances or self._base_asset not in self._balances:
+            return False
+        balance_age_s = self._balance_age_s()
+        if balance_age_s is None:
+            return False
+        return balance_age_s <= 2.0
+
+    def _force_refresh_balances_and_wait(self, timeout_ms: int) -> bool:
+        if not self._account_client:
+            return False
+        loop = QEventLoop()
+        result = {"done": False, "ok": False}
+
+        def _on_refresh(success: bool) -> None:
+            if result["done"]:
+                return
+            result["done"] = True
+            result["ok"] = success
+            loop.quit()
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        self._signals.balances_refresh.connect(_on_refresh)
+        self._refresh_balances(force=True)
+        timer.start(timeout_ms)
+        loop.exec()
+        self._signals.balances_refresh.disconnect(_on_refresh)
+        timer.stop()
+        return result["done"] and result["ok"]
 
     def _engine_ready(self) -> bool:
         if not self._rules_loaded:
@@ -1911,6 +2080,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             )
             self._balances_snapshot = snapshot
         self._refresh_trade_fees()
+        self._signals.balances_refresh.emit(True)
 
     def _handle_account_error(self, message: str) -> None:
         self._balances_in_flight = False
@@ -1926,6 +2096,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._auto_pause_on_exception(message)
         self._apply_trade_gate()
         self._update_runtime_balances()
+        self._signals.balances_refresh.emit(False)
 
     def _refresh_open_orders(self, force: bool = False) -> None:
         self._orders_tick_count += 1
