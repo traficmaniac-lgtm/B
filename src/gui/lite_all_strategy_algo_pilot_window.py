@@ -140,6 +140,14 @@ class PilotState(Enum):
     PAUSED_BY_RISK = "PAUSED_BY_RISK"
 
 
+class PilotAction(Enum):
+    TOGGLE = "TOGGLE"
+    RECENTER = "RECENTER"
+    RECOVERY = "RECOVERY"
+    FLATTEN_BE = "FLATTEN_BE"
+    FLAG_STALE = "FLAG_STALE"
+
+
 RECENTER_THRESHOLD_PCT = 0.7
 MAX_ORDER_AGE_SEC = 180
 STALE_LOG_COOLDOWN_SEC = 30
@@ -718,6 +726,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._auto_fix_tp_enabled = True
         self._stop_in_progress = False
         self._pilot_state = PilotState.OFF
+        self._pilot_auto_actions_enabled = False
+        self._pilot_confirm_dry_run = True
+        self._pilot_allow_market = False
+        self._pilot_action_in_progress = False
+        self._pilot_pending_action: PilotAction | None = None
+        self._pilot_pending_plan: list[GridPlannedOrder] | None = None
+        self._pilot_warning_override: str | None = None
+        self._pilot_warning_override_until: float | None = None
         self._pilot_anchor_price: float | None = None
         self._pilot_stale_active = False
         self._pilot_stale_last_log_ts: float | None = None
@@ -772,7 +788,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=1.1 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=1.2 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1048,17 +1064,31 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             "Включить/выключить автологику пилота (пока без торговли)"
         )
         self._pilot_recenter_button.setToolTip(
-            "Сместить якорь и перестроить сетку от текущей цены"
+            "Отменить текущие ордера и построить сетку заново от текущей цены"
         )
         self._pilot_recovery_button.setToolTip(
-            "Переключить в Recovery (защита/безубыток)"
+            "Защитный режим: цель — выйти в 0 с учётом комиссии"
         )
         self._pilot_flatten_button.setToolTip(
-            "Попытаться закрыть позицию по BE (план/заявки)"
+            "Отменить всё и закрыть позицию по цене безубытка"
         )
         self._pilot_flag_stale_button.setToolTip(
-            "Проверить ордера по возрасту и поднять предупреждение"
+            "Проверить ордера по возрасту и предложить действие"
         )
+        self._pilot_auto_actions_toggle = QCheckBox("Авто-действия пилота")
+        self._pilot_auto_actions_toggle.setChecked(False)
+        self._pilot_auto_actions_toggle.setToolTip(
+            "Если включено — пилот может сам выполнять Перестроить/Recovery по триггерам (с подтверждением в LIVE)"
+        )
+        self._pilot_auto_actions_toggle.toggled.connect(self._handle_pilot_auto_actions_toggle)
+        self._pilot_confirm_dry_run_toggle = QCheckBox("Всегда спрашивать (DRY)")
+        self._pilot_confirm_dry_run_toggle.setChecked(True)
+        self._pilot_confirm_dry_run_toggle.toggled.connect(self._handle_pilot_confirm_dry_run_toggle)
+        self._pilot_allow_market_toggle = QCheckBox("Разрешить MARKET (закрытие)")
+        self._pilot_allow_market_toggle.setChecked(False)
+        self._pilot_allow_market_toggle.toggled.connect(self._handle_pilot_allow_market_toggle)
+        self._pilot_action_status_label = QLabel("Статус: —")
+        self._pilot_action_status_label.setStyleSheet("color: #6b7280; font-size: 11px;")
 
         buttons_widget = QWidget(algo_pilot_frame)
         buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1075,6 +1105,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             pilot_buttons_layout.addWidget(button)
 
+        pilot_buttons_layout.addSpacing(6)
+        pilot_buttons_layout.addWidget(self._pilot_auto_actions_toggle)
+        pilot_buttons_layout.addWidget(self._pilot_confirm_dry_run_toggle)
+        pilot_buttons_layout.addWidget(self._pilot_allow_market_toggle)
+        pilot_buttons_layout.addWidget(self._pilot_action_status_label)
         pilot_buttons_layout.addStretch(1)
         algo_pilot_layout.addWidget(buttons_widget, stretch=0)
 
@@ -1429,41 +1464,514 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         return frame
 
     def _handle_pilot_toggle(self) -> None:
-        next_state = PilotState.NORMAL if self._pilot_state == PilotState.OFF else PilotState.OFF
-        if next_state == PilotState.NORMAL:
-            self._pilot_anchor_price = self._last_price
-        else:
-            self._pilot_anchor_price = None
-        self._set_pilot_state(next_state)
+        self._pilot_execute(PilotAction.TOGGLE)
 
     def _handle_pilot_recenter(self) -> None:
-        self._pilot_anchor_price = self._last_price
-        self._set_pilot_state(PilotState.NORMAL)
-        self._append_log("[ALGO PILOT] anchor recentered manually", kind="INFO")
+        self._pilot_execute(PilotAction.RECENTER)
 
     def _handle_pilot_recovery(self) -> None:
+        self._pilot_execute(PilotAction.RECOVERY)
+
+    def _handle_pilot_flatten(self) -> None:
+        self._pilot_execute(PilotAction.FLATTEN_BE)
+
+    def _handle_pilot_flag_stale(self) -> None:
+        self._pilot_execute(PilotAction.FLAG_STALE)
+
+    def _handle_pilot_auto_actions_toggle(self, checked: bool) -> None:
+        self._pilot_auto_actions_enabled = checked
+        state = "enabled" if checked else "disabled"
+        self._append_log(f"[ALGO PILOT] auto-actions {state}", kind="INFO")
+
+    def _handle_pilot_confirm_dry_run_toggle(self, checked: bool) -> None:
+        self._pilot_confirm_dry_run = checked
+        state = "enabled" if checked else "disabled"
+        self._append_log(f"[ALGO PILOT] dry-run confirm {state}", kind="INFO")
+
+    def _handle_pilot_allow_market_toggle(self, checked: bool) -> None:
+        self._pilot_allow_market = checked
+        state = "enabled" if checked else "disabled"
+        self._append_log(f"[ALGO PILOT] market close {state}", kind="INFO")
+
+    def _set_pilot_buttons_enabled(self, enabled: bool) -> None:
+        for name in (
+            "_pilot_toggle_button",
+            "_pilot_recenter_button",
+            "_pilot_recovery_button",
+            "_pilot_flatten_button",
+            "_pilot_flag_stale_button",
+            "_pilot_auto_actions_toggle",
+            "_pilot_confirm_dry_run_toggle",
+            "_pilot_allow_market_toggle",
+        ):
+            if hasattr(self, name):
+                getattr(self, name).setEnabled(enabled)
+
+    def _set_pilot_action_in_progress(self, enabled: bool, *, status: str | None = None) -> None:
+        self._pilot_action_in_progress = enabled
+        self._set_pilot_buttons_enabled(not enabled)
+        if hasattr(self, "_pilot_action_status_label"):
+            text = status if status else "—"
+            prefix = "Статус: "
+            self._pilot_action_status_label.setText(f"{prefix}{text}")
+
+    def _pilot_action_label(self, action: PilotAction) -> str:
+        mapping = {
+            PilotAction.TOGGLE: "Пилот ВКЛ/ВЫКЛ",
+            PilotAction.RECENTER: "Перестроить сетку",
+            PilotAction.RECOVERY: "В режим безубытка",
+            PilotAction.FLATTEN_BE: "Закрыть в безубыток",
+            PilotAction.FLAG_STALE: "Пометить устаревшие",
+        }
+        return mapping.get(action, action.value.lower())
+
+    def _pilot_set_warning(self, message: str) -> None:
+        self._pilot_warning_override = message
+        self._pilot_warning_override_until = time() + 6
+        if hasattr(self, "_pilot_orders_warning_value"):
+            self._pilot_orders_warning_value.setText(message)
+            self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
+
+    def _pilot_block_action(self, action: PilotAction, reason: str) -> None:
+        action_label = action.value.lower()
+        self._pilot_set_warning(reason)
+        self._append_log(
+            f"[WARN] [ALGO_PILOT] action blocked action={action_label} reason={reason}",
+            kind="WARN",
+        )
+
+    def _pilot_trade_gate_ready(self, action: PilotAction) -> bool:
+        if self._last_price is None:
+            self._pilot_block_action(action, "no last price")
+            return False
+        if not self._symbol_tradeable:
+            self._pilot_block_action(action, "symbol not trading")
+            return False
+        if self._live_enabled():
+            if not self._engine_ready():
+                self._pilot_block_action(action, "engine not ready")
+                return False
+            if self._trade_gate != TradeGate.TRADE_OK:
+                self._pilot_block_action(action, self._trade_gate_reason())
+                return False
+            if not self._account_can_trade:
+                self._pilot_block_action(action, "canTrade=false")
+                return False
+            if not self._account_client:
+                self._pilot_block_action(action, "no account client")
+                return False
+        return True
+
+    def _pilot_confirm_action(
+        self,
+        action: PilotAction,
+        summary_lines: list[str],
+    ) -> bool:
+        needs_confirm = self._live_enabled() or self._pilot_confirm_dry_run
+        if not needs_confirm:
+            return True
+        title = "Подтвердить действие пилота"
+        action_label = self._pilot_action_label(action)
+        details = "\n".join(summary_lines)
+        confirm = QMessageBox.question(
+            self,
+            title,
+            f"Действие: {action_label}\n{details}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return confirm == QMessageBox.Yes
+
+    def _pilot_execute(self, action: PilotAction, *, auto: bool = False) -> None:
+        if self._pilot_action_in_progress:
+            self._pilot_block_action(action, "in_progress")
+            return
+        if action == PilotAction.TOGGLE:
+            next_state = PilotState.NORMAL if self._pilot_state == PilotState.OFF else PilotState.OFF
+            if next_state == PilotState.NORMAL:
+                self._pilot_anchor_price = self._last_price
+            else:
+                self._pilot_anchor_price = None
+            self._set_pilot_state(next_state)
+            return
+        if action == PilotAction.FLAG_STALE:
+            total, buy_count, sell_count, oldest_age_sec = self._collect_order_metrics()
+            oldest_value = oldest_age_sec if oldest_age_sec is not None else 0
+            self._append_log(
+                (
+                    f"[ALGO PILOT] snapshot orders total={total} buy={buy_count} "
+                    f"sell={sell_count} oldest={oldest_value} symbol={self._symbol}"
+                ),
+                kind="INFO",
+            )
+            if oldest_age_sec is None or oldest_age_sec <= MAX_ORDER_AGE_SEC:
+                self._pilot_set_warning("Устаревших ордеров нет")
+                return
+            self._pilot_set_warning("УСТАРЕВШИЕ ОРДЕРА")
+            confirm = QMessageBox.question(
+                self,
+                "Устаревшие ордера",
+                "Отменить и перестроить?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm == QMessageBox.Yes:
+                self._pilot_execute(PilotAction.RECENTER)
+            return
+        if action not in {PilotAction.RECENTER, PilotAction.RECOVERY, PilotAction.FLATTEN_BE}:
+            return
+        if not self._pilot_trade_gate_ready(action):
+            return
+        if action == PilotAction.RECENTER:
+            self._pilot_execute_recenter(auto=auto)
+        elif action == PilotAction.RECOVERY:
+            self._pilot_execute_recovery()
+        elif action == PilotAction.FLATTEN_BE:
+            self._pilot_execute_flatten()
+
+    def _pilot_execute_recenter(self, *, auto: bool = False) -> None:
+        anchor_price = self._pilot_select_anchor(auto=auto)
+        if anchor_price is None:
+            self._pilot_block_action(PilotAction.RECENTER, "no anchor price")
+            return
+        plan, _settings = self._pilot_build_grid_plan(anchor_price)
+        if plan is None or _settings is None:
+            self._pilot_block_action(PilotAction.RECENTER, "grid plan failed")
+            return
+        if not plan:
+            self._pilot_block_action(PilotAction.RECENTER, "empty grid plan")
+            return
+        cancel_count = len(self._open_orders)
+        buy_count = sum(1 for order in plan if order.side == "BUY")
+        sell_count = sum(1 for order in plan if order.side == "SELL")
+        summary = [
+            f"cancel={cancel_count}",
+            f"place={len(plan)} (buy={buy_count} sell={sell_count})",
+            f"anchor={anchor_price:.8f}",
+            f"mode={'LIVE' if self._live_enabled() else 'DRY'}",
+        ]
+        if not self._pilot_confirm_action(PilotAction.RECENTER, summary):
+            return
+        self._set_pilot_action_in_progress(True, status="Выполняю…")
+        old_anchor = self._pilot_anchor_price
+        self._pilot_anchor_price = anchor_price
+        self._set_pilot_state(PilotState.NORMAL)
+        self._append_log(
+            (
+                "[INFO] [ALGO_PILOT] recenter start "
+                f"old_anchor={old_anchor} new_anchor={anchor_price} "
+                f"cancel_n={cancel_count} place_n={len(plan)}"
+            ),
+            kind="INFO",
+        )
+        if self._dry_run_toggle.isChecked():
+            self._render_sim_orders(plan)
+            self._append_log(
+                f"[INFO] [ALGO_PILOT] recenter done place_n={len(plan)}",
+                kind="INFO",
+            )
+            self._set_pilot_action_in_progress(False)
+            return
+        self._pilot_pending_action = PilotAction.RECENTER
+        self._pilot_pending_plan = plan
+        self._pilot_cancel_orders_then_place(plan)
+
+    def _pilot_execute_recovery(self) -> None:
+        position_qty = self._pilot_position_qty()
+        avg_entry = self._pilot_average_entry_price()
+        be_price = self._pilot_break_even_price(avg_entry)
+        summary = [
+            f"cancel={len(self._open_orders)}",
+            f"qty={self._format_balance_decimal(position_qty)}",
+            f"be={self._format_balance_decimal(be_price) if be_price else '—'}",
+            f"mode={'LIVE' if self._live_enabled() else 'DRY'}",
+        ]
+        if not self._pilot_confirm_action(PilotAction.RECOVERY, summary):
+            return
         self._set_pilot_state(PilotState.RECOVERY)
         self._append_log(
             f"[ALGO PILOT] recovery mode enabled symbol={self._symbol}",
             kind="INFO",
         )
+        if position_qty <= 0:
+            self._pilot_set_warning("Нет позиции — recovery пассивный")
+            self._append_log(
+                f"[ALGO PILOT] recovery: no position symbol={self._symbol}",
+                kind="INFO",
+            )
+            return
+        if be_price is None:
+            self._pilot_block_action(PilotAction.RECOVERY, "break-even unknown")
+            return
+        self._set_pilot_action_in_progress(True, status="Выполняю…")
+        self._pilot_place_break_even_order(
+            be_price=be_price,
+            qty=position_qty,
+            action_label="recovery",
+            action=PilotAction.RECOVERY,
+        )
 
-    def _handle_pilot_flatten(self) -> None:
+    def _pilot_execute_flatten(self) -> None:
+        position_qty = self._pilot_position_qty()
+        avg_entry = self._pilot_average_entry_price()
+        be_price = self._pilot_break_even_price(avg_entry)
+        summary = [
+            f"cancel={len(self._open_orders)}",
+            f"qty={self._format_balance_decimal(position_qty)}",
+            f"be={self._format_balance_decimal(be_price) if be_price else '—'}",
+            f"mode={'LIVE' if self._live_enabled() else 'DRY'}",
+        ]
+        if self._pilot_allow_market:
+            summary.append("market=enabled")
+        if not self._pilot_confirm_action(PilotAction.FLATTEN_BE, summary):
+            return
+        if position_qty <= 0:
+            self._pilot_set_warning("Позиции нет")
+            self._append_log(
+                f"[ALGO PILOT] flatten: no position symbol={self._symbol}",
+                kind="INFO",
+            )
+            return
         self._append_log(
             f"[ALGO PILOT] flatten to BE requested symbol={self._symbol}",
             kind="INFO",
         )
-
-    def _handle_pilot_flag_stale(self) -> None:
-        total, buy_count, sell_count, oldest_age_sec = self._collect_order_metrics()
-        oldest_value = oldest_age_sec if oldest_age_sec is not None else 0
-        self._append_log(
-            (
-                f"[ALGO PILOT] snapshot orders total={total} buy={buy_count} "
-                f"sell={sell_count} oldest={oldest_value} symbol={self._symbol}"
-            ),
-            kind="INFO",
+        if be_price is None:
+            self._pilot_block_action(PilotAction.FLATTEN_BE, "break-even unknown")
+            return
+        if self._pilot_allow_market:
+            self._append_log(
+                "[ALGO PILOT] market close requested but not supported, using BE limit",
+                kind="WARN",
+            )
+        self._set_pilot_action_in_progress(True, status="Выполняю…")
+        self._pilot_place_break_even_order(
+            be_price=be_price,
+            qty=position_qty,
+            action_label="flatten",
+            action=PilotAction.FLATTEN_BE,
         )
+
+    def _pilot_place_break_even_order(
+        self,
+        *,
+        be_price: Decimal,
+        qty: Decimal,
+        action_label: str,
+        action: PilotAction,
+    ) -> None:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        qty_rounded = self.q_qty(qty, step)
+        price_rounded = self.q_price(be_price, tick)
+        if qty_rounded <= 0 or price_rounded <= 0:
+            self._pilot_block_action(action, "invalid be order")
+            self._set_pilot_action_in_progress(False)
+            return
+        cancel_count = len(self._open_orders)
+        if self._dry_run_toggle.isChecked():
+            self._render_sim_orders(
+                [
+                    GridPlannedOrder(
+                        side="SELL",
+                        price=float(price_rounded),
+                        qty=float(qty_rounded),
+                        level_index=0,
+                    )
+                ]
+            )
+            self._append_log(
+                (
+                    f"[INFO] [ALGO_PILOT] {action_label} "
+                    f"dry-run be_price={price_rounded} qty={qty_rounded}"
+                ),
+                kind="INFO",
+            )
+            self._set_pilot_action_in_progress(False)
+            return
+        self._pilot_pending_action = PilotAction.RECOVERY if action_label == "recovery" else PilotAction.FLATTEN_BE
+        client_order_id = self._limit_client_order_id(
+            f"BBOT_LAS_v1_{self._symbol}_PILOT_{action_label.upper()}"
+        )
+
+        def _cancel_and_place() -> dict[str, Any]:
+            errors: list[str] = []
+            if self._account_client:
+                for order in self._open_orders:
+                    order_id = str(order.get("orderId", ""))
+                    if not order_id:
+                        continue
+                    try:
+                        self._account_client.cancel_order(self._symbol, order_id)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(self._format_cancel_exception(exc, order_id))
+            response = None
+            error = None
+            status = ""
+            if self._account_client:
+                response, error, status = self._place_limit(
+                    "SELL",
+                    price_rounded,
+                    qty_rounded,
+                    client_order_id,
+                    reason=f"pilot_{action_label}",
+                    skip_open_order_duplicate=False,
+                    skip_registry=False,
+                )
+            if error and status != "skip_duplicate_exchange":
+                errors.append(error)
+            return {"response": response, "errors": errors, "cancel_n": cancel_count}
+
+        worker = _Worker(_cancel_and_place, self._can_emit_worker_results)
+        worker.signals.success.connect(self._handle_pilot_break_even_result)
+        worker.signals.error.connect(self._handle_pilot_action_error)
+        self._thread_pool.start(worker)
+
+    def _pilot_build_grid_plan(
+        self,
+        anchor_price: float,
+    ) -> tuple[list[GridPlannedOrder] | None, GridSettingsState | None]:
+        snapshot = self._collect_strategy_snapshot()
+        settings = self._resolve_start_settings(snapshot)
+        self._apply_auto_clamps(settings, anchor_price)
+        try:
+            planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
+        except ValueError as exc:
+            self._append_log(f"[ALGO PILOT] recenter plan failed: {exc}", kind="WARN")
+            return None, None
+        if not self._dry_run_toggle.isChecked():
+            balance_snapshot = self._balance_snapshot()
+            base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
+            planned = self._limit_sell_plan_by_balance(planned, base_free)
+        planned = planned[: settings.max_active_orders]
+        return planned, settings
+
+    def _pilot_select_anchor(self, *, auto: bool = False) -> float | None:
+        if self._last_price is None:
+            return None
+        if auto:
+            return self._last_price
+        if self._pilot_anchor_price is None or self._pilot_anchor_price == self._last_price:
+            return self._last_price
+        confirm = QMessageBox.question(
+            self,
+            "Якорь пилота",
+            "Использовать текущую цену как якорь?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return self._last_price if confirm == QMessageBox.Yes else self._pilot_anchor_price
+
+    def _pilot_cancel_orders_then_place(self, plan: list[GridPlannedOrder]) -> None:
+        planned_cancel = len(self._open_orders)
+
+        def _cancel() -> dict[str, Any]:
+            errors: list[str] = []
+            canceled = 0
+            if self._account_client:
+                for order in self._open_orders:
+                    order_id = str(order.get("orderId", ""))
+                    if not order_id:
+                        continue
+                    try:
+                        self._account_client.cancel_order(self._symbol, order_id)
+                        canceled += 1
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(self._format_cancel_exception(exc, order_id))
+            return {"errors": errors, "canceled": canceled, "planned": planned_cancel}
+
+        worker = _Worker(_cancel, self._can_emit_worker_results)
+        worker.signals.success.connect(lambda result, latency: self._handle_pilot_recenter_cancel(result, latency, plan))
+        worker.signals.error.connect(self._handle_pilot_action_error)
+        self._thread_pool.start(worker)
+
+    def _handle_pilot_recenter_cancel(self, result: object, latency_ms: int, plan: list[GridPlannedOrder]) -> None:
+        _ = latency_ms
+        if isinstance(result, dict):
+            errors = result.get("errors", [])
+            if isinstance(errors, list):
+                for message in errors:
+                    if message:
+                        self._append_log(str(message), kind="WARN")
+            canceled = int(result.get("canceled", 0) or 0)
+            planned = int(result.get("planned", 0) or 0)
+            self._append_log(
+                f"[ALGO PILOT] recenter cancel done canceled={canceled} planned={planned}",
+                kind="INFO",
+            )
+        self._place_live_orders(plan)
+
+    def _handle_pilot_break_even_result(self, result: object, latency_ms: int) -> None:
+        _ = latency_ms
+        if not isinstance(result, dict):
+            self._handle_pilot_action_error("Unexpected pilot response")
+            return
+        response = result.get("response")
+        errors = result.get("errors", [])
+        cancel_n = int(result.get("cancel_n", 0) or 0)
+        if isinstance(errors, list):
+            for message in errors:
+                if message:
+                    self._append_log(str(message), kind="WARN")
+        if isinstance(response, dict):
+            order_id = str(response.get("orderId", ""))
+            side = str(response.get("side", "")).upper()
+            price = str(response.get("price", ""))
+            qty = str(response.get("origQty", ""))
+            self._append_log(
+                (
+                    f"[ALGO PILOT] be order placed cancel={cancel_n} "
+                    f"orderId={order_id} side={side} price={price} qty={qty}"
+                ),
+                kind="INFO",
+            )
+        self._refresh_open_orders(force=True)
+        self._set_pilot_action_in_progress(False)
+        self._pilot_pending_action = None
+        self._pilot_pending_plan = None
+
+    def _handle_pilot_action_error(self, message: str) -> None:
+        self._append_log(f"[ALGO PILOT] action error: {message}", kind="WARN")
+        self._set_pilot_action_in_progress(False)
+        self._pilot_pending_action = None
+        self._pilot_pending_plan = None
+
+    def _pilot_position_qty(self) -> Decimal:
+        if self._base_lots:
+            total_qty = sum(Decimal(str(lot.qty)) for lot in self._base_lots)
+            return total_qty
+        if self._base_asset:
+            base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
+            return self.as_decimal(base_free)
+        return Decimal("0")
+
+    def _pilot_average_entry_price(self) -> Decimal | None:
+        if not self._base_lots:
+            return None
+        total_qty = sum(Decimal(str(lot.qty)) for lot in self._base_lots)
+        if total_qty <= 0:
+            return None
+        total_cost = sum(Decimal(str(lot.qty)) * Decimal(str(lot.cost_per_unit)) for lot in self._base_lots)
+        return total_cost / total_qty
+
+    def _pilot_break_even_price(self, avg_entry: Decimal | None) -> Decimal | None:
+        if avg_entry is None or avg_entry <= 0:
+            return None
+        inputs = self._runtime_profit_inputs()
+        maker, taker = self._trade_fees
+        maker_fee_pct = (maker * 100) if maker is not None else 0.0
+        taker_fee_pct = (taker * 100) if taker is not None else 0.0
+        fee_total_pct = compute_fee_total_pct(
+            maker_fee_pct,
+            taker_fee_pct,
+            fill_mode=inputs.get("expected_fill_mode") or "MAKER",
+            fee_discount_pct=inputs.get("fee_discount_pct"),
+        )
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        tick_buffer = tick or Decimal("0")
+        be_price = avg_entry * (Decimal("1") + self.as_decimal(fee_total_pct) / Decimal("100"))
+        be_price += tick_buffer
+        return self.q_price(be_price, tick)
 
     def _set_pilot_state(self, state: PilotState) -> None:
         if self._pilot_state == state:
@@ -1524,15 +2032,26 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 kind="INFO",
             )
             self._set_pilot_state(PilotState.DEFENSIVE)
+            if self._pilot_auto_actions_enabled:
+                self._pilot_execute(PilotAction.RECENTER, auto=True)
+            else:
+                self._pilot_set_warning("Рекомендуется перестроить")
 
-        position_qty_text = "—"
-        if self._base_asset:
-            base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
-            position_qty_text = self.fmt_qty(self.as_decimal(base_free), step)
+        position_qty = self._pilot_position_qty()
+        position_qty_text = self.fmt_qty(position_qty, step) if position_qty > 0 else "—"
         self._pilot_position_qty_value.setText(position_qty_text)
 
-        self._pilot_avg_entry_value.setText("—")
-        self._pilot_break_even_value.setText("—")
+        avg_entry = self._pilot_average_entry_price()
+        avg_entry_text = "—"
+        if avg_entry is not None and avg_entry > 0:
+            avg_entry_text = self.fmt_price(avg_entry, tick)
+        self._pilot_avg_entry_value.setText(avg_entry_text)
+
+        break_even = self._pilot_break_even_price(avg_entry)
+        break_even_text = "—"
+        if break_even is not None and break_even > 0:
+            break_even_text = self.fmt_price(break_even, tick)
+        self._pilot_break_even_value.setText(break_even_text)
 
         pnl_text = "—"
         if self._last_price is not None and self._base_asset:
@@ -1588,8 +2107,18 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_orders_buy_value.setText("—")
             self._pilot_orders_sell_value.setText("—")
             self._pilot_orders_oldest_value.setText("—")
-            self._pilot_orders_warning_value.setText("—")
-            self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
+            if self._pilot_warning_override and self._pilot_warning_override_until:
+                if time() <= self._pilot_warning_override_until:
+                    self._pilot_orders_warning_value.setText(self._pilot_warning_override)
+                    self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
+                else:
+                    self._pilot_warning_override = None
+                    self._pilot_warning_override_until = None
+                    self._pilot_orders_warning_value.setText("—")
+                    self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
+            else:
+                self._pilot_orders_warning_value.setText("—")
+                self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
             self._pilot_stale_active = False
             return
         self._pilot_orders_total_value.setText(str(total))
@@ -1606,8 +2135,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
             self._maybe_log_stale_orders(total, oldest_age_sec)
         else:
-            self._pilot_orders_warning_value.setText("—")
-            self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
+            now = time()
+            if self._pilot_warning_override and self._pilot_warning_override_until:
+                if now <= self._pilot_warning_override_until:
+                    self._pilot_orders_warning_value.setText(self._pilot_warning_override)
+                    self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
+                else:
+                    self._pilot_warning_override = None
+                    self._pilot_warning_override_until = None
+                    self._pilot_orders_warning_value.setText("—")
+                    self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
+            else:
+                self._pilot_orders_warning_value.setText("—")
+                self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
             self._pilot_stale_active = False
 
     def _maybe_log_stale_orders(self, total: int, oldest_age_sec: int | None) -> None:
@@ -1624,7 +2164,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if should_log:
             self._append_log(
                 (
-                    f"[ALGO PILOT] stale orders oldest={oldest_age_sec} "
+                    f"[WARN] [ALGO_PILOT] stale detected oldest={oldest_age_sec} "
                     f"total={total} symbol={self._symbol}"
                 ),
                 kind="WARN",
@@ -3765,6 +4305,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         restore_notional = Decimal("0")
         restore_reason = "ok"
         target_qty = fill_qty
+        if self._pilot_state == PilotState.RECOVERY and restore_side == "BUY":
+            restore_reason = "skip_recovery_no_buy"
+            target_qty = Decimal("0")
 
         def _validate_restore_plan() -> tuple[str, Decimal, str, dict[str, Decimal]]:
             debug_fields: dict[str, Decimal] = {
@@ -3773,6 +4316,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 "base_free": base_free,
                 "quote_free": quote_free,
             }
+            if target_qty <= 0:
+                return "skip", Decimal("0"), restore_reason, debug_fields
             if restore_side == "SELL":
                 if target_qty > base_free:
                     return "skip", Decimal("0"), "skip_insufficient_base", debug_fields
@@ -5077,11 +5622,23 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         else:
             self._refresh_open_orders(force=True)
         self._change_state("RUNNING")
+        if self._pilot_pending_action == PilotAction.RECENTER:
+            self._append_log(
+                f"[INFO] [ALGO_PILOT] recenter done place_n={len(results)}",
+                kind="INFO",
+            )
+            self._set_pilot_action_in_progress(False)
+            self._pilot_pending_action = None
+            self._pilot_pending_plan = None
 
     def _handle_live_order_error(self, message: str) -> None:
         self._append_log(f"[LIVE] order error: {message}", kind="WARN")
         if self._state == "PLACING_GRID":
             self._change_state("RUNNING")
+        if self._pilot_pending_action is not None:
+            self._set_pilot_action_in_progress(False)
+            self._pilot_pending_action = None
+            self._pilot_pending_plan = None
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
 
