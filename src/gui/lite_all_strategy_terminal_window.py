@@ -1535,7 +1535,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._bootstrap_mode = False
             self._bootstrap_sell_enabled = False
             if not dry_run:
-                base_free = float(balance_snapshot.get("base_free", Decimal("0")))
+                base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
+                planned = self._limit_sell_plan_by_balance(planned, base_free)
                 if base_free <= 0:
                     self._bootstrap_mode = True
                     planned = [order for order in planned if order.side == "BUY"]
@@ -1676,27 +1677,12 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._finalize_stop()
             return
         self._append_log("[STOP] canceling bot orders...", kind="INFO")
-        client_ids = sorted(self._bot_client_ids)
-        prefix = self._bot_order_prefix()
-        cancel_all_enabled = (
-            hasattr(self, "_cancel_all_on_stop_toggle") and self._cancel_all_on_stop_toggle.isChecked()
-        )
+        prefix = f"BBOT_LAS_v1_{self._symbol}"
 
         def _cancel() -> dict[str, Any]:
             errors: list[str] = []
             canceled_by_tag = 0
-            for client_id in client_ids:
-                if not client_id:
-                    continue
-                try:
-                    self._account_client.cancel_order(
-                        self._symbol,
-                        order_id=None,
-                        orig_client_order_id=client_id,
-                    )
-                    canceled_by_tag += 1
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(self._format_cancel_exception(exc, client_id))
+            failed = 0
             open_orders = self._account_client.get_open_orders(self._symbol)
             tagged_orders = [
                 order
@@ -1704,6 +1690,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 if isinstance(order, dict)
                 and str(order.get("clientOrderId", "")).startswith(prefix)
             ]
+            planned = len(tagged_orders)
             for order in tagged_orders:
                 order_id = str(order.get("orderId", ""))
                 client_id = str(order.get("clientOrderId", ""))
@@ -1720,6 +1707,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         )
                     canceled_by_tag += 1
                 except Exception as exc:  # noqa: BLE001
+                    failed += 1
                     errors.append(self._format_cancel_exception(exc, order_id or client_id))
             open_orders_after = self._account_client.get_open_orders(self._symbol)
             remaining_tagged = [
@@ -1729,12 +1717,14 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 and str(order.get("clientOrderId", "")).startswith(prefix)
             ]
             used_cancel_all = False
-            if remaining_tagged and cancel_all_enabled:
+            if remaining_tagged:
                 self._account_client.cancel_open_orders(self._symbol)
                 used_cancel_all = True
                 open_orders_after = self._account_client.get_open_orders(self._symbol)
             return {
+                "planned": planned,
                 "canceled_by_tag": canceled_by_tag,
+                "failed": failed,
                 "used_cancel_all": used_cancel_all,
                 "open_orders_after": open_orders_after,
                 "errors": errors,
@@ -1750,8 +1740,13 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._handle_cancel_error("Unexpected cancel response")
             self._finalize_stop()
             return
+        planned = int(result.get("planned", 0) or 0)
         canceled_by_tag = int(result.get("canceled_by_tag", 0) or 0)
-        self._append_log(f"[STOP] canceled_by_tag n={canceled_by_tag}", kind="INFO")
+        failed = int(result.get("failed", 0) or 0)
+        self._append_log(
+            f"Cancel bot orders: planned={planned} cancelled={canceled_by_tag} failed={failed}",
+            kind="INFO",
+        )
         used_cancel_all = bool(result.get("used_cancel_all", False))
         if used_cancel_all:
             self._append_log(
@@ -2975,15 +2970,34 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         else:
             restore_price = self.q_price(fill_price + step_abs, tick)
         desired_restore_notional = restore_price * fill_qty
-        restore_qty, restore_notional, restore_reason = compute_order_qty(
-            restore_side,
-            restore_price,
-            desired_restore_notional,
-            balances_snapshot,
-            self._exchange_rules,
-            self._effective_fee_rate(),
-            None,
-        )
+        if restore_side == "SELL":
+            base_free = self.as_decimal(balances_snapshot.get("base_free", Decimal("0")))
+            base_dust_buffer = self._base_dust_buffer(step)
+            usable = max(Decimal("0"), base_free - base_dust_buffer)
+            if usable < fill_qty:
+                restore_qty = Decimal("0")
+                restore_notional = Decimal("0")
+                restore_reason = "insufficient_base"
+            else:
+                restore_qty, restore_notional, restore_reason = compute_order_qty(
+                    restore_side,
+                    restore_price,
+                    desired_restore_notional,
+                    balances_snapshot,
+                    self._exchange_rules,
+                    self._effective_fee_rate(),
+                    None,
+                )
+        else:
+            restore_qty, restore_notional, restore_reason = compute_order_qty(
+                restore_side,
+                restore_price,
+                desired_restore_notional,
+                balances_snapshot,
+                self._exchange_rules,
+                self._effective_fee_rate(),
+                None,
+            )
         allow_restore = restore_qty > 0
         if not allow_restore:
             self._append_log(
@@ -3055,12 +3069,15 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         reference_price = self._last_price or fill.price
         if not settings or reference_price <= 0:
             return
+        balance_snapshot = self._balance_snapshot()
+        base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
         sell_orders = self._grid_engine.build_side_plan(
             settings,
             last_price=reference_price,
             rules=self._exchange_rules,
             side="SELL",
         )
+        sell_orders = self._limit_sell_plan_by_balance(sell_orders, base_free)
         sell_orders = sell_orders[: settings.max_active_orders]
         if not sell_orders:
             self._append_log("[ENGINE] bootstrap sell activation skipped: no sell orders", kind="WARN")
@@ -3302,6 +3319,40 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
 
     def fmt_qty(self, qty: Decimal, step: Decimal | None) -> str:
         return self._format_decimal(qty, step)
+
+    @staticmethod
+    def _base_dust_buffer(step: Decimal | None) -> Decimal:
+        if step is None or step <= 0:
+            return Decimal("0")
+        buffer_value = step * Decimal("2")
+        return max(Decimal("0"), buffer_value)
+
+    def _limit_sell_plan_by_balance(
+        self,
+        planned: list[GridPlannedOrder],
+        base_free: Decimal,
+    ) -> list[GridPlannedOrder]:
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        base_dust_buffer = self._base_dust_buffer(step)
+        max_sell_qty_total = max(Decimal("0"), base_free - base_dust_buffer)
+        if max_sell_qty_total <= 0:
+            return [order for order in planned if order.side != "SELL"]
+        total_sell_qty = Decimal("0")
+        trimmed: list[GridPlannedOrder] = []
+        stop_sells = False
+        for order in planned:
+            if order.side != "SELL":
+                trimmed.append(order)
+                continue
+            if stop_sells:
+                continue
+            order_qty = self.as_decimal(order.qty)
+            if total_sell_qty + order_qty > max_sell_qty_total:
+                stop_sells = True
+                continue
+            total_sell_qty += order_qty
+            trimmed.append(order)
+        return trimmed
 
     @staticmethod
     def _rule_decimal(value: float | None) -> Decimal | None:
@@ -3882,23 +3933,34 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         None,
                     )
                     if qty <= 0:
-                        log_reason = reason
+                        required_qty = self.as_decimal(order.qty)
+                        required_notional = price * required_qty
+                        min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
                         if order.side == "SELL":
-                            required_qty = self.as_decimal(order.qty)
-                            min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
-                            required_notional = price * required_qty
-                            if working_balances["base_free"] < required_qty:
-                                log_reason = "base_free"
+                            if required_qty > working_balances["base_free"]:
+                                log_reason = "insufficient_base"
                             elif min_notional is not None and required_notional < min_notional:
                                 log_reason = "min_notional"
                             else:
-                                log_reason = "unknown_balance"
+                                log_reason = "unknown"
+                            detail = (
+                                f"required_qty={required_qty} base_free={working_balances['base_free']}"
+                            )
+                        else:
+                            if required_notional > working_balances["quote_free"]:
+                                log_reason = "insufficient_quote"
+                            elif min_notional is not None and required_notional < min_notional:
+                                log_reason = "min_notional"
+                            else:
+                                log_reason = "unknown"
+                            detail = (
+                                f"required_quote={required_notional} quote_free={working_balances['quote_free']}"
+                            )
                         self._signals.log_append.emit(
                             (
                                 "[LIVE] grid skipped: insufficient balance "
                                 f"side={order.side} price={self.fmt_price(price, None)} "
-                                f"reason={log_reason} base_free={working_balances['base_free']} "
-                                f"quote_free={working_balances['quote_free']}"
+                                f"reason={log_reason} {detail}"
                             ),
                             "WARN",
                         )
