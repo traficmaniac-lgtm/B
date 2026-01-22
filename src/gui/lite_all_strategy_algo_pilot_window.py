@@ -738,7 +738,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
         outer_layout.addLayout(self._build_header())
         outer_layout.addWidget(self._build_body())
-        outer_layout.addWidget(self._build_logs())
 
         self.setCentralWidget(central)
         self._apply_trade_gate()
@@ -856,11 +855,22 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_market_panel())
         splitter.addWidget(self._build_grid_panel())
-        splitter.addWidget(self._build_runtime_panel())
+        splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 1)
         return splitter
+
+    def _build_right_panel(self) -> QSplitter:
+        self._right_splitter = QSplitter(Qt.Vertical)
+        self._right_splitter.addWidget(self._build_runtime_panel())
+        self._right_splitter.addWidget(self._build_logs())
+        self._right_splitter.setStretchFactor(0, 3)
+        self._right_splitter.setStretchFactor(1, 1)
+        self._right_splitter.setCollapsible(0, False)
+        self._right_splitter.setCollapsible(1, True)
+        self._right_splitter.setSizes([720, 240])
+        return self._right_splitter
 
     def _build_market_panel(self) -> QWidget:
         group = QGroupBox(tr("market"))
@@ -875,7 +885,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         summary_frame = QFrame(group)
         summary_frame.setStyleSheet("QFrame { border: 1px solid #e5e7eb; border-radius: 6px; }")
         summary_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        summary_frame.setFixedHeight(100)
+        summary_frame.setFixedHeight(82)
         summary_layout = QGridLayout(summary_frame)
         summary_layout.setHorizontalSpacing(8)
         summary_layout.setVerticalSpacing(2)
@@ -893,6 +903,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._market_fee = QLabel("—")
         self._market_source = QLabel("—")
         self._rules_label = QLabel(tr("rules_line", rules="—"))
+        self._rules_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._rules_label.setToolTip(tr("rules_line", rules="—"))
+        self._rules_label.setWordWrap(False)
 
         self._set_market_label_state(self._market_price, active=False)
         self._set_market_label_state(self._market_spread, active=False)
@@ -1331,10 +1344,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _build_logs(self) -> QFrame:
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
-        frame.setMinimumHeight(240)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
         fixed_font = QFont()
         fixed_font.setStyleHint(QFont.Monospace)
         fixed_font.setFixedPitch(True)
@@ -1354,6 +1366,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         filter_row = QHBoxLayout()
         filter_label = QLabel(tr("logs"))
         filter_label.setStyleSheet("font-weight: 600;")
+        self._clear_logs_button = QPushButton("Clear")
+        self._copy_logs_button = QPushButton("Copy all")
+        self._toggle_logs_button = QPushButton("↕")
+        self._toggle_logs_button.setFixedWidth(28)
+        self._clear_logs_button.setFixedHeight(24)
+        self._copy_logs_button.setFixedHeight(24)
+        self._toggle_logs_button.setFixedHeight(24)
         self._log_filter = QComboBox()
         self._log_filter.addItems(
             [tr("log_filter_all"), tr("log_filter_orders"), tr("log_filter_errors")]
@@ -1361,12 +1380,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._log_filter.currentTextChanged.connect(self._apply_log_filter)
         filter_row.addWidget(filter_label)
         filter_row.addStretch()
+        filter_row.addWidget(self._clear_logs_button)
+        filter_row.addWidget(self._copy_logs_button)
         filter_row.addWidget(self._log_filter)
+        filter_row.addWidget(self._toggle_logs_button)
 
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(200)
-        self._log_view.setFixedHeight(140)
+        self._log_view.setMinimumHeight(140)
+        self._log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._clear_logs_button.clicked.connect(self._log_view.clear)
+        self._copy_logs_button.clicked.connect(self._copy_all_logs)
+        self._toggle_logs_button.clicked.connect(self._toggle_logs_panel)
         layout.addWidget(self._trades_summary_label)
         layout.addLayout(filter_row)
         layout.addWidget(self._log_view)
@@ -4608,7 +4634,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         maker, taker = self._trade_fees
         has_rules = any(value is not None for value in (tick, step, min_notional, min_qty, max_qty, maker, taker))
         if not has_rules:
-            self._rules_label.setText(tr("rules_line", rules="—"))
+            self._set_rules_label_text(tr("rules_line", rules="—"))
             self._market_fee.setText("—")
             self._set_market_label_state(self._market_fee, active=False)
             return
@@ -4624,9 +4650,37 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f" | minQty {min_qty_text} | maxQty {max_qty_text}"
             f" | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
         )
-        self._rules_label.setText(tr("rules_line", rules=rules))
+        self._set_rules_label_text(tr("rules_line", rules=rules))
         self._market_fee.setText(f"{maker_text}/{taker_text}")
         self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
+
+    def _set_rules_label_text(self, text: str) -> None:
+        if not hasattr(self, "_rules_label"):
+            return
+        metrics = self._rules_label.fontMetrics()
+        available_width = max(self._rules_label.width(), 240)
+        self._rules_label.setToolTip(text)
+        self._rules_label.setText(metrics.elidedText(text, Qt.ElideRight, available_width))
+
+    def _copy_all_logs(self) -> None:
+        if not hasattr(self, "_log_view"):
+            return
+        QApplication.clipboard().setText(self._log_view.toPlainText())
+
+    def _toggle_logs_panel(self) -> None:
+        if not hasattr(self, "_right_splitter"):
+            return
+        sizes = self._right_splitter.sizes()
+        if len(sizes) < 2:
+            return
+        if sizes[1] == 0:
+            restored = getattr(self, "_logs_splitter_sizes", None)
+            if not restored or len(restored) < 2:
+                restored = [720, 240]
+            self._right_splitter.setSizes(restored)
+        else:
+            self._logs_splitter_sizes = sizes
+            self._right_splitter.setSizes([max(1, sizes[0] + sizes[1]), 0])
 
     @staticmethod
     def _extract_filter_value(filters: object, filter_type: str, key: str) -> float | None:
