@@ -48,7 +48,14 @@ from src.gui.i18n import TEXT, tr
 from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
-from src.services.price_feed_manager import PriceFeedManager, PriceUpdate, WS_CONNECTED, WS_DEGRADED, WS_LOST
+from src.services.price_feed_manager import (
+    PriceFeedManager,
+    PriceUpdate,
+    WS_CONNECTED,
+    WS_DEGRADED,
+    WS_LOST,
+    WS_STALE_MS,
+)
 
 
 class _WorkerSignals(QObject):
@@ -714,6 +721,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_anchor_price: float | None = None
         self._pilot_stale_active = False
         self._pilot_stale_last_log_ts: float | None = None
+        self._last_price_update: PriceUpdate | None = None
+        self._kpi_has_data = False
+        self._kpi_last_source: str | None = None
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -727,6 +737,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_ui_timer = QTimer(self)
         self._pilot_ui_timer.setInterval(750)
         self._pilot_ui_timer.timeout.connect(self._update_pilot_panel)
+        self._market_kpi_timer = QTimer(self)
+        self._market_kpi_timer.setInterval(500)
+        self._market_kpi_timer.timeout.connect(self.update_market_kpis)
 
         self.setWindowTitle(f"Lite All Strategy Terminal — ALGO PILOT — {self._symbol}")
         self.resize(1050, 720)
@@ -742,6 +755,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self.setCentralWidget(central)
         self._apply_trade_gate()
         self._pilot_ui_timer.start()
+        self._market_kpi_timer.start()
 
         self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
@@ -758,7 +772,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=1.0 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=1.1 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -885,7 +899,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         summary_frame = QFrame(group)
         summary_frame.setStyleSheet("QFrame { border: 1px solid #e5e7eb; border-radius: 6px; }")
         summary_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        summary_frame.setFixedHeight(82)
+        summary_frame.setMinimumHeight(110)
         summary_layout = QGridLayout(summary_frame)
         summary_layout.setHorizontalSpacing(8)
         summary_layout.setVerticalSpacing(2)
@@ -918,7 +932,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             ("Последняя цена:", self._market_price),
             ("Спред:", self._market_spread),
             ("Волатильность:", self._market_volatility),
-            ("Комиссия (maker / taker):", self._market_fee),
+            ("Комиссия (maker/taker):", self._market_fee),
             ("Источник + возраст:", self._market_source),
         ]
         for row, (key_text, value_label) in enumerate(summary_rows):
@@ -1030,11 +1044,21 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_flatten_button.clicked.connect(self._handle_pilot_flatten)
         self._pilot_flag_stale_button = QPushButton("Пометить устаревшие")
         self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
-        self._pilot_toggle_button.setToolTip("Включить или выключить пилота")
-        self._pilot_recenter_button.setToolTip("Перестроить сетку от текущей цены")
-        self._pilot_recovery_button.setToolTip("Перейти в режим выхода в безубыток")
-        self._pilot_flatten_button.setToolTip("Закрыть позицию в безубыток")
-        self._pilot_flag_stale_button.setToolTip("Пометить ордера как устаревшие")
+        self._pilot_toggle_button.setToolTip(
+            "Включить/выключить автологику пилота (пока без торговли)"
+        )
+        self._pilot_recenter_button.setToolTip(
+            "Сместить якорь и перестроить сетку от текущей цены"
+        )
+        self._pilot_recovery_button.setToolTip(
+            "Переключить в Recovery (защита/безубыток)"
+        )
+        self._pilot_flatten_button.setToolTip(
+            "Попытаться закрыть позицию по BE (план/заявки)"
+        )
+        self._pilot_flag_stale_button.setToolTip(
+            "Проверить ордера по возрасту и поднять предупреждение"
+        )
 
         buttons_widget = QWidget(algo_pilot_frame)
         buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1615,12 +1639,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._signals.status_update.emit(status, message)
 
     def _apply_price_update(self, update: PriceUpdate) -> None:
+        self._last_price_update = update
         if update.last_price is not None:
             self._last_price = update.last_price
             self._record_price(update.last_price)
             self._last_price_label.setText(tr("last_price", price=f"{update.last_price:.8f}"))
-            self._market_price.setText(f"{update.last_price:.8f}")
-            self._set_market_label_state(self._market_price, active=True)
             self._grid_engine.on_price(update.last_price)
         else:
             self._last_price = None
@@ -1631,20 +1654,90 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._latency_label.setText(tr("latency", latency=latency))
         clock_status = "✓" if update.price_age_ms is not None else "—"
         self._feed_indicator.setText(f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK {clock_status}")
-        if update.source is not None or update.price_age_ms is not None:
-            source_text = update.source if update.source is not None else "—"
-            self._market_source.setText(f"{source_text} | {age}")
-            self._set_market_label_state(self._market_source, active=True)
-
-        micro = update.microstructure
-        if micro.spread_pct is not None:
-            self._market_spread.setText(f"{micro.spread_pct:.4f}%")
-            self._set_market_label_state(self._market_spread, active=True)
-        elif micro.spread_abs is not None:
-            self._market_spread.setText(f"{micro.spread_abs:.8f}")
-            self._set_market_label_state(self._market_spread, active=True)
+        self.update_market_kpis()
         self._update_runtime_balances()
         self._refresh_unrealized_pnl()
+
+    def update_market_kpis(self) -> None:
+        if not hasattr(self, "_market_price"):
+            return
+        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
+        price = snapshot.last_price if snapshot else None
+        source = snapshot.source if snapshot else None
+        age_ms = snapshot.price_age_ms if snapshot else None
+        micro = snapshot
+        if self._last_price_update:
+            if price is None and self._last_price_update.last_price is not None:
+                price = self._last_price_update.last_price
+            if source is None and self._last_price_update.source is not None:
+                source = self._last_price_update.source
+            if age_ms is None and self._last_price_update.price_age_ms is not None:
+                age_ms = self._last_price_update.price_age_ms
+            if micro is None:
+                micro = self._last_price_update.microstructure
+
+        if price is None:
+            self._market_price.setText("—")
+        else:
+            self._market_price.setText(f"{price:.8f}")
+        self._set_market_label_state(self._market_price, active=price is not None)
+
+        spread_text = "—"
+        if micro is not None:
+            if micro.spread_pct is not None:
+                spread_text = f"{micro.spread_pct:.4f}%"
+            elif micro.spread_abs is not None:
+                spread_text = f"{micro.spread_abs:.8f}"
+        self._market_spread.setText(spread_text)
+        self._set_market_label_state(self._market_spread, active=spread_text != "—")
+
+        volatility_pct = self._compute_recent_volatility_pct()
+        volatility_text = f"{volatility_pct:.2f}%" if volatility_pct is not None else "—"
+        self._market_volatility.setText(volatility_text)
+        self._set_market_label_state(self._market_volatility, active=volatility_text != "—")
+
+        maker, taker = self._trade_fees
+        if maker is None and taker is None:
+            self._market_fee.setText("—")
+        self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
+
+        source_age_text = "—"
+        if price is not None and source is not None:
+            if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
+                source_age_text = "WS | stale"
+            elif age_ms is not None:
+                source_age_text = f"{source} | {age_ms}ms"
+        self._market_source.setText(source_age_text)
+        self._set_market_label_state(self._market_source, active=source_age_text != "—")
+
+        if price is not None and source is not None:
+            should_log = False
+            if not self._kpi_has_data or self._kpi_last_source != source:
+                should_log = True
+            if should_log:
+                if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
+                    age_text = "stale"
+                else:
+                    age_text = f"{age_ms}ms" if age_ms is not None else "—"
+                self._append_log(
+                    f"[ALGO_PILOT] kpi updated src={source} age={age_text} price={price:.8f}",
+                    kind="INFO",
+                )
+            self._kpi_has_data = True
+            self._kpi_last_source = source
+        else:
+            self._kpi_has_data = False
+            self._kpi_last_source = None
+
+    def _compute_recent_volatility_pct(self) -> float | None:
+        if len(self._price_history) < 2:
+            return None
+        prices = self._price_history[-50:]
+        low = min(prices)
+        high = max(prices)
+        if low <= 0:
+            return None
+        return (high - low) / low * 100
 
     def _apply_status_update(self, status: str, _: str) -> None:
         overall_status = (
@@ -5366,6 +5459,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._balances_timer.stop()
         self._orders_timer.stop()
         self._fills_timer.stop()
+        self._market_kpi_timer.stop()
         self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
         self._price_feed_manager.unregister_symbol(self._symbol)

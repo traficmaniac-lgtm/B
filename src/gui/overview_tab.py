@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from time import perf_counter
 from typing import Callable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEvent,
     QModelIndex,
     QObject,
     QRunnable,
@@ -68,7 +70,8 @@ class _PairsTableModel(QAbstractTableModel):
         self._pairs: list[Pair] = []
         self._row_by_symbol: dict[str, int] = {}
         self._price_data: dict[str, tuple[str, str, str]] = {}
-        self._headers = ["Symbol", "Price", "Source", "Updated(ms)"]
+        self._favorites: set[str] = set()
+        self._headers = ["★", "Symbol", "Price", "Source", "Updated(ms)"]
 
     def rowCount(self, parent: QModelIndex | None = None) -> int:  # noqa: N802
         if parent is not None and parent.isValid():
@@ -86,12 +89,14 @@ class _PairsTableModel(QAbstractTableModel):
         pair = self._pairs[index.row()]
         if role == Qt.DisplayRole:
             if index.column() == 0:
-                return pair.symbol
+                return "★" if pair.symbol in self._favorites else "☆"
             if index.column() == 1:
-                return self._price_data.get(pair.symbol, ("--", "--", "--"))[0]
+                return pair.symbol
             if index.column() == 2:
-                return self._price_data.get(pair.symbol, ("--", "--", "--"))[1]
+                return self._price_data.get(pair.symbol, ("--", "--", "--"))[0]
             if index.column() == 3:
+                return self._price_data.get(pair.symbol, ("--", "--", "--"))[1]
+            if index.column() == 4:
                 return self._price_data.get(pair.symbol, ("--", "--", "--"))[2]
         if role == Qt.UserRole:
             return pair.symbol
@@ -113,13 +118,31 @@ class _PairsTableModel(QAbstractTableModel):
         self._price_data = {}
         self.endResetModel()
 
+    def set_favorites(self, favorites: set[str]) -> None:
+        self._favorites = set(favorites)
+        if self._pairs:
+            top_left = self.index(0, 0)
+            bottom_right = self.index(len(self._pairs) - 1, 0)
+            self.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole])
+
+    def update_favorite(self, symbol: str, is_favorite: bool) -> None:
+        row = self._row_by_symbol.get(symbol)
+        if row is None:
+            return
+        if is_favorite:
+            self._favorites.add(symbol)
+        else:
+            self._favorites.discard(symbol)
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [Qt.DisplayRole])
+
     def update_price(self, symbol: str, price: str, source: str, age_ms: str) -> None:
         row = self._row_by_symbol.get(symbol)
         if row is None:
             return
         self._price_data[symbol] = (price, source, age_ms)
-        top_left = self.index(row, 1)
-        bottom_right = self.index(row, 3)
+        top_left = self.index(row, 2)
+        bottom_right = self.index(row, 4)
         self.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole])
 
     def symbol_for_row(self, row: int) -> str | None:
@@ -133,6 +156,8 @@ class _PairsFilterProxyModel(QSortFilterProxyModel):
         super().__init__(parent)
         self._quote_filter = ""
         self._search_text = ""
+        self._favorites_only = False
+        self._favorites: set[str] = set()
 
     def set_quote_filter(self, quote: str) -> None:
         self._quote_filter = quote.strip().upper()
@@ -142,13 +167,23 @@ class _PairsFilterProxyModel(QSortFilterProxyModel):
         self._search_text = text.strip().upper()
         self.invalidateFilter()
 
+    def set_favorites_only(self, enabled: bool) -> None:
+        self._favorites_only = enabled
+        self.invalidateFilter()
+
+    def set_favorites(self, favorites: set[str]) -> None:
+        self._favorites = set(favorites)
+        self.invalidateFilter()
+
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
         model = self.sourceModel()
         if model is None:
             return False
-        index = model.index(source_row, 0, source_parent)
+        index = model.index(source_row, 1, source_parent)
         symbol = model.data(index, Qt.DisplayRole) or ""
         quote = model.data(index, Qt.UserRole + 1) or ""
+        if self._favorites_only and str(symbol).upper() not in self._favorites:
+            return False
         if self._quote_filter:
             if quote:
                 if quote.upper() != self._quote_filter:
@@ -175,6 +210,10 @@ class OverviewTab(QWidget):
         self._app_state = app_state
         self._logger = get_logger("gui.overview")
         self._on_open_pair = on_open_pair
+        self._favorites_path = self._resolve_favorites_path()
+        self._favorite_symbols = self._load_favorites()
+        self._active_streams: set[str] = set()
+        self._status_streams: set[str] = set()
         self._http_client = BinanceHttpClient(
             base_url=config.binance.base_url,
             timeout_s=config.http.timeout_s,
@@ -201,12 +240,14 @@ class OverviewTab(QWidget):
         self._pending_symbol: str | None = None
         self._price_update_in_flight = False
         self._selected_symbol: str | None = None
-        self._latest_price_update: PriceUpdate | None = None
+        self._latest_price_updates: dict[str, PriceUpdate] = {}
         self._all_pairs: list[Pair] = []
         self._cache_partial = False
         self._pairs_model = _PairsTableModel(self)
         self._proxy_model = _PairsFilterProxyModel(self)
         self._proxy_model.setSourceModel(self._pairs_model)
+        self._pairs_model.set_favorites(self._favorite_symbols)
+        self._proxy_model.set_favorites(self._favorite_symbols)
         self._account_client: BinanceAccountClient | None = None
         self._account_balances: list[dict[str, object]] = []
         self._account_last_error: str | None = None
@@ -238,8 +279,11 @@ class OverviewTab(QWidget):
         self._table.setSelectionBehavior(QTableView.SelectRows)
         self._table.setEditTriggers(QTableView.NoEditTriggers)
         self._table.doubleClicked.connect(self._handle_double_click)
+        self._table.clicked.connect(self._handle_table_click)
         self._table.selectionModel().selectionChanged.connect(self._update_selected_pair)
         self._table.setSortingEnabled(True)
+        self._table.setColumnWidth(0, 36)
+        self._table.installEventFilter(self)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -251,6 +295,7 @@ class OverviewTab(QWidget):
         layout.addWidget(splitter)
 
         self.setLayout(layout)
+        self._sync_favorite_streams()
         self.refresh_account_status()
 
     def _build_status_row(self) -> QHBoxLayout:
@@ -317,11 +362,15 @@ class OverviewTab(QWidget):
         self._load_button.clicked.connect(self._handle_load_pairs)
         self._refresh_button = QPushButton("Force refresh from exchange")
         self._refresh_button.clicked.connect(self._handle_refresh_pairs)
+        self._favorites_only_toggle = QPushButton("★ Избранные")
+        self._favorites_only_toggle.setCheckable(True)
+        self._favorites_only_toggle.toggled.connect(self._handle_favorites_filter_toggle)
 
         layout.addWidget(QLabel("Search"))
         layout.addWidget(self._search_input)
         layout.addWidget(QLabel("Quote"))
         layout.addWidget(self._quote_combo)
+        layout.addWidget(self._favorites_only_toggle)
         layout.addWidget(self._load_button)
         layout.addWidget(self._refresh_button)
         layout.addStretch()
@@ -348,6 +397,45 @@ class OverviewTab(QWidget):
         symbol = self._pairs_model.symbol_for_row(source_index.row())
         if symbol:
             self._on_open_pair(symbol)
+
+    def _handle_table_click(self, index: QModelIndex) -> None:
+        if index.column() != 0:
+            return
+        source_index = self._proxy_model.mapToSource(index)
+        symbol = self._pairs_model.symbol_for_row(source_index.row())
+        if symbol:
+            self._toggle_favorite(symbol)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is self._table and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_F:
+                self._toggle_selected_favorite()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _toggle_selected_favorite(self) -> None:
+        selected = self._table.selectionModel().selectedRows()
+        if not selected:
+            return
+        proxy_index = selected[0]
+        source_index = self._proxy_model.mapToSource(proxy_index)
+        symbol = self._pairs_model.symbol_for_row(source_index.row())
+        if symbol:
+            self._toggle_favorite(symbol)
+
+    def _toggle_favorite(self, symbol: str) -> None:
+        if symbol in self._favorite_symbols:
+            self._favorite_symbols.discard(symbol)
+            self._pairs_model.update_favorite(symbol, False)
+            self._logger.info("[OVERVIEW] favorite remove symbol=%s", symbol)
+        else:
+            self._favorite_symbols.add(symbol)
+            self._pairs_model.update_favorite(symbol, True)
+            self._logger.info("[OVERVIEW] favorite add symbol=%s", symbol)
+        self._proxy_model.set_favorites(self._favorite_symbols)
+        self._save_favorites()
+        self._sync_favorite_streams()
+        self._apply_filters()
 
     def _run_self_check(self) -> None:
         worker = _Worker(self._run_self_check_tasks)
@@ -535,24 +623,26 @@ class OverviewTab(QWidget):
 
     def _refresh_prices(self) -> None:
         self._update_ws_status_badge()
-        selected = self._table.selectionModel().selectedRows()
-        if self._price_update_in_flight or not selected:
+        if self._price_update_in_flight or not self._active_streams:
             return
         self._price_update_in_flight = True
-        if self._latest_price_update and self._latest_price_update.last_price is not None:
-            symbol = self._latest_price_update.symbol
-            self._pairs_model.update_price(
-                symbol,
-                f"{self._latest_price_update.last_price:.8f}",
-                self._latest_price_update.source,
-                str(self._latest_price_update.price_age_ms or "--"),
-            )
+        for symbol in sorted(self._active_streams):
+            price, source, age_ms = self._price_manager.get_price(symbol)
+            if price is None and age_ms is None:
+                price_text = "--"
+                source_text = "--"
+                age_text = "--"
+            else:
+                price_text = f"{price:.8f}" if price is not None else "--"
+                source_text = source
+                age_text = str(age_ms) if age_ms is not None else "--"
+            self._pairs_model.update_price(symbol, price_text, source_text, age_text)
         self._price_update_in_flight = False
 
     def _handle_price_update(self, update: PriceUpdate) -> None:
-        if self._selected_symbol != update.symbol:
+        if update.symbol not in self._active_streams:
             return
-        self._latest_price_update = update
+        self._latest_price_updates[update.symbol] = update
 
     def _schedule_selected_symbol(self, symbol: str | None) -> None:
         self._pending_symbol = symbol
@@ -572,25 +662,57 @@ class OverviewTab(QWidget):
         if self._selected_symbol:
             self._stop_selected_symbol_stream()
         self._selected_symbol = symbol
-        self._latest_price_update = None
-        self._price_manager.register_symbol(symbol)
-        self._price_manager.subscribe(symbol, self._handle_price_update)
-        self._price_manager.subscribe_status(symbol, self._emit_ws_status)
+        self._subscribe_symbol(symbol, include_status=True)
         self._price_manager.start()
-        if not self._price_timer.isActive():
-            self._price_timer.start()
+        self._update_price_timer()
 
     def _stop_selected_symbol_stream(self) -> None:
         if not self._selected_symbol:
-            self._price_timer.stop()
+            self._update_price_timer()
             return
         symbol = self._selected_symbol
-        self._price_manager.unsubscribe(symbol, self._handle_price_update)
-        self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
-        self._price_manager.unregister_symbol(symbol)
+        if symbol in self._status_streams:
+            self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
+            self._status_streams.discard(symbol)
         self._selected_symbol = None
-        self._latest_price_update = None
-        self._price_timer.stop()
+        if symbol not in self._favorite_symbols:
+            self._unsubscribe_symbol(symbol)
+        self._update_price_timer()
+
+    def _subscribe_symbol(self, symbol: str, *, include_status: bool = False) -> None:
+        if symbol not in self._active_streams:
+            self._price_manager.register_symbol(symbol)
+            self._price_manager.subscribe(symbol, self._handle_price_update)
+            self._active_streams.add(symbol)
+        if include_status and symbol not in self._status_streams:
+            self._price_manager.subscribe_status(symbol, self._emit_ws_status)
+            self._status_streams.add(symbol)
+
+    def _unsubscribe_symbol(self, symbol: str) -> None:
+        if symbol in self._active_streams:
+            self._price_manager.unsubscribe(symbol, self._handle_price_update)
+            self._price_manager.unregister_symbol(symbol)
+            self._active_streams.discard(symbol)
+        self._latest_price_updates.pop(symbol, None)
+
+    def _sync_favorite_streams(self) -> None:
+        for symbol in sorted(self._favorite_symbols):
+            self._subscribe_symbol(symbol)
+        if self._favorite_symbols:
+            self._price_manager.start()
+        for symbol in list(self._active_streams):
+            if symbol == self._selected_symbol:
+                continue
+            if symbol not in self._favorite_symbols:
+                self._unsubscribe_symbol(symbol)
+        self._update_price_timer()
+
+    def _update_price_timer(self) -> None:
+        if self._active_streams:
+            if not self._price_timer.isActive():
+                self._price_timer.start()
+        else:
+            self._price_timer.stop()
 
     def _set_pairs_buttons_enabled(self, enabled: bool) -> None:
         self._load_button.setEnabled(enabled)
@@ -635,6 +757,10 @@ class OverviewTab(QWidget):
     def _handle_search_text(self, _: str) -> None:
         self._search_timer.start()
 
+    def _handle_favorites_filter_toggle(self, enabled: bool) -> None:
+        self._proxy_model.set_favorites_only(enabled)
+        self._apply_filters()
+
     def _persist_app_state(self) -> None:
         if self._app_state.user_config_path is None:
             return
@@ -643,10 +769,42 @@ class OverviewTab(QWidget):
         except Exception as exc:  # noqa: BLE001
             self._logger.warning("Failed to persist UI state: %s", exc)
 
+    def _resolve_favorites_path(self) -> Path:
+        return Path(__file__).resolve().parents[2] / "data" / "favorites_symbols.txt"
+
+    def _load_favorites(self) -> set[str]:
+        if not self._favorites_path.exists():
+            return set()
+        try:
+            content = self._favorites_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self._logger.warning("Failed to load favorites: %s", exc)
+            return set()
+        favorites = {line.strip().upper() for line in content if line.strip()}
+        return favorites
+
+    def _save_favorites(self) -> None:
+        try:
+            self._favorites_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = "\n".join(sorted(self._favorite_symbols))
+            self._favorites_path.write_text(lines, encoding="utf-8")
+        except OSError as exc:
+            self._logger.warning("Failed to save favorites: %s", exc)
+            return
+        self._logger.info("[OVERVIEW] favorites saved n=%s", len(self._favorite_symbols))
+
     def shutdown(self) -> None:
         self._price_timer.stop()
         self._account_timer.stop()
-        self._stop_selected_symbol_stream()
+        for symbol in list(self._status_streams):
+            self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
+        for symbol in list(self._active_streams):
+            self._price_manager.unsubscribe(symbol, self._handle_price_update)
+            self._price_manager.unregister_symbol(symbol)
+        self._status_streams.clear()
+        self._active_streams.clear()
+        self._selected_symbol = None
+        self._latest_price_updates.clear()
 
     @staticmethod
     def _summarize_error(message: str, max_len: int = 80) -> str:
