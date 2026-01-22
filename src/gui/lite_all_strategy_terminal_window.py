@@ -580,6 +580,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._closing = False
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
+        self._sell_side_enabled = False
+        self._tp_active = False
+        self._restore_active = False
         self._settings_state = GridSettingsState()
         self._log_entries: list[tuple[str, str]] = []
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
@@ -1626,6 +1629,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._update_trade_summary()
             self._live_settings = settings
             self._first_live_session = False
+            self._sell_side_enabled = False
+            self._tp_active = False
+            self._restore_active = False
             self._change_state("PLACING_GRID")
             self._place_live_orders(planned)
         finally:
@@ -1650,6 +1656,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._start_button.setEnabled(True)
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
+        self._sell_side_enabled = False
+        self._tp_active = False
+        self._restore_active = False
         if self._dry_run_toggle.isChecked():
             self._finalize_stop()
             return
@@ -1673,6 +1682,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._bot_session_id = None
         self._open_orders = []
         self._open_orders_all = []
+        self._sell_side_enabled = False
+        self._tp_active = False
+        self._restore_active = False
         self._render_open_orders()
         self._change_state("STOPPED")
 
@@ -2466,6 +2478,18 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
     def _bot_order_prefix(self) -> str:
         return f"BBOT_LAS_v1_{self._symbol}_"
 
+    def _has_open_order_type(self, order_type: str) -> bool:
+        prefix = f"{self._bot_order_prefix()}{order_type}"
+        if not prefix:
+            return False
+        for order in self._open_orders_all:
+            if not isinstance(order, dict):
+                continue
+            client_order_id = str(order.get("clientOrderId", ""))
+            if client_order_id.startswith(prefix):
+                return True
+        return False
+
     @staticmethod
     def _order_registry_type(reason: str) -> str:
         reason_upper = reason.upper()
@@ -2914,53 +2938,70 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         tp_dec = self.as_decimal(tp_pct) / Decimal("100")
         fill_price = self.as_decimal(fill.price)
         fill_qty = delta_qty
-        raw_tp_price = fill_price * (Decimal("1") + tp_dec) if tp_side == "SELL" else fill_price * (Decimal("1") - tp_dec)
-        tp_price = self.q_price(raw_tp_price, tick)
+        allow_tp = True
+        if self._tp_active or self._has_open_order_type("TP"):
+            self._append_log("[SKIP] duplicate TP order detected", kind="WARN")
+            allow_tp = False
+        if allow_tp:
+            raw_tp_price = (
+                fill_price * (Decimal("1") + tp_dec)
+                if tp_side == "SELL"
+                else fill_price * (Decimal("1") - tp_dec)
+            )
+            tp_price = self.q_price(raw_tp_price, tick)
+        else:
+            tp_price = Decimal("0")
         balances_snapshot = self._balance_snapshot()
         desired_tp_notional = tp_price * fill_qty
-        tp_qty, tp_notional, tp_reason = compute_order_qty(
-            tp_side,
-            tp_price,
-            desired_tp_notional,
-            balances_snapshot,
-            self._exchange_rules,
-            self._effective_fee_rate(),
-            None,
-        )
-        if tp_price <= 0 or tp_qty <= 0:
-            self._append_log(
-                f"[LIVE] TP planned qty={tp_qty} skip reason={tp_reason}",
-                kind="WARN",
+        if allow_tp:
+            tp_qty, tp_notional, tp_reason = compute_order_qty(
+                tp_side,
+                tp_price,
+                desired_tp_notional,
+                balances_snapshot,
+                self._exchange_rules,
+                self._effective_fee_rate(),
+                None,
             )
-            return
-        tp_action_key = build_action_key("TP", fill.order_id, tp_price, tp_qty, step)
-        if tp_action_key in self._active_action_keys:
-            return
-        self._active_action_keys.add(tp_action_key)
-        self._append_log(
-            f"[LIVE] TP planned qty={self.fmt_qty(tp_qty, step)} ok notional={self.fmt_price(tp_notional, None)}",
-            kind="ORDERS",
-        )
-        existing_tp = self.find_matching_order(tp_side, tp_price, tp_qty, tolerance_ticks=0)
-        existing_qty = Decimal("0")
-        existing_order_id = ""
-        if existing_tp:
-            existing_order_id = str(existing_tp.get("orderId", ""))
-            existing_qty = self.q_qty(
-                self.as_decimal(self._coerce_float(str(existing_tp.get("origQty", ""))) or 0.0),
-                step,
-            )
-            merged_qty = self.q_qty(existing_qty + tp_qty, step)
+            if tp_price <= 0 or tp_qty <= 0:
+                self._append_log(
+                    f"[LIVE] TP planned qty={tp_qty} skip reason={tp_reason}",
+                    kind="WARN",
+                )
+                return
+            tp_action_key = build_action_key("TP", fill.order_id, tp_price, tp_qty, step)
+            if tp_action_key in self._active_action_keys:
+                return
+            self._active_action_keys.add(tp_action_key)
             self._append_log(
-                (
-                    "[LIVE] MERGE TP "
-                    f"price={self.fmt_price(tp_price, tick)} old_qty={self.fmt_qty(existing_qty, step)} "
-                    f"add={self.fmt_qty(tp_qty, step)} new={self.fmt_qty(merged_qty, step)}"
-                ),
+                f"[LIVE] TP planned qty={self.fmt_qty(tp_qty, step)} ok notional={self.fmt_price(tp_notional, None)}",
                 kind="ORDERS",
             )
+            existing_tp = self.find_matching_order(tp_side, tp_price, tp_qty, tolerance_ticks=0)
+            existing_qty = Decimal("0")
+            existing_order_id = ""
+            if existing_tp:
+                existing_order_id = str(existing_tp.get("orderId", ""))
+                existing_qty = self.q_qty(
+                    self.as_decimal(self._coerce_float(str(existing_tp.get("origQty", ""))) or 0.0),
+                    step,
+                )
+                merged_qty = self.q_qty(existing_qty + tp_qty, step)
+                self._append_log(
+                    (
+                        "[LIVE] MERGE TP "
+                        f"price={self.fmt_price(tp_price, tick)} old_qty={self.fmt_qty(existing_qty, step)} "
+                        f"add={self.fmt_qty(tp_qty, step)} new={self.fmt_qty(merged_qty, step)}"
+                    ),
+                    kind="ORDERS",
+                )
+            else:
+                merged_qty = tp_qty
         else:
-            merged_qty = tp_qty
+            tp_qty = Decimal("0")
+            merged_qty = Decimal("0")
+            existing_tp = None
+            existing_order_id = ""
 
         step_pct = settings.grid_step_pct or 0.0
         reference_price = self._last_price or fill.price
@@ -3009,6 +3050,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 kind="WARN",
             )
         else:
+            if self._restore_active or self._has_open_order_type("RESTORE"):
+                self._append_log("[SKIP] duplicate RESTORE order detected", kind="WARN")
+                allow_restore = False
             restore_action_key = build_action_key("RESTORE", fill.order_id, restore_price, restore_qty, step)
             if restore_action_key in self._active_action_keys:
                 allow_restore = False
@@ -3020,31 +3064,34 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     kind="ORDERS",
                 )
 
-        tp_client_order_id = self._next_client_order_id("TP", suffix="M" if existing_tp else "")
+        tp_client_order_id = (
+            self._next_client_order_id("TP", suffix="M" if existing_tp else "") if allow_tp else ""
+        )
         restore_client_order_id = (
             self._next_client_order_id("RESTORE") if restore_price > 0 and allow_restore else ""
         )
 
         def _place() -> dict[str, Any]:
             results: dict[str, Any] = {"tp": None, "restore": None, "errors": []}
-            if existing_tp and existing_order_id:
+            if allow_tp and existing_tp and existing_order_id:
                 try:
                     self._account_client.cancel_order(self._symbol, existing_order_id)
                 except Exception as exc:  # noqa: BLE001
                     results["errors"].append(self._format_cancel_exception(exc, existing_order_id))
                 self._sleep_ms(75)
-            tp_response, tp_error = self._place_limit(
-                tp_side,
-                tp_price,
-                merged_qty,
-                tp_client_order_id,
-                reason="tp_merge" if existing_tp else "tp",
-            )
-            if tp_response:
-                results["tp"] = tp_response
-            if tp_error:
-                results["errors"].append(tp_error)
-            self._sleep_ms(75)
+            if allow_tp and tp_client_order_id:
+                tp_response, tp_error = self._place_limit(
+                    tp_side,
+                    tp_price,
+                    merged_qty,
+                    tp_client_order_id,
+                    reason="tp_merge" if existing_tp else "tp",
+                )
+                if tp_response:
+                    results["tp"] = tp_response
+                if tp_error:
+                    results["errors"].append(tp_error)
+                self._sleep_ms(75)
             if restore_price > 0 and restore_qty > 0 and restore_client_order_id:
                 restore_response, restore_error = self._place_limit(
                     restore_side,
@@ -3065,9 +3112,12 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _maybe_enable_bootstrap_sell_side(self, fill: TradeFill) -> None:
-        if not self._bootstrap_mode or self._bootstrap_sell_enabled:
-            return
         if fill.side != "BUY":
+            return
+        if not self._sell_side_enabled:
+            self._sell_side_enabled = True
+            self._append_log("[STATE] sell_side_enabled -> true", kind="INFO")
+        if not self._bootstrap_mode or self._bootstrap_sell_enabled:
             return
         settings = self._live_settings or self._settings_state
         reference_price = self._last_price or fill.price
@@ -3084,7 +3134,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         sell_orders = self._limit_sell_plan_by_balance(sell_orders, base_free)
         sell_orders = sell_orders[: settings.max_active_orders]
         if not sell_orders:
-            self._append_log("[ENGINE] bootstrap sell activation skipped: no sell orders", kind="WARN")
+            self._bootstrap_sell_enabled = True
+            self._bootstrap_mode = False
             return
         self._append_log(
             "[ENGINE] first buy filled -> enabling SELL side + TP + restore",
@@ -3123,6 +3174,12 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     self._order_key(side, self.as_decimal(price), self.as_decimal(qty))
                 )
             self._append_log(f"[LIVE] PLACE {label} orderId={order_id}", kind="ORDERS")
+            if label == "TP" and not self._tp_active:
+                self._tp_active = True
+                self._append_log("[STATE] TP active", kind="INFO")
+            if label == "RESTORE" and not self._restore_active:
+                self._restore_active = True
+                self._append_log("[STATE] RESTORE active", kind="INFO")
         self._refresh_open_orders(force=True)
 
     def _place_limit(
@@ -3923,7 +3980,14 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             for idx, order in enumerate(planned, start=1):
                 if skip_sells and order.side == "SELL":
                     continue
-                client_order_id = self._make_client_order_id("GRID", idx)
+                order_type = f"GRID_{order.side}"
+                if self._has_open_order_type(order_type):
+                    self._signals.log_append.emit(
+                        f"[SKIP] duplicate {order_type} order detected",
+                        "WARN",
+                    )
+                    continue
+                client_order_id = self._make_client_order_id(order_type, idx)
                 try:
                     price = self.as_decimal(order.price)
                     desired_notional = price * self.as_decimal(order.qty)
