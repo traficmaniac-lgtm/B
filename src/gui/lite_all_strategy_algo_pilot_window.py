@@ -868,7 +868,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
         layout = QVBoxLayout(group)
-        layout.setSpacing(4)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         self._market_price = QLabel(f"{tr('price')}: —")
         self._market_spread = QLabel(f"{tr('spread')}: —")
@@ -887,12 +888,17 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         layout.addWidget(self._market_volatility)
         layout.addWidget(self._market_fee)
         layout.addWidget(self._rules_label)
-        algo_pilot_group = QGroupBox("ALGO PILOT")
-        algo_pilot_layout = QVBoxLayout(algo_pilot_group)
+        algo_pilot_frame = QGroupBox("ALGO PILOT")
+        algo_pilot_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        algo_pilot_frame.setMinimumHeight(260)
+        algo_pilot_layout = QVBoxLayout(algo_pilot_frame)
         algo_pilot_layout.setContentsMargins(6, 6, 6, 6)
         algo_pilot_layout.setSpacing(4)
 
-        indicator_grid = QGridLayout()
+        metrics_widget = QWidget(algo_pilot_frame)
+        metrics_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        metrics_widget.setMinimumHeight(220)
+        indicator_grid = QGridLayout(metrics_widget)
         indicator_grid.setHorizontalSpacing(8)
         indicator_grid.setVerticalSpacing(2)
 
@@ -923,6 +929,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             label.setWordWrap(wrap)
             label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            label.setMinimumWidth(160)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             if hasattr(label, "setTextElideMode"):
                 label.setTextElideMode(Qt.ElideRight)
 
@@ -969,7 +977,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             indicator_grid.addWidget(value_label, row, 1)
 
         indicator_grid.setColumnStretch(1, 1)
-        algo_pilot_layout.addLayout(indicator_grid)
+        algo_pilot_layout.addWidget(metrics_widget, stretch=0)
+        algo_pilot_layout.addSpacing(6)
 
         self._pilot_toggle_button = QPushButton("Pilot ON / OFF")
         self._pilot_toggle_button.clicked.connect(self._handle_pilot_toggle)
@@ -982,7 +991,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_flag_stale_button = QPushButton("Flag Stale")
         self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
 
-        pilot_buttons_layout = QVBoxLayout()
+        buttons_widget = QWidget(algo_pilot_frame)
+        buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        pilot_buttons_layout = QVBoxLayout(buttons_widget)
         pilot_buttons_layout.setSpacing(6)
         for button in (
             self._pilot_toggle_button,
@@ -991,12 +1002,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_flatten_button,
             self._pilot_flag_stale_button,
         ):
-            button.setMinimumHeight(30)
+            button.setMinimumHeight(34)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             pilot_buttons_layout.addWidget(button)
 
-        algo_pilot_layout.addLayout(pilot_buttons_layout)
+        pilot_buttons_layout.addStretch(1)
+        algo_pilot_layout.addWidget(buttons_widget, stretch=1)
 
-        layout.addWidget(algo_pilot_group)
+        layout.addWidget(algo_pilot_frame)
         layout.addStretch()
         return group
 
