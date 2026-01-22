@@ -1117,6 +1117,7 @@ class LiteGridWindow(QMainWindow):
         layout.addWidget(self._trades_summary_label)
         layout.addLayout(filter_row)
         layout.addWidget(self._log_view)
+        self._apply_log_filter()
         return frame
 
     def _emit_price_update(self, update: PriceUpdate) -> None:
@@ -3762,6 +3763,8 @@ class LiteGridWindow(QMainWindow):
         self._logger.info("%s | %s | %s", self._symbol, entry[0], entry[1])
 
     def _apply_log_filter(self) -> None:
+        if not hasattr(self, "_log_view"):
+            return
         selected = self._log_filter.currentText() if hasattr(self, "_log_filter") else tr("log_filter_all")
         if selected == tr("log_filter_orders"):
             allowed = {"ORDERS"}
