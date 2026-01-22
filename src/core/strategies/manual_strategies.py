@@ -30,6 +30,11 @@ class StrategyContext:
     params: dict[str, Any]
     klines: list[Any] | None = None
     klines_by_tf: dict[str, list[Any]] | None = None
+    trade_gate: str | None = None
+    spot_enabled: bool | None = None
+    rules_loaded: bool | None = None
+    balances_ready: bool | None = None
+    balance_age_s: float | None = None
 
 
 class ManualStrategy(Protocol):
@@ -337,7 +342,7 @@ class MeanReversionBandsStrategy(BaseManualStrategy):
 
     def validate(self, ctx: StrategyContext) -> tuple[bool, str]:
         if not ctx.klines:
-            return False, "нет данных klines для стратегии"
+            return False, "нет klines"
         params = MeanReversionBandsParams(**ctx.params)
         levels = max(2, min(6, ctx.max_active_orders))
         return _validate_common(ctx, levels)
@@ -386,7 +391,7 @@ class BreakoutPullbackStrategy(BaseManualStrategy):
 
     def validate(self, ctx: StrategyContext) -> tuple[bool, str]:
         if not ctx.klines:
-            return False, "нет данных klines для стратегии"
+            return False, "нет klines"
         params = BreakoutPullbackParams(**ctx.params)
         if params.breakout_window <= 1:
             return False, "breakout_window"
@@ -395,7 +400,7 @@ class BreakoutPullbackStrategy(BaseManualStrategy):
             return ok, reason
         closes, highs, lows = _extract_ohlc(ctx.klines)
         if len(highs) < params.breakout_window:
-            return False, "нет данных klines для стратегии"
+            return False, "нет klines"
         window_high = max(highs[-params.breakout_window :])
         window_low = min(lows[-params.breakout_window :])
         if ctx.current_price > window_high:
@@ -485,7 +490,7 @@ class TrendFollowGridStrategy(BaseManualStrategy):
         params = TrendFollowGridParams(**ctx.params)
         klines = (ctx.klines_by_tf or {}).get(params.trend_tf) or ctx.klines
         if not klines:
-            return False, "нет данных klines для стратегии"
+            return False, "нет klines"
         total_orders = max(2, min(ctx.max_active_orders, 6))
         return _validate_common(ctx, total_orders)
 
