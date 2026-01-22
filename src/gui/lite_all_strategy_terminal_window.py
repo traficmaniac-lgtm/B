@@ -2934,26 +2934,47 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             return
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
-        tp_side = "SELL" if fill.side == "BUY" else "BUY"
         tp_dec = self.as_decimal(tp_pct) / Decimal("100")
         fill_price = self.as_decimal(fill.price)
         fill_qty = delta_qty
-        allow_tp = True
+        balances_snapshot = self._balance_snapshot()
+        base_free = self.as_decimal(balances_snapshot.get("base_free", Decimal("0")))
+        quote_free = self.as_decimal(balances_snapshot.get("quote_free", Decimal("0")))
+        net_base_position = sum((lot.qty for lot in self._base_lots), Decimal("0"))
+        dust = step * Decimal("2")
+        position_mode = "LONG" if net_base_position > dust else "FLAT"
+        self._append_log(
+            (
+                "[POS] "
+                f"net_base={self.fmt_qty(net_base_position, step)} mode={position_mode} "
+                f"base_free={self.fmt_qty(base_free, step)} quote_free={self.fmt_price(quote_free, None)}"
+            ),
+            kind="INFO",
+        )
+        tp_side = "SELL"
+        tp_qty_cap = min(net_base_position, fill_qty)
+        allow_tp = position_mode == "LONG"
+        tp_qty = Decimal("0")
+        tp_notional = Decimal("0")
+        tp_reason = "skip_flat" if position_mode == "FLAT" else "ok"
+        existing_tp = None
+        existing_order_id = ""
+        merged_qty = Decimal("0")
         if self._tp_active or self._has_open_order_type("TP"):
             self._append_log("[SKIP] duplicate TP order detected", kind="WARN")
+            allow_tp = False
+        if allow_tp and tp_qty_cap <= 0:
+            tp_reason = "skip_insufficient"
             allow_tp = False
         if allow_tp:
             raw_tp_price = (
                 fill_price * (Decimal("1") + tp_dec)
-                if tp_side == "SELL"
-                else fill_price * (Decimal("1") - tp_dec)
             )
             tp_price = self.q_price(raw_tp_price, tick)
         else:
             tp_price = Decimal("0")
-        balances_snapshot = self._balance_snapshot()
-        desired_tp_notional = tp_price * fill_qty
         if allow_tp:
+            desired_tp_notional = tp_price * tp_qty_cap
             tp_qty, tp_notional, tp_reason = compute_order_qty(
                 tp_side,
                 tp_price,
@@ -2964,39 +2985,44 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 None,
             )
             if tp_price <= 0 or tp_qty <= 0:
-                self._append_log(
-                    f"[LIVE] TP planned qty={tp_qty} skip reason={tp_reason}",
-                    kind="WARN",
-                )
-                return
+                tp_reason = "skip_insufficient"
+                allow_tp = False
+                tp_qty = Decimal("0")
+                tp_notional = Decimal("0")
+        self._append_log(
+            f"[TP] side={tp_side} qty={self.fmt_qty(tp_qty, step)} reason={tp_reason}",
+            kind="INFO",
+        )
+        if allow_tp:
             tp_action_key = build_action_key("TP", fill.order_id, tp_price, tp_qty, step)
             if tp_action_key in self._active_action_keys:
-                return
-            self._active_action_keys.add(tp_action_key)
-            self._append_log(
-                f"[LIVE] TP planned qty={self.fmt_qty(tp_qty, step)} ok notional={self.fmt_price(tp_notional, None)}",
-                kind="ORDERS",
-            )
-            existing_tp = self.find_matching_order(tp_side, tp_price, tp_qty, tolerance_ticks=0)
-            existing_qty = Decimal("0")
-            existing_order_id = ""
-            if existing_tp:
-                existing_order_id = str(existing_tp.get("orderId", ""))
-                existing_qty = self.q_qty(
-                    self.as_decimal(self._coerce_float(str(existing_tp.get("origQty", ""))) or 0.0),
-                    step,
-                )
-                merged_qty = self.q_qty(existing_qty + tp_qty, step)
+                allow_tp = False
+            else:
+                self._active_action_keys.add(tp_action_key)
+            if allow_tp:
                 self._append_log(
-                    (
-                        "[LIVE] MERGE TP "
-                        f"price={self.fmt_price(tp_price, tick)} old_qty={self.fmt_qty(existing_qty, step)} "
-                        f"add={self.fmt_qty(tp_qty, step)} new={self.fmt_qty(merged_qty, step)}"
-                    ),
+                    f"[LIVE] TP planned qty={self.fmt_qty(tp_qty, step)} ok notional={self.fmt_price(tp_notional, None)}",
                     kind="ORDERS",
                 )
-            else:
-                merged_qty = tp_qty
+                existing_tp = self.find_matching_order(tp_side, tp_price, tp_qty, tolerance_ticks=0)
+                existing_qty = Decimal("0")
+                if existing_tp:
+                    existing_order_id = str(existing_tp.get("orderId", ""))
+                    existing_qty = self.q_qty(
+                        self.as_decimal(self._coerce_float(str(existing_tp.get("origQty", ""))) or 0.0),
+                        step,
+                    )
+                    merged_qty = self.q_qty(existing_qty + tp_qty, step)
+                    self._append_log(
+                        (
+                            "[LIVE] MERGE TP "
+                            f"price={self.fmt_price(tp_price, tick)} old_qty={self.fmt_qty(existing_qty, step)} "
+                            f"add={self.fmt_qty(tp_qty, step)} new={self.fmt_qty(merged_qty, step)}"
+                        ),
+                        kind="ORDERS",
+                    )
+                else:
+                    merged_qty = tp_qty
         else:
             tp_qty = Decimal("0")
             merged_qty = Decimal("0")
@@ -3016,10 +3042,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             restore_price = self.q_price(fill_price + step_abs, tick)
         desired_restore_notional = restore_price * fill_qty
         if restore_side == "SELL":
-            base_free = self.as_decimal(balances_snapshot.get("base_free", Decimal("0")))
-            base_dust_buffer = self._base_dust_buffer(step)
-            usable = max(Decimal("0"), base_free - base_dust_buffer)
-            if usable < fill_qty:
+            if base_free < fill_qty:
                 restore_qty = Decimal("0")
                 restore_notional = Decimal("0")
                 restore_reason = "insufficient_base"
@@ -3034,15 +3057,23 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     None,
                 )
         else:
-            restore_qty, restore_notional, restore_reason = compute_order_qty(
-                restore_side,
-                restore_price,
-                desired_restore_notional,
-                balances_snapshot,
-                self._exchange_rules,
-                self._effective_fee_rate(),
-                None,
-            )
+            fill_notional = fill_price * fill_qty
+            required_quote = desired_restore_notional
+            quote_available = quote_free + fill_notional
+            if quote_available < required_quote:
+                restore_qty = Decimal("0")
+                restore_notional = Decimal("0")
+                restore_reason = "insufficient_quote"
+            else:
+                restore_qty, restore_notional, restore_reason = compute_order_qty(
+                    restore_side,
+                    restore_price,
+                    desired_restore_notional,
+                    balances_snapshot,
+                    self._exchange_rules,
+                    self._effective_fee_rate(),
+                    None,
+                )
         allow_restore = restore_qty > 0
         if not allow_restore:
             self._append_log(
