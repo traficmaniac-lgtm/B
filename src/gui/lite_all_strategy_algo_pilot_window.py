@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QGridLayout,
     QLabel,
     QMainWindow,
     QMenu,
@@ -891,10 +892,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         algo_pilot_layout.setContentsMargins(6, 6, 6, 6)
         algo_pilot_layout.setSpacing(4)
 
-        indicator_form = QFormLayout()
-        indicator_form.setLabelAlignment(Qt.AlignLeft)
-        indicator_form.setFormAlignment(Qt.AlignLeft)
-        indicator_form.setVerticalSpacing(2)
+        indicator_grid = QGridLayout()
+        indicator_grid.setHorizontalSpacing(8)
+        indicator_grid.setVerticalSpacing(2)
 
         self._pilot_state_value = QLabel(self._pilot_state.value)
         self._pilot_regime_value = QLabel("RANGE")
@@ -913,23 +913,63 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_orders_warning_value = QLabel("--")
         self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
 
-        indicator_form.addRow(QLabel("Pilot State:"), self._pilot_state_value)
-        indicator_form.addRow(QLabel("Market Regime:"), self._pilot_regime_value)
-        indicator_form.addRow(QLabel("Anchor Price:"), self._pilot_anchor_value)
-        indicator_form.addRow(QLabel("Distance from Anchor (%):"), self._pilot_distance_value)
-        indicator_form.addRow(QLabel("Threshold (%):"), self._pilot_threshold_value)
-        indicator_form.addRow(QLabel("Position Qty:"), self._pilot_position_qty_value)
-        indicator_form.addRow(QLabel("Avg Entry:"), self._pilot_avg_entry_value)
-        indicator_form.addRow(QLabel("Break-even Price:"), self._pilot_break_even_value)
-        indicator_form.addRow(QLabel("Unrealized PnL:"), self._pilot_unrealized_value)
-        indicator_form.addRow(QLabel("Open Orders:"), self._pilot_orders_total_value)
-        indicator_form.addRow(QLabel("Buy Orders:"), self._pilot_orders_buy_value)
-        indicator_form.addRow(QLabel("Sell Orders:"), self._pilot_orders_sell_value)
-        indicator_form.addRow(QLabel("Oldest Order Age:"), self._pilot_orders_oldest_value)
-        indicator_form.addRow(QLabel("Max Age Threshold:"), self._pilot_orders_threshold_value)
-        indicator_form.addRow(QLabel("Warning:"), self._pilot_orders_warning_value)
+        def make_key_label(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setFixedWidth(170)
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            return label
 
-        algo_pilot_layout.addLayout(indicator_form)
+        def configure_value_label(label: QLabel, wrap: bool = False) -> None:
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label.setWordWrap(wrap)
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            if hasattr(label, "setTextElideMode"):
+                label.setTextElideMode(Qt.ElideRight)
+
+        value_labels = [
+            self._pilot_state_value,
+            self._pilot_regime_value,
+            self._pilot_anchor_value,
+            self._pilot_distance_value,
+            self._pilot_threshold_value,
+            self._pilot_position_qty_value,
+            self._pilot_avg_entry_value,
+            self._pilot_break_even_value,
+            self._pilot_unrealized_value,
+            self._pilot_orders_total_value,
+            self._pilot_orders_buy_value,
+            self._pilot_orders_sell_value,
+            self._pilot_orders_oldest_value,
+            self._pilot_orders_threshold_value,
+        ]
+        for value_label in value_labels:
+            configure_value_label(value_label)
+        configure_value_label(self._pilot_orders_warning_value, wrap=True)
+
+        indicator_rows = [
+            ("Pilot State:", self._pilot_state_value),
+            ("Market Regime:", self._pilot_regime_value),
+            ("Anchor Price:", self._pilot_anchor_value),
+            ("Distance from Anchor (%):", self._pilot_distance_value),
+            ("Threshold (%):", self._pilot_threshold_value),
+            ("Position Qty:", self._pilot_position_qty_value),
+            ("Avg Entry:", self._pilot_avg_entry_value),
+            ("Break-even Price:", self._pilot_break_even_value),
+            ("Unrealized PnL:", self._pilot_unrealized_value),
+            ("Open Orders:", self._pilot_orders_total_value),
+            ("Buy Orders:", self._pilot_orders_buy_value),
+            ("Sell Orders:", self._pilot_orders_sell_value),
+            ("Oldest Order Age:", self._pilot_orders_oldest_value),
+            ("Max Age Threshold:", self._pilot_orders_threshold_value),
+            ("Warning:", self._pilot_orders_warning_value),
+        ]
+
+        for row, (key_text, value_label) in enumerate(indicator_rows):
+            indicator_grid.addWidget(make_key_label(key_text), row, 0)
+            indicator_grid.addWidget(value_label, row, 1)
+
+        indicator_grid.setColumnStretch(1, 1)
+        algo_pilot_layout.addLayout(indicator_grid)
 
         self._pilot_toggle_button = QPushButton("Pilot ON / OFF")
         self._pilot_toggle_button.clicked.connect(self._handle_pilot_toggle)
@@ -942,11 +982,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_flag_stale_button = QPushButton("Flag Stale")
         self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
 
-        algo_pilot_layout.addWidget(self._pilot_toggle_button)
-        algo_pilot_layout.addWidget(self._pilot_recenter_button)
-        algo_pilot_layout.addWidget(self._pilot_recovery_button)
-        algo_pilot_layout.addWidget(self._pilot_flatten_button)
-        algo_pilot_layout.addWidget(self._pilot_flag_stale_button)
+        pilot_buttons_layout = QVBoxLayout()
+        pilot_buttons_layout.setSpacing(6)
+        for button in (
+            self._pilot_toggle_button,
+            self._pilot_recenter_button,
+            self._pilot_recovery_button,
+            self._pilot_flatten_button,
+            self._pilot_flag_stale_button,
+        ):
+            button.setMinimumHeight(30)
+            pilot_buttons_layout.addWidget(button)
+
+        algo_pilot_layout.addLayout(pilot_buttons_layout)
 
         layout.addWidget(algo_pilot_group)
         layout.addStretch()
