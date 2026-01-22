@@ -135,8 +135,8 @@ class TradeGateState(Enum):
 class PilotState(Enum):
     OFF = "OFF"
     NORMAL = "NORMAL"
+    RECENTERING = "RECENTERING"
     RECOVERY = "RECOVERY"
-    DEFENSIVE = "DEFENSIVE"
     PAUSED_BY_RISK = "PAUSED_BY_RISK"
 
 
@@ -183,6 +183,15 @@ class TradeFill:
 class BaseLot:
     qty: float
     cost_per_unit: float
+
+
+@dataclass
+class PositionState:
+    position_qty: float
+    avg_entry_price: float | None
+    realized_pnl_quote: float
+    fees_paid_quote: float
+    break_even_price: float | None
 
 
 class GridEngine:
@@ -707,6 +716,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._seen_trade_ids: set[str] = set()
         self._realized_pnl = 0.0
         self._fees_total = 0.0
+        self._position_fees_paid_quote = 0.0
         self._closed_trades = 0
         self._win_trades = 0
         self._replacement_counter = 0
@@ -735,11 +745,20 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_warning_override: str | None = None
         self._pilot_warning_override_until: float | None = None
         self._pilot_anchor_price: float | None = None
+        self._pilot_pending_anchor: float | None = None
+        self._pilot_recenter_expected_min: int | None = None
         self._pilot_stale_active = False
         self._pilot_stale_last_log_ts: float | None = None
         self._last_price_update: PriceUpdate | None = None
         self._kpi_has_data = False
         self._kpi_last_source: str | None = None
+        self._position_state = PositionState(
+            position_qty=0.0,
+            avg_entry_price=None,
+            realized_pnl_quote=0.0,
+            fees_paid_quote=0.0,
+            break_even_price=None,
+        )
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -788,7 +807,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=1.2 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=1.3 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1653,9 +1672,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if not self._pilot_confirm_action(PilotAction.RECENTER, summary):
             return
         self._set_pilot_action_in_progress(True, status="Выполняю…")
-        old_anchor = self._pilot_anchor_price
-        self._pilot_anchor_price = anchor_price
-        self._set_pilot_state(PilotState.NORMAL)
+        old_anchor = self._pilot_anchor_price or anchor_price
+        self._pilot_pending_anchor = anchor_price
+        self._pilot_recenter_expected_min = len(plan)
+        if not self._dry_run_toggle.isChecked():
+            balance_snapshot = self._balance_snapshot()
+            base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
+            if base_free <= 0:
+                self._pilot_recenter_expected_min = sum(1 for order in plan if order.side == "BUY")
+        self._set_pilot_state(PilotState.RECENTERING)
         self._append_log(
             (
                 "[INFO] [ALGO_PILOT] recenter start "
@@ -1670,6 +1695,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 f"[INFO] [ALGO_PILOT] recenter done place_n={len(plan)}",
                 kind="INFO",
             )
+            self._pilot_anchor_price = anchor_price
+            self._pilot_pending_anchor = None
+            self._pilot_recenter_expected_min = None
+            self._set_pilot_state(PilotState.NORMAL)
             self._set_pilot_action_in_progress(False)
             return
         self._pilot_pending_action = PilotAction.RECENTER
@@ -1678,8 +1707,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
     def _pilot_execute_recovery(self) -> None:
         position_qty = self._pilot_position_qty()
-        avg_entry = self._pilot_average_entry_price()
-        be_price = self._pilot_break_even_price(avg_entry)
+        be_price = self._pilot_break_even_price()
+        if position_qty <= 0 or be_price is None:
+            self._pilot_block_action(PilotAction.RECOVERY, "break-even unknown")
+            return
         summary = [
             f"cancel={len(self._open_orders)}",
             f"qty={self._format_balance_decimal(position_qty)}",
@@ -1693,16 +1724,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f"[ALGO PILOT] recovery mode enabled symbol={self._symbol}",
             kind="INFO",
         )
-        if position_qty <= 0:
-            self._pilot_set_warning("Нет позиции — recovery пассивный")
-            self._append_log(
-                f"[ALGO PILOT] recovery: no position symbol={self._symbol}",
-                kind="INFO",
-            )
-            return
-        if be_price is None:
-            self._pilot_block_action(PilotAction.RECOVERY, "break-even unknown")
-            return
         self._set_pilot_action_in_progress(True, status="Выполняю…")
         self._pilot_place_break_even_order(
             be_price=be_price,
@@ -1713,8 +1734,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
     def _pilot_execute_flatten(self) -> None:
         position_qty = self._pilot_position_qty()
-        avg_entry = self._pilot_average_entry_price()
-        be_price = self._pilot_break_even_price(avg_entry)
+        be_price = self._pilot_break_even_price()
+        if position_qty <= 0 or be_price is None:
+            self._pilot_block_action(PilotAction.FLATTEN_BE, "break-even unknown")
+            return
         summary = [
             f"cancel={len(self._open_orders)}",
             f"qty={self._format_balance_decimal(position_qty)}",
@@ -1725,20 +1748,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             summary.append("market=enabled")
         if not self._pilot_confirm_action(PilotAction.FLATTEN_BE, summary):
             return
-        if position_qty <= 0:
-            self._pilot_set_warning("Позиции нет")
-            self._append_log(
-                f"[ALGO PILOT] flatten: no position symbol={self._symbol}",
-                kind="INFO",
-            )
-            return
         self._append_log(
             f"[ALGO PILOT] flatten to BE requested symbol={self._symbol}",
             kind="INFO",
         )
-        if be_price is None:
-            self._pilot_block_action(PilotAction.FLATTEN_BE, "break-even unknown")
-            return
         if self._pilot_allow_market:
             self._append_log(
                 "[ALGO PILOT] market close requested but not supported, using BE limit",
@@ -1864,6 +1877,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
     def _pilot_cancel_orders_then_place(self, plan: list[GridPlannedOrder]) -> None:
         planned_cancel = len(self._open_orders)
+        expected_min = self._pilot_recenter_expected_min or len(plan)
 
         def _cancel() -> dict[str, Any]:
             errors: list[str] = []
@@ -1878,7 +1892,24 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                         canceled += 1
                     except Exception as exc:  # noqa: BLE001
                         errors.append(self._format_cancel_exception(exc, order_id))
-            return {"errors": errors, "canceled": canceled, "planned": planned_cancel}
+            open_orders_after: list[dict[str, Any]] = []
+            if self._account_client:
+                deadline = monotonic() + 5.0
+                while monotonic() < deadline:
+                    open_orders_after = self._account_client.get_open_orders(self._symbol)
+                    bot_orders = self._filter_bot_orders(
+                        [order for order in open_orders_after if isinstance(order, dict)]
+                    )
+                    if not bot_orders:
+                        break
+                    self._sleep_ms(500)
+            return {
+                "errors": errors,
+                "canceled": canceled,
+                "planned": planned_cancel,
+                "open_orders_after": open_orders_after,
+                "expected_min": expected_min,
+            }
 
         worker = _Worker(_cancel, self._can_emit_worker_results)
         worker.signals.success.connect(lambda result, latency: self._handle_pilot_recenter_cancel(result, latency, plan))
@@ -1899,7 +1930,78 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 f"[ALGO PILOT] recenter cancel done canceled={canceled} planned={planned}",
                 kind="INFO",
             )
+            open_orders_after = result.get("open_orders_after", [])
+            if isinstance(open_orders_after, list):
+                open_count = len([order for order in open_orders_after if isinstance(order, dict)])
+                if open_count:
+                    self._append_log(
+                        f"[ALGO PILOT] recenter cancel wait timeout open_orders={open_count}",
+                        kind="WARN",
+                    )
+            self._clear_local_order_registry()
         self._place_live_orders(plan)
+
+    def _pilot_wait_for_recenter_open_orders(self, expected_min: int) -> None:
+        if not self._account_client:
+            self._finalize_pilot_recenter(met=False, open_orders=[])
+            return
+        if expected_min <= 0:
+            self._finalize_pilot_recenter(met=True, open_orders=list(self._open_orders))
+            return
+
+        def _poll() -> dict[str, Any]:
+            deadline = monotonic() + 5.0
+            open_orders: list[dict[str, Any]] = []
+            met = False
+            while monotonic() < deadline:
+                open_orders = self._account_client.get_open_orders(self._symbol)
+                bot_orders = self._filter_bot_orders(
+                    [order for order in open_orders if isinstance(order, dict)]
+                )
+                if len(bot_orders) >= expected_min:
+                    met = True
+                    break
+                self._sleep_ms(500)
+            return {"open_orders": open_orders, "met": met, "expected_min": expected_min}
+
+        worker = _Worker(_poll, self._can_emit_worker_results)
+        worker.signals.success.connect(self._handle_pilot_recenter_open_orders)
+        worker.signals.error.connect(self._handle_pilot_action_error)
+        self._thread_pool.start(worker)
+
+    def _handle_pilot_recenter_open_orders(self, result: object, latency_ms: int) -> None:
+        _ = latency_ms
+        if not isinstance(result, dict):
+            self._handle_pilot_action_error("Unexpected recenter open_orders response")
+            return
+        open_orders = result.get("open_orders", [])
+        met = bool(result.get("met", False))
+        expected_min = int(result.get("expected_min", 0) or 0)
+        if isinstance(open_orders, list):
+            self._handle_open_orders(open_orders, latency_ms)
+        if not met:
+            self._append_log(
+                f"[ALGO PILOT] recenter open_orders wait timeout expected_min={expected_min}",
+                kind="WARN",
+            )
+        self._finalize_pilot_recenter(met=met, open_orders=open_orders if isinstance(open_orders, list) else [])
+
+    def _finalize_pilot_recenter(self, *, met: bool, open_orders: list[dict[str, Any]]) -> None:
+        _ = met
+        if open_orders is None:
+            open_orders = []
+        if self._pilot_pending_anchor is not None:
+            self._pilot_anchor_price = self._pilot_pending_anchor
+        self._pilot_pending_anchor = None
+        self._pilot_recenter_expected_min = None
+        self._set_pilot_state(PilotState.NORMAL)
+        self._append_log(
+            f"[INFO] [ALGO_PILOT] recenter done open_orders={len(open_orders)}",
+            kind="INFO",
+        )
+        self._set_pilot_action_in_progress(False)
+        self._pilot_pending_action = None
+        self._pilot_pending_plan = None
 
     def _handle_pilot_break_even_result(self, result: object, latency_ms: int) -> None:
         _ = latency_ms
@@ -1933,45 +2035,67 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _handle_pilot_action_error(self, message: str) -> None:
         self._append_log(f"[ALGO PILOT] action error: {message}", kind="WARN")
         self._set_pilot_action_in_progress(False)
+        if self._pilot_state == PilotState.RECENTERING:
+            self._set_pilot_state(PilotState.NORMAL)
+            self._pilot_pending_anchor = None
+            self._pilot_recenter_expected_min = None
         self._pilot_pending_action = None
         self._pilot_pending_plan = None
 
+    def _reset_position_state(self) -> None:
+        self._position_fees_paid_quote = 0.0
+        self._position_state = PositionState(
+            position_qty=0.0,
+            avg_entry_price=None,
+            realized_pnl_quote=0.0,
+            fees_paid_quote=0.0,
+            break_even_price=None,
+        )
+
+    def _rebuild_position_state(self) -> PositionState:
+        total_qty = sum(Decimal(str(lot.qty)) for lot in self._base_lots)
+        realized_pnl = float(self._realized_pnl)
+        fees_paid = float(self._position_fees_paid_quote)
+        if total_qty <= 0:
+            return PositionState(
+                position_qty=0.0,
+                avg_entry_price=None,
+                realized_pnl_quote=realized_pnl,
+                fees_paid_quote=fees_paid,
+                break_even_price=None,
+            )
+        total_cost = sum(
+            Decimal(str(lot.qty)) * Decimal(str(lot.cost_per_unit)) for lot in self._base_lots
+        )
+        avg_entry = total_cost / total_qty if total_qty > 0 else Decimal("0")
+        break_even = (total_cost + self.as_decimal(fees_paid)) / total_qty
+        return PositionState(
+            position_qty=float(total_qty),
+            avg_entry_price=float(avg_entry),
+            realized_pnl_quote=realized_pnl,
+            fees_paid_quote=fees_paid,
+            break_even_price=float(break_even),
+        )
+
+    def _pilot_position_state(self) -> PositionState:
+        self._position_state = self._rebuild_position_state()
+        return self._position_state
+
     def _pilot_position_qty(self) -> Decimal:
-        if self._base_lots:
-            total_qty = sum(Decimal(str(lot.qty)) for lot in self._base_lots)
-            return total_qty
-        if self._base_asset:
-            base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
-            return self.as_decimal(base_free)
-        return Decimal("0")
+        state = self._pilot_position_state()
+        return self.as_decimal(state.position_qty)
 
     def _pilot_average_entry_price(self) -> Decimal | None:
-        if not self._base_lots:
+        state = self._pilot_position_state()
+        if state.avg_entry_price is None:
             return None
-        total_qty = sum(Decimal(str(lot.qty)) for lot in self._base_lots)
-        if total_qty <= 0:
-            return None
-        total_cost = sum(Decimal(str(lot.qty)) * Decimal(str(lot.cost_per_unit)) for lot in self._base_lots)
-        return total_cost / total_qty
+        return self.as_decimal(state.avg_entry_price)
 
-    def _pilot_break_even_price(self, avg_entry: Decimal | None) -> Decimal | None:
-        if avg_entry is None or avg_entry <= 0:
+    def _pilot_break_even_price(self) -> Decimal | None:
+        state = self._pilot_position_state()
+        if state.break_even_price is None:
             return None
-        inputs = self._runtime_profit_inputs()
-        maker, taker = self._trade_fees
-        maker_fee_pct = (maker * 100) if maker is not None else 0.0
-        taker_fee_pct = (taker * 100) if taker is not None else 0.0
-        fee_total_pct = compute_fee_total_pct(
-            maker_fee_pct,
-            taker_fee_pct,
-            fill_mode=inputs.get("expected_fill_mode") or "MAKER",
-            fee_discount_pct=inputs.get("fee_discount_pct"),
-        )
-        tick = self._rule_decimal(self._exchange_rules.get("tick"))
-        tick_buffer = tick or Decimal("0")
-        be_price = avg_entry * (Decimal("1") + self.as_decimal(fee_total_pct) / Decimal("100"))
-        be_price += tick_buffer
-        return self.q_price(be_price, tick)
+        return self.as_decimal(state.break_even_price)
 
     def _set_pilot_state(self, state: PilotState) -> None:
         if self._pilot_state == state:
@@ -1987,8 +2111,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         mapping = {
             PilotState.OFF: "Выключен",
             PilotState.NORMAL: "Нормальный",
+            PilotState.RECENTERING: "Перестроение",
             PilotState.RECOVERY: "Безубыток",
-            PilotState.DEFENSIVE: "Защитный",
             PilotState.PAUSED_BY_RISK: "Пауза риска",
         }
         return mapping.get(state, state.value)
@@ -2031,13 +2155,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 f"[ALGO PILOT] auto-recenter trigger distance={distance_pct:.2f}% symbol={self._symbol}",
                 kind="INFO",
             )
-            self._set_pilot_state(PilotState.DEFENSIVE)
             if self._pilot_auto_actions_enabled:
                 self._pilot_execute(PilotAction.RECENTER, auto=True)
             else:
                 self._pilot_set_warning("Рекомендуется перестроить")
 
-        position_qty = self._pilot_position_qty()
+        position_state = self._pilot_position_state()
+        position_qty = self.as_decimal(position_state.position_qty)
         position_qty_text = self.fmt_qty(position_qty, step) if position_qty > 0 else "—"
         self._pilot_position_qty_value.setText(position_qty_text)
 
@@ -2047,11 +2171,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             avg_entry_text = self.fmt_price(avg_entry, tick)
         self._pilot_avg_entry_value.setText(avg_entry_text)
 
-        break_even = self._pilot_break_even_price(avg_entry)
+        break_even = self._pilot_break_even_price()
         break_even_text = "—"
         if break_even is not None and break_even > 0:
             break_even_text = self.fmt_price(break_even, tick)
         self._pilot_break_even_value.setText(break_even_text)
+        if break_even is None or position_state.position_qty <= 0:
+            self._pilot_break_even_value.setToolTip("Нет позиции или недостаточно данных")
+        else:
+            self._pilot_break_even_value.setToolTip("")
 
         pnl_text = "—"
         if self._last_price is not None and self._base_asset:
@@ -2688,6 +2816,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._seen_trade_ids.clear()
             self._realized_pnl = 0.0
             self._fees_total = 0.0
+            self._reset_position_state()
             self._closed_trades = 0
             self._win_trades = 0
             self._replacement_counter = 0
@@ -2744,21 +2873,22 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         self._cancel_bot_orders_on_stop()
 
-    def _finalize_stop(self) -> None:
+    def _finalize_stop(self, *, keep_open_orders: bool = False) -> None:
         self._bot_order_ids.clear()
         self._bot_client_ids.clear()
         self._bot_order_keys.clear()
         self._fill_keys.clear()
         self._fill_accumulator = FillAccumulator()
         self._active_action_keys.clear()
-        self._active_order_keys.clear()
-        self._recent_order_keys.clear()
-        self._order_id_to_registry_key.clear()
+        if not keep_open_orders:
+            self._clear_local_order_registry()
         self._order_id_to_level_index.clear()
         self._open_orders_map = {}
         self._bot_session_id = None
-        self._open_orders = []
-        self._open_orders_all = []
+        if not keep_open_orders:
+            self._open_orders = []
+            self._open_orders_all = []
+        self._reset_position_state()
         self._sell_side_enabled = False
         self._active_tp_ids.clear()
         self._active_restore_ids.clear()
@@ -2825,6 +2955,16 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 if isinstance(order, dict)
                 and str(order.get("clientOrderId", "")).startswith(prefix)
             ]
+            deadline = monotonic() + 5.0
+            while final_remaining and monotonic() < deadline:
+                self._sleep_ms(500)
+                open_orders_after = self._account_client.get_open_orders(self._symbol)
+                final_remaining = [
+                    order
+                    for order in open_orders_after
+                    if isinstance(order, dict)
+                    and str(order.get("clientOrderId", "")).startswith(prefix)
+                ]
             return {
                 "planned": planned,
                 "canceled_by_tag": canceled_by_tag,
@@ -2873,12 +3013,22 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         open_orders_after = result.get("open_orders_after", [])
         if isinstance(open_orders_after, list):
             self._append_log(f"[STOP] open_orders_after n={len(open_orders_after)}", kind="INFO")
+            self._open_orders_all = [item for item in open_orders_after if isinstance(item, dict)]
+            self._open_orders = self._filter_bot_orders(self._open_orders_all)
+            self._open_orders_map = {
+                str(order.get("orderId", "")): order
+                for order in self._open_orders
+                if str(order.get("orderId", ""))
+            }
+            self._clear_local_order_registry()
+            if self._open_orders:
+                self._sync_registry_from_open_orders(self._open_orders)
         errors = result.get("errors", [])
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(str(message), kind="WARN")
         self._refresh_open_orders(force=True)
-        self._finalize_stop()
+        self._finalize_stop(keep_open_orders=bool(self._open_orders))
 
     def _handle_stop_cancel_error(self, message: str) -> None:
         self._handle_cancel_error(message)
@@ -3633,6 +3783,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pending_tp_ids.difference_update(tp_ids)
         self._pending_restore_ids.difference_update(restore_ids)
 
+    def _clear_local_order_registry(self) -> None:
+        self._active_order_keys.clear()
+        self._recent_order_keys.clear()
+        self._order_id_to_registry_key.clear()
+
     def _sync_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
@@ -4103,8 +4258,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         fee_usdt = self._estimate_fee_usdt(fill)
         if fee_usdt:
             self._fees_total += fee_usdt
+            self._position_fees_paid_quote += fee_usdt
             realized_delta -= fee_usdt
         self._realized_pnl += realized_delta
+        if self._pilot_position_qty() <= 0:
+            self._position_fees_paid_quote = 0.0
+            self._position_state = self._rebuild_position_state()
         self._update_pnl(self._estimate_unrealized_pnl(), self._realized_pnl)
         self._update_trade_summary()
 
@@ -5623,13 +5782,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._refresh_open_orders(force=True)
         self._change_state("RUNNING")
         if self._pilot_pending_action == PilotAction.RECENTER:
+            expected_min = self._pilot_recenter_expected_min or 0
             self._append_log(
-                f"[INFO] [ALGO_PILOT] recenter done place_n={len(results)}",
+                f"[INFO] [ALGO_PILOT] recenter placed place_n={len(results)} expected_min={expected_min}",
                 kind="INFO",
             )
-            self._set_pilot_action_in_progress(False)
-            self._pilot_pending_action = None
-            self._pilot_pending_plan = None
+            self._pilot_wait_for_recenter_open_orders(expected_min)
 
     def _handle_live_order_error(self, message: str) -> None:
         self._append_log(f"[LIVE] order error: {message}", kind="WARN")
@@ -5637,6 +5795,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._change_state("RUNNING")
         if self._pilot_pending_action is not None:
             self._set_pilot_action_in_progress(False)
+            if self._pilot_state == PilotState.RECENTERING:
+                self._set_pilot_state(PilotState.NORMAL)
+                self._pilot_pending_anchor = None
+                self._pilot_recenter_expected_min = None
             self._pilot_pending_action = None
             self._pilot_pending_plan = None
         self._auto_pause_on_api_error(message)
