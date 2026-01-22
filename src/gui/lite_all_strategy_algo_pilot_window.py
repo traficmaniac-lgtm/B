@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -871,22 +872,48 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        self._market_price = QLabel(f"{tr('price')}: —")
-        self._market_spread = QLabel(f"{tr('spread')}: —")
-        self._market_volatility = QLabel(f"{tr('volatility')}: —")
-        self._market_fee = QLabel(f"{tr('fee')}: —")
+        summary_frame = QFrame(group)
+        summary_frame.setStyleSheet("QFrame { border: 1px solid #e5e7eb; border-radius: 6px; }")
+        summary_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        summary_frame.setFixedHeight(100)
+        summary_layout = QGridLayout(summary_frame)
+        summary_layout.setHorizontalSpacing(8)
+        summary_layout.setVerticalSpacing(2)
+        summary_layout.setContentsMargins(6, 6, 6, 6)
+
+        def make_summary_key(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setStyleSheet("color: #6b7280; font-size: 10px;")
+            label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            return label
+
+        self._market_price = QLabel("—")
+        self._market_spread = QLabel("—")
+        self._market_volatility = QLabel("—")
+        self._market_fee = QLabel("—")
+        self._market_source = QLabel("—")
         self._rules_label = QLabel(tr("rules_line", rules="—"))
 
         self._set_market_label_state(self._market_price, active=False)
         self._set_market_label_state(self._market_spread, active=False)
         self._set_market_label_state(self._market_volatility, active=False)
         self._set_market_label_state(self._market_fee, active=False)
+        self._set_market_label_state(self._market_source, active=False)
         self._rules_label.setStyleSheet("color: #6b7280; font-size: 10px;")
 
-        layout.addWidget(self._market_price)
-        layout.addWidget(self._market_spread)
-        layout.addWidget(self._market_volatility)
-        layout.addWidget(self._market_fee)
+        summary_rows = [
+            ("Last Price:", self._market_price),
+            ("Spread:", self._market_spread),
+            ("Volatility:", self._market_volatility),
+            ("Fee maker/taker:", self._market_fee),
+            ("Source + age:", self._market_source),
+        ]
+        for row, (key_text, value_label) in enumerate(summary_rows):
+            summary_layout.addWidget(make_summary_key(key_text), row, 0)
+            summary_layout.addWidget(value_label, row, 1)
+
+        summary_layout.setColumnStretch(1, 1)
+        layout.addWidget(summary_frame)
         layout.addWidget(self._rules_label)
         algo_pilot_frame = QGroupBox("ALGO PILOT")
         algo_pilot_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -992,7 +1019,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
 
         buttons_widget = QWidget(algo_pilot_frame)
-        buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         pilot_buttons_layout = QVBoxLayout(buttons_widget)
         pilot_buttons_layout.setSpacing(6)
         for button in (
@@ -1007,10 +1034,23 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             pilot_buttons_layout.addWidget(button)
 
         pilot_buttons_layout.addStretch(1)
-        algo_pilot_layout.addWidget(buttons_widget, stretch=1)
+        algo_pilot_layout.addWidget(buttons_widget, stretch=0)
 
-        layout.addWidget(algo_pilot_frame)
-        layout.addStretch()
+        algo_scroll = QScrollArea(group)
+        algo_scroll.setWidgetResizable(True)
+        algo_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        algo_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        algo_scroll.setFrameShape(QFrame.NoFrame)
+        algo_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        algo_container = QWidget(algo_scroll)
+        algo_container_layout = QVBoxLayout(algo_container)
+        algo_container_layout.setContentsMargins(0, 0, 0, 0)
+        algo_container_layout.setSpacing(0)
+        algo_container_layout.addWidget(algo_pilot_frame)
+        algo_scroll.setWidget(algo_container)
+
+        layout.addWidget(algo_scroll, stretch=1)
         return group
 
     def _build_grid_panel(self) -> QWidget:
@@ -1537,13 +1577,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._last_price = update.last_price
             self._record_price(update.last_price)
             self._last_price_label.setText(tr("last_price", price=f"{update.last_price:.8f}"))
-            self._market_price.setText(f"{tr('price')}: {update.last_price:.8f}")
+            self._market_price.setText(f"{update.last_price:.8f}")
             self._set_market_label_state(self._market_price, active=True)
             self._grid_engine.on_price(update.last_price)
         else:
             self._last_price = None
             self._last_price_label.setText(tr("last_price", price="—"))
-            self._market_price.setText(f"{tr('price')}: —")
+            self._market_price.setText("—")
             self._set_market_label_state(self._market_price, active=False)
 
         latency = f"{update.latency_ms}ms" if update.latency_ms is not None else "—"
@@ -1552,16 +1592,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._latency_label.setText(tr("latency", latency=latency))
         clock_status = "✓" if update.price_age_ms is not None else "—"
         self._feed_indicator.setText(f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK {clock_status}")
+        source_text = update.source if update.source is not None else "—"
+        self._market_source.setText(f"{source_text} | {age}")
+        self._set_market_label_state(self._market_source, active=update.price_age_ms is not None)
 
         micro = update.microstructure
         if micro.spread_pct is not None:
-            self._market_spread.setText(f"{tr('spread')}: {micro.spread_pct:.4f}%")
+            self._market_spread.setText(f"{micro.spread_pct:.4f}%")
             self._set_market_label_state(self._market_spread, active=True)
         elif micro.spread_abs is not None:
-            self._market_spread.setText(f"{tr('spread')}: {micro.spread_abs:.8f}")
+            self._market_spread.setText(f"{micro.spread_abs:.8f}")
             self._set_market_label_state(self._market_spread, active=True)
         else:
-            self._market_spread.setText(f"{tr('spread')}: —")
+            self._market_spread.setText("—")
             self._set_market_label_state(self._market_spread, active=False)
         self._update_runtime_balances()
         self._refresh_unrealized_pnl()
@@ -4566,7 +4609,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         has_rules = any(value is not None for value in (tick, step, min_notional, min_qty, max_qty, maker, taker))
         if not has_rules:
             self._rules_label.setText(tr("rules_line", rules="—"))
-            self._market_fee.setText(f"{tr('fee')}: —")
+            self._market_fee.setText("—")
             self._set_market_label_state(self._market_fee, active=False)
             return
         tick_text = f"{tick:.8f}" if tick is not None else "—"
@@ -4582,7 +4625,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f" | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
         )
         self._rules_label.setText(tr("rules_line", rules=rules))
-        self._market_fee.setText(f"{tr('fee')}: {maker_text}/{taker_text}")
+        self._market_fee.setText(f"{maker_text}/{taker_text}")
         self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
 
     @staticmethod
