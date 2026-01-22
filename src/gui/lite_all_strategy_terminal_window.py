@@ -583,6 +583,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._sell_side_enabled = False
         self._active_tp_ids: set[str] = set()
         self._active_restore_ids: set[str] = set()
+        self._pending_tp_ids: set[str] = set()
+        self._pending_restore_ids: set[str] = set()
         self._settings_state = GridSettingsState()
         self._log_entries: list[tuple[str, str]] = []
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
@@ -632,6 +634,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._active_order_keys: set[str] = set()
         self._recent_order_keys: dict[str, float] = {}
         self._order_id_to_registry_key: dict[str, str] = {}
+        self._order_id_to_level_index: dict[str, int] = {}
         self._recent_key_ttl_s = 8.0
         self._recent_key_insufficient_ttl_s = 2.0
         self._bot_session_id: str | None = None
@@ -683,6 +686,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._start_locked_logged = False
         self._tp_fix_target: float | None = None
         self._auto_fix_tp_enabled = True
+        self._stop_in_progress = False
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -1616,6 +1620,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._active_order_keys.clear()
             self._recent_order_keys.clear()
             self._order_id_to_registry_key.clear()
+            self._order_id_to_level_index.clear()
             self._open_orders_map = {}
             self._fills = []
             self._base_lots.clear()
@@ -1632,6 +1637,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._sell_side_enabled = False
             self._active_tp_ids.clear()
             self._active_restore_ids.clear()
+            self._pending_tp_ids.clear()
+            self._pending_restore_ids.clear()
             self._change_state("PLACING_GRID")
             self._place_live_orders(planned)
         finally:
@@ -1648,6 +1655,10 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._change_state("PAUSED")
 
     def _handle_stop(self) -> None:
+        if self._stop_in_progress:
+            self._append_log("[STOP] ignored: already in progress", kind="WARN")
+            return
+        self._stop_in_progress = True
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("STOPPING")
@@ -1659,6 +1670,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._sell_side_enabled = False
         self._active_tp_ids.clear()
         self._active_restore_ids.clear()
+        self._pending_tp_ids.clear()
+        self._pending_restore_ids.clear()
         if self._dry_run_toggle.isChecked():
             self._finalize_stop()
             return
@@ -1678,6 +1691,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._active_order_keys.clear()
         self._recent_order_keys.clear()
         self._order_id_to_registry_key.clear()
+        self._order_id_to_level_index.clear()
         self._open_orders_map = {}
         self._bot_session_id = None
         self._open_orders = []
@@ -1685,6 +1699,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._sell_side_enabled = False
         self._active_tp_ids.clear()
         self._active_restore_ids.clear()
+        self._pending_tp_ids.clear()
+        self._pending_restore_ids.clear()
+        self._stop_in_progress = False
         self._render_open_orders()
         self._change_state("STOPPED")
 
@@ -2483,7 +2500,10 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
 
     def _sync_active_ids_from_open_orders(self) -> None:
         tp_prefix = f"{self._bot_order_prefix()}TP_"
-        restore_prefix = f"{self._bot_order_prefix()}RESTORE_"
+        restore_prefixes = (
+            f"{self._bot_order_prefix()}RESTORE_",
+            f"{self._bot_order_prefix()}R_",
+        )
         tp_ids: set[str] = set()
         restore_ids: set[str] = set()
         for order in self._open_orders_all:
@@ -2492,10 +2512,12 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             client_order_id = str(order.get("clientOrderId", ""))
             if client_order_id.startswith(tp_prefix):
                 tp_ids.add(client_order_id)
-            elif client_order_id.startswith(restore_prefix):
+            elif any(client_order_id.startswith(prefix) for prefix in restore_prefixes):
                 restore_ids.add(client_order_id)
         self._active_tp_ids = tp_ids
         self._active_restore_ids = restore_ids
+        self._pending_tp_ids.difference_update(tp_ids)
+        self._pending_restore_ids.difference_update(restore_ids)
 
     def _has_open_order_client_id(self, client_id: str) -> bool:
         if not client_id:
@@ -2553,6 +2575,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
 
     def _discard_registry_for_order_id(self, order_id: str) -> None:
         key = self._order_id_to_registry_key.pop(order_id, None)
+        self._order_id_to_level_index.pop(order_id, None)
         if key:
             self._discard_order_registry_key(key, drop_recent=True)
 
@@ -2688,6 +2711,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 if client_order_id:
                     self._active_tp_ids.discard(client_order_id)
                     self._active_restore_ids.discard(client_order_id)
+                    self._pending_tp_ids.discard(client_order_id)
+                    self._pending_restore_ids.discard(client_order_id)
                 if order_id:
                     self._discard_registry_for_order_id(order_id)
                 continue
@@ -2696,6 +2721,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 if client_order_id:
                     self._active_tp_ids.discard(client_order_id)
                     self._active_restore_ids.discard(client_order_id)
+                    self._pending_tp_ids.discard(client_order_id)
+                    self._pending_restore_ids.discard(client_order_id)
                 self._discard_registry_for_order(order)
                 self._append_log(
                     f"[LIVE] order closed orderId={order_id} status={status}",
@@ -2758,6 +2785,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             if client_order_id:
                 self._active_tp_ids.discard(client_order_id)
                 self._active_restore_ids.discard(client_order_id)
+                self._pending_tp_ids.discard(client_order_id)
+                self._pending_restore_ids.discard(client_order_id)
         if fill.order_id:
             self._discard_registry_for_order_id(fill.order_id)
         else:
@@ -2992,20 +3021,33 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         balances_snapshot = self._balance_snapshot()
         base_free = self.as_decimal(balances_snapshot.get("base_free", Decimal("0")))
         quote_free = self.as_decimal(balances_snapshot.get("quote_free", Decimal("0")))
+        min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
         tp_side = "SELL" if fill.side == "BUY" else "BUY"
         tp_qty = Decimal("0")
         tp_notional = Decimal("0")
         tp_reason = "ok"
+        allow_tp = True
+        tp_qty_cap = Decimal("0")
         if tp_side == "SELL":
             tp_price = self.q_price(fill_price * (Decimal("1") + tp_dec), tick)
-            tp_qty_cap = min(fill_qty, base_free)
+            required_qty = fill_qty
+            if required_qty > base_free:
+                tp_reason = "skip_insufficient_base"
+                allow_tp = False
+            else:
+                tp_qty_cap = min(fill_qty, base_free)
         else:
             tp_price = self.q_price(fill_price * (Decimal("1") - tp_dec), tick)
-            quote_cap = quote_free / tp_price if tp_price > 0 else Decimal("0")
-            tp_qty_cap = min(fill_qty, quote_cap)
-        allow_tp = tp_qty_cap > 0
-        if not allow_tp:
-            tp_reason = "skip_insufficient"
+            required_quote = tp_price * fill_qty
+            if required_quote > quote_free:
+                tp_reason = "skip_insufficient_quote"
+                allow_tp = False
+            else:
+                quote_cap = quote_free / tp_price if tp_price > 0 else Decimal("0")
+                tp_qty_cap = min(fill_qty, quote_cap)
+        if allow_tp and (tp_price <= 0 or tp_qty_cap <= 0):
+            tp_reason = "skip_unknown"
+            allow_tp = False
         fill_order_key = fill.order_id or fill.trade_id or self._fill_key(fill)
         tp_client_order_id = self._limit_client_order_id(
             f"BBOT_LAS_v1_{self._symbol}_TP_{fill.side}_{fill_order_key}"
@@ -3014,40 +3056,47 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._has_open_order_client_id(tp_client_order_id)
             or tp_client_order_id in self._active_tp_ids
         ):
-            tp_reason = "skip_duplicate"
+            tp_reason = "skip_duplicate_local"
             allow_tp = False
-        if allow_tp and tp_qty_cap <= 0:
-            tp_reason = "skip_insufficient"
+        if allow_tp and tp_client_order_id in self._pending_tp_ids:
+            tp_reason = "skip_duplicate_local"
             allow_tp = False
         if allow_tp:
             desired_tp_notional = tp_price * tp_qty_cap
-            tp_qty, tp_notional, tp_reason = compute_order_qty(
-                tp_side,
-                tp_price,
-                desired_tp_notional,
-                balances_snapshot,
-                self._exchange_rules,
-                self._effective_fee_rate(),
-                None,
-            )
-            if tp_reason != "ok":
-                tp_reason = "skip_insufficient"
+            if min_notional is not None and desired_tp_notional < min_notional:
+                tp_reason = "skip_min_notional"
                 allow_tp = False
-                tp_qty = Decimal("0")
-                tp_notional = Decimal("0")
-            if tp_price <= 0 or tp_qty <= 0:
-                tp_reason = "skip_insufficient"
-                allow_tp = False
-                tp_qty = Decimal("0")
-                tp_notional = Decimal("0")
-        else:
+            else:
+                tp_qty, tp_notional, tp_reason = compute_order_qty(
+                    tp_side,
+                    tp_price,
+                    desired_tp_notional,
+                    balances_snapshot,
+                    self._exchange_rules,
+                    self._effective_fee_rate(),
+                    None,
+                )
+                if tp_reason != "ok":
+                    if tp_reason == "min_notional":
+                        tp_reason = "skip_min_notional"
+                    else:
+                        tp_reason = "skip_unknown"
+                    allow_tp = False
+                    tp_qty = Decimal("0")
+                    tp_notional = Decimal("0")
+                if tp_price <= 0 or tp_qty <= 0:
+                    tp_reason = "skip_unknown"
+                    allow_tp = False
+                    tp_qty = Decimal("0")
+                    tp_notional = Decimal("0")
+        if not allow_tp:
             tp_price = Decimal("0")
             tp_qty = Decimal("0")
             tp_notional = Decimal("0")
         if allow_tp:
             tp_action_key = build_action_key("TP", fill.order_id, tp_price, tp_qty, step)
             if tp_action_key in self._active_action_keys:
-                tp_reason = "skip_duplicate"
+                tp_reason = "skip_duplicate_local"
                 allow_tp = False
         if allow_tp:
             self._active_action_keys.add(tp_action_key)
@@ -3073,10 +3122,16 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             restore_price = self.q_price(fill_price + step_abs, tick)
         desired_restore_notional = restore_price * fill_qty
         if restore_side == "SELL":
-            if base_free < fill_qty:
+            required_qty = fill_qty
+            required_notional = restore_price * required_qty
+            if required_qty > base_free:
                 restore_qty = Decimal("0")
                 restore_notional = Decimal("0")
-                restore_reason = "insufficient_base"
+                restore_reason = "skip_insufficient_base"
+            elif min_notional is not None and required_notional < min_notional:
+                restore_qty = Decimal("0")
+                restore_notional = Decimal("0")
+                restore_reason = "skip_min_notional"
             else:
                 restore_qty, restore_notional, restore_reason = compute_order_qty(
                     restore_side,
@@ -3091,10 +3146,14 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             fill_notional = fill_price * fill_qty
             required_quote = desired_restore_notional
             quote_available = quote_free + fill_notional
-            if quote_available < required_quote:
+            if required_quote > quote_available:
                 restore_qty = Decimal("0")
                 restore_notional = Decimal("0")
-                restore_reason = "insufficient_quote"
+                restore_reason = "skip_insufficient_quote"
+            elif min_notional is not None and desired_restore_notional < min_notional:
+                restore_qty = Decimal("0")
+                restore_notional = Decimal("0")
+                restore_reason = "skip_min_notional"
             else:
                 restore_qty, restore_notional, restore_reason = compute_order_qty(
                     restore_side,
@@ -3107,24 +3166,43 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 )
         allow_restore = restore_qty > 0
         if not allow_restore:
-            if restore_reason in {"insufficient_base", "insufficient_quote"}:
-                restore_reason = f"skip_{restore_reason}"
+            if restore_reason == "min_notional":
+                restore_reason = "skip_min_notional"
+            elif restore_reason in {"skip_insufficient_base", "skip_insufficient_quote", "skip_min_notional"}:
+                restore_reason = restore_reason
             else:
-                restore_reason = "skip_insufficient"
-        grid_level_key = self._format_decimal(self.q_price(restore_price, tick), tick)
+                restore_reason = "skip_unknown"
+        filled_order_id = fill.order_id or fill.trade_id or self._fill_key(fill)
+        level_index = None
+        if fill.order_id:
+            level_index = self._order_id_to_level_index.get(fill.order_id)
+        if level_index is None:
+            level_key = int(
+                round(
+                    float(restore_price / tick)
+                    if tick is not None and tick > 0
+                    else float(restore_price)
+                )
+            )
+            level_suffix = str(level_key)
+        else:
+            level_suffix = str(level_index)
         restore_client_order_id = self._limit_client_order_id(
-            f"BBOT_LAS_v1_{self._symbol}_RESTORE_{restore_side}_{grid_level_key}"
+            f"BBOT_LAS_v1_{self._symbol}_R_{fill.side}_{filled_order_id}_{level_suffix}"
         )
         if allow_restore and (
             self._has_open_order_client_id(restore_client_order_id)
             or restore_client_order_id in self._active_restore_ids
         ):
-            restore_reason = "skip_duplicate"
+            restore_reason = "skip_duplicate_local"
+            allow_restore = False
+        if allow_restore and restore_client_order_id in self._pending_restore_ids:
+            restore_reason = "skip_duplicate_local"
             allow_restore = False
         if allow_restore:
             restore_action_key = build_action_key("RESTORE", fill.order_id, restore_price, restore_qty, step)
             if restore_action_key in self._active_action_keys:
-                restore_reason = "skip_duplicate"
+                restore_reason = "skip_duplicate_local"
                 allow_restore = False
         if allow_restore:
             self._active_action_keys.add(restore_action_key)
@@ -3146,29 +3224,55 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         def _place() -> dict[str, Any]:
             results: dict[str, Any] = {"tp": None, "restore": None, "errors": []}
             if allow_tp and tp_client_order_id:
-                tp_response, tp_error = self._place_limit(
+                self._pending_tp_ids.add(tp_client_order_id)
+                tp_response, tp_error, tp_status = self._place_limit(
                     tp_side,
                     tp_price,
                     tp_qty,
                     tp_client_order_id,
                     reason="tp",
+                    skip_open_order_duplicate=True,
+                    skip_registry=True,
                 )
                 if tp_response:
+                    self._pending_tp_ids.discard(tp_client_order_id)
+                    self._active_tp_ids.add(tp_client_order_id)
+                else:
+                    self._pending_tp_ids.discard(tp_client_order_id)
+                    if tp_status == "skip_duplicate_exchange":
+                        self._signals.log_append.emit(
+                            f"[TP] skip reason=skip_duplicate_exchange clientId={tp_client_order_id}",
+                            "WARN",
+                        )
+                if tp_response:
                     results["tp"] = tp_response
-                if tp_error:
+                if tp_error and tp_status != "skip_duplicate_exchange":
                     results["errors"].append(tp_error)
                 self._sleep_ms(75)
             if restore_price > 0 and restore_qty > 0 and restore_client_order_id:
-                restore_response, restore_error = self._place_limit(
+                self._pending_restore_ids.add(restore_client_order_id)
+                restore_response, restore_error, restore_status = self._place_limit(
                     restore_side,
                     restore_price,
                     restore_qty,
                     restore_client_order_id,
                     reason="restore",
+                    skip_open_order_duplicate=True,
+                    skip_registry=True,
                 )
                 if restore_response:
+                    self._pending_restore_ids.discard(restore_client_order_id)
+                    self._active_restore_ids.add(restore_client_order_id)
+                else:
+                    self._pending_restore_ids.discard(restore_client_order_id)
+                    if restore_status == "skip_duplicate_exchange":
+                        self._signals.log_append.emit(
+                            f"[RESTORE] skip reason=skip_duplicate_exchange clientId={restore_client_order_id}",
+                            "WARN",
+                        )
+                if restore_response:
                     results["restore"] = restore_response
-                if restore_error:
+                if restore_error and restore_status != "skip_duplicate_exchange":
                     results["errors"].append(restore_error)
             return results
 
@@ -3243,8 +3347,10 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             if client_order_id:
                 if label == "TP":
                     self._active_tp_ids.add(client_order_id)
+                    self._pending_tp_ids.discard(client_order_id)
                 elif label == "RESTORE":
                     self._active_restore_ids.add(client_order_id)
+                    self._pending_restore_ids.discard(client_order_id)
         self._refresh_open_orders(force=True)
 
     def _place_limit(
@@ -3257,9 +3363,11 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         *,
         ignore_order_id: str | None = None,
         ignore_keys: set[str] | None = None,
-    ) -> tuple[dict[str, Any] | None, str | None]:
+        skip_open_order_duplicate: bool = False,
+        skip_registry: bool = False,
+    ) -> tuple[dict[str, Any] | None, str | None, str]:
         if not self._account_client:
-            return None, "[LIVE] place skipped: no account client"
+            return None, "[LIVE] place skipped: no account client", "skip_no_account"
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
         min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
@@ -3276,7 +3384,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 ),
                 "WARN",
             )
-            return None, None
+            return None, None, "skip_min_qty"
         if max_qty is not None and qty > max_qty:
             qty = self.q_qty(max_qty, step)
         notional = price * qty
@@ -3295,7 +3403,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     ),
                     "WARN",
                 )
-                return None, None
+                return None, None, "skip_min_notional"
         if price <= 0 or qty <= 0:
             self._signals.log_append.emit(
                 (
@@ -3304,22 +3412,24 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 ),
                 "WARN",
             )
-            return None, None
+            return None, None, "skip_invalid"
         self._purge_recent_order_keys()
         price_str = self.fmt_price(price, tick)
         qty_str = self.fmt_qty(qty, step)
         order_type = self._order_registry_type(reason)
-        registry_key = self._order_registry_key(side, price_str, qty_str, order_type)
-        if registry_key in self._active_order_keys or registry_key in self._recent_order_keys:
-            self._signals.log_append.emit(
-                (
-                    f"[LIVE] skip duplicate key={registry_key} reason=registry "
-                    f"side={side} price={price_str} qty={qty_str}"
-                ),
-                "WARN",
-            )
-            return None, None
-        if self._has_duplicate_order(
+        registry_key = None
+        if not skip_registry:
+            registry_key = self._order_registry_key(side, price_str, qty_str, order_type)
+            if registry_key in self._active_order_keys or registry_key in self._recent_order_keys:
+                self._signals.log_append.emit(
+                    (
+                        f"[LIVE] skip duplicate key={registry_key} reason=registry "
+                        f"side={side} price={price_str} qty={qty_str}"
+                    ),
+                    "WARN",
+                )
+                return None, None, "skip_registry"
+        if not skip_open_order_duplicate and self._has_duplicate_order(
             side,
             price,
             qty,
@@ -3334,8 +3444,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 ),
                 "WARN",
             )
-            return None, None
-        self._register_order_key(registry_key)
+            return None, None, "skip_open_orders"
+        if registry_key:
+            self._register_order_key(registry_key)
         optimistic_added = False
         open_key = self._order_key(side, price, qty)
         if open_key not in self._bot_order_keys:
@@ -3363,8 +3474,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             if code == -2010:
                 reason_tag = self._classify_2010_reason(message)
                 if reason_tag == "DUPLICATE":
-                    self._discard_order_registry_key(registry_key)
-                    self._mark_recent_order_key(registry_key, self._recent_key_ttl_s)
+                    if registry_key:
+                        self._discard_order_registry_key(registry_key)
+                        self._mark_recent_order_key(registry_key, self._recent_key_ttl_s)
                     self._signals.log_append.emit(
                         (
                             "[LIVE] skipped: duplicate reason=exchange "
@@ -3374,10 +3486,11 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         "WARN",
                     )
                     QTimer.singleShot(0, self, lambda: self._refresh_open_orders(force=True))
-                    return None, None
+                    return None, "skip_duplicate_exchange", "skip_duplicate_exchange"
                 if reason_tag == "INSUFFICIENT_BALANCE":
-                    self._discard_order_registry_key(registry_key)
-                    self._mark_recent_order_key(registry_key, self._recent_key_insufficient_ttl_s)
+                    if registry_key:
+                        self._discard_order_registry_key(registry_key)
+                        self._mark_recent_order_key(registry_key, self._recent_key_insufficient_ttl_s)
                     self._signals.log_append.emit(
                         (
                             "[LIVE] skipped: insufficient_balance "
@@ -3386,8 +3499,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         ),
                         "WARN",
                     )
-                    return None, None
-                self._discard_order_registry_key(registry_key, drop_recent=True)
+                    return None, None, "skip_insufficient_balance"
+                if registry_key:
+                    self._discard_order_registry_key(registry_key, drop_recent=True)
                 self._signals.log_append.emit(
                     (
                         "[LIVE] place failed: unknown_2010 "
@@ -3396,8 +3510,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     ),
                     "ERROR",
                 )
-                return None, None
-            self._discard_order_registry_key(registry_key, drop_recent=True)
+                return None, None, "error_2010"
+            if registry_key:
+                self._discard_order_registry_key(registry_key, drop_recent=True)
             message = self._format_binance_exception(
                 exc,
                 context=f"place {reason}",
@@ -3406,11 +3521,12 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 qty=qty,
                 notional=notional,
             )
-            return None, message
+            return None, message, "error"
         order_id = str(response.get("orderId", "")) if isinstance(response, dict) else ""
         if order_id:
-            self._order_id_to_registry_key[order_id] = registry_key
-        return response, None
+            if registry_key:
+                self._order_id_to_registry_key[order_id] = registry_key
+        return response, None, "ok"
 
     @staticmethod
     def _decimal_to_str(value: Decimal) -> str:
@@ -4071,34 +4187,34 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
                         if order.side == "SELL":
                             if required_qty > working_balances["base_free"]:
-                                log_reason = "insufficient_base"
+                                log_reason = "skip_insufficient_base"
                             elif min_notional is not None and required_notional < min_notional:
-                                log_reason = "min_notional"
+                                log_reason = "skip_min_notional"
                             else:
-                                log_reason = "unknown"
+                                log_reason = "skip_unknown"
                             detail = (
                                 f"required_qty={required_qty} base_free={working_balances['base_free']}"
                             )
                         else:
                             if required_notional > working_balances["quote_free"]:
-                                log_reason = "insufficient_quote"
+                                log_reason = "skip_insufficient_quote"
                             elif min_notional is not None and required_notional < min_notional:
-                                log_reason = "min_notional"
+                                log_reason = "skip_min_notional"
                             else:
-                                log_reason = "unknown"
+                                log_reason = "skip_unknown"
                             detail = (
                                 f"required_quote={required_notional} quote_free={working_balances['quote_free']}"
                             )
                         self._signals.log_append.emit(
                             (
-                                "[LIVE] grid skipped: insufficient balance "
+                                "[LIVE] grid skipped: balance check "
                                 f"side={order.side} price={self.fmt_price(price, None)} "
                                 f"reason={log_reason} {detail}"
                             ),
                             "WARN",
                         )
                         continue
-                    response, error = self._place_limit(
+                    response, error, status = self._place_limit(
                         order.side,
                         price,
                         qty,
@@ -4106,8 +4222,10 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         reason="grid",
                     )
                     if response:
+                        if isinstance(response, dict):
+                            response["level_index"] = order.level_index
                         results.append(response)
-                    if error:
+                    if error and status != "skip_duplicate_exchange":
                         errors.append(error)
                     if order.side == "BUY":
                         working_balances["quote_free"] = max(
@@ -4148,6 +4266,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 order_id = str(entry.get("orderId", ""))
                 if order_id:
                     self._bot_order_ids.add(order_id)
+                    level_index = entry.get("level_index")
+                    if isinstance(level_index, int):
+                        self._order_id_to_level_index[order_id] = level_index
                 client_order_id = str(entry.get("clientOrderId", ""))
                 if client_order_id:
                     self._bot_client_ids.add(client_order_id)
