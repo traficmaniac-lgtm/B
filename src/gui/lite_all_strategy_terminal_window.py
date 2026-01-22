@@ -665,7 +665,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._fees_in_flight = False
         self._trade_gate = TradeGate.TRADE_DISABLED_NO_KEYS if not self._has_api_keys else TradeGate.TRADE_DISABLED_READONLY
         self._trade_gate_state = TradeGateState.READ_ONLY_API_ERROR
-        self._engine_ready = False
+        self._engine_ready_state = False
         self._rules_loaded = False
         self._live_mode_confirmed = False
         self._first_live_session = True
@@ -2215,7 +2215,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         return result["done"] and result["ok"]
 
     def _engine_ready(self) -> bool:
-        return self._engine_ready
+        return self._engine_ready_state
 
     def _update_engine_ready(self) -> None:
         new_ready = (
@@ -2223,9 +2223,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             and self._account_can_trade
             and self._live_enabled()
         )
-        if new_ready == self._engine_ready:
+        if new_ready == self._engine_ready_state:
             return
-        self._engine_ready = new_ready
+        self._engine_ready_state = new_ready
         if new_ready:
             self._append_log("[ENGINE] ready=true (trade_gate=ok)", kind="INFO")
 
