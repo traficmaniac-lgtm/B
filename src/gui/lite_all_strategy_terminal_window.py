@@ -3028,18 +3028,20 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         tp_reason = "ok"
         allow_tp = True
         tp_qty_cap = Decimal("0")
+        tp_required_qty = fill_qty
+        tp_required_quote = Decimal("0")
         if tp_side == "SELL":
             tp_price = self.q_price(fill_price * (Decimal("1") + tp_dec), tick)
-            required_qty = fill_qty
-            if required_qty > base_free:
+            tp_required_qty = fill_qty
+            if tp_required_qty > base_free:
                 tp_reason = "skip_insufficient_base"
                 allow_tp = False
             else:
                 tp_qty_cap = min(fill_qty, base_free)
         else:
             tp_price = self.q_price(fill_price * (Decimal("1") - tp_dec), tick)
-            required_quote = tp_price * fill_qty
-            if required_quote > quote_free:
+            tp_required_quote = tp_price * fill_qty
+            if tp_required_quote > quote_free:
                 tp_reason = "skip_insufficient_quote"
                 allow_tp = False
             else:
@@ -3100,14 +3102,34 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 allow_tp = False
         if allow_tp:
             self._active_action_keys.add(tp_action_key)
-        self._append_log(
-            (
-                "[TP] plan "
-                f"tp_side={tp_side} tp_price={self.fmt_price(tp_price, tick)} "
-                f"tp_qty={self.fmt_qty(tp_qty, step)} clientId={tp_client_order_id} reason={tp_reason}"
-            ),
-            kind="INFO",
-        )
+        if allow_tp:
+            self._append_log(
+                (
+                    "[TP] plan "
+                    f"tp_side={tp_side} tp_price={self.fmt_price(tp_price, tick)} "
+                    f"tp_qty={self.fmt_qty(tp_qty, step)} clientId={tp_client_order_id} reason={tp_reason}"
+                ),
+                kind="INFO",
+            )
+        else:
+            if tp_side == "SELL":
+                tp_detail = (
+                    f"required_qty={self._format_balance_decimal(tp_required_qty)} "
+                    f"base_free={self._format_balance_decimal(base_free)}"
+                )
+            else:
+                tp_detail = (
+                    f"required_quote={self._format_balance_decimal(tp_required_quote)} "
+                    f"quote_free={self._format_balance_decimal(quote_free)}"
+                )
+            self._append_log(
+                (
+                    "[SKIP] TP "
+                    f"side={tp_side} price={self.fmt_price(tp_price, tick)} "
+                    f"qty={self.fmt_qty(tp_qty, step)} reason={tp_reason} {tp_detail}"
+                ),
+                kind="WARN",
+            )
 
         step_pct = settings.grid_step_pct or 0.0
         reference_price = self._last_price or fill.price
@@ -3125,55 +3147,32 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         restore_notional = Decimal("0")
         restore_reason = "ok"
         target_qty = fill_qty
-        if restore_side == "SELL":
-            required_qty = target_qty
-            if required_qty > base_free:
-                restore_reason = "skip_insufficient_base"
-                self._append_log(
-                    (
-                        "[SKIP] balance_check "
-                        f"side=SELL price={self.fmt_price(restore_price, tick)} "
-                        f"qty={self.fmt_qty(target_qty, step)} reason={restore_reason} "
-                        f"required_qty={self._format_balance_decimal(required_qty)} "
-                        f"base_free={self._format_balance_decimal(base_free)}"
-                    ),
-                    kind="WARN",
-                )
+
+        def _validate_restore_plan() -> tuple[str, Decimal, str, dict[str, Decimal]]:
+            debug_fields: dict[str, Decimal] = {
+                "required_qty": target_qty,
+                "required_quote": restore_price * target_qty,
+                "base_free": base_free,
+                "quote_free": quote_free,
+            }
+            if restore_side == "SELL":
+                if target_qty > base_free:
+                    return "skip", Decimal("0"), "skip_insufficient_base", debug_fields
             else:
-                qty_rounded = self.q_qty(target_qty, step)
-                if qty_rounded <= 0 or (min_qty is not None and qty_rounded < min_qty):
-                    restore_reason = "skip_min_qty"
-                else:
-                    restore_notional = restore_price * qty_rounded
-                    if min_notional is not None and restore_notional < min_notional:
-                        restore_reason = "skip_min_notional"
-                    else:
-                        restore_qty = qty_rounded
-        else:
-            required_quote = restore_price * target_qty
-            if required_quote > quote_free:
-                restore_reason = "skip_insufficient_quote"
-                self._append_log(
-                    (
-                        "[SKIP] balance_check "
-                        f"side=BUY price={self.fmt_price(restore_price, tick)} "
-                        f"qty={self.fmt_qty(target_qty, step)} reason={restore_reason} "
-                        f"required_quote={self._format_balance_decimal(required_quote)} "
-                        f"quote_free={self._format_balance_decimal(quote_free)}"
-                    ),
-                    kind="WARN",
-                )
-            else:
-                qty_rounded = self.q_qty(target_qty, step)
-                if qty_rounded <= 0 or (min_qty is not None and qty_rounded < min_qty):
-                    restore_reason = "skip_min_qty"
-                else:
-                    restore_notional = restore_price * qty_rounded
-                    if min_notional is not None and restore_notional < min_notional:
-                        restore_reason = "skip_min_notional"
-                    else:
-                        restore_qty = qty_rounded
-        allow_restore = restore_reason == "ok" and restore_qty > 0
+                if debug_fields["required_quote"] > quote_free:
+                    return "skip", Decimal("0"), "skip_insufficient_quote", debug_fields
+            qty_rounded = self.q_qty(target_qty, step)
+            if qty_rounded <= 0 or (min_qty is not None and qty_rounded < min_qty):
+                return "skip", Decimal("0"), "skip_min_qty", debug_fields
+            restore_value = restore_price * qty_rounded
+            if min_notional is not None and restore_value < min_notional:
+                return "skip", Decimal("0"), "skip_min_notional", debug_fields
+            return "ok", qty_rounded, "ok", debug_fields
+
+        restore_decision, restore_qty, restore_reason, restore_debug = _validate_restore_plan()
+        if restore_decision == "ok":
+            restore_notional = restore_price * restore_qty
+        allow_restore = restore_decision == "ok" and restore_qty > 0
         filled_order_id = fill.order_id or fill.trade_id or self._fill_key(fill)
         level_index = None
         if fill.order_id:
@@ -3189,18 +3188,20 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             level_suffix = str(level_key)
         else:
             level_suffix = str(level_index)
-        restore_client_order_id = self._limit_client_order_id(
-            f"BBOT_LAS_v1_{self._symbol}_R_{fill.side}_{filled_order_id}_{level_suffix}"
-        )
-        if allow_restore and (
-            self._has_open_order_client_id(restore_client_order_id)
-            or restore_client_order_id in self._active_restore_ids
-        ):
-            restore_reason = "skip_duplicate_local"
-            allow_restore = False
-        if allow_restore and restore_client_order_id in self._pending_restore_ids:
-            restore_reason = "skip_duplicate_local"
-            allow_restore = False
+        restore_client_order_id = ""
+        if allow_restore:
+            restore_client_order_id = self._limit_client_order_id(
+                f"BBOT_LAS_v1_{self._symbol}_R_{fill.side}_{filled_order_id}_{level_suffix}"
+            )
+            if (
+                self._has_open_order_client_id(restore_client_order_id)
+                or restore_client_order_id in self._active_restore_ids
+            ):
+                restore_reason = "skip_duplicate_local"
+                allow_restore = False
+            elif restore_client_order_id in self._pending_restore_ids:
+                restore_reason = "skip_duplicate_local"
+                allow_restore = False
         if allow_restore:
             restore_action_key = build_action_key("RESTORE", fill.order_id, restore_price, restore_qty, step)
             if restore_action_key in self._active_action_keys:
@@ -3208,21 +3209,37 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 allow_restore = False
         if allow_restore:
             self._active_action_keys.add(restore_action_key)
-        self._append_log(
-            (
-                "[RESTORE] plan "
-                f"side={restore_side} price={self.fmt_price(restore_price, tick)} "
-                f"qty={self.fmt_qty(restore_qty, step)} clientId={restore_client_order_id} "
-                f"reason={'ok' if allow_restore else restore_reason}"
-            ),
-            kind="INFO",
-        )
+            self._append_log(
+                (
+                    "[RESTORE] plan "
+                    f"side={restore_side} price={self.fmt_price(restore_price, tick)} "
+                    f"qty={self.fmt_qty(restore_qty, step)} clientId={restore_client_order_id} "
+                    f"reason={restore_reason}"
+                ),
+                kind="INFO",
+            )
+        else:
+            if restore_side == "SELL":
+                restore_detail = (
+                    f"required_qty={self._format_balance_decimal(restore_debug['required_qty'])} "
+                    f"base_free={self._format_balance_decimal(restore_debug['base_free'])}"
+                )
+            else:
+                restore_detail = (
+                    f"required_quote={self._format_balance_decimal(restore_debug['required_quote'])} "
+                    f"quote_free={self._format_balance_decimal(restore_debug['quote_free'])}"
+                )
+            self._append_log(
+                (
+                    "[SKIP] RESTORE "
+                    f"side={restore_side} price={self.fmt_price(restore_price, tick)} "
+                    f"qty={self.fmt_qty(restore_qty, step)} reason={restore_reason} {restore_detail}"
+                ),
+                kind="WARN",
+            )
 
         if not allow_tp:
             tp_client_order_id = ""
-        if not allow_restore:
-            restore_client_order_id = ""
-
         def _place() -> dict[str, Any]:
             results: dict[str, Any] = {"tp": None, "restore": None, "errors": []}
             if allow_tp and tp_client_order_id:
@@ -4170,8 +4187,24 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     continue
                 order_type = f"GRID_{order.side}"
                 if self._has_open_order_type(order_type):
+                    if order.side == "SELL":
+                        detail = (
+                            f"required_qty={self._format_balance_decimal(self.as_decimal(order.qty))} "
+                            f"base_free={self._format_balance_decimal(working_balances['base_free'])}"
+                        )
+                    else:
+                        required_notional = self.as_decimal(order.price) * self.as_decimal(order.qty)
+                        detail = (
+                            f"required_quote={self._format_balance_decimal(required_notional)} "
+                            f"quote_free={self._format_balance_decimal(working_balances['quote_free'])}"
+                        )
                     self._signals.log_append.emit(
-                        f"[SKIP] duplicate {order_type} order detected",
+                        (
+                            "[SKIP] GRID "
+                            f"side={order.side} price={self.fmt_price(self.as_decimal(order.price), None)} "
+                            f"qty={self.fmt_qty(self.as_decimal(order.qty), step)} "
+                            f"reason=skip_duplicate_local {detail}"
+                        ),
                         "WARN",
                     )
                     continue
@@ -4221,7 +4254,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                             )
                         self._signals.log_append.emit(
                             (
-                                "[SKIP] balance_check "
+                                "[SKIP] GRID "
                                 f"side={order.side} price={self.fmt_price(price, None)} "
                                 f"qty={self.fmt_qty(required_qty, step)} reason={log_reason} {detail}"
                             ),
