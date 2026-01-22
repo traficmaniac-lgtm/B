@@ -1541,15 +1541,19 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                     self._bootstrap_mode = True
                     planned = [order for order in planned if order.side == "BUY"]
                     self._append_log(
-                        "[ENGINE] bootstrap mode: base=0 -> placing BUY-only grid",
+                        "[START] BUY-only mode: sells postponed (base_free insufficient)",
                         kind="INFO",
                     )
             planned = planned[: settings.max_active_orders]
             buy_count = sum(1 for order in planned if order.side == "BUY")
             sell_count = sum(1 for order in planned if order.side == "SELL")
-            if not dry_run and (
-                len(planned) < 1 or buy_count < 1 or (sell_count < 1 and not self._bootstrap_mode)
-            ):
+            if not dry_run and buy_count > 0 and sell_count == 0 and not self._bootstrap_mode:
+                self._bootstrap_mode = True
+                self._append_log(
+                    "[START] BUY-only mode: sells postponed (base_free insufficient)",
+                    kind="INFO",
+                )
+            if not dry_run and (len(planned) < 1 or buy_count < 1):
                 self._append_log(
                     f"Start blocked: insufficient orders after filters (buys={buy_count}, sells={sell_count}).",
                     kind="WARN",
