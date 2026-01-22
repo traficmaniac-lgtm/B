@@ -44,6 +44,9 @@
 │   │   ├── timeutil.py — time/TTL/backoff utilities.
 │   │   └── strategies
 │   │       ├── __init__.py — package marker for strategy helpers.
+│   │       ├── defs
+│   │       │   ├── __init__.py — built-in strategy definition helpers.
+│   │       │   └── grid_classic.py — classic grid strategy definition.
 │   │       ├── manual_runtime.py — manual strategy runtime logic.
 │   │       ├── manual_strategies.py — manual strategy definitions.
 │   │       └── registry.py — strategy registry utilities.
@@ -51,6 +54,7 @@
 │   │   ├── __init__.py — package marker for GUI.
 │   │   ├── ai_operator_grid_window.py — AI operator grid window.
 │   │   ├── i18n.py — GUI translations/localization helpers.
+│   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI).
 │   │   ├── lite_grid_math.py — math helpers for lite grid UI.
 │   │   ├── lite_grid_window.py — lite grid trading window.
 │   │   ├── main_window.py — main application window and menu.
@@ -63,6 +67,11 @@
 │   │   ├── trade_ready_mode_window.py — trade-ready mode window.
 │   │   ├── trading_runtime_window.py — runtime execution UI.
 │   │   ├── trading_workspace_window.py — trading workspace UI for AI.
+│   │   ├── modes
+│   │   │   ├── ai_full_strateg_v2
+│   │   │   │   ├── __init__.py — package marker for AI full strategy mode.
+│   │   │   │   ├── controller.py — controller helpers for the mode.
+│   │   │   │   └── window.py — AI full strategy V2 window.
 │   │   ├── models
 │   │   │   ├── __init__.py — package marker for GUI state models.
 │   │   │   ├── app_state.py — persisted application settings/state.
@@ -106,9 +115,12 @@
 ## Modules overview
 
 - **core**: configuration loading/validation, logging setup, shared models, time utilities, and strategy registry helpers.
+- **core/strategies/defs**: built-in strategy metadata used by advanced manual/AI modes.
 - **app**: GUI entry point (`python -m src.app.main`) and startup state wiring.
 - **gui**: main window, dialogs, tabs, widgets, and UI state models for the PySide6 UI.
 - **gui/models**: UI state containers such as `AppState` and pair/workspace models.
+- **gui/modes**: experimental/advanced UI modes (e.g., AI full strategy V2).
+- **gui/lite_all_strategy_terminal_window.py**: enhanced Lite terminal focused on multi-strategy grid experimentation.
 - **services**: application services for prices, markets, caching, and rate limiting.
 - **binance**: HTTP, websocket, and account client wrappers for Binance endpoints.
 - **ai**: AI operator schemas, datapack building, validation, and OpenAI client wrapper.
