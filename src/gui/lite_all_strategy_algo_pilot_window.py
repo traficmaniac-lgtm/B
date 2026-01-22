@@ -884,7 +884,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
         summary_frame = QFrame(group)
         summary_frame.setStyleSheet("QFrame { border: 1px solid #e5e7eb; border-radius: 6px; }")
-        summary_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        summary_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         summary_frame.setFixedHeight(82)
         summary_layout = QGridLayout(summary_frame)
         summary_layout.setHorizontalSpacing(8)
@@ -915,11 +915,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._rules_label.setStyleSheet("color: #6b7280; font-size: 10px;")
 
         summary_rows = [
-            ("Last Price:", self._market_price),
-            ("Spread:", self._market_spread),
-            ("Volatility:", self._market_volatility),
-            ("Fee maker/taker:", self._market_fee),
-            ("Source + age:", self._market_source),
+            ("Последняя цена:", self._market_price),
+            ("Спред:", self._market_spread),
+            ("Волатильность:", self._market_volatility),
+            ("Комиссия (maker / taker):", self._market_fee),
+            ("Источник + возраст:", self._market_source),
         ]
         for row, (key_text, value_label) in enumerate(summary_rows):
             summary_layout.addWidget(make_summary_key(key_text), row, 0)
@@ -928,7 +928,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         summary_layout.setColumnStretch(1, 1)
         layout.addWidget(summary_frame)
         layout.addWidget(self._rules_label)
-        algo_pilot_frame = QGroupBox("ALGO PILOT")
+        algo_pilot_frame = QGroupBox("АЛГО ПИЛОТ")
         algo_pilot_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         algo_pilot_frame.setMinimumHeight(260)
         algo_pilot_layout = QVBoxLayout(algo_pilot_frame)
@@ -942,22 +942,22 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         indicator_grid.setHorizontalSpacing(8)
         indicator_grid.setVerticalSpacing(2)
 
-        self._pilot_state_value = QLabel(self._pilot_state.value)
-        self._pilot_regime_value = QLabel("RANGE")
-        self._pilot_anchor_value = QLabel("--")
-        self._pilot_distance_value = QLabel("--")
+        self._pilot_state_value = QLabel(self._pilot_state_label(self._pilot_state))
+        self._pilot_regime_value = QLabel("Диапазон")
+        self._pilot_anchor_value = QLabel("—")
+        self._pilot_distance_value = QLabel("—")
         self._pilot_threshold_value = QLabel(f"{RECENTER_THRESHOLD_PCT:.2f} %")
-        self._pilot_position_qty_value = QLabel("--")
-        self._pilot_avg_entry_value = QLabel("--")
-        self._pilot_break_even_value = QLabel("--")
-        self._pilot_unrealized_value = QLabel("--")
-        self._pilot_orders_total_value = QLabel("--")
-        self._pilot_orders_buy_value = QLabel("--")
-        self._pilot_orders_sell_value = QLabel("--")
-        self._pilot_orders_oldest_value = QLabel("--")
-        self._pilot_orders_threshold_value = QLabel(f"{MAX_ORDER_AGE_SEC}s")
-        self._pilot_orders_warning_value = QLabel("--")
-        self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
+        self._pilot_position_qty_value = QLabel("—")
+        self._pilot_avg_entry_value = QLabel("—")
+        self._pilot_break_even_value = QLabel("—")
+        self._pilot_unrealized_value = QLabel("—")
+        self._pilot_orders_total_value = QLabel("—")
+        self._pilot_orders_buy_value = QLabel("—")
+        self._pilot_orders_sell_value = QLabel("—")
+        self._pilot_orders_oldest_value = QLabel("—")
+        self._pilot_orders_threshold_value = QLabel(f"{MAX_ORDER_AGE_SEC}с")
+        self._pilot_orders_warning_value = QLabel("—")
+        self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
 
         def make_key_label(text: str) -> QLabel:
             label = QLabel(text)
@@ -995,21 +995,21 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         configure_value_label(self._pilot_orders_warning_value, wrap=True)
 
         indicator_rows = [
-            ("Pilot State:", self._pilot_state_value),
-            ("Market Regime:", self._pilot_regime_value),
-            ("Anchor Price:", self._pilot_anchor_value),
-            ("Distance from Anchor (%):", self._pilot_distance_value),
-            ("Threshold (%):", self._pilot_threshold_value),
-            ("Position Qty:", self._pilot_position_qty_value),
-            ("Avg Entry:", self._pilot_avg_entry_value),
-            ("Break-even Price:", self._pilot_break_even_value),
-            ("Unrealized PnL:", self._pilot_unrealized_value),
-            ("Open Orders:", self._pilot_orders_total_value),
-            ("Buy Orders:", self._pilot_orders_buy_value),
-            ("Sell Orders:", self._pilot_orders_sell_value),
-            ("Oldest Order Age:", self._pilot_orders_oldest_value),
-            ("Max Age Threshold:", self._pilot_orders_threshold_value),
-            ("Warning:", self._pilot_orders_warning_value),
+            ("Состояние пилота:", self._pilot_state_value),
+            ("Режим рынка:", self._pilot_regime_value),
+            ("Якорная цена:", self._pilot_anchor_value),
+            ("Отклонение от якоря %:", self._pilot_distance_value),
+            ("Порог %:", self._pilot_threshold_value),
+            ("Размер позиции:", self._pilot_position_qty_value),
+            ("Средняя цена входа:", self._pilot_avg_entry_value),
+            ("Цена безубытка:", self._pilot_break_even_value),
+            ("Нереализованный PnL:", self._pilot_unrealized_value),
+            ("Открытых ордеров:", self._pilot_orders_total_value),
+            ("Покупка:", self._pilot_orders_buy_value),
+            ("Продажа:", self._pilot_orders_sell_value),
+            ("Самый старый ордер:", self._pilot_orders_oldest_value),
+            ("Порог устаревания:", self._pilot_orders_threshold_value),
+            ("Предупреждение:", self._pilot_orders_warning_value),
         ]
 
         for row, (key_text, value_label) in enumerate(indicator_rows):
@@ -1020,16 +1020,21 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         algo_pilot_layout.addWidget(metrics_widget, stretch=0)
         algo_pilot_layout.addSpacing(6)
 
-        self._pilot_toggle_button = QPushButton("Pilot ON / OFF")
+        self._pilot_toggle_button = QPushButton("Пилот ВКЛ / ВЫКЛ")
         self._pilot_toggle_button.clicked.connect(self._handle_pilot_toggle)
-        self._pilot_recenter_button = QPushButton("Recenter Grid")
+        self._pilot_recenter_button = QPushButton("Перестроить сетку")
         self._pilot_recenter_button.clicked.connect(self._handle_pilot_recenter)
-        self._pilot_recovery_button = QPushButton("Go Recovery (BE)")
+        self._pilot_recovery_button = QPushButton("В режим безубытка")
         self._pilot_recovery_button.clicked.connect(self._handle_pilot_recovery)
-        self._pilot_flatten_button = QPushButton("Flatten to BE")
+        self._pilot_flatten_button = QPushButton("Закрыть в безубыток")
         self._pilot_flatten_button.clicked.connect(self._handle_pilot_flatten)
-        self._pilot_flag_stale_button = QPushButton("Flag Stale")
+        self._pilot_flag_stale_button = QPushButton("Пометить устаревшие")
         self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
+        self._pilot_toggle_button.setToolTip("Включить или выключить пилота")
+        self._pilot_recenter_button.setToolTip("Перестроить сетку от текущей цены")
+        self._pilot_recovery_button.setToolTip("Перейти в режим выхода в безубыток")
+        self._pilot_flatten_button.setToolTip("Закрыть позицию в безубыток")
+        self._pilot_flag_stale_button.setToolTip("Пометить ордера как устаревшие")
 
         buttons_widget = QWidget(algo_pilot_frame)
         buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1445,29 +1450,40 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             kind="INFO",
         )
 
+    @staticmethod
+    def _pilot_state_label(state: PilotState) -> str:
+        mapping = {
+            PilotState.OFF: "Выключен",
+            PilotState.NORMAL: "Нормальный",
+            PilotState.RECOVERY: "Безубыток",
+            PilotState.DEFENSIVE: "Защитный",
+            PilotState.PAUSED_BY_RISK: "Пауза риска",
+        }
+        return mapping.get(state, state.value)
+
     def _update_pilot_panel(self) -> None:
         if not hasattr(self, "_pilot_state_value"):
             return
-        self._pilot_state_value.setText(self._pilot_state.value)
-        regime = "RANGE"
+        self._pilot_state_value.setText(self._pilot_state_label(self._pilot_state))
+        regime = "Диапазон"
         if len(self._price_history) >= 10:
             first_price = self._price_history[0]
             last_price = self._price_history[-1]
             if first_price:
                 if last_price > first_price * 1.001:
-                    regime = "TREND UP"
+                    regime = "Тренд вверх"
                 elif last_price < first_price * 0.999:
-                    regime = "TREND DOWN"
+                    regime = "Тренд вниз"
         self._pilot_regime_value.setText(regime)
 
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
-        anchor_text = "--"
+        anchor_text = "—"
         if self._pilot_anchor_price is not None:
             anchor_text = self.fmt_price(self.as_decimal(self._pilot_anchor_price), tick)
         self._pilot_anchor_value.setText(anchor_text)
 
-        distance_text = "--"
+        distance_text = "—"
         distance_pct: float | None = None
         if self._pilot_anchor_price and self._last_price is not None:
             distance_pct = abs(self._last_price - self._pilot_anchor_price) / self._pilot_anchor_price * 100
@@ -1485,16 +1501,16 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             )
             self._set_pilot_state(PilotState.DEFENSIVE)
 
-        position_qty_text = "--"
+        position_qty_text = "—"
         if self._base_asset:
             base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
             position_qty_text = self.fmt_qty(self.as_decimal(base_free), step)
         self._pilot_position_qty_value.setText(position_qty_text)
 
-        self._pilot_avg_entry_value.setText("--")
-        self._pilot_break_even_value.setText("--")
+        self._pilot_avg_entry_value.setText("—")
+        self._pilot_break_even_value.setText("—")
 
-        pnl_text = "--"
+        pnl_text = "—"
         if self._last_price is not None and self._base_asset:
             base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
             pnl_text = self.fmt_price(self.as_decimal(base_free), None)
@@ -1534,40 +1550,40 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         minutes, seconds = divmod(age_sec, 60)
         hours, minutes = divmod(minutes, 60)
         if hours:
-            return f"{hours}h {minutes}m"
+            return f"{hours}ч {minutes}м"
         if minutes:
-            return f"{minutes}m {seconds}s"
-        return f"{seconds}s"
+            return f"{minutes}м {seconds}с"
+        return f"{seconds}с"
 
     def _update_pilot_orders_metrics(self) -> None:
         if not hasattr(self, "_pilot_orders_total_value"):
             return
         total, buy_count, sell_count, oldest_age_sec = self._collect_order_metrics()
         if total == 0:
-            self._pilot_orders_total_value.setText("--")
-            self._pilot_orders_buy_value.setText("--")
-            self._pilot_orders_sell_value.setText("--")
-            self._pilot_orders_oldest_value.setText("--")
-            self._pilot_orders_warning_value.setText("--")
-            self._pilot_orders_warning_value.setStyleSheet("color: #9ca3af; font-weight: 600;")
+            self._pilot_orders_total_value.setText("—")
+            self._pilot_orders_buy_value.setText("—")
+            self._pilot_orders_sell_value.setText("—")
+            self._pilot_orders_oldest_value.setText("—")
+            self._pilot_orders_warning_value.setText("—")
+            self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
             self._pilot_stale_active = False
             return
         self._pilot_orders_total_value.setText(str(total))
         self._pilot_orders_buy_value.setText(str(buy_count))
         self._pilot_orders_sell_value.setText(str(sell_count))
         if oldest_age_sec is None:
-            self._pilot_orders_oldest_value.setText("--")
+            self._pilot_orders_oldest_value.setText("—")
         else:
             self._pilot_orders_oldest_value.setText(self._format_order_age_value(oldest_age_sec))
 
         is_stale = oldest_age_sec is not None and oldest_age_sec > MAX_ORDER_AGE_SEC
         if is_stale:
-            self._pilot_orders_warning_value.setText("STALE ORDERS")
+            self._pilot_orders_warning_value.setText("УСТАРЕВШИЕ ОРДЕРА")
             self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
             self._maybe_log_stale_orders(total, oldest_age_sec)
         else:
-            self._pilot_orders_warning_value.setText("--")
-            self._pilot_orders_warning_value.setStyleSheet("color: #9ca3af; font-weight: 600;")
+            self._pilot_orders_warning_value.setText("—")
+            self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
             self._pilot_stale_active = False
 
     def _maybe_log_stale_orders(self, total: int, oldest_age_sec: int | None) -> None:
@@ -1608,9 +1624,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._grid_engine.on_price(update.last_price)
         else:
             self._last_price = None
-            self._last_price_label.setText(tr("last_price", price="—"))
-            self._market_price.setText("—")
-            self._set_market_label_state(self._market_price, active=False)
 
         latency = f"{update.latency_ms}ms" if update.latency_ms is not None else "—"
         age = f"{update.price_age_ms}ms" if update.price_age_ms is not None else "—"
@@ -1618,9 +1631,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._latency_label.setText(tr("latency", latency=latency))
         clock_status = "✓" if update.price_age_ms is not None else "—"
         self._feed_indicator.setText(f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK {clock_status}")
-        source_text = update.source if update.source is not None else "—"
-        self._market_source.setText(f"{source_text} | {age}")
-        self._set_market_label_state(self._market_source, active=update.price_age_ms is not None)
+        if update.source is not None or update.price_age_ms is not None:
+            source_text = update.source if update.source is not None else "—"
+            self._market_source.setText(f"{source_text} | {age}")
+            self._set_market_label_state(self._market_source, active=True)
 
         micro = update.microstructure
         if micro.spread_pct is not None:
@@ -1629,9 +1643,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         elif micro.spread_abs is not None:
             self._market_spread.setText(f"{micro.spread_abs:.8f}")
             self._set_market_label_state(self._market_spread, active=True)
-        else:
-            self._market_spread.setText("—")
-            self._set_market_label_state(self._market_spread, active=False)
         self._update_runtime_balances()
         self._refresh_unrealized_pnl()
 
@@ -1657,10 +1668,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
     @staticmethod
     def _set_market_label_state(label: QLabel, active: bool) -> None:
-        if active:
-            label.setStyleSheet("color: #111827; font-size: 11px;")
-        else:
-            label.setStyleSheet("color: #9ca3af; font-size: 10px;")
+        label.setStyleSheet("color: #111827; font-size: 11px;")
 
     def _update_runtime_balances(self) -> None:
         if self._balances_loaded and self._quote_asset and self._base_asset:
@@ -4635,8 +4643,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         has_rules = any(value is not None for value in (tick, step, min_notional, min_qty, max_qty, maker, taker))
         if not has_rules:
             self._set_rules_label_text(tr("rules_line", rules="—"))
-            self._market_fee.setText("—")
-            self._set_market_label_state(self._market_fee, active=False)
             return
         tick_text = f"{tick:.8f}" if tick is not None else "—"
         step_text = f"{step:.8f}" if step is not None else "—"
@@ -4651,8 +4657,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f" | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
         )
         self._set_rules_label_text(tr("rules_line", rules=rules))
-        self._market_fee.setText(f"{maker_text}/{taker_text}")
-        self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
+        if maker is not None or taker is not None:
+            self._market_fee.setText(f"{maker_text}/{taker_text}")
+            self._set_market_label_state(self._market_fee, active=True)
 
     def _set_rules_label_text(self, text: str) -> None:
         if not hasattr(self, "_rules_label"):
