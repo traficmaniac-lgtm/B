@@ -51,6 +51,9 @@ src/
   runtime/    — локальный runtime‑движок и виртуальные ордера
 ```
 
+Дополнительно: окно Lite All Strategy Terminal (`src/gui/lite_all_strategy_terminal_window.py`) содержит state‑machine готовности trade_gate
+(READ_ONLY_API_ERROR / READ_ONLY_NO_LIVE_CONFIRM / OK) и флаг `engine_ready`, который блокирует старт до полного допуска к live‑торговле.
+
 ## 5. Core: конфигурация, модели и утилиты
 
 ### `src/core/config.py`
