@@ -123,6 +123,14 @@ class TradeGateState(Enum):
     OK = "ok"
 
 
+class PilotState(Enum):
+    OFF = "OFF"
+    NORMAL = "NORMAL"
+    RECOVERY = "RECOVERY"
+    DEFENSIVE = "DEFENSIVE"
+    PAUSED_BY_RISK = "PAUSED_BY_RISK"
+
+
 @dataclass
 class GridPlannedOrder:
     side: str
@@ -695,6 +703,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._tp_fix_target: float | None = None
         self._auto_fix_tp_enabled = True
         self._stop_in_progress = False
+        self._pilot_state = PilotState.OFF
+        self._pilot_anchor_price: float | None = None
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -705,6 +715,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._fills_timer = QTimer(self)
         self._fills_timer.setInterval(2_500)
         self._fills_timer.timeout.connect(self._refresh_fills)
+        self._pilot_ui_timer = QTimer(self)
+        self._pilot_ui_timer.setInterval(750)
+        self._pilot_ui_timer.timeout.connect(self._update_pilot_panel)
 
         self.setWindowTitle(f"Lite All Strategy Terminal — ALGO PILOT — {self._symbol}")
         self.resize(1050, 720)
@@ -720,6 +733,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self._apply_trade_gate()
+        self._pilot_ui_timer.start()
 
         self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
@@ -868,6 +882,45 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         algo_pilot_group = QGroupBox("ALGO PILOT")
         algo_pilot_layout = QVBoxLayout(algo_pilot_group)
         algo_pilot_layout.setContentsMargins(6, 6, 6, 6)
+        algo_pilot_layout.setSpacing(4)
+
+        indicator_form = QFormLayout()
+        indicator_form.setLabelAlignment(Qt.AlignLeft)
+        indicator_form.setFormAlignment(Qt.AlignLeft)
+        indicator_form.setVerticalSpacing(2)
+
+        self._pilot_state_value = QLabel(self._pilot_state.value)
+        self._pilot_regime_value = QLabel("RANGE")
+        self._pilot_anchor_value = QLabel("--")
+        self._pilot_position_qty_value = QLabel("--")
+        self._pilot_avg_entry_value = QLabel("--")
+        self._pilot_break_even_value = QLabel("--")
+        self._pilot_unrealized_value = QLabel("--")
+
+        indicator_form.addRow(QLabel("Pilot State:"), self._pilot_state_value)
+        indicator_form.addRow(QLabel("Market Regime:"), self._pilot_regime_value)
+        indicator_form.addRow(QLabel("Anchor Price:"), self._pilot_anchor_value)
+        indicator_form.addRow(QLabel("Position Qty:"), self._pilot_position_qty_value)
+        indicator_form.addRow(QLabel("Avg Entry:"), self._pilot_avg_entry_value)
+        indicator_form.addRow(QLabel("Break-even Price:"), self._pilot_break_even_value)
+        indicator_form.addRow(QLabel("Unrealized PnL:"), self._pilot_unrealized_value)
+
+        algo_pilot_layout.addLayout(indicator_form)
+
+        self._pilot_toggle_button = QPushButton("Pilot ON / OFF")
+        self._pilot_toggle_button.clicked.connect(self._handle_pilot_toggle)
+        self._pilot_recenter_button = QPushButton("Recenter Grid")
+        self._pilot_recenter_button.clicked.connect(self._handle_pilot_recenter)
+        self._pilot_recovery_button = QPushButton("Go Recovery (BE)")
+        self._pilot_recovery_button.clicked.connect(self._handle_pilot_recovery)
+        self._pilot_flatten_button = QPushButton("Flatten to BE")
+        self._pilot_flatten_button.clicked.connect(self._handle_pilot_flatten)
+
+        algo_pilot_layout.addWidget(self._pilot_toggle_button)
+        algo_pilot_layout.addWidget(self._pilot_recenter_button)
+        algo_pilot_layout.addWidget(self._pilot_recovery_button)
+        algo_pilot_layout.addWidget(self._pilot_flatten_button)
+
         layout.addWidget(algo_pilot_group)
         layout.addStretch()
         return group
@@ -1191,6 +1244,79 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         layout.addWidget(self._log_view)
         self._apply_log_filter()
         return frame
+
+    def _handle_pilot_toggle(self) -> None:
+        next_state = PilotState.NORMAL if self._pilot_state == PilotState.OFF else PilotState.OFF
+        if next_state == PilotState.NORMAL:
+            self._pilot_anchor_price = self._last_price
+        else:
+            self._pilot_anchor_price = None
+        self._set_pilot_state(next_state)
+
+    def _handle_pilot_recenter(self) -> None:
+        self._append_log(
+            f"[ALGO PILOT] recenter requested symbol={self._symbol}",
+            kind="INFO",
+        )
+
+    def _handle_pilot_recovery(self) -> None:
+        self._set_pilot_state(PilotState.RECOVERY)
+        self._append_log(
+            f"[ALGO PILOT] recovery mode enabled symbol={self._symbol}",
+            kind="INFO",
+        )
+
+    def _handle_pilot_flatten(self) -> None:
+        self._append_log(
+            f"[ALGO PILOT] flatten to BE requested symbol={self._symbol}",
+            kind="INFO",
+        )
+
+    def _set_pilot_state(self, state: PilotState) -> None:
+        if self._pilot_state == state:
+            return
+        self._pilot_state = state
+        self._append_log(
+            f"[ALGO PILOT] state={state.value} symbol={self._symbol}",
+            kind="INFO",
+        )
+
+    def _update_pilot_panel(self) -> None:
+        if not hasattr(self, "_pilot_state_value"):
+            return
+        self._pilot_state_value.setText(self._pilot_state.value)
+        regime = "RANGE"
+        if len(self._price_history) >= 10:
+            first_price = self._price_history[0]
+            last_price = self._price_history[-1]
+            if first_price:
+                if last_price > first_price * 1.001:
+                    regime = "TREND UP"
+                elif last_price < first_price * 0.999:
+                    regime = "TREND DOWN"
+        self._pilot_regime_value.setText(regime)
+
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        anchor_text = "--"
+        if self._pilot_anchor_price is not None:
+            anchor_text = self.fmt_price(self.as_decimal(self._pilot_anchor_price), tick)
+        self._pilot_anchor_value.setText(anchor_text)
+
+        position_qty_text = "--"
+        if self._base_asset:
+            base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
+            position_qty_text = self.fmt_qty(self.as_decimal(base_free), step)
+        self._pilot_position_qty_value.setText(position_qty_text)
+
+        self._pilot_avg_entry_value.setText("--")
+        self._pilot_break_even_value.setText("--")
+
+        pnl_text = "--"
+        if self._last_price is not None and self._base_asset:
+            base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
+            pnl_text = self.fmt_price(self.as_decimal(base_free), None)
+        self._pilot_unrealized_value.setText(pnl_text)
 
     def _emit_price_update(self, update: PriceUpdate) -> None:
         self._signals.price_update.emit(update)
