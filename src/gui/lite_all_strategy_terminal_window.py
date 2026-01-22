@@ -117,6 +117,12 @@ class TradeGate(Enum):
     TRADE_DISABLED_NO_CONFIRM = "no live confirm"
 
 
+class TradeGateState(Enum):
+    READ_ONLY_API_ERROR = "read-only api error"
+    READ_ONLY_NO_LIVE_CONFIRM = "read-only no live confirm"
+    OK = "ok"
+
+
 @dataclass
 class GridPlannedOrder:
     side: str
@@ -658,6 +664,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._rules_in_flight = False
         self._fees_in_flight = False
         self._trade_gate = TradeGate.TRADE_DISABLED_NO_KEYS if not self._has_api_keys else TradeGate.TRADE_DISABLED_READONLY
+        self._trade_gate_state = TradeGateState.READ_ONLY_API_ERROR
+        self._engine_ready = False
         self._rules_loaded = False
         self._live_mode_confirmed = False
         self._first_live_session = True
@@ -1457,8 +1465,13 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 self._mark_preflight_blocked()
                 return
             if not self._engine_ready():
-                reason = self._engine_ready_reason()
-                self._append_log(f"Start blocked: engine not ready ({reason}).", kind="WARN")
+                self._append_log(
+                    "Start blocked: engine not ready "
+                    f"(trade_gate={self._trade_gate_state.value} "
+                    f"live_enabled={str(self._live_enabled()).lower()} "
+                    f"canTrade={str(self._account_can_trade).lower()})",
+                    kind="WARN",
+                )
                 self._mark_preflight_blocked()
                 return
             dry_run = self._dry_run_toggle.isChecked()
@@ -2202,26 +2215,24 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         return result["done"] and result["ok"]
 
     def _engine_ready(self) -> bool:
-        if not self._rules_loaded:
-            return False
-        if self._trade_gate != TradeGate.TRADE_OK:
-            return False
-        balance_age_s = self._balance_age_s()
-        if balance_age_s is None:
-            return False
-        return balance_age_s <= 2
+        return self._engine_ready
 
-    def _engine_ready_reason(self) -> str:
-        if not self._rules_loaded:
-            return "rules_not_loaded"
-        if self._trade_gate != TradeGate.TRADE_OK:
-            return f"trade_gate={self._trade_gate.value}"
-        balance_age_s = self._balance_age_s()
-        if balance_age_s is None:
-            return "balances_not_ready"
-        if balance_age_s > 2:
-            return f"balances_stale age={balance_age_s:.2f}s"
-        return "ok"
+    def _update_engine_ready(self) -> None:
+        new_ready = (
+            self._trade_gate_state == TradeGateState.OK
+            and self._account_can_trade
+            and self._live_enabled()
+        )
+        if new_ready == self._engine_ready:
+            return
+        self._engine_ready = new_ready
+        if new_ready:
+            self._append_log("[ENGINE] ready=true (trade_gate=ok)", kind="INFO")
+
+    def _live_enabled(self) -> bool:
+        if not hasattr(self, "_dry_run_toggle"):
+            return False
+        return not self._dry_run_toggle.isChecked()
 
     def _balance_age_s(self) -> float | None:
         if self._balance_ready_ts_monotonic_ms is None:
@@ -4025,11 +4036,16 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
     def _apply_trade_gate(self) -> None:
         gate = self._determine_trade_gate()
         if gate != self._trade_gate:
+            self._trade_gate = gate
+        state, reason = self._determine_trade_gate_state()
+        if state != self._trade_gate_state:
             self._append_log(
-                f"trade_gate: {self._trade_gate.value} -> {gate.value}",
+                f"[TRADE_GATE] state: {self._trade_gate_state.value} -> {state.value} "
+                f"(reason={reason})",
                 kind="INFO",
             )
-            self._trade_gate = gate
+            self._trade_gate_state = state
+        self._update_engine_ready()
         if gate in {
             TradeGate.TRADE_DISABLED_NO_KEYS,
             TradeGate.TRADE_DISABLED_API_ERROR,
@@ -4092,6 +4108,17 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         if not self._account_can_trade:
             return TradeGate.TRADE_DISABLED_CANT_TRADE
         return TradeGate.TRADE_OK
+
+    def _determine_trade_gate_state(self) -> tuple[TradeGateState, str]:
+        if not self._has_api_keys:
+            return TradeGateState.READ_ONLY_API_ERROR, "no keys"
+        if self._account_api_error or not self._can_read_account:
+            return TradeGateState.READ_ONLY_API_ERROR, "api error"
+        if not self._live_enabled():
+            return TradeGateState.READ_ONLY_NO_LIVE_CONFIRM, "live disabled"
+        if not self._live_mode_confirmed:
+            return TradeGateState.READ_ONLY_NO_LIVE_CONFIRM, "no live confirm"
+        return TradeGateState.OK, "ok"
 
     def _trade_gate_reason(self) -> str:
         mapping = {

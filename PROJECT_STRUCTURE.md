@@ -56,7 +56,7 @@
 │   │   ├── __init__.py — package marker for GUI.
 │   │   ├── ai_operator_grid_window.py — AI operator grid window.
 │   │   ├── i18n.py — GUI translations/localization helpers.
-│   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI).
+│   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI, trade-gate readiness).
 │   │   ├── lite_grid_math.py — math helpers for lite grid UI.
 │   │   ├── lite_grid_window.py — lite grid trading window.
 │   │   ├── main_window.py — main application window and menu.
