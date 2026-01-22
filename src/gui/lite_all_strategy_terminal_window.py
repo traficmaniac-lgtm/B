@@ -3120,58 +3120,60 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             restore_price = self.q_price(fill_price - step_abs, tick)
         else:
             restore_price = self.q_price(fill_price + step_abs, tick)
-        desired_restore_notional = restore_price * fill_qty
+        min_qty = self._rule_decimal(self._exchange_rules.get("min_qty"))
+        restore_qty = Decimal("0")
+        restore_notional = Decimal("0")
+        restore_reason = "ok"
+        target_qty = fill_qty
         if restore_side == "SELL":
-            required_qty = fill_qty
-            required_notional = restore_price * required_qty
+            required_qty = target_qty
             if required_qty > base_free:
-                restore_qty = Decimal("0")
-                restore_notional = Decimal("0")
                 restore_reason = "skip_insufficient_base"
-            elif min_notional is not None and required_notional < min_notional:
-                restore_qty = Decimal("0")
-                restore_notional = Decimal("0")
-                restore_reason = "skip_min_notional"
-            else:
-                restore_qty, restore_notional, restore_reason = compute_order_qty(
-                    restore_side,
-                    restore_price,
-                    desired_restore_notional,
-                    balances_snapshot,
-                    self._exchange_rules,
-                    self._effective_fee_rate(),
-                    None,
+                self._append_log(
+                    (
+                        "[SKIP] balance_check "
+                        f"side=SELL price={self.fmt_price(restore_price, tick)} "
+                        f"qty={self.fmt_qty(target_qty, step)} reason={restore_reason} "
+                        f"required_qty={self._format_balance_decimal(required_qty)} "
+                        f"base_free={self._format_balance_decimal(base_free)}"
+                    ),
+                    kind="WARN",
                 )
+            else:
+                qty_rounded = self.q_qty(target_qty, step)
+                if qty_rounded <= 0 or (min_qty is not None and qty_rounded < min_qty):
+                    restore_reason = "skip_min_qty"
+                else:
+                    restore_notional = restore_price * qty_rounded
+                    if min_notional is not None and restore_notional < min_notional:
+                        restore_reason = "skip_min_notional"
+                    else:
+                        restore_qty = qty_rounded
         else:
-            fill_notional = fill_price * fill_qty
-            required_quote = desired_restore_notional
-            quote_available = quote_free + fill_notional
-            if required_quote > quote_available:
-                restore_qty = Decimal("0")
-                restore_notional = Decimal("0")
+            required_quote = restore_price * target_qty
+            if required_quote > quote_free:
                 restore_reason = "skip_insufficient_quote"
-            elif min_notional is not None and desired_restore_notional < min_notional:
-                restore_qty = Decimal("0")
-                restore_notional = Decimal("0")
-                restore_reason = "skip_min_notional"
-            else:
-                restore_qty, restore_notional, restore_reason = compute_order_qty(
-                    restore_side,
-                    restore_price,
-                    desired_restore_notional,
-                    balances_snapshot,
-                    self._exchange_rules,
-                    self._effective_fee_rate(),
-                    None,
+                self._append_log(
+                    (
+                        "[SKIP] balance_check "
+                        f"side=BUY price={self.fmt_price(restore_price, tick)} "
+                        f"qty={self.fmt_qty(target_qty, step)} reason={restore_reason} "
+                        f"required_quote={self._format_balance_decimal(required_quote)} "
+                        f"quote_free={self._format_balance_decimal(quote_free)}"
+                    ),
+                    kind="WARN",
                 )
-        allow_restore = restore_qty > 0
-        if not allow_restore:
-            if restore_reason == "min_notional":
-                restore_reason = "skip_min_notional"
-            elif restore_reason in {"skip_insufficient_base", "skip_insufficient_quote", "skip_min_notional"}:
-                restore_reason = restore_reason
             else:
-                restore_reason = "skip_unknown"
+                qty_rounded = self.q_qty(target_qty, step)
+                if qty_rounded <= 0 or (min_qty is not None and qty_rounded < min_qty):
+                    restore_reason = "skip_min_qty"
+                else:
+                    restore_notional = restore_price * qty_rounded
+                    if min_notional is not None and restore_notional < min_notional:
+                        restore_reason = "skip_min_notional"
+                    else:
+                        restore_qty = qty_rounded
+        allow_restore = restore_reason == "ok" and restore_qty > 0
         filled_order_id = fill.order_id or fill.trade_id or self._fill_key(fill)
         level_index = None
         if fill.order_id:
@@ -3544,6 +3546,11 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             return format(value, "f")
         decimals = self._decimal_places(step)
         quant = Decimal("1").scaleb(-decimals)
+        return format(value.quantize(quant), "f")
+
+    @staticmethod
+    def _format_balance_decimal(value: Decimal) -> str:
+        quant = Decimal("0.00000001")
         return format(value.quantize(quant), "f")
 
     def q_price(self, price: Decimal, tick: Decimal | None) -> Decimal:
@@ -4185,31 +4192,38 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         required_qty = self.as_decimal(order.qty)
                         required_notional = price * required_qty
                         min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
+                        min_qty = self._rule_decimal(self._exchange_rules.get("min_qty"))
                         if order.side == "SELL":
                             if required_qty > working_balances["base_free"]:
                                 log_reason = "skip_insufficient_base"
                             elif min_notional is not None and required_notional < min_notional:
                                 log_reason = "skip_min_notional"
+                            elif min_qty is not None and required_qty < min_qty:
+                                log_reason = "skip_min_qty"
                             else:
-                                log_reason = "skip_unknown"
+                                log_reason = "skip_min_qty"
                             detail = (
-                                f"required_qty={required_qty} base_free={working_balances['base_free']}"
+                                f"required_qty={self._format_balance_decimal(required_qty)} "
+                                f"base_free={self._format_balance_decimal(working_balances['base_free'])}"
                             )
                         else:
                             if required_notional > working_balances["quote_free"]:
                                 log_reason = "skip_insufficient_quote"
                             elif min_notional is not None and required_notional < min_notional:
                                 log_reason = "skip_min_notional"
+                            elif min_qty is not None and required_qty < min_qty:
+                                log_reason = "skip_min_qty"
                             else:
-                                log_reason = "skip_unknown"
+                                log_reason = "skip_min_qty"
                             detail = (
-                                f"required_quote={required_notional} quote_free={working_balances['quote_free']}"
+                                f"required_quote={self._format_balance_decimal(required_notional)} "
+                                f"quote_free={self._format_balance_decimal(working_balances['quote_free'])}"
                             )
                         self._signals.log_append.emit(
                             (
-                                "[LIVE] grid skipped: balance check "
+                                "[SKIP] balance_check "
                                 f"side={order.side} price={self.fmt_price(price, None)} "
-                                f"reason={log_reason} {detail}"
+                                f"qty={self.fmt_qty(required_qty, step)} reason={log_reason} {detail}"
                             ),
                             "WARN",
                         )
