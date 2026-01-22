@@ -10,6 +10,8 @@
 ├── REPORT.md — project report/notes.
 ├── SYSTEM_OVERVIEW_RU.md — detailed system overview in Russian.
 ├── _link_test.txt — link test artifact.
+├── config.json — main application configuration (env, endpoints, limits).
+├── config.user.yaml — user state (auto-created at first run).
 ├── requirements.txt — Python dependencies.
 ├── requirements.txt.txt — duplicate dependency list (legacy).
 ├── run_gui.bat — Windows batch launcher for the GUI.
@@ -105,6 +107,8 @@
 │       ├── price_hub.py — Qt hub for price updates.
 │       ├── price_service.py — price caching and TTL checks.
 │       └── rate_limiter.py — rate limiter utility.
+├── data
+│   └── exchange_info_*.json — cached Binance exchange info (created at runtime).
 └── tests
     ├── __init__.py — test package marker.
     ├── test_app_state.py — tests for AppState persistence.
@@ -112,7 +116,7 @@
     └── test_markets_service.py — tests for MarketsService.
 ```
 
-## Modules overview
+## Modules overview (expanded)
 
 - **core**: configuration loading/validation, logging setup, shared models, time utilities, and strategy registry helpers.
 - **core/strategies/defs**: built-in strategy metadata used by advanced manual/AI modes.
@@ -126,6 +130,15 @@
 - **ai**: AI operator schemas, datapack building, validation, and OpenAI client wrapper.
 - **runtime**: local runtime engine and virtual order simulation.
 - **tests**: unit tests for config loading, service behavior, and GUI import smoke checks.
+- **data**: runtime cache artifacts and exchange info snapshots.
+
+## Runtime data flow (high-level)
+
+1. `src/app/main.py` reads `config.json` via `core/config.py` and loads `config.user.yaml` via `gui/models/app_state.py`.
+2. `MainWindow` creates `PriceFeedManager` and `PairModeManager`, then initializes UI tabs.
+3. `OverviewTab` loads markets through `services/markets_service.py` and uses `PriceFeedManager` for live prices.
+4. Selecting a pair opens `LiteGridWindow` or `LiteAllStrategyTerminalWindow` through `gui/pair_mode_manager.py`.
+5. Optional AI modes build datapacks in `ai/operator_datapack.py` and validate patches in `ai/operator_validation.py`.
 
 ## Run
 
@@ -154,6 +167,11 @@ run_gui.bat
   - `default_period`, `default_quality`, `allow_ai_more_data`
   - `price_ttl_ms`, `price_refresh_ms`
   - `default_quote`, `pnl_period`
+
+## Cached data
+
+- `data/exchange_info_*.json` caches Binance `exchangeInfo` payloads for faster startup and offline reuse.
+- Cache freshness is evaluated by `MarketsService` and can be invalidated by TTL or explicit refresh.
 
 ## Known limitations
 
