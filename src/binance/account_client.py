@@ -133,8 +133,19 @@ class BinanceAccountClient:
             raise ValueError("Unexpected order response format")
         return payload
 
-    def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
-        params = {"symbol": symbol, "orderId": order_id}
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        orig_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not order_id and not orig_client_order_id:
+            raise ValueError("order_id or orig_client_order_id is required")
+        params = {"symbol": symbol}
+        if orig_client_order_id:
+            params["origClientOrderId"] = orig_client_order_id
+        else:
+            params["orderId"] = str(order_id)
         try:
             payload = self._request_signed("DELETE", "/api/v3/order", params=params, retry_on_timestamp=True)
         except Exception as exc:  # noqa: BLE001
@@ -145,7 +156,7 @@ class BinanceAccountClient:
                 side=None,
                 price=None,
                 quantity=None,
-                client_order_id=None,
+                client_order_id=orig_client_order_id,
                 order_id=order_id,
             )
             raise

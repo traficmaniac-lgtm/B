@@ -621,6 +621,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._open_orders: list[dict[str, Any]] = []
         self._open_orders_all: list[dict[str, Any]] = []
         self._bot_order_ids: set[str] = set()
+        self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
         self._fill_keys: set[str] = set()
         self._fill_accumulator = FillAccumulator()
@@ -1119,6 +1120,10 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         buttons.addWidget(self._refresh_button)
         layout.addLayout(buttons)
 
+        self._cancel_all_on_stop_toggle = QCheckBox(tr("cancel_all_on_stop"))
+        self._cancel_all_on_stop_toggle.setChecked(True)
+        layout.addWidget(self._cancel_all_on_stop_toggle)
+
         self._apply_pnl_style(self._pnl_label, None)
         self._refresh_orders_metrics()
         return group
@@ -1595,6 +1600,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._last_preflight_blocked = False
             self._bot_session_id = uuid4().hex[:8]
             self._bot_order_ids.clear()
+            self._bot_client_ids.clear()
             self._bot_order_keys.clear()
             self._fill_keys.clear()
             self._fill_accumulator = FillAccumulator()
@@ -1633,13 +1639,24 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
     def _handle_stop(self) -> None:
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
-        self._change_state("IDLE")
+        self._change_state("STOPPING")
         self._start_in_progress = False
         self._start_in_progress_logged = False
         self._start_button.setEnabled(True)
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
+        if self._dry_run_toggle.isChecked():
+            self._finalize_stop()
+            return
+        if not self._account_client:
+            self._append_log("[STOP] cancel skipped: no account client.", kind="WARN")
+            self._finalize_stop()
+            return
+        self._cancel_bot_orders_on_stop()
+
+    def _finalize_stop(self) -> None:
         self._bot_order_ids.clear()
+        self._bot_client_ids.clear()
         self._bot_order_keys.clear()
         self._fill_keys.clear()
         self._fill_accumulator = FillAccumulator()
@@ -1652,19 +1669,109 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         self._open_orders = []
         self._open_orders_all = []
         self._render_open_orders()
-        if self._dry_run_toggle.isChecked():
+        self._change_state("STOPPED")
+
+    def _cancel_bot_orders_on_stop(self) -> None:
+        if not self._account_client:
+            self._finalize_stop()
             return
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle(tr("stop_confirm_title"))
-        dialog.setText(tr("stop_confirm_message"))
-        leave_button = dialog.addButton(tr("stop_leave_orders"), QMessageBox.RejectRole)
-        cancel_button = dialog.addButton(tr("stop_cancel_orders"), QMessageBox.AcceptRole)
-        dialog.exec()
-        if dialog.clickedButton() == leave_button:
-            self._append_log("Stop: left bot orders open.", kind="INFO")
+        self._append_log("[STOP] canceling bot orders...", kind="INFO")
+        client_ids = sorted(self._bot_client_ids)
+        prefix = self._bot_order_prefix()
+        cancel_all_enabled = (
+            hasattr(self, "_cancel_all_on_stop_toggle") and self._cancel_all_on_stop_toggle.isChecked()
+        )
+
+        def _cancel() -> dict[str, Any]:
+            errors: list[str] = []
+            canceled_by_tag = 0
+            for client_id in client_ids:
+                if not client_id:
+                    continue
+                try:
+                    self._account_client.cancel_order(
+                        self._symbol,
+                        order_id=None,
+                        orig_client_order_id=client_id,
+                    )
+                    canceled_by_tag += 1
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(self._format_cancel_exception(exc, client_id))
+            open_orders = self._account_client.get_open_orders(self._symbol)
+            tagged_orders = [
+                order
+                for order in open_orders
+                if isinstance(order, dict)
+                and str(order.get("clientOrderId", "")).startswith(prefix)
+            ]
+            for order in tagged_orders:
+                order_id = str(order.get("orderId", ""))
+                client_id = str(order.get("clientOrderId", ""))
+                if not order_id and not client_id:
+                    continue
+                try:
+                    if order_id:
+                        self._account_client.cancel_order(self._symbol, order_id=order_id)
+                    else:
+                        self._account_client.cancel_order(
+                            self._symbol,
+                            order_id=None,
+                            orig_client_order_id=client_id,
+                        )
+                    canceled_by_tag += 1
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(self._format_cancel_exception(exc, order_id or client_id))
+            open_orders_after = self._account_client.get_open_orders(self._symbol)
+            remaining_tagged = [
+                order
+                for order in open_orders_after
+                if isinstance(order, dict)
+                and str(order.get("clientOrderId", "")).startswith(prefix)
+            ]
+            used_cancel_all = False
+            if remaining_tagged and cancel_all_enabled:
+                self._account_client.cancel_open_orders(self._symbol)
+                used_cancel_all = True
+                open_orders_after = self._account_client.get_open_orders(self._symbol)
+            return {
+                "canceled_by_tag": canceled_by_tag,
+                "used_cancel_all": used_cancel_all,
+                "open_orders_after": open_orders_after,
+                "errors": errors,
+            }
+
+        worker = _Worker(_cancel, self._can_emit_worker_results)
+        worker.signals.success.connect(self._handle_stop_cancel_result)
+        worker.signals.error.connect(self._handle_stop_cancel_error)
+        self._thread_pool.start(worker)
+
+    def _handle_stop_cancel_result(self, result: object, latency_ms: int) -> None:
+        if not isinstance(result, dict):
+            self._handle_cancel_error("Unexpected cancel response")
+            self._finalize_stop()
             return
-        if dialog.clickedButton() == cancel_button:
-            self._cancel_bot_orders()
+        canceled_by_tag = int(result.get("canceled_by_tag", 0) or 0)
+        self._append_log(f"[STOP] canceled_by_tag n={canceled_by_tag}", kind="INFO")
+        used_cancel_all = bool(result.get("used_cancel_all", False))
+        if used_cancel_all:
+            self._append_log(
+                f"[STOP] cancel_all_open_orders symbol={self._symbol} (cancels all open orders for symbol)",
+                kind="WARN",
+            )
+        self._append_log(f"[STOP] fallback_cancel_all used={used_cancel_all}", kind="INFO")
+        open_orders_after = result.get("open_orders_after", [])
+        if isinstance(open_orders_after, list):
+            self._append_log(f"[STOP] open_orders_after n={len(open_orders_after)}", kind="INFO")
+        errors = result.get("errors", [])
+        if isinstance(errors, list):
+            for message in errors:
+                self._append_log(str(message), kind="WARN")
+        self._refresh_open_orders(force=True)
+        self._finalize_stop()
+
+    def _handle_stop_cancel_error(self, message: str) -> None:
+        self._handle_cancel_error(message)
+        self._finalize_stop()
 
     def _handle_cancel_selected(self) -> None:
         selected_rows = sorted({index.row() for index in self._orders_table.selectionModel().selectedRows()})
@@ -2200,6 +2307,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             self._open_orders_all = []
             self._open_orders = []
             self._open_orders_map = {}
+            self._bot_client_ids.clear()
             self._bot_order_keys = set()
             self._active_order_keys.clear()
             self._recent_order_keys.clear()
@@ -2307,6 +2415,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             order_id = str(order.get("orderId", ""))
             if order_id:
                 self._bot_order_ids.add(order_id)
+            client_order_id = str(order.get("clientOrderId", ""))
+            if client_order_id:
+                self._bot_client_ids.add(client_order_id)
         closed_order_ids = [
             order_id
             for order_id in list(self._order_id_to_registry_key)
@@ -2354,9 +2465,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
         return bool(prefix and client_order_id.startswith(prefix))
 
     def _bot_order_prefix(self) -> str:
-        if not self._bot_session_id:
-            return ""
-        return f"BBOT_LITE_{self._symbol}_{self._bot_session_id}_"
+        return f"BBOT_LAS_v1_{self._symbol}_"
 
     @staticmethod
     def _order_registry_type(reason: str) -> str:
@@ -2454,7 +2563,8 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
 
     def _make_client_order_id(self, role: str, idx: int, suffix: str = "") -> str:
         prefix = self._bot_order_prefix()
-        return self._limit_client_order_id(f"{prefix}{role}_{idx}{suffix}")
+        short_id = f"{uuid4().hex[:4]}{idx:02d}"
+        return self._limit_client_order_id(f"{prefix}{role}_{short_id}{suffix}")
 
     def _next_client_order_id(self, role: str, suffix: str = "") -> str:
         self._replacement_counter += 1
@@ -2894,7 +3004,7 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
 
         tp_client_order_id = self._next_client_order_id("TP", suffix="M" if existing_tp else "")
         restore_client_order_id = (
-            self._next_client_order_id("GRID") if restore_price > 0 and allow_restore else ""
+            self._next_client_order_id("RESTORE") if restore_price > 0 and allow_restore else ""
         )
 
         def _place() -> dict[str, Any]:
@@ -2981,6 +3091,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
             order_id = str(entry.get("orderId", ""))
             if order_id:
                 self._bot_order_ids.add(order_id)
+            client_order_id = str(entry.get("clientOrderId", ""))
+            if client_order_id:
+                self._bot_client_ids.add(client_order_id)
             side = str(entry.get("side", "")).upper()
             price = self._coerce_float(str(entry.get("price", ""))) or 0.0
             qty = self._coerce_float(str(entry.get("origQty", ""))) or 0.0
@@ -3769,11 +3882,22 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                         None,
                     )
                     if qty <= 0:
+                        log_reason = reason
+                        if order.side == "SELL":
+                            required_qty = self.as_decimal(order.qty)
+                            min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
+                            required_notional = price * required_qty
+                            if working_balances["base_free"] < required_qty:
+                                log_reason = "base_free"
+                            elif min_notional is not None and required_notional < min_notional:
+                                log_reason = "min_notional"
+                            else:
+                                log_reason = "unknown_balance"
                         self._signals.log_append.emit(
                             (
                                 "[LIVE] grid skipped: insufficient balance "
                                 f"side={order.side} price={self.fmt_price(price, None)} "
-                                f"reason={reason} base_free={working_balances['base_free']} "
+                                f"reason={log_reason} base_free={working_balances['base_free']} "
                                 f"quote_free={working_balances['quote_free']}"
                             ),
                             "WARN",
@@ -3829,6 +3953,9 @@ class LiteAllStrategyTerminalWindow(QMainWindow):
                 order_id = str(entry.get("orderId", ""))
                 if order_id:
                     self._bot_order_ids.add(order_id)
+                client_order_id = str(entry.get("clientOrderId", ""))
+                if client_order_id:
+                    self._bot_client_ids.add(client_order_id)
                 side = str(entry.get("side", "—")).upper()
                 price = str(entry.get("price", "—"))
                 qty = str(entry.get("origQty", "—"))
