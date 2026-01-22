@@ -132,6 +132,8 @@ class PilotState(Enum):
 
 
 RECENTER_THRESHOLD_PCT = 0.7
+MAX_ORDER_AGE_SEC = 180
+STALE_LOG_COOLDOWN_SEC = 30
 
 
 @dataclass
@@ -708,6 +710,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._stop_in_progress = False
         self._pilot_state = PilotState.OFF
         self._pilot_anchor_price: float | None = None
+        self._pilot_stale_active = False
+        self._pilot_stale_last_log_ts: float | None = None
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
@@ -901,6 +905,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_avg_entry_value = QLabel("--")
         self._pilot_break_even_value = QLabel("--")
         self._pilot_unrealized_value = QLabel("--")
+        self._pilot_orders_total_value = QLabel("--")
+        self._pilot_orders_buy_value = QLabel("--")
+        self._pilot_orders_sell_value = QLabel("--")
+        self._pilot_orders_oldest_value = QLabel("--")
+        self._pilot_orders_threshold_value = QLabel(f"{MAX_ORDER_AGE_SEC}s")
+        self._pilot_orders_warning_value = QLabel("--")
+        self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
 
         indicator_form.addRow(QLabel("Pilot State:"), self._pilot_state_value)
         indicator_form.addRow(QLabel("Market Regime:"), self._pilot_regime_value)
@@ -911,6 +922,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         indicator_form.addRow(QLabel("Avg Entry:"), self._pilot_avg_entry_value)
         indicator_form.addRow(QLabel("Break-even Price:"), self._pilot_break_even_value)
         indicator_form.addRow(QLabel("Unrealized PnL:"), self._pilot_unrealized_value)
+        indicator_form.addRow(QLabel("Open Orders:"), self._pilot_orders_total_value)
+        indicator_form.addRow(QLabel("Buy Orders:"), self._pilot_orders_buy_value)
+        indicator_form.addRow(QLabel("Sell Orders:"), self._pilot_orders_sell_value)
+        indicator_form.addRow(QLabel("Oldest Order Age:"), self._pilot_orders_oldest_value)
+        indicator_form.addRow(QLabel("Max Age Threshold:"), self._pilot_orders_threshold_value)
+        indicator_form.addRow(QLabel("Warning:"), self._pilot_orders_warning_value)
 
         algo_pilot_layout.addLayout(indicator_form)
 
@@ -922,11 +939,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_recovery_button.clicked.connect(self._handle_pilot_recovery)
         self._pilot_flatten_button = QPushButton("Flatten to BE")
         self._pilot_flatten_button.clicked.connect(self._handle_pilot_flatten)
+        self._pilot_flag_stale_button = QPushButton("Flag Stale")
+        self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
 
         algo_pilot_layout.addWidget(self._pilot_toggle_button)
         algo_pilot_layout.addWidget(self._pilot_recenter_button)
         algo_pilot_layout.addWidget(self._pilot_recovery_button)
         algo_pilot_layout.addWidget(self._pilot_flatten_button)
+        algo_pilot_layout.addWidget(self._pilot_flag_stale_button)
 
         layout.addWidget(algo_pilot_group)
         layout.addStretch()
@@ -1278,6 +1298,17 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             kind="INFO",
         )
 
+    def _handle_pilot_flag_stale(self) -> None:
+        total, buy_count, sell_count, oldest_age_sec = self._collect_order_metrics()
+        oldest_value = oldest_age_sec if oldest_age_sec is not None else 0
+        self._append_log(
+            (
+                f"[ALGO PILOT] snapshot orders total={total} buy={buy_count} "
+                f"sell={sell_count} oldest={oldest_value} symbol={self._symbol}"
+            ),
+            kind="INFO",
+        )
+
     def _set_pilot_state(self, state: PilotState) -> None:
         if self._pilot_state == state:
             return
@@ -1341,6 +1372,98 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
             pnl_text = self.fmt_price(self.as_decimal(base_free), None)
         self._pilot_unrealized_value.setText(pnl_text)
+
+    def _collect_order_metrics(self) -> tuple[int, int, int, int | None]:
+        total = self._orders_table.rowCount() if hasattr(self, "_orders_table") else 0
+        buy_count = 0
+        sell_count = 0
+        for row in range(total):
+            side_item = self._orders_table.item(row, 1)
+            side_text = side_item.text().upper() if side_item else ""
+            if side_text == "BUY":
+                buy_count += 1
+            elif side_text == "SELL":
+                sell_count += 1
+        oldest_age_sec = self._calculate_oldest_order_age_sec()
+        return total, buy_count, sell_count, oldest_age_sec
+
+    def _calculate_oldest_order_age_sec(self) -> int | None:
+        if not self._open_orders:
+            return None
+        now_ms = int(time() * 1000)
+        ages: list[int] = []
+        for order in self._open_orders:
+            time_ms = order.get("time")
+            if not isinstance(time_ms, (int, float)):
+                continue
+            age_sec = max(now_ms - int(time_ms), 0) // 1000
+            ages.append(age_sec)
+        if not ages:
+            return None
+        return max(ages)
+
+    @staticmethod
+    def _format_order_age_value(age_sec: int) -> str:
+        minutes, seconds = divmod(age_sec, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    def _update_pilot_orders_metrics(self) -> None:
+        if not hasattr(self, "_pilot_orders_total_value"):
+            return
+        total, buy_count, sell_count, oldest_age_sec = self._collect_order_metrics()
+        if total == 0:
+            self._pilot_orders_total_value.setText("--")
+            self._pilot_orders_buy_value.setText("--")
+            self._pilot_orders_sell_value.setText("--")
+            self._pilot_orders_oldest_value.setText("--")
+            self._pilot_orders_warning_value.setText("--")
+            self._pilot_orders_warning_value.setStyleSheet("color: #9ca3af; font-weight: 600;")
+            self._pilot_stale_active = False
+            return
+        self._pilot_orders_total_value.setText(str(total))
+        self._pilot_orders_buy_value.setText(str(buy_count))
+        self._pilot_orders_sell_value.setText(str(sell_count))
+        if oldest_age_sec is None:
+            self._pilot_orders_oldest_value.setText("--")
+        else:
+            self._pilot_orders_oldest_value.setText(self._format_order_age_value(oldest_age_sec))
+
+        is_stale = oldest_age_sec is not None and oldest_age_sec > MAX_ORDER_AGE_SEC
+        if is_stale:
+            self._pilot_orders_warning_value.setText("STALE ORDERS")
+            self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
+            self._maybe_log_stale_orders(total, oldest_age_sec)
+        else:
+            self._pilot_orders_warning_value.setText("--")
+            self._pilot_orders_warning_value.setStyleSheet("color: #9ca3af; font-weight: 600;")
+            self._pilot_stale_active = False
+
+    def _maybe_log_stale_orders(self, total: int, oldest_age_sec: int | None) -> None:
+        if oldest_age_sec is None:
+            return
+        now = monotonic()
+        should_log = False
+        if not self._pilot_stale_active:
+            should_log = True
+        elif self._pilot_stale_last_log_ts is None:
+            should_log = True
+        elif now - self._pilot_stale_last_log_ts >= STALE_LOG_COOLDOWN_SEC:
+            should_log = True
+        if should_log:
+            self._append_log(
+                (
+                    f"[ALGO PILOT] stale orders oldest={oldest_age_sec} "
+                    f"total={total} symbol={self._symbol}"
+                ),
+                kind="WARN",
+            )
+            self._pilot_stale_last_log_ts = now
+        self._pilot_stale_active = True
 
     def _emit_price_update(self, update: PriceUpdate) -> None:
         self._signals.price_update.emit(update)
@@ -4893,6 +5016,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._update_runtime_balances()
         for row in range(self._orders_table.rowCount()):
             self._set_order_row_tooltip(row)
+        self._update_pilot_orders_metrics()
 
     def _apply_pnl_style(self, label: QLabel, value: float | None) -> None:
         if value is None:
