@@ -5,6 +5,7 @@ from enum import Enum
 
 class PairMode(Enum):
     LITE = "lite"
+    LITE_ALL_STRATEGY = "lite_all_strategy"
     TRADING = "trading"
     TRADE_READY = "trade_ready"
     AI_OPERATOR_GRID = "ai_operator_grid"
@@ -12,6 +13,7 @@ class PairMode(Enum):
 
 
 PAIR_MODE_LITE = PairMode.LITE
+PAIR_MODE_LITE_ALL_STRATEGY = PairMode.LITE_ALL_STRATEGY
 PAIR_MODE_TRADING = PairMode.TRADING
 PAIR_MODE_TRADE_READY = PairMode.TRADE_READY
 PAIR_MODE_AI_OPERATOR_GRID = PairMode.AI_OPERATOR_GRID
