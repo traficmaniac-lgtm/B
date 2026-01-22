@@ -9,11 +9,13 @@ from src.core.logging import get_logger
 from src.gui.models.pair_mode import (
     PAIR_MODE_LITE,
     PAIR_MODE_AI_OPERATOR_GRID,
+    PAIR_MODE_AI_FULL_STRATEG_V2,
     PAIR_MODE_TRADE_READY,
     PAIR_MODE_TRADING,
     PairMode,
 )
 from src.gui.ai_operator_grid_window import AiOperatorGridWindow
+from src.gui.modes.ai_full_strateg_v2.controller import AiFullStrategV2Controller
 from src.gui.models.app_state import AppState
 from src.gui.pair_action_dialog import PairActionDialog
 from src.gui.trade_ready_mode_window import TradeReadyModeWindow
@@ -41,6 +43,7 @@ class PairModeManager:
         self._logger = get_logger("gui.pair_mode_manager")
         self._trade_ready_windows: list[TradeReadyModeWindow] = []
         self._ai_operator_grid_windows: list[AiOperatorGridWindow] = []
+        self._ai_full_strateg_v2_windows: list[QWidget] = []
 
     def open_pair_dialog(
         self,
@@ -104,3 +107,15 @@ class PairModeManager:
             )
             window.show()
             self._ai_operator_grid_windows.append(window)
+            return
+        if mode == PAIR_MODE_AI_FULL_STRATEG_V2:
+            self._logger.info("[MODE] open window=AiFullStrategV2Window symbol=%s", symbol)
+            controller = AiFullStrategV2Controller(
+                config=self._config,
+                app_state=self._app_state,
+                price_feed_manager=self._price_feed_manager,
+                parent=window_parent,
+            )
+            window = controller.open(symbol)
+            if window is not None:
+                self._ai_full_strateg_v2_windows.append(window)
