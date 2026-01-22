@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.logging import get_logger
-from src.gui.models.pair_mode import PAIR_MODE_LITE, PAIR_MODE_LITE_ALL_STRATEGY, PairMode
+from src.gui.models.pair_mode import PAIR_MODE_ALGO_PILOT, PAIR_MODE_LITE, PAIR_MODE_LITE_ALL_STRATEGY, PairMode
 
 
 class PairActionDialog(QDialog):
@@ -25,7 +25,7 @@ class PairActionDialog(QDialog):
 
         self.setWindowTitle(f"Работа с парой: {symbol}")
         self.setModal(True)
-        self.resize(520, 180)
+        self.resize(520, 260)
 
         layout = QVBoxLayout()
         layout.addWidget(self._build_option_card(
@@ -39,6 +39,12 @@ class PairActionDialog(QDialog):
             description="клон Lite для экспериментов со стратегиями",
             button_text="Open Lite All Strategy",
             on_click=lambda: self._choose_mode(PAIR_MODE_LITE_ALL_STRATEGY),
+        ))
+        layout.addWidget(self._build_option_card(
+            title="Lite All Strategy — ALGO PILOT",
+            description="Lite All Strategy Terminal — ALGO PILOT",
+            button_text="Open Lite All Strategy — ALGO PILOT",
+            on_click=lambda: self._choose_mode(PAIR_MODE_ALGO_PILOT),
         ))
         layout.addStretch()
         self.setLayout(layout)

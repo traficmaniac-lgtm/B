@@ -6,8 +6,14 @@ from PySide6.QtWidgets import QDialog, QWidget
 
 from src.core.config import Config
 from src.core.logging import get_logger
+from src.gui.lite_all_strategy_algo_pilot_window import LiteAllStrategyAlgoPilotWindow
 from src.gui.lite_all_strategy_terminal_window import LiteAllStrategyTerminalWindow
-from src.gui.models.pair_mode import PAIR_MODE_LITE, PAIR_MODE_LITE_ALL_STRATEGY, PairMode
+from src.gui.models.pair_mode import (
+    PAIR_MODE_ALGO_PILOT,
+    PAIR_MODE_LITE,
+    PAIR_MODE_LITE_ALL_STRATEGY,
+    PairMode,
+)
 from src.gui.models.app_state import AppState
 from src.gui.pair_action_dialog import PairActionDialog
 from src.services.price_feed_manager import PriceFeedManager
@@ -33,6 +39,7 @@ class PairModeManager:
         self._price_feed_manager = price_feed_manager
         self._logger = get_logger("gui.pair_mode_manager")
         self._lite_all_strategy_windows: list[LiteAllStrategyTerminalWindow] = []
+        self._lite_all_strategy_algo_pilot_windows: list[LiteAllStrategyAlgoPilotWindow] = []
 
     def open_pair_dialog(
         self,
@@ -79,5 +86,20 @@ class PairModeManager:
             )
             window.show()
             self._lite_all_strategy_windows.append(window)
+            return
+        if mode == PAIR_MODE_ALGO_PILOT:
+            self._logger.info("[MODE] open window=LiteAllStrategyAlgoPilotWindow symbol=%s", symbol)
+            if self._config is None or self._app_state is None or self._price_feed_manager is None:
+                self._logger.error("Lite All Strategy Algo Pilot unavailable: missing runtime dependencies.")
+                return
+            window = LiteAllStrategyAlgoPilotWindow(
+                symbol=symbol,
+                config=self._config,
+                app_state=self._app_state,
+                price_feed_manager=self._price_feed_manager,
+                parent=window_parent,
+            )
+            window.show()
+            self._lite_all_strategy_algo_pilot_windows.append(window)
             return
         self._logger.warning("[MODE] unsupported mode=%s symbol=%s", mode.name, symbol)
