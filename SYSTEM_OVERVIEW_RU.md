@@ -1,6 +1,6 @@
 # BBOT Desktop Terminal — системное описание (RU)
 
-Этот файл описывает архитектуру, расположение модулей, назначение каждого элемента и то, как они взаимодействуют. Он предназначен как единая «карта системы» для быстрого ввода в контекст.
+Этот файл описывает архитектуру, расположение модулей, назначение каждого элемента и то, как они взаимодействуют. Он предназначен как единая «карта системы» для быстрого ввода в контекст и навигации по коду.
 
 ## 1. План работы программы (кратко)
 
@@ -29,7 +29,15 @@
    - подключает лог‑хендлер GUI и exception hook.
 2. `MainWindow` формирует весь интерфейс и создаёт системные сервисы (PriceFeedManager, PairModeManager).
 
-## 3. Общая структура директорий
+## 3. Файлы конфигурации и состояния (верхний уровень)
+
+- `config.json` — основная конфигурация приложения (env, лимиты, URL‑адреса). Загружается `load_config()` и валидируется `Config.validate()`.
+- `config.user.yaml` — пользовательское состояние (настройки GUI, API ключи, дефолтные параметры). Читается/пишется через `AppState`.
+- `data/` — локальные кэши и артефакты:
+  - `data/exchange_info_*.json` — кеш ответа Binance `exchangeInfo`, используется `MarketsService`.
+  - прочие файлы кэша, если добавлены сервисами/окнами.
+
+## 4. Общая структура директорий
 
 ```
 src/
@@ -43,7 +51,7 @@ src/
   runtime/    — локальный runtime‑движок и виртуальные ордера
 ```
 
-## 4. Core: конфигурация, модели и утилиты
+## 5. Core: конфигурация, модели и утилиты
 
 ### `src/core/config.py`
 - **Dataclasses**:
@@ -78,7 +86,7 @@ src/
 - `registry.py` — регистрация/поиск стратегий.
 - `defs/` — встроенные определения стратегий (например, grid classic) для UI‑режимов.
 
-## 5. Binance клиенты
+## 6. Binance клиенты
 
 ### `src/binance/http_client.py`
 - `BinanceHttpClient` — HTTP обёртка на httpx.
@@ -96,7 +104,7 @@ src/
   - синхронизация времени (`sync_time_offset`).
 - `AccountStatus` — результат проверки торговых прав.
 
-## 6. Services: рынки, цены, кэш
+## 7. Services: рынки, цены, кэш
 
 ### `src/services/markets_service.py`
 - `MarketsService` — загрузка списка торговых пар:
@@ -136,7 +144,7 @@ src/
 ### `src/services/ai_provider.py`
 - Простой stub‑AI: генерирует `StrategyPlan`, умеет `chat_adjustment` + `apply_patch`.
 
-## 7. AI модуль
+## 8. AI модуль
 
 ### `src/ai/models.py`
 - Модели аналитики: `AiAnalysisResult`, `AiTradeOption`, `AiActionSuggestion`, `AiStrategyPatch`, `AiResponseEnvelope`.
@@ -175,7 +183,7 @@ src/
 ### `src/ai/operator_state_machine.py`
 - Логика состояний AI оператора (переходы/решения).
 
-## 8. Runtime (локальная симуляция)
+## 9. Runtime (локальная симуляция)
 
 ### `src/runtime/virtual_orders.py`
 - `VirtualOrder`, `VirtualOrderBook` — создание/отмена/фиксация виртуальных ордеров.
@@ -193,7 +201,7 @@ src/
 ### `src/runtime/runtime_state.py`
 - `RuntimeState` — IDLE/RUNNING/PAUSED/STOPPED.
 
-## 9. GUI: окна, диалоги, вкладки
+## 10. GUI: окна, диалоги, вкладки
 
 ### Главный контейнер
 
@@ -326,7 +334,7 @@ src/
 - `PairLogsPanel` — простая панель логов.
 - `DashboardTab`, `MarketsTab`, `BotTab`, `SettingsTab` — исторические вкладки (плейсхолдеры/демо), сейчас используются как reference.
 
-## 10. Взаимодействия и потоки данных
+## 11. Взаимодействия и потоки данных
 
 ### Основные потоки
 
@@ -350,13 +358,20 @@ src/
 - Все компоненты используют `get_logger()`.
 - `MainWindow` подключает `LogDock.handler` к root‑логгеру.
 
-## 11. Тесты
+## 12. Жизненный цикл сервисов (практика)
+
+- `PriceFeedManager` создаётся один раз в `MainWindow` и живёт до закрытия приложения.
+- `PriceHub` создаётся в контексте GUI и раздаёт цены через Qt‑сигналы; окна подписываются при открытии.
+- Сервис `MarketsService` запрашивает/кэширует пары, затем отдаёт их в `OverviewTab`.
+- При закрытии окон и приложения подписки снимаются, а сервисы останавливают потоки/таймеры.
+
+## 13. Тесты
 
 - `tests/test_app_state.py` — проверка сохранения/загрузки AppState.
 - `tests/test_imports.py` — smoke‑imports GUI.
 - `tests/test_markets_service.py` — тесты MarketsService.
 
-## 12. Примечания
+## 14. Примечания
 
 - В проекте есть несколько UI‑веток (Lite Grid, Lite All Strategy Terminal, Pair Workspace, Trade Ready, AI Operator). Это связано со стадиями развития и экспериментами.
 - Реальные сделки не запускаются автоматически: многие режимы содержат confirm/approve шаги и работают в dry‑run.
