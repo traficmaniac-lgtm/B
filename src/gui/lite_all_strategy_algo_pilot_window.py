@@ -131,6 +131,9 @@ class PilotState(Enum):
     PAUSED_BY_RISK = "PAUSED_BY_RISK"
 
 
+RECENTER_THRESHOLD_PCT = 0.7
+
+
 @dataclass
 class GridPlannedOrder:
     side: str
@@ -892,6 +895,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_state_value = QLabel(self._pilot_state.value)
         self._pilot_regime_value = QLabel("RANGE")
         self._pilot_anchor_value = QLabel("--")
+        self._pilot_distance_value = QLabel("--")
+        self._pilot_threshold_value = QLabel(f"{RECENTER_THRESHOLD_PCT:.2f} %")
         self._pilot_position_qty_value = QLabel("--")
         self._pilot_avg_entry_value = QLabel("--")
         self._pilot_break_even_value = QLabel("--")
@@ -900,6 +905,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         indicator_form.addRow(QLabel("Pilot State:"), self._pilot_state_value)
         indicator_form.addRow(QLabel("Market Regime:"), self._pilot_regime_value)
         indicator_form.addRow(QLabel("Anchor Price:"), self._pilot_anchor_value)
+        indicator_form.addRow(QLabel("Distance from Anchor (%):"), self._pilot_distance_value)
+        indicator_form.addRow(QLabel("Threshold (%):"), self._pilot_threshold_value)
         indicator_form.addRow(QLabel("Position Qty:"), self._pilot_position_qty_value)
         indicator_form.addRow(QLabel("Avg Entry:"), self._pilot_avg_entry_value)
         indicator_form.addRow(QLabel("Break-even Price:"), self._pilot_break_even_value)
@@ -1254,10 +1261,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._set_pilot_state(next_state)
 
     def _handle_pilot_recenter(self) -> None:
-        self._append_log(
-            f"[ALGO PILOT] recenter requested symbol={self._symbol}",
-            kind="INFO",
-        )
+        self._pilot_anchor_price = self._last_price
+        self._set_pilot_state(PilotState.NORMAL)
+        self._append_log("[ALGO PILOT] anchor recentered manually", kind="INFO")
 
     def _handle_pilot_recovery(self) -> None:
         self._set_pilot_state(PilotState.RECOVERY)
@@ -1302,6 +1308,24 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if self._pilot_anchor_price is not None:
             anchor_text = self.fmt_price(self.as_decimal(self._pilot_anchor_price), tick)
         self._pilot_anchor_value.setText(anchor_text)
+
+        distance_text = "--"
+        distance_pct: float | None = None
+        if self._pilot_anchor_price and self._last_price is not None:
+            distance_pct = abs(self._last_price - self._pilot_anchor_price) / self._pilot_anchor_price * 100
+            distance_text = f"{distance_pct:.2f} %"
+        self._pilot_distance_value.setText(distance_text)
+
+        if (
+            self._pilot_state == PilotState.NORMAL
+            and distance_pct is not None
+            and distance_pct > RECENTER_THRESHOLD_PCT
+        ):
+            self._append_log(
+                f"[ALGO PILOT] auto-recenter trigger distance={distance_pct:.2f}% symbol={self._symbol}",
+                kind="INFO",
+            )
+            self._set_pilot_state(PilotState.DEFENSIVE)
 
         position_qty_text = "--"
         if self._base_asset:
