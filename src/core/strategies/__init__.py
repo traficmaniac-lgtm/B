@@ -1,0 +1,1 @@
+"""Strategy registry and definitions."""

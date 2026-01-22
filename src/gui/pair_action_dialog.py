@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from src.gui.models.pair_mode import (
     PAIR_MODE_LITE,
     PAIR_MODE_AI_OPERATOR_GRID,
+    PAIR_MODE_AI_FULL_STRATEG_V2,
     PairMode,
 )
 
@@ -41,6 +42,12 @@ class PairActionDialog(QDialog):
             description="Adaptive Micro-Grid Market Making (AI Operator)",
             button_text="Open AI Operator Grid",
             on_click=lambda: self._choose_mode(PAIR_MODE_AI_OPERATOR_GRID),
+        ))
+        layout.addWidget(self._build_option_card(
+            title="AI Full Strateg v2.0",
+            description="Advanced multi-strategy grid workspace (AI/Manual)",
+            button_text="Open AI Full Strateg v2.0",
+            on_click=lambda: self._choose_mode(PAIR_MODE_AI_FULL_STRATEG_V2),
         ))
         layout.addStretch()
         self.setLayout(layout)
