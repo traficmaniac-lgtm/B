@@ -1016,7 +1016,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.4 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.5 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -3675,13 +3675,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             book = self._http_client.get_book_ticker(self._symbol)
             return book if isinstance(book, dict) else {}
 
-        def _handle_success(payload: object, _latency_ms: int) -> None:
+        worker = _Worker(_fetch, self._can_emit_worker_results)
+        worker.signals.success.connect(self._handle_book_ticker_success)
+        self._thread_pool.start(worker)
+
+    def _handle_book_ticker_success(self, payload: object, _latency_ms: int) -> None:
+        assert isinstance(self, LiteAllStrategyNcMicroWindow)
+        try:
             if isinstance(payload, dict) and payload:
                 self._set_http_cache("book_ticker", payload)
-
-        worker = _Worker(_fetch, self._can_emit_worker_results)
-        worker.signals.success.connect(_handle_success)
-        self._thread_pool.start(worker)
+        except Exception as exc:
+            self._append_log(
+                f"[HTTP_BOOK] handle success error: {exc}",
+                kind="WARN",
+            )
 
     def _fetch_bidask_http_book(self) -> None:
         now_ts = monotonic()
@@ -3695,25 +3702,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             book = self._http_client.get_book_ticker(self._symbol)
             return book if isinstance(book, dict) else {}
 
-        def _safe_float(x: object) -> float | None:
-            try:
-                if x is None:
-                    return None
-                s = str(x).strip()
-                if not s:
-                    return None
-                return float(s)
-            except Exception:
-                return None
+        worker = _Worker(_fetch, self._can_emit_worker_results)
+        worker.signals.success.connect(self._handle_success)
+        self._thread_pool.start(worker)
 
-        def _handle_success(payload: object, _latency_ms: int) -> None:
+    def _handle_success(self, payload: object, _latency_ms: int) -> None:
+        assert isinstance(self, LiteAllStrategyNcMicroWindow)
+        try:
             if not isinstance(payload, dict) or not payload:
                 return
-            bid = _safe_float(payload.get("bidPrice"))
-            ask = _safe_float(payload.get("askPrice"))
-            last_price = _safe_float(payload.get("lastPrice"))
+            bid = self._coerce_float(payload.get("bidPrice"))
+            ask = self._coerce_float(payload.get("askPrice"))
+            last_price = self._coerce_float(payload.get("lastPrice"))
             if last_price is None:
-                last_price = _safe_float(payload.get("price"))
+                last_price = self._coerce_float(payload.get("price"))
             if bid is None or ask is None or bid <= 0 or ask <= 0:
                 if bid is None or ask is None:
                     payload_keys = sorted(payload.keys())
@@ -3733,10 +3735,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     kind="INFO",
                 )
                 self._bidask_ready_logged = True
-
-        worker = _Worker(_fetch, self._can_emit_worker_results)
-        worker.signals.success.connect(_handle_success)
-        self._thread_pool.start(worker)
+        except Exception as exc:
+            self._append_log(
+                f"[BIDASK] handle success error: {exc}",
+                kind="WARN",
+            )
 
     def update_market_kpis(self) -> None:
         try:
@@ -7892,7 +7895,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return price * qty
 
     @staticmethod
-    def _coerce_float(value: str) -> float | None:
+    def _coerce_float(value: str | float | None) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if not isinstance(value, str):
+            return None
         cleaned = value.replace(",", "").strip()
         if not cleaned or cleaned == "—":
             return None
