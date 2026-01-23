@@ -13,7 +13,13 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.logging import get_logger
-from src.gui.models.pair_mode import PAIR_MODE_ALGO_PILOT, PAIR_MODE_LITE, PAIR_MODE_LITE_ALL_STRATEGY, PairMode
+from src.gui.models.pair_mode import (
+    PAIR_MODE_ALGO_PILOT,
+    PAIR_MODE_LITE,
+    PAIR_MODE_LITE_ALL_STRATEGY,
+    PAIR_MODE_NC_MICRO,
+    PairMode,
+)
 
 
 class PairActionDialog(QDialog):
@@ -25,7 +31,7 @@ class PairActionDialog(QDialog):
 
         self.setWindowTitle(f"Работа с парой: {symbol}")
         self.setModal(True)
-        self.resize(520, 260)
+        self.resize(520, 340)
 
         layout = QVBoxLayout()
         layout.addWidget(self._build_option_card(
@@ -45,6 +51,12 @@ class PairActionDialog(QDialog):
             description="Lite All Strategy Terminal — ALGO PILOT",
             button_text="Open Lite All Strategy — ALGO PILOT",
             on_click=lambda: self._choose_mode(PAIR_MODE_ALGO_PILOT),
+        ))
+        layout.addWidget(self._build_option_card(
+            title="NC MICRO",
+            description="No-Commission Micro Grid (auto pilot)",
+            button_text="Open NC MICRO",
+            on_click=lambda: self._choose_mode(PAIR_MODE_NC_MICRO),
         ))
         layout.addStretch()
         self.setLayout(layout)
