@@ -9,7 +9,7 @@
 ├── README.md — quickstart and usage instructions.
 ├── REPORT.md — project report/notes.
 ├── SYSTEM_OVERVIEW_RU.md — detailed system overview in Russian.
-├── ALGO_PILOT_v1.5.md — detailed description of the ALGO PILOT mode (RU).
+├── ALGO_PILOT_v1.5.md — detailed description of the ALGO PILOT mode (RU, фактическая версия v1.6.5).
 ├── _link_test.txt — link test artifact.
 ├── requirements.txt — Python dependencies.
 ├── requirements.txt.txt — duplicate dependency list (legacy).
@@ -21,7 +21,7 @@
 │   │   ├── models.py — AI response/data models and parsing helpers.
 │   │   ├── openai_client.py — OpenAI API client wrapper.
 │   │   ├── operator_datapack.py — builds AI operator datapacks.
-│   │   ├── operator_math.py — math helpers for operator calculations.
+│   │   ├── operator_math.py — math helpers (fees, break-even, TP checks).
 │   │   ├── operator_models.py — operator request/response schemas.
 │   │   ├── operator_profiles.py — operator profiles and presets.
 │   │   ├── operator_request_loop.py — iterative AI request loop logic.
@@ -52,9 +52,9 @@
 │   │   ├── __init__.py — package marker for GUI.
 │   │   ├── ai_operator_grid_window.py — AI operator grid window.
 │   │   ├── i18n.py — GUI translations/localization helpers.
-│   │   ├── lite_all_strategy_algo_pilot_window.py — Lite All Strategy Terminal with ALGO PILOT.
+│   │   ├── lite_all_strategy_algo_pilot_window.py — Lite All Strategy Terminal with ALGO PILOT (v1.6.5).
 │   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI).
-│   │   ├── lite_grid_math.py — math helpers for lite grid UI.
+│   │   ├── lite_grid_math.py — math helpers for lite grid UI and fills.
 │   │   ├── lite_grid_window.py — lite grid trading window.
 │   │   ├── main_window.py — main application window and menu.
 │   │   ├── overview_tab.py — overview tab with market list.
@@ -94,8 +94,8 @@
 │       ├── ai_provider.py — AI provider stub/bridge.
 │       ├── data_cache.py — in-memory data cache.
 │       ├── markets_service.py — market list loading/filtering.
-│       ├── price_feed_manager.py — price feed orchestration.
-│       ├── price_feed_service.py — per-symbol price feed client.
+│       ├── price_feed_manager.py — price feed orchestration (WS + HTTP fallback).
+│       ├── price_feed_service.py — per-symbol feed service used by the manager.
 │       ├── price_hub.py — Qt hub for price updates.
 │       ├── price_service.py — price caching and TTL checks.
 │       └── rate_limiter.py — rate limiter utility.
@@ -122,8 +122,10 @@ These files are created at runtime and are not tracked in the repo:
 - **gui**: main window, dialogs, tabs, widgets, and UI state models for the PySide6 UI.
 - **gui/models**: UI state containers such as `AppState` and pair/workspace models.
 - **gui/lite_all_strategy_terminal_window.py**: Lite All Strategy Terminal (grid experimentation and trade gating).
-- **gui/lite_all_strategy_algo_pilot_window.py**: Lite All Strategy Terminal with ALGO PILOT automation panel.
+- **gui/lite_all_strategy_algo_pilot_window.py**: ALGO PILOT v1.6.5 (grid automation, KPI checks, stale handling, profit guard).
 - **services**: application services for prices, markets, caching, and rate limiting.
+- **services/price_feed_manager.py**: WS/HTTP price orchestration and status reporting.
+- **services/price_feed_service.py**: per‑symbol feed used by the manager.
 - **binance**: HTTP, websocket, and account client wrappers for Binance endpoints.
 - **ai**: AI operator schemas, datapack building, validation, and OpenAI client wrapper.
 - **runtime**: local runtime engine and virtual order simulation.
@@ -138,7 +140,8 @@ These files are created at runtime and are not tracked in the repo:
    - `LiteGridWindow` (legacy grid terminal),
    - `LiteAllStrategyTerminalWindow` (multi-strategy grid experiments),
    - `LiteAllStrategyAlgoPilotWindow` (ALGO PILOT automation + grid runtime).
-5. Optional AI modes build datapacks in `ai/operator_datapack.py` and validate patches in `ai/operator_validation.py`.
+5. ALGO PILOT pulls KPIs, validates market state, builds grid plans, and applies stale policies before placing/refreshing orders.
+6. Optional AI modes build datapacks in `ai/operator_datapack.py` and validate patches in `ai/operator_validation.py`.
 
 ## Run
 
