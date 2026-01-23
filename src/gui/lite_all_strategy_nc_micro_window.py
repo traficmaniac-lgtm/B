@@ -194,6 +194,7 @@ KPI_STATE_INVALID = "INVALID"
 BIDASK_POLL_MS = 700
 BIDASK_FAIL_SOFT_MS = 1500
 BIDASK_STALE_MS = 4000
+PRICE_STALE_MS = 4000
 SPREAD_DISPLAY_EPS_PCT = 0.0001
 REGISTRY_GC_INTERVAL_MS = 60_000
 REGISTRY_GC_TTL_SEC = 600
@@ -761,6 +762,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._recent_key_insufficient_ttl_s = 2.0
         self._bot_session_id: str | None = None
         self._last_price: float | None = None
+        self._last_price_ts: float | None = None
         self._price_history: list[float] = []
         self._account_can_trade = False
         self._account_permissions: list[str] = []
@@ -865,11 +867,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._bidask_ts: float | None = None
         self._bidask_src: str | None = None
         self._bidask_last_request_ts: float | None = None
+        self._bidask_ready_logged = False
         self._kpi_vol_samples: deque[tuple[float, float]] = deque(maxlen=KPI_VOL_SAMPLE_MAXLEN)
         self._kpi_last_good_vol: float | None = None
         self._kpi_last_good_ts: float | None = None
         self._kpi_last_state_ts: float | None = None
         self._kpi_last_reason: str | None = None
+        self._kpi_last_good: dict[str, Any] | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._registry_key_last_seen_ts: dict[str, float] = {}
@@ -933,7 +937,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.1 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.2 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -3482,13 +3486,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _apply_price_update(self, update: PriceUpdate) -> None:
         self._last_price_update = update
-        if update.last_price is not None:
-            self._last_price = update.last_price
-            self._record_price(update.last_price)
-            self._last_price_label.setText(tr("last_price", price=f"{update.last_price:.8f}"))
-            self._grid_engine.on_price(update.last_price)
-        else:
-            self._last_price = None
+        price = update.last_price if isinstance(update.last_price, (int, float)) else None
+        if price is not None and price > 0:
+            self._last_price = price
+            self._last_price_ts = monotonic()
+            self._record_price(price)
+            self._last_price_label.setText(tr("last_price", price=f"{price:.8f}"))
+            self._grid_engine.on_price(price)
+        elif self._last_price is None:
+            self._last_price_label.setText(tr("last_price", price="—"))
 
         latency = f"{update.latency_ms}ms" if update.latency_ms is not None else "—"
         age = f"{update.price_age_ms}ms" if update.price_age_ms is not None else "—"
@@ -3602,16 +3608,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._bidask_ts = monotonic()
             self._bidask_src = "HTTP_BOOK"
             self._set_http_cache("book_ticker", payload)
-            self._append_log(
-                f"[BIDASK] updated src=HTTP_BOOK bid={bid:.8f} ask={ask:.8f} age=0ms",
-                kind="INFO",
-            )
+            if not self._bidask_ready_logged:
+                self._append_log(
+                    f"[BIDASK] ready src=HTTP_BOOK bid={bid:.8f} ask={ask:.8f}",
+                    kind="INFO",
+                )
+                self._bidask_ready_logged = True
 
         worker = _Worker(_fetch, self._can_emit_worker_results)
         worker.signals.success.connect(_handle_success)
         self._thread_pool.start(worker)
 
     def update_market_kpis(self) -> None:
+        if self._closing:
+            return
         if not hasattr(self, "_market_price"):
             return
         snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
@@ -3630,6 +3640,23 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 micro = self._last_price_update.microstructure
 
         now_ts = monotonic()
+        price_cache_used = False
+        price_cache_age_ms = None
+        if not isinstance(price, (int, float)) or price <= 0:
+            price = None
+        if price is not None:
+            self._last_price = price
+            self._last_price_ts = now_ts
+        elif self._last_price is not None and self._last_price_ts is not None:
+            price_cache_age_ms = int((now_ts - self._last_price_ts) * 1000)
+            if price_cache_age_ms <= PRICE_STALE_MS:
+                price = self._last_price
+                price_cache_used = True
+        if price_cache_used:
+            if age_ms is None:
+                age_ms = price_cache_age_ms
+            if source is None:
+                source = "CACHE"
         if (
             self._bidask_last_request_ts is None
             or (now_ts - self._bidask_last_request_ts) * 1000 >= BIDASK_POLL_MS
@@ -3741,8 +3768,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         else:
             self._kpi_missing_bidask_active = False
         if not price_available:
-            kpi_state = KPI_STATE_INVALID
-            kpi_reason = "no_price"
+            kpi_state = KPI_STATE_UNKNOWN
+            kpi_reason = "no_price_yet"
         elif spread_zero_ok:
             kpi_state = KPI_STATE_OK
             kpi_reason = "spread=0 allowed"
@@ -3770,25 +3797,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if cache_used and cache_ttl is not None and kpi_reason == "vol_cached":
             log_reason = f"{kpi_reason} ttl={cache_ttl}s"
         if self._kpi_last_state != kpi_state or self._kpi_last_reason != kpi_reason:
-            kind = "WARN" if kpi_state == KPI_STATE_INVALID else "INFO"
             bidask_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
             self._append_log(
                 (
                     f"[KPI] state={kpi_state} spread={spread_log} vol={vol_text} "
                     f"src={book_source} age={bidask_age_text} reason={log_reason}"
                 ),
-                kind=kind,
+                kind="INFO",
             )
             self._kpi_last_state = kpi_state
             self._kpi_last_reason = kpi_reason
             self._kpi_last_state_ts = now_ts
-        if kpi_state == KPI_STATE_INVALID:
-            self._kpi_invalid_reason = kpi_reason
-        else:
-            self._kpi_invalid_reason = None
+        self._kpi_invalid_reason = None
         self._kpi_vol_state = vol_state
         self._kpi_state = kpi_state
         self._kpi_valid = kpi_state != KPI_STATE_INVALID
+        if kpi_state == KPI_STATE_OK and spread_pct is not None:
+            self._kpi_last_good = {
+                "spread": spread_pct,
+                "vol": volatility_pct,
+                "src": book_source,
+                "ts": now_ts,
+            }
 
         if price is not None and source is not None:
             should_log = False
@@ -4282,6 +4312,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._append_log("[STOP] ignored: already in progress", kind="WARN")
             return
         self._stop_in_progress = True
+        self._closing = True
+        self._stop_local_timers()
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("STOPPING")
@@ -4328,6 +4360,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids.clear()
         self._pending_restore_ids.clear()
         self._stop_in_progress = False
+        self._closing = False
+        self._resume_local_timers()
         self._render_open_orders()
         self._change_state("STOPPED")
 
@@ -7885,12 +7919,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _can_emit_worker_results(self) -> bool:
         return not self._closing
 
+    def _stop_local_timers(self) -> None:
+        if self._market_kpi_timer.isActive():
+            self._market_kpi_timer.stop()
+        if self._pilot_ui_timer.isActive():
+            self._pilot_ui_timer.stop()
+        if self._registry_gc_timer.isActive():
+            self._registry_gc_timer.stop()
+
+    def _resume_local_timers(self) -> None:
+        if not self._market_kpi_timer.isActive():
+            self._market_kpi_timer.start()
+        if not self._pilot_ui_timer.isActive():
+            self._pilot_ui_timer.start()
+        if not self._registry_gc_timer.isActive():
+            self._registry_gc_timer.start()
+
     def closeEvent(self, event: object) -> None:  # noqa: N802
         self._closing = True
         self._balances_timer.stop()
         self._orders_timer.stop()
         self._fills_timer.stop()
-        self._market_kpi_timer.stop()
+        self._stop_local_timers()
         self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
         self._price_feed_manager.unregister_symbol(self._symbol)
