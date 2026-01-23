@@ -182,7 +182,6 @@ PROFIT_GUARD_LOW_VOL_FLOOR_PCT = 0.05
 PROFIT_GUARD_MIN_VOL_PCT = 0.05
 VOL_CONFIRM_TICKS = 3
 VOL_CONFIRM_TIME_MS = 1000
-KPI_TIMEOUT_MS = 5000
 KPI_BOOK_REQUEST_INTERVAL_MS = 1000
 KPI_DEBOUNCE_SEC = 5
 KPI_VOL_SAMPLE_MAXLEN = 60
@@ -192,6 +191,9 @@ KPI_VOL_TTL_SEC = 120
 KPI_STATE_OK = "OK"
 KPI_STATE_UNKNOWN = "UNKNOWN"
 KPI_STATE_INVALID = "INVALID"
+BIDASK_POLL_MS = 700
+BIDASK_FAIL_SOFT_MS = 1500
+BIDASK_STALE_MS = 4000
 SPREAD_DISPLAY_EPS_PCT = 0.0001
 REGISTRY_GC_INTERVAL_MS = 60_000
 REGISTRY_GC_TTL_SEC = 600
@@ -859,6 +861,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._kpi_missing_bidask_since_ts: float | None = None
         self._kpi_last_book_request_ts: float | None = None
         self._kpi_missing_bidask_active = False
+        self._bidask_last: tuple[float, float] | None = None
+        self._bidask_ts: float | None = None
+        self._bidask_src: str | None = None
+        self._bidask_last_request_ts: float | None = None
         self._kpi_vol_samples: deque[tuple[float, float]] = deque(maxlen=KPI_VOL_SAMPLE_MAXLEN)
         self._kpi_last_good_vol: float | None = None
         self._kpi_last_good_ts: float | None = None
@@ -927,7 +933,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.1 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -3573,6 +3579,38 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         worker.signals.success.connect(_handle_success)
         self._thread_pool.start(worker)
 
+    def _fetch_bidask_http_book(self) -> None:
+        now_ts = monotonic()
+        if self._bidask_last_request_ts and (
+            (now_ts - self._bidask_last_request_ts) * 1000 < BIDASK_POLL_MS
+        ):
+            return
+        self._bidask_last_request_ts = now_ts
+
+        def _fetch() -> dict[str, Any]:
+            book = self._http_client.get_book_ticker(self._symbol)
+            return book if isinstance(book, dict) else {}
+
+        def _handle_success(payload: object, _latency_ms: int) -> None:
+            if not isinstance(payload, dict) or not payload:
+                return
+            bid = self._coerce_float(str(payload.get("bidPrice", "")))
+            ask = self._coerce_float(str(payload.get("askPrice", "")))
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                return
+            self._bidask_last = (bid, ask)
+            self._bidask_ts = monotonic()
+            self._bidask_src = "HTTP_BOOK"
+            self._set_http_cache("book_ticker", payload)
+            self._append_log(
+                f"[BIDASK] updated src=HTTP_BOOK bid={bid:.8f} ask={ask:.8f} age=0ms",
+                kind="INFO",
+            )
+
+        worker = _Worker(_fetch, self._can_emit_worker_results)
+        worker.signals.success.connect(_handle_success)
+        self._thread_pool.start(worker)
+
     def update_market_kpis(self) -> None:
         if not hasattr(self, "_market_price"):
             return
@@ -3591,13 +3629,31 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if micro is None:
                 micro = self._last_price_update.microstructure
 
+        now_ts = monotonic()
+        if (
+            self._bidask_last_request_ts is None
+            or (now_ts - self._bidask_last_request_ts) * 1000 >= BIDASK_POLL_MS
+        ):
+            self._fetch_bidask_http_book()
+        best_bid = None
+        best_ask = None
+        book_source = self._bidask_src or "HTTP_BOOK"
+        bidask_age_ms = None
+        bidask_state = "missing"
+        if self._bidask_last and self._bidask_ts is not None:
+            age_ms = int((now_ts - self._bidask_ts) * 1000)
+            if age_ms <= BIDASK_STALE_MS:
+                best_bid, best_ask = self._bidask_last
+                bidask_age_ms = age_ms
+                bidask_state = "stale_cache" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
+            else:
+                bidask_age_ms = age_ms
+
         if price is None:
             self._market_price.setText("—")
         else:
             self._market_price.setText(f"{price:.8f}")
         self._set_market_label_state(self._market_price, active=price is not None)
-
-        best_bid, best_ask, book_source = self._resolve_book_bid_ask()
         spread_pct = self._compute_spread_pct_from_book(best_bid, best_ask)
         spread_text = self._format_spread_display(spread_pct)
         self._market_spread.setText(spread_text)
@@ -3654,7 +3710,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
         is_spread_zero = spread_pct is not None and spread_pct == 0
         spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
-        now_ts = monotonic()
         if volatility_pct is None:
             self._kpi_zero_vol_ticks = 0
             self._kpi_zero_vol_start_ts = None
@@ -3671,20 +3726,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         spread_log = spread_text if spread_text != "—" else "—"
         vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
         bidask_missing = best_bid is None or best_ask is None
-        if bidask_missing:
-            if self._kpi_missing_bidask_since_ts is None:
-                self._kpi_missing_bidask_since_ts = now_ts
-            missing_ms = (now_ts - self._kpi_missing_bidask_since_ts) * 1000
-        else:
+        if bidask_missing and self._kpi_missing_bidask_since_ts is None:
+            self._kpi_missing_bidask_since_ts = now_ts
+        if not bidask_missing:
             self._kpi_missing_bidask_since_ts = None
-            missing_ms = 0
         price_available = price is not None
-        bidask_timeout = bidask_missing and missing_ms >= KPI_TIMEOUT_MS
         if bidask_missing:
-            self._request_book_ticker()
             if not self._kpi_missing_bidask_active:
                 self._append_log(
-                    "[KPI] state=UNKNOWN reason=no_bidask -> requesting_book",
+                    "[KPI] state=UNKNOWN reason=no_bidask_yet",
                     kind="INFO",
                 )
                 self._kpi_missing_bidask_active = True
@@ -3693,15 +3743,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not price_available:
             kpi_state = KPI_STATE_INVALID
             kpi_reason = "no_price"
-        elif bidask_timeout:
-            kpi_state = KPI_STATE_INVALID
-            kpi_reason = "no_bidask_timeout"
         elif spread_zero_ok:
             kpi_state = KPI_STATE_OK
             kpi_reason = "spread=0 allowed"
         elif bidask_missing:
             kpi_state = KPI_STATE_UNKNOWN
-            kpi_reason = "no_bidask"
+            kpi_reason = "no_bidask_yet"
+        elif bidask_state == "stale_cache":
+            kpi_state = KPI_STATE_OK
+            kpi_reason = "bidask_stale_cache"
         elif vol_state == KPI_STATE_UNKNOWN:
             kpi_state = KPI_STATE_UNKNOWN
             kpi_reason = vol_reason
@@ -3721,10 +3771,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             log_reason = f"{kpi_reason} ttl={cache_ttl}s"
         if self._kpi_last_state != kpi_state or self._kpi_last_reason != kpi_reason:
             kind = "WARN" if kpi_state == KPI_STATE_INVALID else "INFO"
+            bidask_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
             self._append_log(
                 (
                     f"[KPI] state={kpi_state} spread={spread_log} vol={vol_text} "
-                    f"src={book_source} reason={log_reason}"
+                    f"src={book_source} age={bidask_age_text} reason={log_reason}"
                 ),
                 kind=kind,
             )
