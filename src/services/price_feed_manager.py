@@ -1728,11 +1728,11 @@ class PriceFeedManager:
         if source == "HTTP" and isinstance(router, SymbolDataRouter):
             if router.http_last_tick_ts is None:
                 last_price = None
-                best_bid = None
-                best_ask = None
-                spread_abs = None
-                spread_pct = None
-                mid_price = None
+            best_bid = None
+            best_ask = None
+            spread_abs = None
+            spread_pct = None
+            mid_price = None
         ws_status = state.get("ws_status", WS_LOST)
         ws_health_state = state.get("ws_health_state", resolve_health_state(ws_status))
         price_age_ms = None

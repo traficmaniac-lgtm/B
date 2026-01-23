@@ -170,6 +170,7 @@ PROFIT_GUARD_EXIT_BUFFER_PCT = 0.02
 PROFIT_GUARD_THIN_SPREAD_FACTOR = 0.25
 PROFIT_GUARD_LOW_VOL_FACTOR = 0.5
 PROFIT_GUARD_LOW_VOL_FLOOR_PCT = 0.05
+PROFIT_GUARD_MIN_VOL_PCT = 0.05
 
 
 @dataclass
@@ -778,6 +779,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_confirm_dry_run = True
         self._pilot_allow_market = False
         self._pilot_action_in_progress = False
+        self._current_action: str | None = None
         self._pilot_pending_action: PilotAction | None = None
         self._pilot_pending_plan: list[GridPlannedOrder] | None = None
         self._pilot_warning_override: str | None = None
@@ -796,6 +798,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._last_price_update: PriceUpdate | None = None
         self._kpi_has_data = False
         self._kpi_last_source: str | None = None
+        self._kpi_valid = False
+        self._kpi_last_valid: bool | None = None
+        self._kpi_invalid_reason: str | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._position_state = PositionState(
@@ -853,7 +858,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=1.4 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.0 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1628,6 +1633,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             kind="WARN",
         )
 
+    def _action_lock_blocked(self, requested: str) -> bool:
+        if self._current_action and self._current_action != requested:
+            self._append_log(
+                f"[ALGO_PILOT] action blocked current={self._current_action} requested={requested}",
+                kind="WARN",
+            )
+            return True
+        return False
+
     def _pilot_trade_gate_ready(self, action: PilotAction) -> bool:
         if self._last_price is None:
             self._pilot_block_action(action, "no last price")
@@ -1671,6 +1685,17 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         return confirm == QMessageBox.Yes
 
     def _pilot_execute(self, action: PilotAction, *, auto: bool = False) -> None:
+        action_key = {
+            PilotAction.RECENTER: "recenter",
+            PilotAction.RECOVERY: "recovery",
+            PilotAction.FLATTEN_BE: "flatten",
+            PilotAction.TOGGLE: "toggle",
+            PilotAction.FLAG_STALE: "flag_stale",
+            PilotAction.CANCEL_REPLACE_STALE: "cancel_replace_stale",
+        }
+        requested = action_key.get(action, action.value.lower())
+        if self._action_lock_blocked(requested):
+            return
         if self._pilot_action_in_progress:
             self._pilot_block_action(action, "in_progress")
             return
@@ -1779,6 +1804,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         ]
         if not self._pilot_confirm_action(PilotAction.RECENTER, summary):
             return
+        self._current_action = "recenter"
         self._set_pilot_action_in_progress(True, status="Выполняю…")
         old_anchor = self._pilot_anchor_price or anchor_price
         self._pilot_pending_anchor = anchor_price
@@ -1808,6 +1834,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_recenter_expected_min = None
             self._set_pilot_state(PilotState.NORMAL)
             self._set_pilot_action_in_progress(False)
+            self._current_action = None
             return
         self._pilot_pending_action = PilotAction.RECENTER
         self._pilot_pending_plan = plan
@@ -1909,7 +1936,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         position_qty = self._pilot_position_qty()
         be_price = self._pilot_break_even_price()
         if position_qty <= 0 or be_price is None:
-            self._pilot_block_action(PilotAction.RECOVERY, "break-even unknown")
             return
         summary = [
             f"cancel={len(self._open_orders)}",
@@ -1924,6 +1950,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f"[ALGO PILOT] recovery mode enabled symbol={self._symbol}",
             kind="INFO",
         )
+        self._current_action = "recovery"
         self._set_pilot_action_in_progress(True, status="Выполняю…")
         self._pilot_place_break_even_order(
             be_price=be_price,
@@ -1936,7 +1963,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         position_qty = self._pilot_position_qty()
         be_price = self._pilot_break_even_price()
         if position_qty <= 0 or be_price is None:
-            self._pilot_block_action(PilotAction.FLATTEN_BE, "break-even unknown")
             return
         summary = [
             f"cancel={len(self._open_orders)}",
@@ -1957,6 +1983,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 "[ALGO PILOT] market close requested but not supported, using BE limit",
                 kind="WARN",
             )
+        self._current_action = "flatten"
         self._set_pilot_action_in_progress(True, status="Выполняю…")
         self._pilot_place_break_even_order(
             be_price=be_price,
@@ -2055,7 +2082,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         snapshot = self._collect_strategy_snapshot()
         settings = self._resolve_start_settings(snapshot)
         self._apply_auto_clamps(settings, anchor_price)
-        if self._apply_profit_guard(settings, anchor_price, action_label=action_label, update_ui=False):
+        guard_decision = self._apply_profit_guard(
+            settings,
+            anchor_price,
+            action_label=action_label,
+            update_ui=False,
+        )
+        if guard_decision == "HOLD":
             return None, settings, True
         try:
             planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
@@ -2091,7 +2124,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return True, ""
         break_even = self._pilot_break_even_price()
         if break_even is None:
-            return False, "break-even unknown (soft actions only)"
+            return True, ""
         be_price = float(break_even)
         if position_qty > 0:
             violations = [order for order in plan if order.side == "SELL" and order.price < be_price]
@@ -2241,6 +2274,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             kind="INFO",
         )
         self._set_pilot_action_in_progress(False)
+        self._current_action = None
         self._pilot_pending_action = None
         self._pilot_pending_plan = None
 
@@ -2289,12 +2323,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             )
         self._refresh_open_orders(force=True)
         self._set_pilot_action_in_progress(False)
+        self._current_action = None
         self._pilot_pending_action = None
         self._pilot_pending_plan = None
 
     def _handle_pilot_action_error(self, message: str) -> None:
         self._append_log(f"[ALGO PILOT] action error: {message}", kind="WARN")
         self._set_pilot_action_in_progress(False)
+        self._current_action = None
         if self._pilot_state == PilotState.RECENTERING:
             self._set_pilot_state(PilotState.NORMAL)
             self._pilot_pending_anchor = None
@@ -2441,9 +2477,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             break_even_text = self.fmt_price(break_even, tick)
         self._pilot_break_even_value.setText(break_even_text)
         if break_even is None or position_state.position_qty <= 0:
-            self._pilot_break_even_value.setToolTip("Нет позиции или недостаточно данных")
+            self._pilot_break_even_value.setToolTip("")
         else:
             self._pilot_break_even_value.setToolTip("")
+        has_position = position_qty > 0
+        be_actions_enabled = has_position and break_even is not None and break_even > 0
+        if hasattr(self, "_pilot_recovery_button"):
+            self._pilot_recovery_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
+        if hasattr(self, "_pilot_flatten_button"):
+            self._pilot_flatten_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
 
         pnl_text = "—"
         if self._last_price is not None and self._base_asset:
@@ -2814,6 +2856,39 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._market_source.setText(source_age_text)
         self._set_market_label_state(self._market_source, active=source_age_text != "—")
 
+        kpi_valid = True
+        invalid_reasons: list[str] = []
+        if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
+            kpi_valid = False
+            invalid_reasons.append("ws_stale")
+        spread_value: float | None = None
+        if micro is not None:
+            if micro.spread_pct is not None:
+                spread_value = float(micro.spread_pct)
+            elif micro.spread_abs is not None:
+                spread_value = float(micro.spread_abs)
+        if spread_value == 0:
+            kpi_valid = False
+            invalid_reasons.append("spread=0")
+        if volatility_pct == 0:
+            kpi_valid = False
+            invalid_reasons.append("vol=0")
+        invalid_reason_text = ",".join(invalid_reasons) if invalid_reasons else None
+        if not kpi_valid and invalid_reason_text:
+            if self._kpi_invalid_reason != invalid_reason_text or self._kpi_valid:
+                self._append_log(f"[KPI] invalid reason={invalid_reason_text}", kind="WARN")
+            self._kpi_invalid_reason = invalid_reason_text
+        else:
+            self._kpi_invalid_reason = None
+        if source is not None and age_ms is not None:
+            if self._kpi_last_source != source or self._kpi_last_valid != kpi_valid:
+                self._append_log(
+                    f"[PRICE] source={source} age={age_ms} valid={str(kpi_valid).lower()}",
+                    kind="INFO",
+                )
+        self._kpi_valid = kpi_valid
+        self._kpi_last_valid = kpi_valid if source is not None else None
+
         if price is not None and source is not None:
             should_log = False
             if not self._kpi_has_data or self._kpi_last_source != source:
@@ -2832,6 +2907,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         else:
             self._kpi_has_data = False
             self._kpi_last_source = None
+            self._kpi_valid = False
+            self._kpi_last_valid = None
 
     def _compute_recent_volatility_pct(self) -> float | None:
         if len(self._price_history) < 2:
@@ -3042,6 +3119,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._tp_fix_button.setEnabled(False)
 
     def _handle_start(self) -> None:
+        if self._action_lock_blocked("start"):
+            return
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
@@ -3061,6 +3140,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         self._start_in_progress = True
         self._start_in_progress_logged = False
+        self._current_action = "start"
         self._start_token += 1
         self._last_preflight_hash = snapshot_hash
         self._last_preflight_blocked = False
@@ -3114,7 +3194,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 balance_snapshot = self._balance_snapshot()
                 settings = self._resolve_start_settings(snapshot)
                 self._apply_auto_clamps(settings, anchor_price)
-                if self._apply_profit_guard(settings, anchor_price, action_label="start", update_ui=True):
+                guard_decision = self._apply_profit_guard(
+                    settings,
+                    anchor_price,
+                    action_label="start",
+                    update_ui=True,
+                )
+                if guard_decision == "HOLD":
                     self._append_log("[START] blocked: profit guard HOLD", kind="WARN")
                     self._mark_preflight_blocked()
                     return
@@ -3279,6 +3365,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             if not started:
                 self._start_in_progress = False
                 self._start_in_progress_logged = False
+                self._current_action = None
                 if self._state == "IDLE":
                     self._start_button.setEnabled(True)
 
@@ -3539,6 +3626,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._apply_engine_state_style(self._engine_state)
         self._update_orders_timer_interval()
         self._update_fills_timer()
+        if new_state in {"RUNNING", "PAUSED", "WAITING_FILLS"} and self._current_action == "start":
+            self._current_action = None
         if new_state == "IDLE" and not self._start_in_progress:
             self._start_in_progress_logged = False
             self._start_button.setEnabled(True)
@@ -4023,6 +4112,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._render_open_orders()
             self._apply_trade_gate()
             return
+        if not force:
+            snapshot_age_sec = self._snapshot_age_sec()
+            if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
+                self._append_log("[ORDERS] snapshot stale -> refresh", kind="INFO")
+                force = True
         if self._orders_in_flight and not force:
             return
         self._orders_in_flight = True
@@ -4681,17 +4775,22 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return 0.0
         return tick / anchor_price * 100
 
-    def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[bool, float | None, float | None]:
+    def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[str, float | None, float | None]:
         spread_pct = self._current_spread_pct()
         volatility_pct = self._compute_recent_volatility_pct()
+        if not self._kpi_valid:
+            return "REQUEST_DATA", spread_pct, volatility_pct
         if spread_pct is None or volatility_pct is None:
-            return False, spread_pct, volatility_pct
-        if spread_pct >= min_profit_pct * PROFIT_GUARD_THIN_SPREAD_FACTOR:
-            return False, spread_pct, volatility_pct
-        low_vol_threshold = max(min_profit_pct * PROFIT_GUARD_LOW_VOL_FACTOR, PROFIT_GUARD_LOW_VOL_FLOOR_PCT)
-        if volatility_pct >= low_vol_threshold:
-            return False, spread_pct, volatility_pct
-        return True, spread_pct, volatility_pct
+            return "OK", spread_pct, volatility_pct
+        if spread_pct <= 0:
+            return "OK", spread_pct, volatility_pct
+        if volatility_pct <= PROFIT_GUARD_MIN_VOL_PCT:
+            return "OK", spread_pct, volatility_pct
+        fee_cost = self._profit_guard_round_trip_cost_pct()
+        required_edge = spread_pct + fee_cost + PROFIT_GUARD_BUFFER_PCT
+        if min_profit_pct > required_edge:
+            return "HOLD", spread_pct, volatility_pct
+        return "OK", spread_pct, volatility_pct
 
     def _apply_profit_guard(
         self,
@@ -4700,7 +4799,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         *,
         action_label: str,
         update_ui: bool,
-    ) -> bool:
+    ) -> str:
         min_profit_pct = self._profit_guard_min_profit_pct()
         tp_old = settings.take_profit_pct
         step_old = settings.grid_step_pct
@@ -4774,7 +4873,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 or settings.range_high_pct != range_high_old
             ):
                 self._update_grid_preview()
-        hold, spread_pct, volatility_pct = self._profit_guard_should_hold(min_profit_pct)
+        decision, spread_pct, volatility_pct = self._profit_guard_should_hold(min_profit_pct)
         maker_pct, taker_pct, used_default = self._profit_guard_fee_inputs()
         if used_default:
             self._append_log(
@@ -4784,7 +4883,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 ),
                 kind="INFO",
             )
-        if hold:
+        if decision == "REQUEST_DATA":
+            return "REQUEST_DATA"
+        if decision == "HOLD":
             spread_text = f"{spread_pct:.4f}%" if spread_pct is not None else "—"
             vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
             self._append_log(
@@ -4794,8 +4895,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 ),
                 kind="WARN",
             )
-            return True
-        return False
+            return "HOLD"
+        return "OK"
 
     def _evaluate_tp_profitability(self, tp_pct: float) -> dict[str, float | bool]:
         profile = get_profile_preset(self._profit_profile_name())
