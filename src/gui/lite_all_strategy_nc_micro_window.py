@@ -950,6 +950,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._bidask_last: tuple[float, float] | None = None
         self._bidask_ts: float | None = None
         self._bidask_src: str | None = None
+        self.bidask_ready = False
         self._bidask_last_request_ts: float | None = None
         self._bidask_ready_logged = False
         self._kpi_vol_samples: deque[tuple[float, float]] = deque(maxlen=KPI_VOL_SAMPLE_MAXLEN)
@@ -1021,7 +1022,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.6 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.7 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -3050,9 +3051,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_warmup_until = monotonic() + STALE_WARMUP_SEC
         self._pilot_stale_warmup_last_log_ts = None
 
+    def _http_book_age_ms(self) -> int | None:
+        snapshot = self.book_snapshot or {}
+        snapshot_ts = snapshot.get("ts") if snapshot else None
+        if not isinstance(snapshot_ts, (int, float)):
+            return None
+        return int((monotonic() - snapshot_ts) * 1000)
+
     def _stale_warmup_remaining(self) -> int | None:
         if self._pilot_stale_warmup_until is None:
             return None
+        if self.bidask_ready:
+            book_age_ms = self._http_book_age_ms()
+            if book_age_ms is not None and book_age_ms < 1000:
+                self._pilot_stale_warmup_until = None
+                self._pilot_stale_warmup_last_log_ts = None
+                return None
         remaining = int(self._pilot_stale_warmup_until - monotonic())
         if remaining <= 0:
             self._pilot_stale_warmup_until = None
@@ -3609,11 +3623,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._bidask_last = (bid, ask)
         self._bidask_ts = now_ts
         self._bidask_src = "HTTP_BOOK"
+        self.bidask_ready = True
         return bid, ask
 
     def _validate_bid_ask(self, bid: float | None, ask: float | None, *, source: str) -> bool:
         if bid is None or ask is None:
-            self._append_log("[SKIP] no bid/ask", kind="WARN")
+            if not self.bidask_ready:
+                self._append_log("[SKIP] no bid/ask", kind="WARN")
             return False
         if not isfinite(bid) or not isfinite(ask):
             return False
@@ -5427,6 +5443,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             client_order_id = str(order.get("clientOrderId", ""))
             if client_order_id.startswith(prefix):
                 return True
+        return False
+
+    def _has_open_order_side_price(self, side: str, price: Decimal, tolerance_ticks: int = 0) -> bool:
+        side = side.upper()
+        if side not in {"BUY", "SELL"}:
+            return False
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        target_price = self.q_price(price, tick)
+        tolerance = (tick or Decimal("0")) * Decimal(tolerance_ticks)
+        for order in self._open_orders:
+            if str(order.get("side", "")).upper() != side:
+                continue
+            order_price = self._coerce_float(str(order.get("price", ""))) or 0.0
+            if order_price <= 0:
+                continue
+            order_price_dec = self.q_price(self.as_decimal(order_price), tick)
+            if tolerance > 0:
+                if abs(order_price_dec - target_price) > tolerance:
+                    continue
+            elif order_price_dec != target_price:
+                continue
+            return True
         return False
 
     @staticmethod
@@ -7473,7 +7511,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if skip_sells and order.side == "SELL":
                     continue
                 order_type = f"GRID_{order.side}"
-                if self._has_open_order_type(order_type):
+                if self._has_open_order_side_price(order.side, self.as_decimal(order.price)):
                     if order.side == "SELL":
                         detail = (
                             f"required_qty={self._format_balance_decimal(self.as_decimal(order.qty))} "
