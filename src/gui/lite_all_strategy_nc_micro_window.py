@@ -3695,12 +3695,33 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             book = self._http_client.get_book_ticker(self._symbol)
             return book if isinstance(book, dict) else {}
 
+        def _safe_float(x: object) -> float | None:
+            try:
+                if x is None:
+                    return None
+                s = str(x).strip()
+                if not s:
+                    return None
+                return float(s)
+            except Exception:
+                return None
+
         def _handle_success(payload: object, _latency_ms: int) -> None:
             if not isinstance(payload, dict) or not payload:
                 return
-            bid = self._coerce_float(str(payload.get("bidPrice", "")))
-            ask = self._coerce_float(str(payload.get("askPrice", "")))
+            bid = _safe_float(payload.get("bidPrice"))
+            ask = _safe_float(payload.get("askPrice"))
+            last_price = _safe_float(payload.get("lastPrice"))
+            if last_price is None:
+                last_price = _safe_float(payload.get("price"))
             if bid is None or ask is None or bid <= 0 or ask <= 0:
+                if bid is None or ask is None:
+                    payload_keys = sorted(payload.keys())
+                    self._append_log(
+                        "[BIDASK] missing bid/ask src=HTTP_BOOK "
+                        f"symbol={self._symbol} keys={payload_keys}",
+                        kind="WARN",
+                    )
                 return
             self._bidask_last = (bid, ask)
             self._bidask_ts = monotonic()
