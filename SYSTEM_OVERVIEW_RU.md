@@ -1,384 +1,192 @@
 # BBOT Desktop Terminal — системное описание (RU)
 
-Этот файл описывает архитектуру, расположение модулей, назначение каждого элемента и то, как они взаимодействуют. Он предназначен как единая «карта системы» для быстрого ввода в контекст и навигации по коду.
+Этот файл описывает архитектуру, расположение модулей, назначение каждого элемента и то, как они взаимодействуют. Он служит «картой системы» для быстрого онбординга и навигации по коду.
 
-## 1. План работы программы (кратко)
+## 1. Цели и общая логика
 
-1. **Старт приложения**: запускается `src.app.main`, читается `config.json`, поднимается логирование, загружается `AppState` из `config.user.yaml`.
-2. **Инициализация GUI**: создаётся `QApplication`, затем `MainWindow`, подключается GUI‑лог‑хендлер и общий exception hook.
-3. **Запуск сервисов**: `MainWindow` поднимает ключевые сервисы цен/рынков (PriceFeed/Markets) и менеджер режимов пары.
-4. **Экран обзора**: `OverviewTab` загружает список пар через `MarketsService` и подписывается на цены через `PriceFeedManager`.
-5. **Выбор режима**: при выборе пары `PairModeManager` открывает нужное окно (Lite Grid или Lite All Strategy Terminal).
-6. **Потоки данных**: цены приходят через WS/HTTP, кэшируются `PriceService` и транслируются в UI через `PriceHub`.
-7. **AI‑контуры** (опционально/legacy): окна с AI собирают datapack, отправляют в `OpenAIClient`, валидируют и применяют ответ.
-8. **Runtime** (опционально/legacy): торговый runtime запускает `RuntimeEngine`, используя цены и виртуальные ордера.
-9. **Завершение**: при закрытии окна останавливаются активные сервисы и освобождаются подписки.
+BBOT Desktop Terminal — настольный GUI‑терминал для работы с рынками Binance: обзор пар, лайв‑цены, экспериментальные grid‑режимы, режимы AI‑анализа, а также локальный runtime для симуляций. Центральный поток приложения:
 
-## 2. Точки входа и общий запуск
+1. Запуск GUI и загрузка конфигурации.
+2. Инициализация сервисов цен/рынков.
+3. Взаимодействие пользователя с Overview и выбор режима для конкретной пары.
+4. Опциональные режимы (Lite Grid, Lite All Strategy, ALGO PILOT, AI Operator, Trade Ready/Runtime).
 
-- **Запуск GUI**: `python -m src.app.main` (см. README/PROJECT_STRUCTURE). Главный путь: `src/app/main.py`.
-- **Назначение**: загрузить конфигурацию и пользовательское состояние, поднять главное окно, связать логирование и GUI.
+## 2. Точки входа и запуск
 
-### Стартовая цепочка
+- **GUI**: `python -m src.app.main` (главный путь `src/app/main.py`).
+- **Назначение**: прочитать runtime‑конфиг (ожидаемый `config.json`), загрузить пользовательское состояние (`config.user.yaml`), поднять окно `MainWindow`, подключить логирование/GUI‑хендлеры.
+
+### Стартовая цепочка (упрощённо)
 
 1. `src.app.main.main()`:
-   - читает конфиг (`src.core.config.load_config`),
+   - читает конфиг через `src.core.config.load_config`,
    - поднимает логирование (`src.core.logging.configure_logging`),
    - загружает `AppState` из `config.user.yaml`,
-   - создаёт `QApplication` и `MainWindow`,
-   - подключает лог‑хендлер GUI и exception hook.
-2. `MainWindow` формирует весь интерфейс и создаёт системные сервисы (PriceFeedManager, PairModeManager).
+   - создаёт `QApplication` и `MainWindow`.
+2. `MainWindow` инициализирует `PriceFeedManager`, `PairModeManager`, вкладки и лог‑док.
 
-## 3. Файлы конфигурации и состояния (верхний уровень)
+## 3. Конфигурация и runtime‑артефакты
 
-- `config.json` — основная конфигурация приложения (env, лимиты, URL‑адреса). Загружается `load_config()` и валидируется `Config.validate()`.
-- `config.user.yaml` — пользовательское состояние (настройки GUI, API ключи, дефолтные параметры). Читается/пишется через `AppState`.
-- `data/` — локальные кэши и артефакты:
-  - `data/exchange_info_*.json` — кеш ответа Binance `exchangeInfo`, используется `MarketsService`.
-  - прочие файлы кэша, если добавлены сервисами/окнами.
+- `config.json` — ожидаемый runtime‑конфиг (env, лимиты, URL‑адреса, таймауты). Не хранится в репозитории.
+- `config.user.yaml` — пользовательское состояние GUI (ключи, дефолты). Создаётся при первом запуске.
+- `data/exchange_info_*.json` — кэш Binance `exchangeInfo` (создаётся/обновляется `MarketsService`).
 
-## 4. Общая структура директорий
+## 4. Структура директорий (коротко)
 
 ```
 src/
-  app/        — точка входа GUI
-  core/       — конфигурация, модели, утилиты времени, логирование, стратегии
-  binance/    — HTTP/WS клиенты + account client
-  services/   — сервисы: рынки, цены, кэш, rate limit, price feed
-  gui/        — окна/вкладки интерфейса, диалоги, модели состояния UI
-    modes/    — экспериментальные режимы (AI full strategy v2)
-  ai/         — схемы и логика AI/оператора
-  runtime/    — локальный runtime‑движок и виртуальные ордера
+  app/        — запуск GUI
+  core/       — конфигурация, модели, логирование, стратегии
+  binance/    — HTTP/WS/Account клиенты
+  services/   — рынки, цены, кэши, rate‑limiter
+  gui/        — окна/вкладки/диалоги/модели UI
+  ai/         — AI‑схемы и OpenAI‑клиент
+  runtime/    — локальный runtime и виртуальные ордера
 ```
 
-Дополнительно: окно Lite All Strategy Terminal (`src/gui/lite_all_strategy_terminal_window.py`) содержит state‑machine готовности trade_gate
-(READ_ONLY_API_ERROR / READ_ONLY_NO_LIVE_CONFIRM / OK) и флаг `engine_ready`, который блокирует старт до полного допуска к live‑торговле.
-
-## 5. Core: конфигурация, модели и утилиты
+## 5. Core: конфигурация, модели, утилиты
 
 ### `src/core/config.py`
-- **Dataclasses**:
-  - `AppConfig` — окружение, уровень логов.
-  - `HttpConfig` — таймауты и ретраи.
-  - `RateLimitConfig` — лимиты запросов.
-  - `PricesConfig` — ttl для цены, интервал обновления, fallback.
-  - `BinanceConfig` — base URL, WS URL, recvWindow, API ключи.
-  - `Config` — агрегатор конфигурации + `validate()`.
-- **Функции**:
-  - `load_config()` читает JSON, поверх применяет env vars.
-  - `_get_nested/_get_env*()` — утилиты доступа.
+- Конфиги: `AppConfig`, `HttpConfig`, `RateLimitConfig`, `PricesConfig`, `BinanceConfig`, `Config`.
+- `load_config()` — чтение JSON + применение переменных окружения.
+- `Config.validate()` — проверка полноты и диапазонов.
 
 ### `src/core/models.py`
-- `Pair`, `PriceTick`, `ExchangeInfo` — базовые модели домена.
+- Базовые модели домена: `Pair`, `PriceTick`, `ExchangeInfo`.
 
 ### `src/core/logging.py`
-- `configure_logging()` — базовая конфигурация root‑логов.
-- `get_logger()` — логгер‑адаптер с extra.
+- `configure_logging()` и `get_logger()`.
 
 ### `src/core/timeutil.py`
-- `utc_ms()/monotonic_ms()` — метки времени.
-- `is_expired()` — TTL‑проверка.
-- `backoff_delay()` — экспоненциальный backoff с джиттером.
-
-### `src/core/symbols.py`
-- `sanitize_symbol()`, `validate_trade_symbol()`, `validate_asset()` — нормализация и валидация тикеров.
+- Временные утилиты (UTC/monotonic), TTL‑проверки, экспоненциальный backoff.
 
 ### `src/core/strategies/*`
-- `manual_strategies.py` — ручные стратегии и параметры.
-- `manual_runtime.py` — runtime‑логика ручных стратегий.
-- `registry.py` — регистрация/поиск стратегий.
-- `defs/` — встроенные определения стратегий (например, grid classic) для UI‑режимов.
+- `manual_strategies.py`, `manual_runtime.py`, `registry.py` — ручные стратегии и их регистрация.
 
 ## 6. Binance клиенты
 
 ### `src/binance/http_client.py`
-- `BinanceHttpClient` — HTTP обёртка на httpx.
-- Методы: `get_exchange_info`, `get_ticker_price(s)`, `get_klines`, `get_orderbook_depth`, `get_recent_trades`, etc.
-- `_request_json()` — общий retry/backoff, обработка статус‑кодов.
+- `BinanceHttpClient` — HTTP‑обёртка на httpx, методы получения `exchangeInfo`, `ticker`, `klines`, `orderbook`, `trades`.
+- `_request_json()` — retry/backoff и статус‑контроль.
 
 ### `src/binance/ws_client.py`
-- `WsManager` — управляет loop в отдельном потоке.
-- `BinanceWsClient` — подписка на `!miniTicker@arr`, парсит сообщения, вызывает `on_tick` и `on_status`.
-- Обработка reconnect/backoff.
+- `WsManager` и `BinanceWsClient` — WS‑подписки на цены, reconnect и backoff.
 
 ### `src/binance/account_client.py`
-- `BinanceAccountClient` — подписанные запросы (HMAC), операции:
-  - `get_account_info/status`, `get_open_orders`, `place_limit_order`, `cancel_order`, `get_trade_fees`, `get_my_trades`.
-  - синхронизация времени (`sync_time_offset`).
-- `AccountStatus` — результат проверки торговых прав.
+- `BinanceAccountClient` — HMAC‑запросы, аккаунт, ордера, комиссии.
+- `AccountStatus` — статус доступа/торговых прав.
 
 ## 7. Services: рынки, цены, кэш
 
 ### `src/services/markets_service.py`
-- `MarketsService` — загрузка списка торговых пар:
-  - фильтрация по quote asset, статусу, blacklist, корректность символов.
-  - кеширование в `data/exchange_info_*.json`.
-  - `load_pairs_cached` / `load_pairs_cached_all` возвращают пары + флаг cache‑fresh.
+- Загружает список пар, фильтрует по quote/статусу и поддерживает кэш `exchange_info_*.json`.
 
 ### `src/services/price_feed_manager.py`
-- **Центральный агрегатор цен** (WS + HTTP fallback + микроструктура).
-- Основные сущности:
-  - `PriceUpdate`, `MicrostructureSnapshot`, `SymbolDataRouter`.
-  - Логика маршрутизации источника цены (`decide_price_source`).
-- **Механизм подписок**:
-  - `register_symbol` / `unregister_symbol` — учёт refcount.
-  - `subscribe` / `unsubscribe` — подписки на `PriceUpdate`.
-  - `subscribe_status` / `unsubscribe_status` — статус WS по символу.
-- **Состояния**: `WS_CONNECTED`, `WS_DEGRADED`, `WS_LOST` + health.
-- **Дополнительно**: self‑test / transport test, warmup и анти‑флап логика.
-
-### `src/services/price_feed_service.py`
-- `PriceFeedService` — low‑level WS для одного символа.
-- Выдаёт `PriceTick`, статусы WS, heartbeat‑монитор.
-
-### `src/services/price_service.py`
-- `PriceService` — кэш последних WS‑цен, ttl‑валидация.
+- Агрегатор цен (WS + HTTP fallback), статус WS (`WS_CONNECTED/WS_DEGRADED/WS_LOST`).
+- Умеет `register_symbol`, `subscribe`, `subscribe_status` и отдаёт `PriceUpdate`.
 
 ### `src/services/price_hub.py`
-- `PriceHub` — Qt‑сервис для UI (QTimer); рассылает price snapshot через signal.
-- Умеет `register_symbol`/`unregister_symbol`, использует `PriceFeedManager`.
+- Qt‑hub для UI: QTimer + signals, рассылка снапшотов цен.
+
+### `src/services/price_service.py`
+- Кэш последних цен + TTL‑проверки.
 
 ### `src/services/data_cache.py`
-- `DataCache` — in‑memory cache (symbol + data_type → data + timestamp).
+- In‑memory кэш (symbol/data_type → data + timestamp).
 
 ### `src/services/rate_limiter.py`
-- `RateLimiter` — блокировка частых вызовов по ключу.
+- Rate‑limit по ключам.
 
-### `src/services/ai_provider.py`
-- Простой stub‑AI: генерирует `StrategyPlan`, умеет `chat_adjustment` + `apply_patch`.
+## 8. GUI: основные окна и режимы
 
-## 8. AI модуль
+### MainWindow и Overview
+
+- `src/gui/main_window.py` — главный контейнер GUI: создаёт `PriceFeedManager`, `PairModeManager`, вкладки, лог‑док.
+- `src/gui/overview_tab.py` — каталог пар: загрузка через `MarketsService`, фильтры, выбор пар.
+
+### PairModeManager + PairActionDialog
+
+- `src/gui/pair_action_dialog.py` — карточки режимов для выбранной пары (Lite Grid, Lite All Strategy, ALGO PILOT).
+- `src/gui/pair_mode_manager.py` — открытие окон для выбранного режима.
+
+### Lite Grid (legacy)
+
+- `src/gui/lite_grid_window.py` — классический grid‑режим, live‑цены и торговые операции через Binance clients.
+- `src/gui/lite_grid_math.py` — математика лотов, сетки, утилиты расчётов.
+
+### Lite All Strategy Terminal (v1.0)
+
+- `src/gui/lite_all_strategy_terminal_window.py` — расширенный Lite‑режим для тестирования сеточных стратегий и торговых гейтов.
+
+### Lite All Strategy — ALGO PILOT (v1.5)
+
+- `src/gui/lite_all_strategy_algo_pilot_window.py` — отдельное окно с панелью ALGO PILOT.
+- Объединяет:
+  - **Market panel** с ценой/спредом/волатильностью/комиссией и источником данных.
+  - **Grid settings panel** (budget, direction, grid count, шаг сетки, диапазоны, TP/SL, max orders).
+  - **Runtime panel** (балансы, PnL, список ордеров, отмена/refresh).
+  - **ALGO PILOT panel** с метриками (якорь, отклонение, PnL, устаревшие ордера) и кнопками действий.
+
+#### Ключевые состояния пилота
+
+- `PilotState`: `OFF`, `NORMAL`, `RECENTERING`, `RECOVERY`, `PAUSED_BY_RISK`.
+- Якорь (`_pilot_anchor_price`) по умолчанию привязывается к последней цене при включении.
+
+#### Основные действия пилота
+
+- **TOGGLE** — включить/выключить пилот (без торговли при OFF).
+- **RECENTER** — отменить текущие ордера и перестроить сетку от якорной цены.
+- **RECOVERY** — защитный режим: поставить ордер на безубыток с учётом комиссий.
+- **FLATTEN_BE** — закрыть позицию в безубыток (лимит; при включённом флаге возможен MARKET, но fallback остаётся лимитным).
+- **FLAG_STALE** — проверить устаревшие ордера и предложить действие.
+- **CANCEL_REPLACE_STALE** — отменить устаревшие и разместить заново (авто‑режим).
+
+#### Автологика и политика устаревания
+
+- Переключатель **Авто‑действия** позволяет пилоту выполнять RECENTER/RECOVERY по триггерам.
+- `StalePolicy` управляет реакцией на устаревшие ордера: `NONE`, `RECENTER`, `CANCEL_REPLACE_STALE`.
+- Внутренний таймер обновляет метрики, предупреждения и age‑проверки.
+
+#### Guards и безопасность
+
+- `TradeGate` блокирует live‑действия при отсутствии ключей, canTrade=false, read‑only или отсутствии подтверждения.
+- Profit guard повышает TP/шаг/диапазон до минимально прибыльных значений с учётом комиссий, спреда и волатильности.
+- Break‑even guard блокирует перестроение, если сетка пересекает цену безубытка в неверную сторону.
+
+## 9. AI модуль
 
 ### `src/ai/models.py`
-- Модели аналитики: `AiAnalysisResult`, `AiTradeOption`, `AiActionSuggestion`, `AiStrategyPatch`, `AiResponseEnvelope`.
-- `parse_ai_response`, `parse_ai_response_with_fallback`, `fallback_do_not_trade`.
+- Модели AI‑ответов и парсинг JSON.
 
 ### `src/ai/openai_client.py`
-- `OpenAIClient` — асинхронный клиент:
-  - `self_check()` — проверка ключа.
-  - `analyze_pair()` — JSON‑анализ датапака (AiResponseEnvelope).
-  - `analyze_operator()` / `chat_operator()` — JSON‑ответы под AI Operator.
+- Асинхронный клиент OpenAI, self‑check и анализ датапаков.
 
-### `src/ai/operator_models.py`
-- Описание схемы оператора: `OperatorAIResult`, `StrategyPatch`, `OperatorAIRequestData`.
-- Парсер JSON и нормализаторы действий/состояний.
+### `src/ai/operator_*`
+- Схемы AI‑оператора, сбор datapack, проверки и state‑machine.
 
-### `src/ai/operator_datapack.py`
-- `build_ai_datapack()` — собирает датапак для AI Operator:
-  - exchange rules, fees, balances, market data (orderbook, trades, klines), data quality, риск‑ограничения.
-  - `estimate_grid_edge()` для оценки edge.
+## 10. Runtime (локальная симуляция)
 
-### `src/ai/operator_math.py`
-- `estimate_grid_edge()` — расчет net edge и break-even.
+- `src/runtime/engine.py` — `RuntimeEngine` для симуляций и рекомендаций.
+- `src/runtime/virtual_orders.py` — локальные ордера, фиксация fills.
+- `src/runtime/strategy_executor.py` — генерация планов сеток и перестроение после fills.
 
-### `src/ai/operator_profiles.py`
-- `ProfilePreset` и `PROFILE_PRESETS` — профили (CONSERVATIVE/BALANCED/AGGRESSIVE).
+## 11. Потоки данных
 
-### `src/ai/operator_validation.py`
-- `validate_strategy_patch()` — проверка патча стратегии на профили/ограничения.
+1. **Конфиг**: `load_config()` → `AppState.load()` → настройки GUI.
+2. **Список пар**: `OverviewTab` → `MarketsService` → Binance HTTP → кэш → таблица.
+3. **Цены**: `PriceFeedManager` (WS/HTTP) → сигналы → UI.
+4. **Режимы пары**: `PairModeManager` → окно режима (Lite/Lite All Strategy/ALGO PILOT).
+5. **ALGO PILOT**: обновляет метрики по таймеру, строит сетку через GridEngine, управляет ордерами/балансами.
+6. **AI режимы**: Pair Workspace/AI Operator собирает datapack → `OpenAIClient` → JSON → UI.
 
-### `src/ai/operator_request_loop.py`
-- `run_request_data_loop()` — итерационный запрос доп.данных по просьбе AI.
+## 12. Тесты
 
-### `src/ai/operator_runtime.py`
-- `cancel_all_bot_orders()` + helper‑обвязки `pause_state` / `stop_state`.
-
-### `src/ai/operator_state_machine.py`
-- Логика состояний AI оператора (переходы/решения).
-
-## 9. Runtime (локальная симуляция)
-
-### `src/runtime/virtual_orders.py`
-- `VirtualOrder`, `VirtualOrderBook` — создание/отмена/фиксация виртуальных ордеров.
-
-### `src/runtime/strategy_executor.py`
-- `StrategyExecutor` — строит grid/range планы, rebuild после fills.
-- `StrategyConfig` — минимальная конфигурация стратегии.
-
-### `src/runtime/engine.py`
-- `RuntimeEngine` — цикл исполнения:
-  - подписки на price feed,
-  - управление состояниями RUNNING/PAUSED/STOPPED,
-  - расчет PnL, volatility, microstructure, рекомендации для AI observer.
-
-### `src/runtime/runtime_state.py`
-- `RuntimeState` — IDLE/RUNNING/PAUSED/STOPPED.
-
-## 10. GUI: окна, диалоги, вкладки
-
-### Главный контейнер
-
-#### `src/gui/main_window.py`
-- `MainWindow` — главное окно:
-  - создает `PriceFeedManager`, `PairModeManager`, `OverviewTab`, `LogDock`.
-  - меню/toolbar Settings, status bar, управление лог‑доком.
-  - на закрытие: останавливает OverviewTab, окна, price feed.
-
-### Overview (каталог пар)
-
-#### `src/gui/overview_tab.py`
-- `OverviewTab` — главный экран:
-  - таблица пар + фильтры (quote, search), статусные бейджи.
-  - работает через `MarketsService` (HTTP Binance) и `PriceFeedManager`.
-  - обновляет цену только для выбранной строки.
-  - поддерживает обновление балансов, статуса аккаунта.
-  - double‑click по строке → вызывает `on_open_pair` (PairModeManager).
-
-### Менеджер режимов пары
-
-#### `src/gui/pair_mode_manager.py`
-- `PairModeManager` — шлюз открытия окон:
-  - `open_pair_dialog()` → `PairActionDialog`.
-  - `open_pair_mode()` → окно Lite Grid или Lite All Strategy Terminal.
-
-#### `src/gui/pair_action_dialog.py`
-- Диалог выбора режима работы с парой (Lite Grid Terminal / Lite All Strategy Terminal v1.0).
-
-### Lite Grid Terminal (основной)
-
-#### `src/gui/lite_grid_window.py`
-- Главное окно Lite Grid (базовый grid‑бот):
-  - `GridEngine` формирует план ордеров.
-  - UI: параметры сетки, статус, таблицы ордеров, logs.
-  - Binance API: `BinanceAccountClient` + `BinanceHttpClient`.
-  - `PriceFeedManager` для живых цен.
-  - `FillAccumulator`, `DataCache`, `TradeGate` (гейт на live).
-
-#### `src/gui/lite_grid_math.py`
-- Математика лота и расчетов для grid (используется в LiteGridWindow).
-
-### Lite All Strategy Terminal (v1.0) — особый режим
-
-#### `src/gui/lite_all_strategy_terminal_window.py`
-- Экспериментальный терминал для «Lite all strategy»:
-  - визуально и по механикам близок к Lite Grid, но расширен под тест разных сеточных режимов;
-  - использует отдельный `GridEngine` и состояние `GridSettingsState` с параметрами:
-    - бюджет, направление, шаг/кол-во уровней, режим шага (AUTO_ATR/MANUAL),
-    - режим диапазона (Auto/Manual), `range_low_pct`/`range_high_pct`,
-    - take‑profit/stop‑loss, лимит активных ордеров, режим размера ордера.
-  - получает live‑цены через `PriceFeedManager` и обновляет UI по сигналам;
-  - использует Binance HTTP/Account клиентов для правил/балансов/ордеров;
-  - есть `TradeGate` для проверки возможности живой торговли (ключи, canTrade, read‑only);
-  - поддерживает dry‑run/live режимы, подтверждение live‑запуска и отмену ордеров;
-  - хранит локальные кэши (`DataCache`), рассчитывает план/профит‑метрики;
-  - применяет авто‑шаг (AUTO ATR) на основе истории цен с fallback на HTTP;
-  - использует профили прибыльности из `ai.operator_profiles` и математику комиссий
-    (`compute_fee_total_pct` + `evaluate_tp_profitability`) для подсказок по TP.
-- Важная роль: точка для экспериментов с расширенными стратегиями, не ломая основной Lite‑терминал.
-
-### AI Operator Grid
-
-#### `src/gui/ai_operator_grid_window.py`
-- Расширенный режим AI Operator поверх Lite Grid:
-  - строит MarketSnapshot, собирает datapack,
-  - общается с OpenAI (`OpenAIClient`), валидирует patch,
-  - поддерживает apply patch / request data / start/stop/pause,
-  - хранит историю AI ответов и использует `RateLimiter`/`DataCache`.
-
-### AI Full Strategy V2 (эксперимент)
-
-#### `src/gui/modes/ai_full_strateg_v2/window.py`
-- Экспериментальный режим «полной стратегии»:
-  - расширяет AI Operator Grid, добавляя переключатель стратегий;
-  - использует `core/strategies` (manual стратегии) для валидации и сборки ордеров;
-  - поддерживает MANUAL/Dry‑Run поток, сбор параметров под разные типы стратегий.
-
-#### `src/gui/modes/ai_full_strateg_v2/controller.py`
-- Вспомогательная логика/контроллер для окна AI Full Strategy V2.
-
-### Trade Ready Mode + Runtime
-
-#### `src/gui/trade_ready_mode_window.py`
-- Trade Ready Mode:
-  - показывает market context, AI отчёт, варианты сделок.
-  - создаёт `TradingRuntimeWindow` по выбранному варианту.
-  - слушает `PriceFeedManager` для live‑цены.
-
-#### `src/gui/trading_runtime_window.py`
-- Runtime UI:
-  - интерфейс к `RuntimeEngine`, подписка на цены и events.
-  - панели: ордера, fills, PnL, рекомендации, чаты/логи.
-  - кнопки Start/Pause/Stop/Emergency.
-
-### Pair Workspace (старый режим)
-
-#### `src/gui/pair_workspace_window.py`
-- Простая версия Pair Workspace:
-  - `AIProvider` stub, имитация prepare/analyze/apply.
-  - Отдельный chat dock и набор вкладок.
-
-#### `src/gui/pair_workspace_tab.py`
-- Расширенная версия Pair Workspace для вкладки:
-  - Управляет состоянием `PairState` и `PairWorkspaceState`.
-  - Готовит datapack, запускает AI через `OpenAIClient`.
-  - Ведёт статус и логи, открывает `TradingWorkspaceWindow`.
-
-#### `src/gui/trading_workspace_window.py`
-- Trading Workspace:
-  - мониторинг активной стратегии,
-  - AI observer циклы, кнопки approve для действий.
-
-### Settings
-
-#### `src/gui/settings_dialog.py`
-- Модальный диалог настроек: ключи Binance/OpenAI, периоды, TTL, quote и т.д.
-
-#### `src/gui/i18n.py`
-- Помощники локализации и текстовых ресурсов.
-
-#### `src/gui/models/*`
-- `AppState`, `PairState`, `PairWorkspaceState`, `MarketState`, `PairMode` — контейнеры UI‑состояний.
-
-### GUI Widgets и legacy‑вкладки
-
-#### `src/gui/widgets/*`
-- `LogDock` — GUI‑лог‑док с Qt‑хендлером.
-- `PairTopBar` — верхняя панель действий в Pair Workspace.
-- `PairLogsPanel` — простая панель логов.
-- `DashboardTab`, `MarketsTab`, `BotTab`, `SettingsTab` — исторические вкладки (плейсхолдеры/демо), сейчас используются как reference.
-
-## 11. Взаимодействия и потоки данных
-
-### Основные потоки
-
-1. **Конфиг и состояние пользователя**:
-   - `load_config()` → `AppState.load()` → настройки в GUI.
-2. **Список пар**:
-   - `OverviewTab` → `MarketsService` → Binance HTTP → кэш → таблица.
-3. **Цены**:
-   - все окна подписываются на `PriceFeedManager` (WS + HTTP fallback).
-   - `OverviewTab` и `TradeReadyMode` слушают обновления для UI.
-4. **Запуск режима**:
-   - `OverviewTab` (двойной клик) → `PairModeManager` → окно режима (Lite Grid / Lite All Strategy).
-5. **AI анализ**:
-   - Pair Workspace / AI Operator Grid собирает datapack → `OpenAIClient` → парсинг JSON → UI.
-6. **Runtime**:
-   - `TradingRuntimeWindow` управляет `RuntimeEngine`.
-   - RuntimeEngine использует `PriceFeedManager` и `VirtualOrderBook`.
-
-### Логирование
-
-- Все компоненты используют `get_logger()`.
-- `MainWindow` подключает `LogDock.handler` к root‑логгеру.
-
-## 12. Жизненный цикл сервисов (практика)
-
-- `PriceFeedManager` создаётся один раз в `MainWindow` и живёт до закрытия приложения.
-- `PriceHub` создаётся в контексте GUI и раздаёт цены через Qt‑сигналы; окна подписываются при открытии.
-- Сервис `MarketsService` запрашивает/кэширует пары, затем отдаёт их в `OverviewTab`.
-- При закрытии окон и приложения подписки снимаются, а сервисы останавливают потоки/таймеры.
-
-## 13. Тесты
-
-- `tests/test_app_state.py` — проверка сохранения/загрузки AppState.
+- `tests/test_app_state.py` — сохранение/загрузка `AppState`.
 - `tests/test_imports.py` — smoke‑imports GUI.
-- `tests/test_markets_service.py` — тесты MarketsService.
+- `tests/test_markets_service.py` — проверки `MarketsService`.
 
-## 14. Примечания
+## 13. Ограничения и примечания
 
-- В проекте есть несколько UI‑веток (Lite Grid, Lite All Strategy Terminal, Pair Workspace, Trade Ready, AI Operator). Это связано со стадиями развития и экспериментами.
-- Реальные сделки не запускаются автоматически: многие режимы содержат confirm/approve шаги и работают в dry‑run.
-
----
-
-Если нужно сделать ещё более подробную карту (например, расписать каждый метод), сообщите, какие модули важнее всего, и я расширю этот файл.
+- `services/ai_provider.py` — stub AI, не вызывает внешние API.
+- Реальная торговля требует ключей Binance и подтверждений; большинство действий остаются в dry‑run, пока не подтверждены.
+- Режимы (Lite Grid, Lite All Strategy, ALGO PILOT, Pair Workspace) — разные ветки UI одного проекта, часть из них экспериментальна.
