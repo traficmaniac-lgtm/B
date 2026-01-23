@@ -4720,6 +4720,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._start_run_id += 1
         self._stop_local_timers()
         self._append_log("Stop pressed.", kind="ORDERS")
+        self._append_log("[STOP] requested", kind="INFO")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("STOPPING")
         self._orders_in_flight = True
@@ -4784,6 +4785,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             events: list[tuple[str, str]] = []
             errors: list[str] = []
             open_orders_after: list[dict[str, Any]] = []
+            verify_ok = False
             for attempt in range(1, 4):
                 events.append(("INFO", f"[STOP] cancel_all symbol={symbol} attempt={attempt}"))
                 ok = True
@@ -4797,12 +4799,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 err_log = err_text if err_text is not None else "None"
                 events.append(("INFO", f"[STOP] cancel_all result ok={ok} err={err_log}"))
                 self._sleep_ms(random.randint(300, 500))
-                verify_ok = True
                 try:
                     open_orders_after = self._account_client.get_open_orders(symbol)
                     if not isinstance(open_orders_after, list):
                         verify_ok = False
                         open_orders_after = []
+                    else:
+                        verify_ok = True
                 except Exception as exc:  # noqa: BLE001
                     verify_ok = False
                     open_orders_after = []
@@ -4816,6 +4819,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return {
                 "events": events,
                 "open_orders_after": open_orders_after,
+                "verify_ok": verify_ok,
                 "errors": errors,
             }
 
@@ -4843,8 +4847,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     self._append_log(str(message), kind=kind)
                 elif isinstance(entry, str):
                     self._append_log(entry, kind="INFO")
+        verify_ok = bool(result.get("verify_ok", False))
         open_orders_after = result.get("open_orders_after", [])
-        if isinstance(open_orders_after, list):
+        if verify_ok and isinstance(open_orders_after, list):
             self._open_orders_all = [item for item in open_orders_after if isinstance(item, dict)]
             self._open_orders = self._filter_bot_orders(self._open_orders_all)
             self._open_orders_map = {
@@ -4853,13 +4858,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if str(order.get("orderId", ""))
             }
             self._clear_local_order_registry()
+        elif not verify_ok:
+            self._append_log("[STOP] verify open_orders failed; keeping local state until refresh", kind="WARN")
         errors = result.get("errors", [])
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(str(message), kind="WARN")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
-        self._finalize_stop(keep_open_orders=bool(self._open_orders))
+        keep_open_orders = (not verify_ok) or bool(self._open_orders)
+        self._finalize_stop(keep_open_orders=keep_open_orders)
         self._append_log("[STOP] done", kind="INFO")
 
     def _handle_stop_cancel_error(self, message: str) -> None:
