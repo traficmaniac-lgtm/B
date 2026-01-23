@@ -4848,9 +4848,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._snapshot_refresh_inflight = False
         if not isinstance(result, dict):
             self._handle_cancel_error("Unexpected cancel response")
+            self._append_log("[STOP] force gui refresh", kind="INFO")
             self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
             self._force_refresh_balances_and_wait(timeout_ms=2_000)
             self._finalize_stop()
+            self._append_log("[STOP] gui orders cleared", kind="INFO")
             self._append_log("[STOP] done", kind="INFO")
             return
         events = result.get("events", [])
@@ -4865,6 +4867,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         verify_ok = bool(result.get("verify_ok", False))
         open_orders_after = result.get("open_orders_after", [])
         if verify_ok and isinstance(open_orders_after, list):
+            self._append_log(
+                f"[STOP] verify exchange open_orders n={len(open_orders_after)}",
+                kind="INFO",
+            )
             self._open_orders_all = [item for item in open_orders_after if isinstance(item, dict)]
             self._open_orders = self._filter_bot_orders(self._open_orders_all)
             self._open_orders_map = {
@@ -4879,16 +4885,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(str(message), kind="WARN")
+        self._append_log("[STOP] force gui refresh", kind="INFO")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
         keep_open_orders = (not verify_ok) or bool(self._open_orders)
         self._finalize_stop(keep_open_orders=keep_open_orders)
+        if not keep_open_orders:
+            self._append_log("[STOP] gui orders cleared", kind="INFO")
         self._append_log("[STOP] done", kind="INFO")
 
     def _handle_stop_cancel_error(self, message: str) -> None:
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
         self._handle_cancel_error(message)
+        self._append_log("[STOP] force gui refresh", kind="INFO")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
         self._finalize_stop(keep_open_orders=True)
@@ -5326,7 +5336,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         timer.setSingleShot(True)
         timer.timeout.connect(loop.quit)
         self._signals.open_orders_refresh.connect(_on_refresh)
-        self._refresh_open_orders(force=True)
+        self._refresh_open_orders(force=True, force_refresh=True)
         timer.start(timeout_ms)
         loop.exec()
         self._signals.open_orders_refresh.disconnect(_on_refresh)
@@ -5494,8 +5504,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_runtime_balances()
         self._signals.balances_refresh.emit(False)
 
-    def _refresh_open_orders(self, force: bool = False) -> None:
+    def _refresh_open_orders(self, force: bool = False, *, force_refresh: bool = False) -> None:
         try:
+            if force_refresh:
+                force = True
+                self._snapshot_refresh_inflight = False
+                self._snapshot_refresh_suppressed_log_ts = None
             if self._stop_in_progress:
                 force = True
             self._orders_tick_count += 1
