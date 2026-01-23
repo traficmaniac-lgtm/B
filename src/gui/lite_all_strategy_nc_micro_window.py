@@ -3718,205 +3718,205 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             now_ts = monotonic()
             price_cache_used = False
             price_cache_age_ms = None
-        if not isinstance(price, (int, float)) or price <= 0:
-            price = None
-        if price is not None:
-            self._last_price = price
-            self._last_price_ts = now_ts
-        elif self._last_price is not None and self._last_price_ts is not None:
-            price_cache_age_ms = int((now_ts - self._last_price_ts) * 1000)
-            if price_cache_age_ms <= PRICE_STALE_MS:
-                price = self._last_price
-                price_cache_used = True
-        if price_cache_used:
-            if age_ms is None:
-                age_ms = price_cache_age_ms
-            if source is None:
-                source = "CACHE"
-        if (
-            self._bidask_last_request_ts is None
-            or (now_ts - self._bidask_last_request_ts) * 1000 >= BIDASK_POLL_MS
-        ):
-            self._fetch_bidask_http_book()
-        best_bid = None
-        best_ask = None
-        book_source = self._bidask_src or "HTTP_BOOK"
-        bidask_age_ms = None
-        bidask_state = "missing"
-        if self._bidask_last and self._bidask_ts is not None:
-            age_ms = int((now_ts - self._bidask_ts) * 1000)
-            if age_ms <= BIDASK_STALE_MS:
-                best_bid, best_ask = self._bidask_last
-                bidask_age_ms = age_ms
-                bidask_state = "stale_cache" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
-            else:
-                bidask_age_ms = age_ms
-
-        if price is None:
-            self._market_price.setText("—")
-        else:
-            self._market_price.setText(f"{price:.8f}")
-        self._set_market_label_state(self._market_price, active=price is not None)
-        spread_pct = self._compute_spread_pct_from_book(best_bid, best_ask)
-        spread_text = self._format_spread_display(spread_pct)
-        self._market_spread.setText(spread_text)
-        self._set_market_label_state(self._market_spread, active=spread_text != "—")
-
-        sample_ts = time_fn()
-        if best_bid is not None and best_ask is not None:
-            mid = (best_bid + best_ask) / 2
-            self._record_kpi_vol_sample(mid, sample_ts)
-        volatility_pct, sample_count = self._compute_kpi_volatility_pct(sample_ts)
-        cache_used = False
-        cache_ttl = None
-        if volatility_pct is not None:
-            self._kpi_last_good_vol = volatility_pct
-            self._kpi_last_good_ts = sample_ts
-        elif self._kpi_last_good_vol is not None and self._kpi_last_good_ts is not None:
-            age_sec = sample_ts - self._kpi_last_good_ts
-            if age_sec < KPI_VOL_TTL_SEC:
-                volatility_pct = self._kpi_last_good_vol
-                cache_used = True
-                cache_ttl = int(max(KPI_VOL_TTL_SEC - age_sec, 0))
-        volatility_text = f"{volatility_pct:.2f}%" if volatility_pct is not None else "—"
-        self._market_volatility.setText(volatility_text)
-        self._set_market_label_state(self._market_volatility, active=volatility_text != "—")
-
-        maker, taker = self._trade_fees
-        if maker is None and taker is None:
-            self._market_fee.setText("—")
-        self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
-
-        source_age_text = "—"
-        if price is not None and source is not None:
-            if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
-                source_age_text = "WS | stale"
-            elif age_ms is not None:
-                source_age_text = f"{source} | {age_ms}ms"
-        self._market_source.setText(source_age_text)
-        self._set_market_label_state(self._market_source, active=source_age_text != "—")
-
-        feed_ok = bool(source == "WS" and age_ms is not None and age_ms < WS_STALE_MS)
-        self._feed_ok = feed_ok
-        feed_age_text = f"{age_ms}ms" if age_ms is not None else "—"
-        if (
-            self._feed_last_ok is None
-            or self._feed_last_ok != feed_ok
-            or self._feed_last_source != source
-        ):
-            self._append_log(
-                f"[FEED] src={source or '—'} age={feed_age_text} ok={str(feed_ok).lower()}",
-                kind="INFO",
-            )
-            self._feed_last_ok = feed_ok
-            self._feed_last_source = source
-
-        is_spread_zero = spread_pct is not None and spread_pct == 0
-        spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
-        if volatility_pct is None:
-            self._kpi_zero_vol_ticks = 0
-            self._kpi_zero_vol_start_ts = None
-            vol_state = KPI_STATE_UNKNOWN
-            vol_reason = "vol=unknown"
-        else:
-            self._kpi_zero_vol_ticks = 0
-            self._kpi_zero_vol_start_ts = None
-            vol_state = KPI_STATE_OK
-            if cache_used and cache_ttl is not None:
-                vol_reason = "vol_cached"
-            else:
-                vol_reason = "vol>0"
-        spread_log = spread_text if spread_text != "—" else "—"
-        vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
-        bidask_missing = best_bid is None or best_ask is None
-        if bidask_missing and self._kpi_missing_bidask_since_ts is None:
-            self._kpi_missing_bidask_since_ts = now_ts
-        if not bidask_missing:
-            self._kpi_missing_bidask_since_ts = None
-        price_available = price is not None
-        if bidask_missing:
-            if not self._kpi_missing_bidask_active:
-                self._append_log(
-                    "[KPI] state=UNKNOWN reason=no_bidask_yet",
-                    kind="INFO",
-                )
-                self._kpi_missing_bidask_active = True
-        else:
-            self._kpi_missing_bidask_active = False
-        if not price_available:
-            kpi_state = KPI_STATE_UNKNOWN
-            kpi_reason = "no_price_yet"
-        elif spread_zero_ok:
-            kpi_state = KPI_STATE_OK
-            kpi_reason = "spread=0 allowed"
-        elif bidask_missing:
-            kpi_state = KPI_STATE_UNKNOWN
-            kpi_reason = "no_bidask_yet"
-        elif bidask_state == "stale_cache":
-            kpi_state = KPI_STATE_OK
-            kpi_reason = "bidask_stale_cache"
-        elif vol_state == KPI_STATE_UNKNOWN:
-            kpi_state = KPI_STATE_UNKNOWN
-            kpi_reason = vol_reason
-        else:
-            kpi_state = KPI_STATE_OK
-            kpi_reason = vol_reason
-        if (
-            kpi_state == KPI_STATE_UNKNOWN
-            and self._kpi_last_state == KPI_STATE_OK
-            and self._kpi_last_state_ts is not None
-            and now_ts - self._kpi_last_state_ts < KPI_DEBOUNCE_SEC
-        ):
-            kpi_state = KPI_STATE_OK
-            kpi_reason = "debounce"
-        log_reason = kpi_reason
-        if cache_used and cache_ttl is not None and kpi_reason == "vol_cached":
-            log_reason = f"{kpi_reason} ttl={cache_ttl}s"
-        if self._kpi_last_state != kpi_state or self._kpi_last_reason != kpi_reason:
-            bidask_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
-            self._append_log(
-                (
-                    f"[KPI] state={kpi_state} spread={spread_log} vol={vol_text} "
-                    f"src={book_source} age={bidask_age_text} reason={log_reason}"
-                ),
-                kind="INFO",
-            )
-            self._kpi_last_state = kpi_state
-            self._kpi_last_reason = kpi_reason
-            self._kpi_last_state_ts = now_ts
-        self._kpi_invalid_reason = None
-        self._kpi_vol_state = vol_state
-        self._kpi_state = kpi_state
-        self._kpi_valid = kpi_state != KPI_STATE_INVALID
-        if kpi_state == KPI_STATE_OK and spread_pct is not None:
-            self._kpi_last_good = {
-                "spread": spread_pct,
-                "vol": volatility_pct,
-                "src": book_source,
-                "ts": now_ts,
-            }
-
-        if price is not None and source is not None:
-            should_log = False
-            if not self._kpi_has_data or self._kpi_last_source != source:
-                should_log = True
-            if should_log:
-                if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
-                    age_text = "stale"
+            if not isinstance(price, (int, float)) or price <= 0:
+                price = None
+            if price is not None:
+                self._last_price = price
+                self._last_price_ts = now_ts
+            elif self._last_price is not None and self._last_price_ts is not None:
+                price_cache_age_ms = int((now_ts - self._last_price_ts) * 1000)
+                if price_cache_age_ms <= PRICE_STALE_MS:
+                    price = self._last_price
+                    price_cache_used = True
+            if price_cache_used:
+                if age_ms is None:
+                    age_ms = price_cache_age_ms
+                if source is None:
+                    source = "CACHE"
+            if (
+                self._bidask_last_request_ts is None
+                or (now_ts - self._bidask_last_request_ts) * 1000 >= BIDASK_POLL_MS
+            ):
+                self._fetch_bidask_http_book()
+            best_bid = None
+            best_ask = None
+            book_source = self._bidask_src or "HTTP_BOOK"
+            bidask_age_ms = None
+            bidask_state = "missing"
+            if self._bidask_last and self._bidask_ts is not None:
+                age_ms = int((now_ts - self._bidask_ts) * 1000)
+                if age_ms <= BIDASK_STALE_MS:
+                    best_bid, best_ask = self._bidask_last
+                    bidask_age_ms = age_ms
+                    bidask_state = "stale_cache" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
                 else:
-                    age_text = f"{age_ms}ms" if age_ms is not None else "—"
+                    bidask_age_ms = age_ms
+
+            if price is None:
+                self._market_price.setText("—")
+            else:
+                self._market_price.setText(f"{price:.8f}")
+            self._set_market_label_state(self._market_price, active=price is not None)
+            spread_pct = self._compute_spread_pct_from_book(best_bid, best_ask)
+            spread_text = self._format_spread_display(spread_pct)
+            self._market_spread.setText(spread_text)
+            self._set_market_label_state(self._market_spread, active=spread_text != "—")
+
+            sample_ts = time_fn()
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) / 2
+                self._record_kpi_vol_sample(mid, sample_ts)
+            volatility_pct, sample_count = self._compute_kpi_volatility_pct(sample_ts)
+            cache_used = False
+            cache_ttl = None
+            if volatility_pct is not None:
+                self._kpi_last_good_vol = volatility_pct
+                self._kpi_last_good_ts = sample_ts
+            elif self._kpi_last_good_vol is not None and self._kpi_last_good_ts is not None:
+                age_sec = sample_ts - self._kpi_last_good_ts
+                if age_sec < KPI_VOL_TTL_SEC:
+                    volatility_pct = self._kpi_last_good_vol
+                    cache_used = True
+                    cache_ttl = int(max(KPI_VOL_TTL_SEC - age_sec, 0))
+            volatility_text = f"{volatility_pct:.2f}%" if volatility_pct is not None else "—"
+            self._market_volatility.setText(volatility_text)
+            self._set_market_label_state(self._market_volatility, active=volatility_text != "—")
+
+            maker, taker = self._trade_fees
+            if maker is None and taker is None:
+                self._market_fee.setText("—")
+            self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
+
+            source_age_text = "—"
+            if price is not None and source is not None:
+                if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
+                    source_age_text = "WS | stale"
+                elif age_ms is not None:
+                    source_age_text = f"{source} | {age_ms}ms"
+            self._market_source.setText(source_age_text)
+            self._set_market_label_state(self._market_source, active=source_age_text != "—")
+
+            feed_ok = bool(source == "WS" and age_ms is not None and age_ms < WS_STALE_MS)
+            self._feed_ok = feed_ok
+            feed_age_text = f"{age_ms}ms" if age_ms is not None else "—"
+            if (
+                self._feed_last_ok is None
+                or self._feed_last_ok != feed_ok
+                or self._feed_last_source != source
+            ):
                 self._append_log(
-                    f"[NC_MICRO] kpi updated src={source} age={age_text} price={price:.8f}",
+                    f"[FEED] src={source or '—'} age={feed_age_text} ok={str(feed_ok).lower()}",
                     kind="INFO",
                 )
-            self._kpi_has_data = True
-            self._kpi_last_source = source
-        else:
-            self._kpi_has_data = False
-            self._kpi_last_source = None
-            self._kpi_zero_vol_ticks = 0
-            self._kpi_zero_vol_start_ts = None
-            self._kpi_missing_bidask_since_ts = None
+                self._feed_last_ok = feed_ok
+                self._feed_last_source = source
+
+            is_spread_zero = spread_pct is not None and spread_pct == 0
+            spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
+            if volatility_pct is None:
+                self._kpi_zero_vol_ticks = 0
+                self._kpi_zero_vol_start_ts = None
+                vol_state = KPI_STATE_UNKNOWN
+                vol_reason = "vol=unknown"
+            else:
+                self._kpi_zero_vol_ticks = 0
+                self._kpi_zero_vol_start_ts = None
+                vol_state = KPI_STATE_OK
+                if cache_used and cache_ttl is not None:
+                    vol_reason = "vol_cached"
+                else:
+                    vol_reason = "vol>0"
+            spread_log = spread_text if spread_text != "—" else "—"
+            vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
+            bidask_missing = best_bid is None or best_ask is None
+            if bidask_missing and self._kpi_missing_bidask_since_ts is None:
+                self._kpi_missing_bidask_since_ts = now_ts
+            if not bidask_missing:
+                self._kpi_missing_bidask_since_ts = None
+            price_available = price is not None
+            if bidask_missing:
+                if not self._kpi_missing_bidask_active:
+                    self._append_log(
+                        "[KPI] state=UNKNOWN reason=no_bidask_yet",
+                        kind="INFO",
+                    )
+                    self._kpi_missing_bidask_active = True
+            else:
+                self._kpi_missing_bidask_active = False
+            if not price_available:
+                kpi_state = KPI_STATE_UNKNOWN
+                kpi_reason = "no_price_yet"
+            elif spread_zero_ok:
+                kpi_state = KPI_STATE_OK
+                kpi_reason = "spread=0 allowed"
+            elif bidask_missing:
+                kpi_state = KPI_STATE_UNKNOWN
+                kpi_reason = "no_bidask_yet"
+            elif bidask_state == "stale_cache":
+                kpi_state = KPI_STATE_OK
+                kpi_reason = "bidask_stale_cache"
+            elif vol_state == KPI_STATE_UNKNOWN:
+                kpi_state = KPI_STATE_UNKNOWN
+                kpi_reason = vol_reason
+            else:
+                kpi_state = KPI_STATE_OK
+                kpi_reason = vol_reason
+            if (
+                kpi_state == KPI_STATE_UNKNOWN
+                and self._kpi_last_state == KPI_STATE_OK
+                and self._kpi_last_state_ts is not None
+                and now_ts - self._kpi_last_state_ts < KPI_DEBOUNCE_SEC
+            ):
+                kpi_state = KPI_STATE_OK
+                kpi_reason = "debounce"
+            log_reason = kpi_reason
+            if cache_used and cache_ttl is not None and kpi_reason == "vol_cached":
+                log_reason = f"{kpi_reason} ttl={cache_ttl}s"
+            if self._kpi_last_state != kpi_state or self._kpi_last_reason != kpi_reason:
+                bidask_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
+                self._append_log(
+                    (
+                        f"[KPI] state={kpi_state} spread={spread_log} vol={vol_text} "
+                        f"src={book_source} age={bidask_age_text} reason={log_reason}"
+                    ),
+                    kind="INFO",
+                )
+                self._kpi_last_state = kpi_state
+                self._kpi_last_reason = kpi_reason
+                self._kpi_last_state_ts = now_ts
+            self._kpi_invalid_reason = None
+            self._kpi_vol_state = vol_state
+            self._kpi_state = kpi_state
+            self._kpi_valid = kpi_state != KPI_STATE_INVALID
+            if kpi_state == KPI_STATE_OK and spread_pct is not None:
+                self._kpi_last_good = {
+                    "spread": spread_pct,
+                    "vol": volatility_pct,
+                    "src": book_source,
+                    "ts": now_ts,
+                }
+
+            if price is not None and source is not None:
+                should_log = False
+                if not self._kpi_has_data or self._kpi_last_source != source:
+                    should_log = True
+                if should_log:
+                    if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
+                        age_text = "stale"
+                    else:
+                        age_text = f"{age_ms}ms" if age_ms is not None else "—"
+                    self._append_log(
+                        f"[NC_MICRO] kpi updated src={source} age={age_text} price={price:.8f}",
+                        kind="INFO",
+                    )
+                self._kpi_has_data = True
+                self._kpi_last_source = source
+            else:
+                self._kpi_has_data = False
+                self._kpi_last_source = None
+                self._kpi_zero_vol_ticks = 0
+                self._kpi_zero_vol_start_ts = None
+                self._kpi_missing_bidask_since_ts = None
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in update_market_kpis")
             self._notify_crash("update_market_kpis")
