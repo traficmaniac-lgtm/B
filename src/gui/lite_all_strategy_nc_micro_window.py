@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
-from math import ceil, floor
+from math import ceil, floor, isfinite
 from time import monotonic, perf_counter, sleep, time as time_fn
 from typing import Any, Callable
 from uuid import uuid4
@@ -758,6 +758,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._app_state = app_state
         self._symbol = symbol.strip().upper()
         self._price_feed_manager = price_feed_manager
+        self.trade_source = "HTTP_ONLY"
         self._signals = _LiteGridSignals()
         self._signals.price_update.connect(self._apply_price_update)
         self._signals.status_update.connect(self._apply_status_update)
@@ -843,6 +844,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._last_price: float | None = None
         self._last_price_ts: float | None = None
         self._price_history: list[float] = []
+        self.book_snapshot: dict[str, float] | None = None
+        self._ws_last_tick_ts: float | None = None
+        self._ws_last_price: float | None = None
+        self._ws_alive = False
         self._account_can_trade = False
         self._account_permissions: list[str] = []
         self._account_api_error = False
@@ -1016,7 +1021,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.5 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.6 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -3583,42 +3588,45 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return price is not None and best_bid is not None and best_ask is not None
 
     def _apply_price_update(self, update: PriceUpdate) -> None:
-        self._last_price_update = update
-        price = update.last_price if isinstance(update.last_price, (int, float)) else None
-        if price is not None and price > 0:
-            self._last_price = price
-            self._last_price_ts = monotonic()
-            self._record_price(price)
-            self._last_price_label.setText(tr("last_price", price=f"{price:.8f}"))
-            self._grid_engine.on_price(price)
-        elif self._last_price is None:
-            self._last_price_label.setText(tr("last_price", price="—"))
+        try:
+            self._last_price_update = update
+            self._ws_last_tick_ts = monotonic()
+            self._ws_alive = True
+            price = update.last_price if isinstance(update.last_price, (int, float)) else None
+            if price is not None and price > 0:
+                self._ws_last_price = price
+        except Exception as exc:
+            self._logger.error("SAFE_SKIP _apply_price_update: %s", exc)
+            return
 
-        latency = f"{update.latency_ms}ms" if update.latency_ms is not None else "—"
-        age = f"{update.price_age_ms}ms" if update.price_age_ms is not None else "—"
-        self._age_label.setText(tr("age", age=age))
-        self._latency_label.setText(tr("latency", latency=latency))
-        clock_status = "✓" if update.price_age_ms is not None else "—"
-        self._feed_indicator.setText(f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK {clock_status}")
-        self.update_market_kpis()
-        self._update_runtime_balances()
-        self._refresh_unrealized_pnl()
+    def _update_http_book_snapshot(self, payload: dict[str, Any]) -> tuple[float | None, float | None]:
+        bid = self._coerce_float(payload.get("bidPrice"))
+        ask = self._coerce_float(payload.get("askPrice"))
+        if not self._validate_bid_ask(bid, ask, source="HTTP_BOOK"):
+            return None, None
+        now_ts = monotonic()
+        self.book_snapshot = {"bid": bid, "ask": ask, "ts": now_ts}
+        self._bidask_last = (bid, ask)
+        self._bidask_ts = now_ts
+        self._bidask_src = "HTTP_BOOK"
+        return bid, ask
+
+    def _validate_bid_ask(self, bid: float | None, ask: float | None, *, source: str) -> bool:
+        if bid is None or ask is None:
+            self._append_log("[SKIP] no bid/ask", kind="WARN")
+            return False
+        if not isfinite(bid) or not isfinite(ask):
+            return False
+        if ask <= bid:
+            return False
+        return True
 
     def _resolve_book_bid_ask(self) -> tuple[float | None, float | None, str]:
-        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
-        micro = snapshot
-        if self._last_price_update and micro is None:
-            micro = self._last_price_update.microstructure
-        best_bid = micro.best_bid if micro else None
-        best_ask = micro.best_ask if micro else None
-        if best_bid is not None and best_ask is not None:
-            return best_bid, best_ask, "WS_BOOK"
-        cached_book = self._get_http_cached("book_ticker")
-        if isinstance(cached_book, dict):
-            bid = self._coerce_float(str(cached_book.get("bidPrice", "")))
-            ask = self._coerce_float(str(cached_book.get("askPrice", "")))
-            if bid is not None and ask is not None:
-                return bid, ask, "HTTP_BOOK"
+        snapshot = self.book_snapshot or {}
+        bid = self._coerce_float(snapshot.get("bid")) if snapshot else None
+        ask = self._coerce_float(snapshot.get("ask")) if snapshot else None
+        if self._validate_bid_ask(bid, ask, source="HTTP_BOOK"):
+            return bid, ask, self.trade_source
         return None, None, "—"
 
     @staticmethod
@@ -3683,12 +3691,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         assert isinstance(self, LiteAllStrategyNcMicroWindow)
         try:
             if isinstance(payload, dict) and payload:
-                self._set_http_cache("book_ticker", payload)
+                bid, ask = self._update_http_book_snapshot(payload)
+                if bid is not None and ask is not None:
+                    self._set_http_cache("book_ticker", payload)
         except Exception as exc:
-            self._append_log(
-                f"[HTTP_BOOK] handle success error: {exc}",
-                kind="WARN",
-            )
+            self._logger.error("SAFE_SKIP _handle_book_ticker_success: %s", exc)
+            return
 
     def _fetch_bidask_http_book(self) -> None:
         now_ts = monotonic()
@@ -3711,23 +3719,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         try:
             if not isinstance(payload, dict) or not payload:
                 return
-            bid = self._coerce_float(payload.get("bidPrice"))
-            ask = self._coerce_float(payload.get("askPrice"))
-            last_price = self._coerce_float(payload.get("lastPrice"))
-            if last_price is None:
-                last_price = self._coerce_float(payload.get("price"))
-            if bid is None or ask is None or bid <= 0 or ask <= 0:
-                if bid is None or ask is None:
-                    payload_keys = sorted(payload.keys())
-                    self._append_log(
-                        "[BIDASK] missing bid/ask src=HTTP_BOOK "
-                        f"symbol={self._symbol} keys={payload_keys}",
-                        kind="WARN",
-                    )
+            bid, ask = self._update_http_book_snapshot(payload)
+            if bid is None or ask is None:
                 return
-            self._bidask_last = (bid, ask)
-            self._bidask_ts = monotonic()
-            self._bidask_src = "HTTP_BOOK"
             self._set_http_cache("book_ticker", payload)
             if not self._bidask_ready_logged:
                 self._append_log(
@@ -3736,10 +3730,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 )
                 self._bidask_ready_logged = True
         except Exception as exc:
-            self._append_log(
-                f"[BIDASK] handle success error: {exc}",
-                kind="WARN",
-            )
+            self._logger.error("SAFE_SKIP _handle_success: %s", exc)
+            return
 
     def update_market_kpis(self) -> None:
         try:
@@ -3747,76 +3739,48 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 return
             if not hasattr(self, "_market_price"):
                 return
-            snapshot = (
-                self._price_feed_manager.get_snapshot(self._symbol)
-                if hasattr(self, "_price_feed_manager")
-                else None
-            )
-            price = snapshot.last_price if snapshot else None
-            source = snapshot.source if snapshot else None
-            age_ms = snapshot.price_age_ms if snapshot else None
-            micro = snapshot
-            if self._last_price_update:
-                if price is None and self._last_price_update.last_price is not None:
-                    price = self._last_price_update.last_price
-                if source is None and self._last_price_update.source is not None:
-                    source = self._last_price_update.source
-                if age_ms is None and self._last_price_update.price_age_ms is not None:
-                    age_ms = self._last_price_update.price_age_ms
-                if micro is None:
-                    micro = self._last_price_update.microstructure
-
             now_ts = monotonic()
-            price_cache_used = False
-            price_cache_age_ms = None
-            if not isinstance(price, (int, float)) or price <= 0:
-                price = None
-            if price is not None:
-                self._last_price = price
-                self._last_price_ts = now_ts
-            elif self._last_price is not None and self._last_price_ts is not None:
-                price_cache_age_ms = int((now_ts - self._last_price_ts) * 1000)
-                if price_cache_age_ms <= PRICE_STALE_MS:
-                    price = self._last_price
-                    price_cache_used = True
-            if price_cache_used:
-                if age_ms is None:
-                    age_ms = price_cache_age_ms
-                if source is None:
-                    source = "CACHE"
             if (
                 self._bidask_last_request_ts is None
                 or (now_ts - self._bidask_last_request_ts) * 1000 >= BIDASK_POLL_MS
             ):
                 self._fetch_bidask_http_book()
+
             best_bid = None
             best_ask = None
-            book_source = self._bidask_src or "HTTP_BOOK"
             bidask_age_ms = None
             bidask_state = "missing"
-            if self._bidask_last and self._bidask_ts is not None:
-                age_ms = int((now_ts - self._bidask_ts) * 1000)
+            book_source = self.trade_source
+            snapshot = self.book_snapshot or {}
+            snapshot_ts = snapshot.get("ts") if snapshot else None
+            bid = self._coerce_float(snapshot.get("bid")) if snapshot else None
+            ask = self._coerce_float(snapshot.get("ask")) if snapshot else None
+            if isinstance(snapshot_ts, (int, float)):
+                age_ms = int((now_ts - snapshot_ts) * 1000)
+                bidask_age_ms = age_ms
                 if age_ms <= BIDASK_STALE_MS:
-                    best_bid, best_ask = self._bidask_last
-                    bidask_age_ms = age_ms
+                    best_bid, best_ask = bid, ask
                     bidask_state = "stale_cache" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
                 else:
-                    bidask_age_ms = age_ms
+                    bidask_state = "stale"
+            if not self._validate_bid_ask(best_bid, best_ask, source="HTTP_BOOK"):
+                return
 
-            if price is None:
-                self._market_price.setText("—")
-            else:
-                self._market_price.setText(f"{price:.8f}")
-            self._set_market_label_state(self._market_price, active=price is not None)
+            price = (best_bid + best_ask) / 2
+            self._last_price = price
+            self._last_price_ts = now_ts
+            self._record_price(price)
+            self._last_price_label.setText(tr("last_price", price=f"{price:.8f}"))
+            self._market_price.setText(f"{price:.8f}")
+            self._set_market_label_state(self._market_price, active=True)
             spread_pct = self._compute_spread_pct_from_book(best_bid, best_ask)
             spread_text = self._format_spread_display(spread_pct)
             self._market_spread.setText(spread_text)
             self._set_market_label_state(self._market_spread, active=spread_text != "—")
 
             sample_ts = time_fn()
-            if best_bid is not None and best_ask is not None:
-                mid = (best_bid + best_ask) / 2
-                self._record_kpi_vol_sample(mid, sample_ts)
+            mid = price
+            self._record_kpi_vol_sample(mid, sample_ts)
             volatility_pct, sample_count = self._compute_kpi_volatility_pct(sample_ts)
             cache_used = False
             cache_ttl = None
@@ -3839,28 +3803,25 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
 
             source_age_text = "—"
-            if price is not None and source is not None:
-                if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
-                    source_age_text = "WS | stale"
-                elif age_ms is not None:
-                    source_age_text = f"{source} | {age_ms}ms"
+            if bidask_age_ms is not None:
+                source_age_text = f"{book_source} | {bidask_age_ms}ms"
             self._market_source.setText(source_age_text)
             self._set_market_label_state(self._market_source, active=source_age_text != "—")
 
-            feed_ok = bool(source == "WS" and age_ms is not None and age_ms < WS_STALE_MS)
+            feed_ok = bool(bidask_age_ms is not None and bidask_age_ms < BIDASK_FAIL_SOFT_MS)
             self._feed_ok = feed_ok
-            feed_age_text = f"{age_ms}ms" if age_ms is not None else "—"
+            feed_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
             if (
                 self._feed_last_ok is None
                 or self._feed_last_ok != feed_ok
-                or self._feed_last_source != source
+                or self._feed_last_source != book_source
             ):
                 self._append_log(
-                    f"[FEED] src={source or '—'} age={feed_age_text} ok={str(feed_ok).lower()}",
+                    f"[FEED] src={book_source} age={feed_age_text} ok={str(feed_ok).lower()}",
                     kind="INFO",
                 )
                 self._feed_last_ok = feed_ok
-                self._feed_last_source = source
+                self._feed_last_source = book_source
 
             is_spread_zero = spread_pct is not None and spread_pct == 0
             spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
@@ -3884,7 +3845,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._kpi_missing_bidask_since_ts = now_ts
             if not bidask_missing:
                 self._kpi_missing_bidask_since_ts = None
-            price_available = price is not None
             if bidask_missing:
                 if not self._kpi_missing_bidask_active:
                     self._append_log(
@@ -3894,10 +3854,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     self._kpi_missing_bidask_active = True
             else:
                 self._kpi_missing_bidask_active = False
-            if not price_available:
-                kpi_state = KPI_STATE_UNKNOWN
-                kpi_reason = "no_price_yet"
-            elif spread_zero_ok:
+            if spread_zero_ok:
                 kpi_state = KPI_STATE_OK
                 kpi_reason = "spread=0 allowed"
             elif bidask_missing:
@@ -3947,30 +3904,47 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     "ts": now_ts,
                 }
 
-            if price is not None and source is not None:
+            if price is not None:
                 should_log = False
-                if not self._kpi_has_data or self._kpi_last_source != source:
+                if not self._kpi_has_data or self._kpi_last_source != book_source:
                     should_log = True
                 if should_log:
-                    if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
-                        age_text = "stale"
-                    else:
-                        age_text = f"{age_ms}ms" if age_ms is not None else "—"
+                    age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
                     self._append_log(
-                        f"[NC_MICRO] kpi updated src={source} age={age_text} price={price:.8f}",
+                        f"[NC_MICRO] kpi updated src={book_source} age={age_text} price={price:.8f}",
                         kind="INFO",
                     )
                 self._kpi_has_data = True
-                self._kpi_last_source = source
+                self._kpi_last_source = book_source
             else:
                 self._kpi_has_data = False
                 self._kpi_last_source = None
                 self._kpi_zero_vol_ticks = 0
                 self._kpi_zero_vol_start_ts = None
                 self._kpi_missing_bidask_since_ts = None
-        except Exception:
-            self._logger.exception("[NC_MICRO][CRASH] exception in update_market_kpis")
-            self._notify_crash("update_market_kpis")
+            ws_age_ms = None
+            if self._ws_last_tick_ts is not None:
+                ws_age_ms = int((now_ts - self._ws_last_tick_ts) * 1000)
+            age_text = f"{ws_age_ms}ms" if ws_age_ms is not None else "—"
+            self._age_label.setText(tr("age", age=age_text))
+            latency_text = "—"
+            if self._last_price_update and self._last_price_update.latency_ms is not None:
+                latency_text = f"{self._last_price_update.latency_ms}ms"
+            self._latency_label.setText(tr("latency", latency=latency_text))
+            ws_clock_ok = bool(ws_age_ms is not None and ws_age_ms < WS_STALE_MS)
+            clock_status = "✓" if ws_clock_ok else "—"
+            if self._ws_status in {WS_DEGRADED, WS_LOST}:
+                self._feed_indicator.setToolTip(tr("ws_degraded_tooltip"))
+            else:
+                self._feed_indicator.setToolTip("")
+            self._feed_indicator.setText(
+                f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK {clock_status}"
+            )
+            self._grid_engine.on_price(price)
+            self._update_runtime_balances()
+            self._refresh_unrealized_pnl()
+        except Exception as exc:
+            self._logger.error("SAFE_SKIP update_market_kpis: %s", exc)
             return
 
     def _compute_recent_volatility_pct(self) -> float | None:
@@ -3984,24 +3958,23 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return (high - low) / low * 100
 
     def _apply_status_update(self, status: str, _: str) -> None:
-        overall_status = (
-            self._price_feed_manager.get_ws_overall_status()
-            if hasattr(self, "_price_feed_manager")
-            else status
-        )
-        if overall_status == WS_CONNECTED:
-            self._ws_status = WS_CONNECTED
-            self._feed_indicator.setToolTip("")
-        elif overall_status == WS_DEGRADED:
-            self._ws_status = WS_DEGRADED
-            self._feed_indicator.setToolTip(tr("ws_degraded_tooltip"))
-        elif overall_status == WS_LOST:
-            self._ws_status = WS_LOST
-            self._feed_indicator.setToolTip(tr("ws_degraded_tooltip"))
-        else:
-            self._ws_status = ""
-            self._feed_indicator.setToolTip("")
-        self._feed_indicator.setText(f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK —")
+        try:
+            overall_status = (
+                self._price_feed_manager.get_ws_overall_status()
+                if hasattr(self, "_price_feed_manager")
+                else status
+            )
+            if overall_status == WS_CONNECTED:
+                self._ws_status = WS_CONNECTED
+            elif overall_status == WS_DEGRADED:
+                self._ws_status = WS_DEGRADED
+            elif overall_status == WS_LOST:
+                self._ws_status = WS_LOST
+            else:
+                self._ws_status = ""
+        except Exception as exc:
+            self._logger.error("SAFE_SKIP _apply_status_update: %s", exc)
+            return
 
     @staticmethod
     def _set_market_label_state(label: QLabel, active: bool) -> None:
@@ -4909,41 +4882,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return settings
 
     def get_anchor_price(self, symbol: str) -> float | None:
-        snapshot = self._price_feed_manager.get_snapshot(symbol)
-        ttl_ms = self._config.prices.ttl_ms
-        if snapshot and snapshot.last_price is not None:
-            age_ms = snapshot.price_age_ms or 0
-            if snapshot.price_age_ms is None or age_ms <= ttl_ms:
-                self._append_log(f"PRICE: WS age={age_ms}ms", kind="INFO")
-                return snapshot.last_price
+        best_bid, best_ask, _source = self._resolve_book_bid_ask()
+        if best_bid is not None and best_ask is not None:
+            self._append_log("PRICE: HTTP_BOOK age=live", kind="INFO")
+            return (best_bid + best_ask) / 2
         cached_book = self._get_http_cached("book_ticker")
         if isinstance(cached_book, dict):
-            bid = self._coerce_float(str(cached_book.get("bidPrice", "")))
-            ask = self._coerce_float(str(cached_book.get("askPrice", "")))
-            if bid and ask:
+            bid, ask = self._update_http_book_snapshot(cached_book)
+            if bid is not None and ask is not None:
                 self._append_log("PRICE: HTTP_BOOK age=cached", kind="INFO")
                 return (bid + ask) / 2
         try:
             book = self._http_client.get_book_ticker(symbol)
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"PRICE: HTTP_BOOK failed ({exc})", kind="WARN")
-            book = {}
-        bid = self._coerce_float(str(book.get("bidPrice", ""))) if isinstance(book, dict) else None
-        ask = self._coerce_float(str(book.get("askPrice", ""))) if isinstance(book, dict) else None
-        if bid and ask:
-            if isinstance(book, dict):
-                self._set_http_cache("book_ticker", book)
-            anchor = (bid + ask) / 2
-            self._append_log("PRICE: HTTP_BOOK age=0ms", kind="INFO")
-            return anchor
-        try:
-            price_raw = self._http_client.get_ticker_price(symbol)
-            anchor = float(price_raw)
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"PRICE: HTTP_LAST failed ({exc})", kind="WARN")
             return None
-        self._append_log("PRICE: HTTP_LAST age=0ms", kind="INFO")
-        return anchor
+        if isinstance(book, dict):
+            bid, ask = self._update_http_book_snapshot(book)
+            if bid is not None and ask is not None:
+                self._set_http_cache("book_ticker", book)
+                self._append_log("PRICE: HTTP_BOOK age=0ms", kind="INFO")
+                return (bid + ask) / 2
+        return None
 
     def _get_http_cached(self, key: str) -> Any | None:
         cached = self._http_cache.get(self._symbol, key)
