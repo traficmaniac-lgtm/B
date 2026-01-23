@@ -25,6 +25,7 @@ class AppState:
     pnl_period: str = "24h"
     zero_fee_symbols: list[str] = field(default_factory=lambda: ["USDTUSDC", "EURIUSDT"])
     nc_micro_legacy_policy: str = "CANCEL"
+    nc_micro_profit_guard_mode: str = "BLOCK"
     ai_connected: bool = False
     ai_checked: bool = False
     user_config_path: Path | None = None
@@ -54,6 +55,9 @@ class AppState:
         nc_micro_legacy_policy = str(
             data.get("nc_micro_legacy_policy", defaults.nc_micro_legacy_policy)
         ).upper()
+        nc_micro_profit_guard_mode = str(
+            data.get("nc_micro_profit_guard_mode", defaults.nc_micro_profit_guard_mode)
+        ).upper()
         return cls(
             env=env,
             log_level=log_level,
@@ -71,6 +75,7 @@ class AppState:
             pnl_period=pnl_period,
             zero_fee_symbols=zero_fee_symbols,
             nc_micro_legacy_policy=nc_micro_legacy_policy,
+            nc_micro_profit_guard_mode=nc_micro_profit_guard_mode,
             user_config_path=path,
         )
 
@@ -92,6 +97,7 @@ class AppState:
             "pnl_period": self.pnl_period,
             "zero_fee_symbols": list(self.zero_fee_symbols),
             "nc_micro_legacy_policy": self.nc_micro_legacy_policy,
+            "nc_micro_profit_guard_mode": self.nc_micro_profit_guard_mode,
         }
 
     def save(self, path: Path) -> None:

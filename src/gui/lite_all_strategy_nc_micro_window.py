@@ -229,6 +229,11 @@ class LegacyPolicy(Enum):
     IGNORE = "IGNORE"
 
 
+class ProfitGuardMode(Enum):
+    BLOCK = "BLOCK"
+    WARN_ONLY = "WARN_ONLY"
+
+
 RECENTER_THRESHOLD_PCT = 0.7
 STALE_DRIFT_PCT_DEFAULT = 0.20
 STALE_DRIFT_PCT_STABLE = 0.05
@@ -244,8 +249,8 @@ STALE_COOLDOWN_SEC = 120
 STALE_ACTION_COOLDOWN_SEC = 120
 STALE_AUTO_ACTION_PAUSE_SEC = 300
 TP_MIN_PROFIT_COOLDOWN_SEC = 30
-PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.10
-PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.10
+PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.0
+PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.0
 PROFIT_GUARD_SLIPPAGE_BPS = 1.5
 PROFIT_GUARD_EXTRA_BUFFER_PCT = 0.02
 PROFIT_GUARD_BUFFER_PCT = 0.03
@@ -870,6 +875,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._exchange_rules: dict[str, float | None] = {}
         self._trade_fees: tuple[float | None, float | None] = (None, None)
         self._fees_last_fetch_ts: float | None = None
+        self._fee_unverified = True
+        self._fee_source: str | None = None
+        self._profit_guard_mode = self._resolve_profit_guard_mode()
+        self._update_fee_state(None, None, "DEFAULT_UNVERIFIED")
         self._quote_asset = ""
         self._base_asset = ""
         self._balances_in_flight = False
@@ -1039,7 +1048,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.9 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.10 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1054,6 +1063,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if policy.value == policy_value:
                 return policy
         return LegacyPolicy.CANCEL
+
+    def _resolve_profit_guard_mode(self) -> ProfitGuardMode:
+        mode_raw = getattr(self._app_state, "nc_micro_profit_guard_mode", "BLOCK")
+        mode_value = str(mode_raw or "BLOCK").upper()
+        for mode in ProfitGuardMode:
+            if mode.value == mode_value:
+                return mode
+        return ProfitGuardMode.BLOCK
 
     def _register_owned_order_id(self, order_id: str) -> None:
         if not order_id:
@@ -3674,10 +3691,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_stale_last_log_total = total
         self._pilot_stale_active = True
 
-    def _maybe_log_snapshot_refresh_suppressed(self, now: float, cooldown_sec: float) -> None:
+    def _maybe_log_snapshot_refresh_suppressed(self, reason: str, detail: str | None = None) -> None:
+        now = monotonic()
+        cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
         last_log = self._snapshot_refresh_suppressed_log_ts
         if last_log is None or now - last_log >= cooldown_sec:
-            self._append_log("[ORDERS] snapshot stale -> suppressed (cooldown)", kind="INFO")
+            suffix = f" ({detail})" if detail else ""
+            self._append_log(
+                f"[ORDERS] snapshot stale -> suppressed {reason}{suffix}",
+                kind="INFO",
+            )
             self._snapshot_refresh_suppressed_log_ts = now
 
     def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
@@ -3959,10 +3982,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._market_volatility.setText(volatility_text)
             self._set_market_label_state(self._market_volatility, active=volatility_text != "—")
 
-            maker, taker = self._trade_fees
-            if maker is None and taker is None:
-                self._market_fee.setText("—")
-            self._set_market_label_state(self._market_fee, active=maker is not None or taker is not None)
+            self._market_fee.setText(self._fee_display_text())
+            self._set_market_label_state(self._market_fee, active=True)
 
             source_age_text = "—"
             if bidask_age_ms is not None:
@@ -4409,7 +4430,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._dry_run_toggle.setChecked(True)
                 self._suppress_dry_run_event = False
             self._grid_engine.set_mode("DRY_RUN" if dry_run else "LIVE")
-            if not dry_run and (not self._rules_loaded or not self._fees_last_fetch_ts):
+            if not dry_run and (not self._rules_loaded or (not self._fees_last_fetch_ts and not self._fee_unverified)):
                 self._append_log("Start blocked: rules/fees not loaded.", kind="WARN")
                 self._refresh_exchange_rules(force=True)
                 self._refresh_trade_fees(force=True)
@@ -4423,6 +4444,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 balance_snapshot = self._balance_snapshot()
                 settings = self._resolve_start_settings(snapshot)
                 self._apply_auto_clamps(settings, anchor_price)
+                if not self._fees_last_fetch_ts:
+                    self._refresh_trade_fees(force=True)
+                guard_mode = self._current_profit_guard_mode()
+                self._append_log(
+                    f"[GUARD] mode={guard_mode.value} fee_unverified={str(self._fee_unverified).lower()}",
+                    kind="INFO",
+                )
                 guard_decision = self._apply_profit_guard(
                     settings,
                     anchor_price,
@@ -5335,14 +5363,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if not force:
                 snapshot_age_sec = self._snapshot_age_sec()
                 if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
-                    now = time_fn()
+                    now = monotonic()
                     cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
                     if self._snapshot_refresh_inflight:
-                        self._maybe_log_snapshot_refresh_suppressed(now, cooldown_sec)
+                        self._maybe_log_snapshot_refresh_suppressed("inflight")
                     elif now - self._last_snapshot_refresh_ts < cooldown_sec:
-                        self._maybe_log_snapshot_refresh_suppressed(now, cooldown_sec)
+                        remaining_ms = max(int((cooldown_sec - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
+                        self._maybe_log_snapshot_refresh_suppressed("cooldown", f"{remaining_ms} ms")
                     else:
-                        self._append_log("[ORDERS] snapshot stale -> refresh", kind="INFO")
+                        self._append_log("[ORDERS] snapshot stale -> refresh (start)", kind="INFO")
                         self._last_snapshot_refresh_ts = now
                         stale_force = True
                         force = True
@@ -6039,6 +6068,57 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         fee_rate = max(maker_rate, taker_rate, 0.0)
         return self.as_decimal(fee_rate)
 
+    def get_effective_fees_pct(self, symbol: str | None = None) -> float:
+        maker, taker = self._trade_fees
+        maker_pct = (maker or 0.0) * 100
+        taker_pct = (taker or 0.0) * 100
+        fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
+        if fill_mode == "TAKER":
+            return maker_pct + taker_pct
+        return 2 * maker_pct
+
+    def _current_profit_guard_mode(self) -> ProfitGuardMode:
+        return ProfitGuardMode.WARN_ONLY if self._fee_unverified else self._profit_guard_mode
+
+    def _fee_display_text(self) -> str:
+        maker, taker = self._trade_fees
+        unverified = self._fee_unverified
+        maker_pct = (maker or 0.0) * 100
+        taker_pct = (taker or 0.0) * 100
+        suffix = " (unverified)" if unverified else ""
+        return f"{maker_pct:.2f}%/{taker_pct:.2f}%{suffix}"
+
+    def _log_fee_source(self, source: str) -> None:
+        if source == "ACCOUNT":
+            maker, taker = self._trade_fees
+            maker_pct = (maker or 0.0) * 100
+            taker_pct = (taker or 0.0) * 100
+            roundtrip = self.get_effective_fees_pct(self._symbol)
+            self._append_log(
+                (
+                    "[FEES] source=ACCOUNT "
+                    f"maker={maker_pct:.4f}% taker={taker_pct:.4f}% roundtrip={roundtrip:.4f}%"
+                ),
+                kind="INFO",
+            )
+        else:
+            roundtrip = self.get_effective_fees_pct(self._symbol)
+            self._append_log(
+                f"[FEES] source=DEFAULT_UNVERIFIED roundtrip={roundtrip:.4f}%",
+                kind="INFO",
+            )
+
+    def _update_fee_state(self, maker: float | None, taker: float | None, source: str) -> None:
+        self._trade_fees = (maker, taker)
+        fee_unverified = maker is None or taker is None or source != "ACCOUNT"
+        source_value = source if not fee_unverified else "DEFAULT_UNVERIFIED"
+        if source_value != self._fee_source or fee_unverified != self._fee_unverified:
+            self._fee_source = source_value
+            self._fee_unverified = fee_unverified
+            self._log_fee_source(source_value)
+        else:
+            self._fee_unverified = fee_unverified
+
     def _profit_profile_name(self) -> str:
         return "BALANCED"
 
@@ -6052,26 +6132,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _profit_guard_fee_inputs(self) -> tuple[float, float, bool]:
         maker, taker = self._trade_fees
-        used_default = False
-        if maker is None:
-            maker_pct = PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT
-            used_default = True
-        else:
-            maker_pct = maker * 100
-        if taker is None:
-            taker_pct = PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT
-            used_default = True
-        else:
-            taker_pct = taker * 100
+        used_default = self._fee_unverified or maker is None or taker is None
+        maker_pct = (maker * 100) if maker is not None else PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT
+        taker_pct = (taker * 100) if taker is not None else PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT
         return maker_pct, taker_pct, used_default
 
     def _profit_guard_round_trip_cost_pct(self) -> float:
-        maker_pct, taker_pct, _used_default = self._profit_guard_fee_inputs()
-        fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
-        if fill_mode == "TAKER":
-            fee_cost = maker_pct + taker_pct
-        else:
-            fee_cost = 2 * maker_pct
+        fee_cost = self.get_effective_fees_pct(self._symbol)
         slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
         return fee_cost + slippage_pct + PROFIT_GUARD_EXTRA_BUFFER_PCT
 
@@ -6099,9 +6166,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return "OK", spread_pct, None, None, None, None
         if spread_pct is None or spread_pct <= 0:
             return "OK", spread_pct, None, None, None, None
-        maker_pct, taker_pct, _used_default = self._profit_guard_fee_inputs()
-        fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
-        fee_cost_pct = maker_pct + taker_pct if fill_mode == "TAKER" else 2 * maker_pct
+        fee_cost_pct = self.get_effective_fees_pct(self._symbol)
         slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
         safety_pad_pct = PROFIT_GUARD_EXTRA_BUFFER_PCT
         expected_edge_pct = spread_pct - fee_cost_pct - slippage_pct - safety_pad_pct
@@ -6199,6 +6264,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         action_label: str,
         update_ui: bool,
     ) -> str:
+        guard_mode = self._current_profit_guard_mode()
         min_profit_pct = self._profit_guard_min_profit_pct(settings)
         decision, spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct = (
             self._profit_guard_should_hold(min_profit_pct)
@@ -6218,15 +6284,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             fee_text = f"{fee_cost_pct:.6f}%" if fee_cost_pct is not None else "—"
             slip_text = f"{slippage_pct:.6f}%" if slippage_pct is not None else "—"
             pad_text = f"{safety_pad_pct:.6f}%" if safety_pad_pct is not None else "—"
+            guard_prefix = "HOLD" if guard_mode == ProfitGuardMode.BLOCK else "WARN_ONLY"
             self._append_log(
                 (
-                    "[GUARD] HOLD thin_edge "
+                    f"[GUARD] {guard_prefix} thin_edge "
                     f"raw_spread={spread_text} expected_edge={expected_text} "
                     f"min_profit={min_profit_pct:.4f}% fees={fee_text} slip={slip_text} pad={pad_text}"
                 ),
                 kind="WARN",
             )
-            return "HOLD"
+            if guard_mode == ProfitGuardMode.BLOCK:
+                return "HOLD"
         if self.enable_guard_autofix:
             self._profit_guard_autofix(
                 settings,
@@ -7366,7 +7434,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if isinstance(entry, dict):
             maker = self._coerce_float(str(entry.get("makerCommission", "")))
             taker = self._coerce_float(str(entry.get("takerCommission", "")))
-            self._trade_fees = (maker, taker)
+            if maker is None or taker is None:
+                self._update_fee_state(None, None, "DEFAULT_UNVERIFIED")
+            else:
+                self._update_fee_state(maker, taker, "ACCOUNT")
         self._fees_last_fetch_ts = time_fn()
         self._update_rules_label()
         self._append_log(f"Trade fees loaded ({latency_ms}ms).", kind="INFO")
@@ -7387,7 +7458,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         taker = self._coerce_float(str(taker_raw))
         if maker is None or taker is None:
             return
-        self._trade_fees = (maker / 10_000, taker / 10_000)
+        self._update_fee_state(maker / 10_000, taker / 10_000, "ACCOUNT")
         self._fees_last_fetch_ts = time_fn()
         self._update_rules_label()
 
@@ -7592,17 +7663,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         min_text = f"{min_notional:.4f}" if min_notional is not None else "—"
         min_qty_text = f"{min_qty:.8f}" if min_qty is not None else "—"
         max_qty_text = f"{max_qty:.8f}" if max_qty is not None else "—"
-        maker_text = f"{(maker or 0.0) * 100:.2f}%" if maker is not None else "—"
-        taker_text = f"{(taker or 0.0) * 100:.2f}%" if taker is not None else "—"
+        fee_text = self._fee_display_text()
         rules = (
             f"tick {tick_text} | step {step_text}"
             f" | minQty {min_qty_text} | maxQty {max_qty_text}"
-            f" | minNotional {min_text} | maker/taker {maker_text}/{taker_text}"
+            f" | minNotional {min_text} | maker/taker {fee_text}"
         )
         self._set_rules_label_text(tr("rules_line", rules=rules))
-        if maker is not None or taker is not None:
-            self._market_fee.setText(f"{maker_text}/{taker_text}")
-            self._set_market_label_state(self._market_fee, active=True)
+        self._market_fee.setText(fee_text)
+        self._set_market_label_state(self._market_fee, active=True)
 
     def _set_rules_label_text(self, text: str) -> None:
         if not hasattr(self, "_rules_label"):
