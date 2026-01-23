@@ -172,6 +172,19 @@ PROFIT_GUARD_THIN_SPREAD_FACTOR = 0.25
 PROFIT_GUARD_LOW_VOL_FACTOR = 0.5
 PROFIT_GUARD_LOW_VOL_FLOOR_PCT = 0.05
 PROFIT_GUARD_MIN_VOL_PCT = 0.05
+VOL_CONFIRM_TICKS = 3
+VOL_CONFIRM_TIME_MS = 1000
+KPI_STATE_OK = "OK"
+KPI_STATE_UNKNOWN = "UNKNOWN"
+KPI_STATE_INVALID = "INVALID"
+SPREAD_ZERO_OK_SYMBOLS = {
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "ADAUSDT",
+}
 
 
 @dataclass
@@ -805,11 +818,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._kpi_has_data = False
         self._kpi_last_source: str | None = None
         self._kpi_valid = False
-        self._kpi_last_valid: bool | None = None
         self._kpi_invalid_reason: str | None = None
+        self._kpi_state = KPI_STATE_UNKNOWN
+        self._kpi_last_state: str | None = None
         self._kpi_vol_state: str | None = None
-        self._kpi_last_vol_state: str | None = None
-        self._kpi_last_spread_text: str | None = None
+        self._kpi_zero_vol_ticks = 0
+        self._kpi_zero_vol_start_ts: float | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._position_state = PositionState(
@@ -867,7 +881,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.1 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.3 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1776,6 +1790,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_execute_cancel_replace_stale(stale_orders, auto=auto, reason=reason)
             return
         if action not in {PilotAction.RECENTER, PilotAction.RECOVERY, PilotAction.FLATTEN_BE}:
+            return
+        if action in {PilotAction.RECENTER, PilotAction.RECOVERY} and self._kpi_state == KPI_STATE_INVALID:
+            self._pilot_block_action(action, "kpi_invalid")
             return
         if not self._pilot_trade_gate_ready(action):
             return
@@ -2886,43 +2903,60 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 spread_value = float(micro.spread_pct)
             elif micro.spread_abs is not None:
                 spread_value = float(micro.spread_abs)
+        is_spread_zero = spread_value is not None and spread_value == 0
+        spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
+        now_ts = monotonic()
         if volatility_pct is None:
-            vol_state = "UNKNOWN"
-        elif volatility_pct == 0:
-            vol_state = "INVALID"
+            self._kpi_zero_vol_ticks = 0
+            self._kpi_zero_vol_start_ts = None
+            vol_state = KPI_STATE_UNKNOWN
+            vol_reason = "vol=unknown"
+        elif volatility_pct > 0:
+            self._kpi_zero_vol_ticks = 0
+            self._kpi_zero_vol_start_ts = None
+            vol_state = KPI_STATE_OK
+            vol_reason = "vol>0"
         else:
-            vol_state = "OK"
+            if self._kpi_zero_vol_start_ts is None:
+                self._kpi_zero_vol_start_ts = now_ts
+                self._kpi_zero_vol_ticks = 1
+            else:
+                self._kpi_zero_vol_ticks += 1
+            elapsed_ms = (now_ts - self._kpi_zero_vol_start_ts) * 1000
+            if self._kpi_zero_vol_ticks >= VOL_CONFIRM_TICKS and elapsed_ms >= VOL_CONFIRM_TIME_MS:
+                vol_state = KPI_STATE_INVALID
+                vol_reason = "vol=0 confirmed"
+            else:
+                vol_state = KPI_STATE_UNKNOWN
+                vol_reason = "vol=0 pending"
         spread_log = spread_text if spread_text != "—" else "—"
-        if self._kpi_last_vol_state != vol_state or self._kpi_last_spread_text != spread_log:
+        vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
+        if vol_state == KPI_STATE_INVALID:
+            kpi_state = KPI_STATE_INVALID
+            kpi_reason = vol_reason
+        elif spread_zero_ok:
+            kpi_state = KPI_STATE_OK
+            kpi_reason = "spread=0 allowed"
+        elif vol_state == KPI_STATE_UNKNOWN:
+            kpi_state = KPI_STATE_UNKNOWN
+            kpi_reason = vol_reason
+        else:
+            kpi_state = KPI_STATE_OK
+            kpi_reason = vol_reason
+        if self._kpi_last_state != kpi_state:
+            kind = "WARN" if kpi_state == KPI_STATE_INVALID else "INFO"
             self._append_log(
-                f"[KPI] vol_state={vol_state} spread={spread_log}",
-                kind="INFO",
-            )
-            self._kpi_last_vol_state = vol_state
-            self._kpi_last_spread_text = spread_log
-
-        kpi_invalid = bool(
-            feed_ok
-            and spread_value is not None
-            and volatility_pct is not None
-            and spread_value == 0
-            and volatility_pct == 0
-        )
-        kpi_valid = not kpi_invalid
-        kpi_reason = "spread=0,vol=0" if kpi_invalid else "ok"
-        if self._kpi_last_valid is None or self._kpi_last_valid != kpi_valid:
-            kind = "WARN" if not kpi_valid else "INFO"
-            self._append_log(
-                f"[KPI] ok={str(kpi_valid).lower()} reason={kpi_reason}",
+                f"[KPI] state={kpi_state} vol={vol_text} spread={spread_log} reason={kpi_reason}",
                 kind=kind,
             )
-        if not kpi_valid:
+            self._kpi_last_state = kpi_state
+        if kpi_state == KPI_STATE_INVALID:
             self._kpi_invalid_reason = kpi_reason
         else:
             self._kpi_invalid_reason = None
         self._kpi_vol_state = vol_state
-        self._kpi_valid = kpi_valid
-        self._kpi_last_valid = kpi_valid
+        self._kpi_state = kpi_state
+        self._kpi_valid = kpi_state != KPI_STATE_INVALID
 
         if price is not None and source is not None:
             should_log = False
@@ -2942,8 +2976,18 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         else:
             self._kpi_has_data = False
             self._kpi_last_source = None
-            self._kpi_valid = False
-            self._kpi_last_valid = None
+            self._kpi_zero_vol_ticks = 0
+            self._kpi_zero_vol_start_ts = None
+            if self._kpi_last_state != KPI_STATE_UNKNOWN:
+                self._append_log(
+                    "[KPI] state=UNKNOWN vol=— spread=— reason=no_data",
+                    kind="INFO",
+                )
+                self._kpi_last_state = KPI_STATE_UNKNOWN
+            self._kpi_vol_state = KPI_STATE_UNKNOWN
+            self._kpi_state = KPI_STATE_UNKNOWN
+            self._kpi_valid = True
+            self._kpi_invalid_reason = None
 
     def _compute_recent_volatility_pct(self) -> float | None:
         if len(self._price_history) < 2:
@@ -4813,9 +4857,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[str, float | None, float | None]:
         spread_pct = self._current_spread_pct()
         volatility_pct = self._compute_recent_volatility_pct()
-        if self._kpi_vol_state == "UNKNOWN":
+        if self._kpi_state == KPI_STATE_UNKNOWN:
             return "OK", spread_pct, volatility_pct
-        if self._feed_ok and not self._kpi_valid:
+        if self._kpi_state == KPI_STATE_INVALID:
             return "HOLD", spread_pct, volatility_pct
         return "OK", spread_pct, volatility_pct
 
