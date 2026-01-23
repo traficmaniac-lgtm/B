@@ -174,6 +174,8 @@ PROFIT_GUARD_LOW_VOL_FLOOR_PCT = 0.05
 PROFIT_GUARD_MIN_VOL_PCT = 0.05
 VOL_CONFIRM_TICKS = 3
 VOL_CONFIRM_TIME_MS = 1000
+KPI_TIMEOUT_MS = 5000
+KPI_BOOK_REQUEST_INTERVAL_MS = 1000
 KPI_STATE_OK = "OK"
 KPI_STATE_UNKNOWN = "UNKNOWN"
 KPI_STATE_INVALID = "INVALID"
@@ -824,6 +826,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._kpi_vol_state: str | None = None
         self._kpi_zero_vol_ticks = 0
         self._kpi_zero_vol_start_ts: float | None = None
+        self._kpi_missing_bidask_since_ts: float | None = None
+        self._kpi_last_book_request_ts: float | None = None
+        self._kpi_missing_bidask_active = False
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._position_state = PositionState(
@@ -1791,7 +1796,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         if action not in {PilotAction.RECENTER, PilotAction.RECOVERY, PilotAction.FLATTEN_BE}:
             return
-        if action in {PilotAction.RECENTER, PilotAction.RECOVERY} and self._kpi_state == KPI_STATE_INVALID:
+        if action in {PilotAction.RECENTER, PilotAction.RECOVERY} and not self._kpi_allows_start():
             self._pilot_block_action(action, "kpi_invalid")
             return
         if not self._pilot_trade_gate_ready(action):
@@ -2810,6 +2815,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _emit_status_update(self, status: str, message: str) -> None:
         self._signals.status_update.emit(status, message)
 
+    def _kpi_allows_start(self) -> bool:
+        if self._kpi_state != KPI_STATE_INVALID:
+            return True
+        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
+        price = snapshot.last_price if snapshot and snapshot.last_price is not None else self._last_price
+        best_bid, best_ask, _source = self._resolve_book_bid_ask()
+        return price is not None and best_bid is not None and best_ask is not None
+
     def _apply_price_update(self, update: PriceUpdate) -> None:
         self._last_price_update = update
         if update.last_price is not None:
@@ -2829,6 +2842,54 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self.update_market_kpis()
         self._update_runtime_balances()
         self._refresh_unrealized_pnl()
+
+    def _resolve_book_bid_ask(self) -> tuple[float | None, float | None, str]:
+        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
+        micro = snapshot
+        if self._last_price_update and micro is None:
+            micro = self._last_price_update.microstructure
+        best_bid = micro.best_bid if micro else None
+        best_ask = micro.best_ask if micro else None
+        if best_bid is not None and best_ask is not None:
+            return best_bid, best_ask, "WS_BOOK"
+        cached_book = self._get_http_cached("book_ticker")
+        if isinstance(cached_book, dict):
+            bid = self._coerce_float(str(cached_book.get("bidPrice", "")))
+            ask = self._coerce_float(str(cached_book.get("askPrice", "")))
+            if bid is not None and ask is not None:
+                return bid, ask, "HTTP_BOOK"
+        return None, None, "—"
+
+    @staticmethod
+    def _compute_spread_pct_from_book(best_bid: float | None, best_ask: float | None) -> float | None:
+        if not isinstance(best_bid, (int, float)) or not isinstance(best_ask, (int, float)):
+            return None
+        if best_bid <= 0 or best_ask <= 0:
+            return None
+        mid = (best_bid + best_ask) / 2
+        if mid <= 0:
+            return None
+        return (best_ask - best_bid) / mid * 100
+
+    def _request_book_ticker(self) -> None:
+        now_ts = monotonic()
+        if self._kpi_last_book_request_ts and (
+            (now_ts - self._kpi_last_book_request_ts) * 1000 < KPI_BOOK_REQUEST_INTERVAL_MS
+        ):
+            return
+        self._kpi_last_book_request_ts = now_ts
+
+        def _fetch() -> dict[str, Any]:
+            book = self._http_client.get_book_ticker(self._symbol)
+            return book if isinstance(book, dict) else {}
+
+        def _handle_success(payload: object, _latency_ms: int) -> None:
+            if isinstance(payload, dict) and payload:
+                self._set_http_cache("book_ticker", payload)
+
+        worker = _Worker(_fetch, self._can_emit_worker_results)
+        worker.signals.success.connect(_handle_success)
+        self._thread_pool.start(worker)
 
     def update_market_kpis(self) -> None:
         if not hasattr(self, "_market_price"):
@@ -2854,16 +2915,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._market_price.setText(f"{price:.8f}")
         self._set_market_label_state(self._market_price, active=price is not None)
 
-        spread_text = "—"
-        if micro is not None:
-            if micro.spread_pct is not None:
-                spread_text = f"{micro.spread_pct:.4f}%"
-            elif micro.spread_abs is not None:
-                spread_text = f"{micro.spread_abs:.8f}"
+        best_bid, best_ask, book_source = self._resolve_book_bid_ask()
+        spread_pct = self._compute_spread_pct_from_book(best_bid, best_ask)
+        spread_text = f"{spread_pct:.4f}%" if spread_pct is not None else "—"
         self._market_spread.setText(spread_text)
         self._set_market_label_state(self._market_spread, active=spread_text != "—")
 
         volatility_pct = self._compute_recent_volatility_pct()
+        if volatility_pct is not None and volatility_pct <= 0:
+            volatility_pct = None
         volatility_text = f"{volatility_pct:.2f}%" if volatility_pct is not None else "—"
         self._market_volatility.setText(volatility_text)
         self._set_market_label_state(self._market_volatility, active=volatility_text != "—")
@@ -2897,13 +2957,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._feed_last_ok = feed_ok
             self._feed_last_source = source
 
-        spread_value: float | None = None
-        if micro is not None:
-            if micro.spread_pct is not None:
-                spread_value = float(micro.spread_pct)
-            elif micro.spread_abs is not None:
-                spread_value = float(micro.spread_abs)
-        is_spread_zero = spread_value is not None and spread_value == 0
+        is_spread_zero = spread_pct is not None and spread_pct == 0
         spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
         now_ts = monotonic()
         if volatility_pct is None:
@@ -2911,32 +2965,45 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._kpi_zero_vol_start_ts = None
             vol_state = KPI_STATE_UNKNOWN
             vol_reason = "vol=unknown"
-        elif volatility_pct > 0:
+        else:
             self._kpi_zero_vol_ticks = 0
             self._kpi_zero_vol_start_ts = None
             vol_state = KPI_STATE_OK
             vol_reason = "vol>0"
-        else:
-            if self._kpi_zero_vol_start_ts is None:
-                self._kpi_zero_vol_start_ts = now_ts
-                self._kpi_zero_vol_ticks = 1
-            else:
-                self._kpi_zero_vol_ticks += 1
-            elapsed_ms = (now_ts - self._kpi_zero_vol_start_ts) * 1000
-            if self._kpi_zero_vol_ticks >= VOL_CONFIRM_TICKS and elapsed_ms >= VOL_CONFIRM_TIME_MS:
-                vol_state = KPI_STATE_INVALID
-                vol_reason = "vol=0 confirmed"
-            else:
-                vol_state = KPI_STATE_UNKNOWN
-                vol_reason = "vol=0 pending"
         spread_log = spread_text if spread_text != "—" else "—"
         vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
-        if vol_state == KPI_STATE_INVALID:
+        bidask_missing = best_bid is None or best_ask is None
+        if bidask_missing:
+            if self._kpi_missing_bidask_since_ts is None:
+                self._kpi_missing_bidask_since_ts = now_ts
+            missing_ms = (now_ts - self._kpi_missing_bidask_since_ts) * 1000
+        else:
+            self._kpi_missing_bidask_since_ts = None
+            missing_ms = 0
+        price_available = price is not None
+        bidask_timeout = bidask_missing and missing_ms >= KPI_TIMEOUT_MS
+        if bidask_missing:
+            self._request_book_ticker()
+            if not self._kpi_missing_bidask_active:
+                self._append_log(
+                    "[KPI] state=UNKNOWN reason=no_bidask -> requesting_book",
+                    kind="INFO",
+                )
+                self._kpi_missing_bidask_active = True
+        else:
+            self._kpi_missing_bidask_active = False
+        if not price_available:
             kpi_state = KPI_STATE_INVALID
-            kpi_reason = vol_reason
+            kpi_reason = "no_price"
+        elif bidask_timeout:
+            kpi_state = KPI_STATE_INVALID
+            kpi_reason = "no_bidask_timeout"
         elif spread_zero_ok:
             kpi_state = KPI_STATE_OK
             kpi_reason = "spread=0 allowed"
+        elif bidask_missing:
+            kpi_state = KPI_STATE_UNKNOWN
+            kpi_reason = "no_bidask"
         elif vol_state == KPI_STATE_UNKNOWN:
             kpi_state = KPI_STATE_UNKNOWN
             kpi_reason = vol_reason
@@ -2946,7 +3013,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if self._kpi_last_state != kpi_state:
             kind = "WARN" if kpi_state == KPI_STATE_INVALID else "INFO"
             self._append_log(
-                f"[KPI] state={kpi_state} vol={vol_text} spread={spread_log} reason={kpi_reason}",
+                (
+                    f"[KPI] state={kpi_state} spread={spread_log} vol={vol_text} "
+                    f"src={book_source} reason={kpi_reason}"
+                ),
                 kind=kind,
             )
             self._kpi_last_state = kpi_state
@@ -2978,16 +3048,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._kpi_last_source = None
             self._kpi_zero_vol_ticks = 0
             self._kpi_zero_vol_start_ts = None
-            if self._kpi_last_state != KPI_STATE_UNKNOWN:
-                self._append_log(
-                    "[KPI] state=UNKNOWN vol=— spread=— reason=no_data",
-                    kind="INFO",
-                )
-                self._kpi_last_state = KPI_STATE_UNKNOWN
-            self._kpi_vol_state = KPI_STATE_UNKNOWN
-            self._kpi_state = KPI_STATE_UNKNOWN
-            self._kpi_valid = True
-            self._kpi_invalid_reason = None
+            self._kpi_missing_bidask_since_ts = None
 
     def _compute_recent_volatility_pct(self) -> float | None:
         if len(self._price_history) < 2:
@@ -4835,18 +4896,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         return max(round_trip_cost + PROFIT_GUARD_BUFFER_PCT, PROFIT_GUARD_MIN_FLOOR_PCT)
 
     def _current_spread_pct(self) -> float | None:
-        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
-        micro = snapshot
-        if self._last_price_update:
-            if micro is None:
-                micro = self._last_price_update.microstructure
-        if micro is None:
-            return None
-        if micro.spread_pct is not None:
-            return float(micro.spread_pct)
-        if micro.spread_abs is not None and self._last_price:
-            return float(micro.spread_abs / self._last_price * 100)
-        return None
+        best_bid, best_ask, _source = self._resolve_book_bid_ask()
+        return self._compute_spread_pct_from_book(best_bid, best_ask)
 
     def _min_tick_step_pct(self, anchor_price: float) -> float:
         tick = self._exchange_rules.get("tick")
@@ -4857,9 +4908,16 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[str, float | None, float | None]:
         spread_pct = self._current_spread_pct()
         volatility_pct = self._compute_recent_volatility_pct()
-        if self._kpi_state == KPI_STATE_UNKNOWN:
+        if volatility_pct is not None and volatility_pct <= 0:
+            volatility_pct = None
+        if self._kpi_state != KPI_STATE_OK:
             return "OK", spread_pct, volatility_pct
-        if self._kpi_state == KPI_STATE_INVALID:
+        if spread_pct is None or spread_pct <= 0:
+            return "OK", spread_pct, volatility_pct
+        if volatility_pct is None:
+            return "OK", spread_pct, volatility_pct
+        round_trip_cost = self._profit_guard_round_trip_cost_pct()
+        if min_profit_pct > spread_pct + round_trip_cost:
             return "HOLD", spread_pct, volatility_pct
         return "OK", spread_pct, volatility_pct
 
@@ -4961,7 +5019,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
             self._append_log(
                 (
-                    "[GUARD] HOLD reason=kpi_invalid "
+                    "[GUARD] HOLD reason=thin_edge "
                     f"spread={spread_text} min_profit={min_profit_pct:.4f}% vol={vol_text}"
                 ),
                 kind="WARN",
