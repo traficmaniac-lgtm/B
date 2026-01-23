@@ -885,6 +885,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._balances_in_flight = False
         self._balances_loaded = False
         self._balance_ready_ts_monotonic_ms: int | None = None
+        self._last_good_balances: dict[str, tuple[float, float, float]] = {}
+        self._last_good_ts: float | None = None
         self._orders_in_flight = False
         self._rules_in_flight = False
         self._fees_in_flight = False
@@ -913,7 +915,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._sell_retry_limit = 5
         self._start_in_progress = False
         self._start_in_progress_logged = False
-        self._start_token = 0
+        self._start_run_id = 0
+        self._start_cancel_event: threading.Event | None = None
         self._last_preflight_hash: str | None = None
         self._last_preflight_blocked = False
         self._start_locked_until_change = False
@@ -3699,24 +3702,39 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if last_log is None or now - last_log >= cooldown_sec:
             suffix = f" ({detail})" if detail else ""
             self._append_log(
-                f"[ORDERS] snapshot stale -> suppressed {reason}{suffix}",
+                f"[ORDERS] stale -> suppressed {reason}{suffix}",
                 kind="INFO",
             )
             self._snapshot_refresh_suppressed_log_ts = now
 
-    def _request_snapshot_refresh_if_stale(self) -> bool:
+    def _ensure_open_orders_snapshot_fresh(
+        self,
+        reason: str,
+        *,
+        max_age_ms: int = 1500,
+        cooldown_s: float = 2.0,
+    ) -> bool:
+        if self._open_orders_snapshot_ts is None:
+            age_ms = None
+        else:
+            age_ms = int(max(time_fn() - self._open_orders_snapshot_ts, 0) * 1000)
+        if age_ms is not None and age_ms <= max_age_ms:
+            return False
         now = monotonic()
-        cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
+        if self._orders_in_flight:
+            self._maybe_log_snapshot_refresh_suppressed("inflight")
+            return False
         if self._snapshot_refresh_inflight:
             self._maybe_log_snapshot_refresh_suppressed("inflight")
             return False
-        if now - self._last_snapshot_refresh_ts < cooldown_sec:
-            remaining_ms = max(int((cooldown_sec - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
+        if now - self._last_snapshot_refresh_ts < cooldown_s:
+            remaining_ms = max(int((cooldown_s - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
             self._maybe_log_snapshot_refresh_suppressed("cooldown", f"{remaining_ms} ms")
             return False
         self._last_snapshot_refresh_ts = now
         self._snapshot_refresh_inflight = True
-        self._append_log("[ORDERS] snapshot stale -> refresh (start)", kind="INFO")
+        self._append_log(f"[ORDERS] stale -> refresh reason={reason}", kind="INFO")
+        self._refresh_open_orders(force=True)
         return True
 
     def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
@@ -4376,15 +4394,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._start_in_progress = True
         self._start_in_progress_logged = False
         self._current_action = "start"
-        self._start_token += 1
+        self._start_run_id += 1
+        run_id = self._start_run_id
+        cancel_event = threading.Event()
+        self._start_cancel_event = cancel_event
         self._last_preflight_hash = snapshot_hash
         self._last_preflight_blocked = False
         self._start_button.setEnabled(False)
         self._set_strategy_controls_enabled(False)
         started = False
         try:
+            def _start_cancelled() -> bool:
+                if cancel_event.is_set() or run_id != self._start_run_id:
+                    self._append_log("Start cancelled by user.", kind="INFO")
+                    self._change_state("IDLE")
+                    return True
+                return False
+
             balances_ok = self._force_refresh_balances_and_wait(timeout_ms=2_000)
             self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
+            if _start_cancelled():
+                return
             if not self._balances_ready_for_start():
                 suffix = " (force_refresh_failed)" if not balances_ok else ""
                 self._append_log(
@@ -4438,6 +4468,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 f"account.canTrade={str(self._account_can_trade).lower()} permissions={self._account_permissions}",
                 kind="INFO",
             )
+            if _start_cancelled():
+                return
             if not dry_run and self._trade_gate != TradeGate.TRADE_OK:
                 reason = self._trade_gate_reason()
                 self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
@@ -4454,10 +4486,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._mark_preflight_blocked()
                 return
             try:
+                if _start_cancelled():
+                    return
                 anchor_price = self.get_anchor_price(self._symbol)
                 if anchor_price is None:
                     raise ValueError("No price available.")
                 balance_snapshot = self._balance_snapshot()
+                last_good_snapshot = self._last_good_balance_snapshot()
+                if (
+                    balance_snapshot.get("quote_free", Decimal("0")) <= 0
+                    and last_good_snapshot.get("quote_free", Decimal("0")) > 0
+                ):
+                    self._append_log(
+                        "[START] blocked: balances_invalid_using_last_good",
+                        kind="WARN",
+                    )
+                    balance_snapshot = last_good_snapshot
                 settings = self._resolve_start_settings(snapshot)
                 self._apply_auto_clamps(settings, anchor_price)
                 if not self._fees_last_fetch_ts:
@@ -4605,8 +4649,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 QMessageBox.No,
             )
             if confirm != QMessageBox.Yes:
-                self._append_log("Start cancelled by user.", kind="INFO")
+                self._append_log("Start cancelled (confirmation declined).", kind="INFO")
                 self._change_state("IDLE")
+                return
+            if _start_cancelled():
                 return
             started = True
             self._last_preflight_blocked = False
@@ -4647,6 +4693,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._place_live_orders(planned)
         finally:
             self._set_strategy_controls_enabled(True)
+            if self._start_cancel_event is cancel_event:
+                self._start_cancel_event = None
             if not started:
                 self._start_in_progress = False
                 self._start_in_progress_logged = False
@@ -4665,6 +4713,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         self._stop_in_progress = True
         self._closing = True
+        if self._start_cancel_event:
+            self._start_cancel_event.set()
+        self._start_run_id += 1
         self._stop_local_timers()
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
@@ -5152,6 +5203,54 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             quote_free = self.as_decimal(balances.get(self._quote_asset, (0.0, 0.0))[0])
         return {"base_free": base_free, "quote_free": quote_free}
 
+    def _last_good_balance_snapshot(self) -> dict[str, Decimal]:
+        base_free = Decimal("0")
+        quote_free = Decimal("0")
+        if self._base_asset:
+            base_free = self.as_decimal(self._last_good_balances.get(self._base_asset, (0.0, 0.0, 0.0))[0])
+        if self._quote_asset:
+            quote_free = self.as_decimal(self._last_good_balances.get(self._quote_asset, (0.0, 0.0, 0.0))[0])
+        return {"base_free": base_free, "quote_free": quote_free}
+
+    def _record_last_good_balances(self, balances: dict[str, tuple[float, float]]) -> None:
+        now = monotonic()
+        for asset, (free, locked) in balances.items():
+            self._last_good_balances[asset] = (free, locked, now)
+        self._last_good_ts = now
+
+    def _validate_balance_snapshot(
+        self,
+        balances: dict[str, tuple[float, float]],
+    ) -> tuple[bool, str]:
+        if not balances:
+            return False, "empty_snapshot"
+        if not self._quote_asset or not self._base_asset:
+            return True, "ok"
+        quote_asset = self._quote_asset
+        base_asset = self._base_asset
+        quote_present = quote_asset in balances
+        base_present = base_asset in balances
+        if not quote_present or not base_present:
+            missing = []
+            if not quote_present:
+                missing.append(quote_asset)
+            if not base_present:
+                missing.append(base_asset)
+            return False, f"missing_assets={','.join(missing)}"
+        quote_free, quote_locked = balances.get(quote_asset, (0.0, 0.0))
+        base_free, base_locked = balances.get(base_asset, (0.0, 0.0))
+        quote_total = quote_free + quote_locked
+        base_total = base_free + base_locked
+        last_quote = self._last_good_balances.get(quote_asset)
+        last_base = self._last_good_balances.get(base_asset)
+        if last_quote and quote_total <= 0 and (last_quote[0] + last_quote[1]) > 0:
+            return False, f"zero_total_quote={quote_asset}"
+        if last_base and base_total <= 0 and (last_base[0] + last_base[1]) > 0:
+            return False, f"zero_total_base={base_asset}"
+        if quote_total <= 0 and base_total <= 0 and (last_quote or last_base):
+            return False, "zero_totals"
+        return True, "ok"
+
     def _balances_ready_for_start(self) -> bool:
         if not self._balances_loaded:
             return False
@@ -5309,10 +5408,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 free = self._coerce_float(str(entry.get("free", ""))) or 0.0
                 locked = self._coerce_float(str(entry.get("locked", ""))) or 0.0
                 balances[asset] = (free, locked)
-        self._balances = balances
-        self._balances_loaded = True
-        if self._rules_loaded:
-            self._balance_ready_ts_monotonic_ms = int(monotonic() * 1000)
+        valid_snapshot, reason = self._validate_balance_snapshot(balances)
+        if valid_snapshot:
+            self._balances = balances
+            self._balances_loaded = True
+            if self._rules_loaded:
+                self._balance_ready_ts_monotonic_ms = int(monotonic() * 1000)
+            self._record_last_good_balances(balances)
         self._set_account_status("ready")
         self._account_api_error = False
         status = self._account_client.get_account_status(result) if self._account_client else AccountStatus(False, [], None)
@@ -5329,19 +5431,29 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._apply_trade_gate()
         self._update_runtime_balances()
         self._grid_engine.sync_balances(self._balances)
-        quote_asset = self._quote_asset or "—"
-        base_asset = self._base_asset or "—"
-        quote_total = self._asset_total(quote_asset)
-        base_total = self._asset_total(base_asset)
-        snapshot = (round(quote_total, 2), round(base_total, 8))
-        if snapshot != self._balances_snapshot:
+        if valid_snapshot:
+            quote_asset = self._quote_asset or "—"
+            base_asset = self._base_asset or "—"
+            quote_total = self._asset_total(quote_asset)
+            base_total = self._asset_total(base_asset)
+            snapshot = (round(quote_total, 2), round(base_total, 8))
+            if snapshot != self._balances_snapshot:
+                self._append_log(
+                    f"balances updated: {quote_asset}={quote_total:.2f}, {base_asset}={base_total:.8f}",
+                    kind="INFO",
+                )
+                self._balances_snapshot = snapshot
+            self._refresh_trade_fees()
+            self._signals.balances_refresh.emit(True)
+        else:
+            age_text = "n/a"
+            if self._last_good_ts is not None:
+                age_text = f"{max(monotonic() - self._last_good_ts, 0.0):.1f}s"
             self._append_log(
-                f"balances updated: {quote_asset}={quote_total:.2f}, {base_asset}={base_total:.8f}",
-                kind="INFO",
+                f"[BAL] rejected snapshot reason={reason} keep_last_good age={age_text}",
+                kind="WARN",
             )
-            self._balances_snapshot = snapshot
-        self._refresh_trade_fees()
-        self._signals.balances_refresh.emit(True)
+            self._signals.balances_refresh.emit(False)
         if self._balances_ready_for_start() and not self._start_locked_until_change:
             self._last_preflight_blocked = False
             self._last_preflight_hash = None
@@ -5349,8 +5461,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_account_error(self, message: str) -> None:
         self._balances_in_flight = False
         self._account_can_trade = False
-        self._balances_loaded = False
-        self._balance_ready_ts_monotonic_ms = None
         self._account_api_error = True
         self._account_permissions = []
         self._last_account_trade_snapshot = None
@@ -5386,17 +5496,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._render_open_orders()
                 self._apply_trade_gate()
                 return
-            stale_force = False
             if not force:
+                if self._ensure_open_orders_snapshot_fresh("poll"):
+                    return
                 snapshot_age_sec = self._snapshot_age_sec()
                 if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
-                    if self._orders_in_flight:
-                        self._maybe_log_snapshot_refresh_suppressed("inflight")
-                    elif self._request_snapshot_refresh_if_stale():
-                        stale_force = True
-                        force = True
-                    if not force:
-                        self._maybe_log_open_orders_snapshot_stale(snapshot_age_sec, skip_actions=True)
+                    self._maybe_log_open_orders_snapshot_stale(snapshot_age_sec, skip_actions=True)
             if self._orders_in_flight:
                 if not force:
                     return
