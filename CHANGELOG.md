@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.8
+- Add NC_MICRO bootstrap legacy-order tracking, owned-order stop handling, and snapshot stale refresh throttling.
+- Unblock Start after balances/open-orders readiness and legacy cleanup flow.
+
 ## v1.0.7
 - Add bid/ask readiness flag, faster warmup exit on fresh HTTP book data, and fix GRID duplicate-local checks to allow full BUY-side placement.
 
