@@ -238,6 +238,7 @@ STALE_ORDER_LOG_DEDUP_SEC = 10
 STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 AUTO_EXEC_ACTION_COOLDOWN_SEC = 30
+SNAPSHOT_REFRESH_COOLDOWN_MS = 1500
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 STALE_COOLDOWN_SEC = 120
 STALE_ACTION_COOLDOWN_SEC = 120
@@ -909,6 +910,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._start_locked_logged = False
         self._tp_fix_target: float | None = None
         self._auto_fix_tp_enabled = True
+        self.enable_guard_autofix = True
         self._stop_in_progress = False
         self._pilot_state = PilotState.OFF
         self._pilot_auto_actions_enabled = True
@@ -930,7 +932,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_last_action_ts: float | None = None
         self._pilot_snapshot_stale_active = False
         self._pilot_snapshot_stale_last_log_ts: float | None = None
-        self._snapshot_stale_refresh_attempted = False
+        self._last_snapshot_refresh_ts = 0.0
+        self._snapshot_refresh_inflight = False
+        self._snapshot_refresh_suppressed_log_ts: float | None = None
         self._pilot_stale_policy = StalePolicy.NONE
         self._pilot_pending_cancel_ids: set[str] = set()
         self._pilot_stale_seen_ids: dict[str, float] = {}
@@ -1035,7 +1039,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.8 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.9 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -3670,6 +3674,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_stale_last_log_total = total
         self._pilot_stale_active = True
 
+    def _maybe_log_snapshot_refresh_suppressed(self, now: float, cooldown_sec: float) -> None:
+        last_log = self._snapshot_refresh_suppressed_log_ts
+        if last_log is None or now - last_log >= cooldown_sec:
+            self._append_log("[ORDERS] snapshot stale -> suppressed (cooldown)", kind="INFO")
+            self._snapshot_refresh_suppressed_log_ts = now
+
     def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
         now = monotonic()
         should_log = False
@@ -5307,7 +5317,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._open_orders_all = []
                 self._open_orders = []
                 self._open_orders_loaded = False
-                self._snapshot_stale_refresh_attempted = False
+                self._snapshot_refresh_inflight = False
+                self._snapshot_refresh_suppressed_log_ts = None
                 self._open_orders_map = {}
                 self._clear_order_info()
                 self._bot_client_ids.clear()
@@ -5320,18 +5331,31 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._render_open_orders()
                 self._apply_trade_gate()
                 return
+            stale_force = False
             if not force:
                 snapshot_age_sec = self._snapshot_age_sec()
                 if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
-                    if not self._snapshot_stale_refresh_attempted:
-                        self._append_log("[ORDERS] snapshot stale -> refresh", kind="INFO")
-                        self._snapshot_stale_refresh_attempted = True
-                        force = True
+                    now = time_fn()
+                    cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
+                    if self._snapshot_refresh_inflight:
+                        self._maybe_log_snapshot_refresh_suppressed(now, cooldown_sec)
+                    elif now - self._last_snapshot_refresh_ts < cooldown_sec:
+                        self._maybe_log_snapshot_refresh_suppressed(now, cooldown_sec)
                     else:
+                        self._append_log("[ORDERS] snapshot stale -> refresh", kind="INFO")
+                        self._last_snapshot_refresh_ts = now
+                        stale_force = True
+                        force = True
+                    if not force:
                         self._maybe_log_open_orders_snapshot_stale(snapshot_age_sec, skip_actions=True)
-            if self._orders_in_flight and not force:
-                return
+            if self._orders_in_flight:
+                if not force:
+                    return
+                if stale_force and self._snapshot_refresh_inflight:
+                    return
             self._orders_in_flight = True
+            if stale_force:
+                self._snapshot_refresh_inflight = True
             worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
             worker.signals.success.connect(self._handle_open_orders)
             worker.signals.error.connect(self._handle_open_orders_error)
@@ -5450,6 +5474,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _handle_open_orders(self, result: object, latency_ms: int) -> None:
         self._orders_in_flight = False
+        self._snapshot_refresh_inflight = False
         if not isinstance(result, list):
             self._handle_open_orders_error("Unexpected open orders response")
             return
@@ -5512,12 +5537,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 kind="INFO",
             )
             self._orders_last_count = count
-        self._snapshot_stale_refresh_attempted = False
         self._update_orders_timer_interval()
         self._signals.open_orders_refresh.emit(True)
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
+        self._snapshot_refresh_inflight = False
         self._signals.open_orders_refresh.emit(False)
         if self._is_auth_error(message):
             self._account_api_error = True
@@ -6050,9 +6075,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
         return fee_cost + slippage_pct + PROFIT_GUARD_EXTRA_BUFFER_PCT
 
-    def _profit_guard_min_profit_pct(self) -> float:
+    def _profit_guard_min_profit_pct(self, settings: GridSettingsState) -> float:
         round_trip_cost = self._profit_guard_round_trip_cost_pct()
-        return max(round_trip_cost + PROFIT_GUARD_BUFFER_PCT, PROFIT_GUARD_MIN_FLOOR_PCT)
+        base_min_profit = max(round_trip_cost + PROFIT_GUARD_BUFFER_PCT, PROFIT_GUARD_MIN_FLOOR_PCT)
+        return max(base_min_profit, settings.take_profit_pct)
 
     def _current_spread_pct(self) -> float | None:
         best_bid, best_ask, _source = self._resolve_book_bid_ask()
@@ -6064,31 +6090,34 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return 0.0
         return tick / anchor_price * 100
 
-    def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[str, float | None, float | None]:
+    def _profit_guard_should_hold(
+        self,
+        min_profit_pct: float,
+    ) -> tuple[str, float | None, float | None, float | None, float | None, float | None]:
         spread_pct = self._current_spread_pct()
-        volatility_pct = self._compute_recent_volatility_pct()
-        if volatility_pct is not None and volatility_pct <= 0:
-            volatility_pct = None
         if self._kpi_state != KPI_STATE_OK:
-            return "OK", spread_pct, volatility_pct
+            return "OK", spread_pct, None, None, None, None
         if spread_pct is None or spread_pct <= 0:
-            return "OK", spread_pct, volatility_pct
-        if volatility_pct is None:
-            return "OK", spread_pct, volatility_pct
-        round_trip_cost = self._profit_guard_round_trip_cost_pct()
-        if min_profit_pct > spread_pct + round_trip_cost:
-            return "HOLD", spread_pct, volatility_pct
-        return "OK", spread_pct, volatility_pct
+            return "OK", spread_pct, None, None, None, None
+        maker_pct, taker_pct, _used_default = self._profit_guard_fee_inputs()
+        fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
+        fee_cost_pct = maker_pct + taker_pct if fill_mode == "TAKER" else 2 * maker_pct
+        slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
+        safety_pad_pct = PROFIT_GUARD_EXTRA_BUFFER_PCT
+        expected_edge_pct = spread_pct - fee_cost_pct - slippage_pct - safety_pad_pct
+        if expected_edge_pct < min_profit_pct:
+            return "HOLD", spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct
+        return "OK", spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct
 
-    def _apply_profit_guard(
+    def _profit_guard_autofix(
         self,
         settings: GridSettingsState,
         anchor_price: float,
         *,
         action_label: str,
         update_ui: bool,
-    ) -> str:
-        min_profit_pct = self._profit_guard_min_profit_pct()
+        min_profit_pct: float,
+    ) -> None:
         tp_old = settings.take_profit_pct
         step_old = settings.grid_step_pct
         range_low_old = settings.range_low_pct
@@ -6161,7 +6190,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 or settings.range_high_pct != range_high_old
             ):
                 self._update_grid_preview()
-        decision, spread_pct, volatility_pct = self._profit_guard_should_hold(min_profit_pct)
+
+    def _apply_profit_guard(
+        self,
+        settings: GridSettingsState,
+        anchor_price: float,
+        *,
+        action_label: str,
+        update_ui: bool,
+    ) -> str:
+        min_profit_pct = self._profit_guard_min_profit_pct(settings)
+        decision, spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct = (
+            self._profit_guard_should_hold(min_profit_pct)
+        )
         maker_pct, taker_pct, used_default = self._profit_guard_fee_inputs()
         if used_default:
             self._append_log(
@@ -6171,19 +6212,29 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 ),
                 kind="INFO",
             )
-        if decision == "REQUEST_DATA":
-            return "REQUEST_DATA"
         if decision == "HOLD":
-            spread_text = self._format_spread_display(spread_pct)
-            vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
+            spread_text = f"{spread_pct:.6f}%" if spread_pct is not None else "—"
+            expected_text = f"{expected_edge_pct:.6f}%" if expected_edge_pct is not None else "—"
+            fee_text = f"{fee_cost_pct:.6f}%" if fee_cost_pct is not None else "—"
+            slip_text = f"{slippage_pct:.6f}%" if slippage_pct is not None else "—"
+            pad_text = f"{safety_pad_pct:.6f}%" if safety_pad_pct is not None else "—"
             self._append_log(
                 (
-                    "[GUARD] HOLD reason=thin_edge "
-                    f"spread={spread_text} min_profit={min_profit_pct:.4f}% vol={vol_text}"
+                    "[GUARD] HOLD thin_edge "
+                    f"raw_spread={spread_text} expected_edge={expected_text} "
+                    f"min_profit={min_profit_pct:.4f}% fees={fee_text} slip={slip_text} pad={pad_text}"
                 ),
                 kind="WARN",
             )
             return "HOLD"
+        if self.enable_guard_autofix:
+            self._profit_guard_autofix(
+                settings,
+                anchor_price,
+                action_label=action_label,
+                update_ui=update_ui,
+                min_profit_pct=min_profit_pct,
+            )
         return "OK"
 
     def _evaluate_tp_profitability(self, tp_pct: float) -> dict[str, float | bool]:
