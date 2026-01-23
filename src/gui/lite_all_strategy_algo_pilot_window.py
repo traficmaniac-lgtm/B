@@ -156,11 +156,13 @@ class StalePolicy(Enum):
 
 
 RECENTER_THRESHOLD_PCT = 0.7
-MAX_ORDER_AGE_SEC = 180
+STALE_DRIFT_PCT_DEFAULT = 0.20
+STALE_DRIFT_PCT_STABLE = 0.05
 STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 STALE_COOLDOWN_SEC = 120
+STALE_ACTION_COOLDOWN_SEC = 120
 STALE_AUTO_ACTION_PAUSE_SEC = 300
 PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.10
 PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.10
@@ -254,6 +256,8 @@ class StaleOrderCandidate:
     info: OrderInfo
     order: dict[str, Any]
     age_s: int
+    reason: str
+    dist_pct: float | None
 
 
 class GridEngine:
@@ -824,6 +828,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_stale_seen_ids: dict[str, float] = {}
         self._pilot_stale_handled: dict[str, float] = {}
         self._pilot_stale_skip_log_ts: dict[str, float] = {}
+        self._pilot_stale_action_ts: dict[str, float] = {}
         self._pilot_auto_actions_paused_until: float | None = None
         self._last_price_update: PriceUpdate | None = None
         self._feed_ok = False
@@ -1106,7 +1111,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_orders_buy_value = QLabel("—")
         self._pilot_orders_sell_value = QLabel("—")
         self._pilot_orders_oldest_value = QLabel("—")
-        self._pilot_orders_threshold_value = QLabel(f"{MAX_ORDER_AGE_SEC}с")
+        self._pilot_orders_threshold_value = QLabel("—")
         self._pilot_orders_stale_value = QLabel("—")
         self._pilot_orders_warning_value = QLabel("—")
         self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
@@ -1197,7 +1202,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             "Отменить всё и закрыть позицию по цене безубытка"
         )
         self._pilot_flag_stale_button.setToolTip(
-            "Проверить ордера по возрасту и предложить действие"
+            "Проверить ордера по дрейфу цены и предложить действие"
         )
         self._pilot_auto_actions_toggle = QCheckBox("Авто-действия пилота")
         self._pilot_auto_actions_toggle.setChecked(True)
@@ -1795,15 +1800,24 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 ),
                 kind="INFO",
             )
-            if oldest_age_sec is None or oldest_age_sec <= MAX_ORDER_AGE_SEC:
+            mid_price, _anchor_price, range_low, range_high = self._stale_context()
+            stale_orders, _oldest_info, _oldest_age = self._collect_stale_orders(
+                mid_price=mid_price,
+                range_low=range_low,
+                range_high=range_high,
+            )
+            if not stale_orders:
                 self._pilot_set_warning("Устаревших ордеров нет")
                 return
             self._pilot_set_warning("УСТАРЕВШИЕ ОРДЕРА")
             self._pilot_execute(PilotAction.RECENTER, auto=True, reason="flag_stale")
             return
         if action == PilotAction.CANCEL_REPLACE_STALE:
+            mid_price, _anchor_price, range_low, range_high = self._stale_context()
             stale_orders, oldest_info, _oldest_age = self._collect_stale_orders(
-                threshold_sec=MAX_ORDER_AGE_SEC
+                mid_price=mid_price,
+                range_low=range_low,
+                range_high=range_high,
             )
             if not stale_orders:
                 self._pilot_set_warning("Устаревших ордеров нет")
@@ -1909,6 +1923,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if not stale_orders:
             self._pilot_set_warning("Устаревших ордеров нет")
             return
+        now_ts = time()
+        last_action_ts = self._pilot_stale_action_ts.get(self._symbol)
+        if last_action_ts and now_ts - last_action_ts < STALE_ACTION_COOLDOWN_SEC:
+            remaining = max(0, int(STALE_ACTION_COOLDOWN_SEC - (now_ts - last_action_ts)))
+            self._append_log(f"[STALE] skip action cooldown={remaining}s", kind="INFO")
+            return
         valid_orders = [
             candidate
             for candidate in stale_orders
@@ -1917,9 +1937,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if not valid_orders:
             self._pilot_set_warning("Нет валидных устаревших ордеров")
             return
+        anchor_price = self._pilot_select_anchor(auto=True)
+        target_price_set: set[str] = set()
+        target_plan: list[GridPlannedOrder] | None = None
+        if anchor_price is not None:
+            target_price_set, target_plan = self._build_target_price_set(anchor_price)
+        existing_price_set = self._collect_price_set_from_orders(self._open_orders)
+        if target_price_set and target_price_set == existing_price_set:
+            self._append_log("[STALE] skip replace reason=prices_same", kind="INFO")
+            return
+        replace_count = len(target_plan) if target_plan else len(valid_orders)
         summary = [
             f"cancel={len(valid_orders)}",
-            f"replace={len(valid_orders)}",
+            f"replace={replace_count}",
             f"mode={'LIVE' if self._live_enabled() else 'DRY'}",
             f"auto={'yes' if auto else 'no'}",
         ]
@@ -1931,6 +1961,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             )
         if not self._pilot_confirm_action(PilotAction.CANCEL_REPLACE_STALE, summary):
             return
+        self._pilot_stale_action_ts[self._symbol] = time()
         self._set_pilot_action_in_progress(True, status="Выполняю…")
         if self._dry_run_toggle.isChecked():
             self._append_log(
@@ -1951,6 +1982,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             open_orders_after: list[dict[str, Any]] = []
             open_orders_retry: list[dict[str, Any]] = []
             stuck_ids: list[str] = []
+            mid_price, _anchor_price, range_low, range_high = self._stale_context()
             ignore_keys = {
                 self._order_key(
                     candidate.info.side,
@@ -1967,7 +1999,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 self._update_order_info_from_snapshot(bot_orders_before)
                 valid_orders_snapshot = self._collect_stale_orders_from_snapshot(
                     bot_orders_before,
-                    threshold_sec=MAX_ORDER_AGE_SEC,
+                    mid_price=mid_price,
+                    range_low=range_low,
+                    range_high=range_high,
                 )
             else:
                 valid_orders_snapshot = list(valid_orders)
@@ -2021,31 +2055,55 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 for key in (self._order_key_from_order(order),)
                 if key
             }
-            for candidate in valid_orders_snapshot:
-                side = candidate.info.side
-                price = self.as_decimal(candidate.info.price)
-                qty = self.as_decimal(candidate.info.qty)
-                order_key = self._order_key(side, price, qty)
-                if candidate.info.order_id in stuck_ids:
-                    continue
-                if order_key in open_keys:
-                    continue
-                client_id = self._next_client_order_id("STALE")
-                response, error, _status = self._place_limit(
-                    side,
-                    price,
-                    qty,
-                    client_id,
-                    reason="stale",
-                    ignore_order_id=candidate.info.order_id,
-                    ignore_keys=ignore_keys,
-                    skip_open_order_duplicate=True,
-                )
-                if response:
-                    placed += 1
-                if error:
-                    errors.append(error)
-                self._sleep_ms(200)
+            if target_plan:
+                for planned in target_plan:
+                    side = planned.side
+                    price = self.as_decimal(planned.price)
+                    qty = self.as_decimal(planned.qty)
+                    order_key = self._order_key(side, price, qty)
+                    if order_key in open_keys:
+                        continue
+                    client_id = self._next_client_order_id("STALE")
+                    response, error, _status = self._place_limit(
+                        side,
+                        price,
+                        qty,
+                        client_id,
+                        reason="stale",
+                        ignore_keys=ignore_keys,
+                        skip_open_order_duplicate=True,
+                    )
+                    if response:
+                        placed += 1
+                    if error:
+                        errors.append(error)
+                    self._sleep_ms(200)
+            else:
+                for candidate in valid_orders_snapshot:
+                    side = candidate.info.side
+                    price = self.as_decimal(candidate.info.price)
+                    qty = self.as_decimal(candidate.info.qty)
+                    order_key = self._order_key(side, price, qty)
+                    if candidate.info.order_id in stuck_ids:
+                        continue
+                    if order_key in open_keys:
+                        continue
+                    client_id = self._next_client_order_id("STALE")
+                    response, error, _status = self._place_limit(
+                        side,
+                        price,
+                        qty,
+                        client_id,
+                        reason="stale",
+                        ignore_order_id=candidate.info.order_id,
+                        ignore_keys=ignore_keys,
+                        skip_open_order_duplicate=True,
+                    )
+                    if response:
+                        placed += 1
+                    if error:
+                        errors.append(error)
+                    self._sleep_ms(200)
             return {
                 "canceled": canceled,
                 "placed": placed,
@@ -2647,6 +2705,78 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return None
         return int(max(time() - info.last_seen_ts, 0))
 
+    def _stale_drift_pct(self) -> float:
+        symbol = self._symbol.replace("/", "").upper()
+        if symbol == "BTCUSDT":
+            return STALE_DRIFT_PCT_DEFAULT
+        if symbol in {"EURIUSDT", "USDCUSDT"}:
+            return STALE_DRIFT_PCT_STABLE
+        return STALE_DRIFT_PCT_DEFAULT
+
+    def _stale_mid_price(self) -> float | None:
+        best_bid, best_ask, _source = self._resolve_book_bid_ask()
+        if best_bid is None or best_ask is None:
+            return None
+        mid = (best_bid + best_ask) / 2
+        return mid if mid > 0 else None
+
+    def _stale_range_bounds(self, anchor_price: float) -> tuple[float | None, float | None]:
+        if anchor_price <= 0:
+            return None, None
+        snapshot = self._collect_strategy_snapshot()
+        settings = self._resolve_start_settings(snapshot)
+        self._apply_auto_clamps(settings, anchor_price)
+        range_low = settings.range_low_pct
+        range_high = settings.range_high_pct
+        if range_low <= 0 or range_high <= 0:
+            return None, None
+        low = anchor_price * (1 - range_low / 100.0)
+        high = anchor_price * (1 + range_high / 100.0)
+        return low, high
+
+    def _stale_context(self) -> tuple[float | None, float | None, float | None, float | None]:
+        mid = self._stale_mid_price()
+        anchor_price = self._pilot_anchor_price or self._last_price
+        range_low, range_high = None, None
+        if anchor_price is not None:
+            range_low, range_high = self._stale_range_bounds(anchor_price)
+        return mid, anchor_price, range_low, range_high
+
+    def _price_key(self, side: str, price: Decimal) -> str:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        price_key = self._format_decimal(self.q_price(price, tick), tick)
+        return f"{self._symbol}|{side}|{price_key}"
+
+    def _price_key_from_order(self, order: dict[str, Any]) -> str | None:
+        side = str(order.get("side", "")).upper()
+        if not side:
+            return None
+        price = self._coerce_float(str(order.get("price", ""))) or 0.0
+        if price <= 0:
+            return None
+        return self._price_key(side, self.as_decimal(price))
+
+    def _collect_price_set_from_orders(self, orders: list[dict[str, Any]]) -> set[str]:
+        return {
+            key
+            for order in orders
+            if isinstance(order, dict)
+            for key in (self._price_key_from_order(order),)
+            if key
+        }
+
+    def _build_target_price_set(
+        self, anchor_price: float
+    ) -> tuple[set[str], list[GridPlannedOrder] | None]:
+        plan, _settings, guard_hold = self._pilot_build_grid_plan(anchor_price, action_label="stale")
+        if guard_hold or not plan:
+            return set(), plan
+        return {
+            self._price_key(order.side, self.as_decimal(order.price))
+            for order in plan
+            if order.price > 0
+        }, plan
+
     def _calculate_oldest_order_age_sec(self) -> tuple[int | None, OrderInfo | None]:
         if not self._open_orders:
             return None, None
@@ -2669,11 +2799,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _collect_stale_orders(
         self,
         *,
-        threshold_sec: int,
+        mid_price: float | None,
+        range_low: float | None,
+        range_high: float | None,
     ) -> tuple[list[StaleOrderCandidate], OrderInfo | None, int | None]:
         if not self._open_orders:
             return [], None, None
         now = time()
+        drift_threshold = self._stale_drift_pct()
         stale: list[StaleOrderCandidate] = []
         oldest_info: OrderInfo | None = None
         oldest_age_sec: int | None = None
@@ -2690,36 +2823,69 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             if oldest_age_sec is None or age_sec > oldest_age_sec:
                 oldest_age_sec = age_sec
                 oldest_info = info
-            if age_sec > threshold_sec:
-                handled_ts = self._pilot_stale_handled.get(order_id)
-                if handled_ts is not None and now - handled_ts < STALE_COOLDOWN_SEC:
-                    last_log = self._pilot_stale_skip_log_ts.get(order_id)
-                    if last_log is None or now - last_log >= STALE_LOG_DEDUP_SEC:
-                        self._append_log(
-                            (
-                                "[STALE] skip already-handled "
-                                f"orderId={order_id} age={age_sec} cooldown={STALE_COOLDOWN_SEC}s"
-                            ),
-                            kind="INFO",
-                        )
-                        self._pilot_stale_skip_log_ts[order_id] = now
-                    continue
-                last_seen = self._pilot_stale_seen_ids.get(order_id)
-                if last_seen is not None and now - last_seen < STALE_COOLDOWN_SEC:
-                    continue
-                self._pilot_stale_seen_ids[order_id] = now
-                stale.append(StaleOrderCandidate(info=info, order=order, age_s=age_sec))
+            dist_pct = None
+            drift_stale = False
+            if mid_price is not None and mid_price > 0 and info.price > 0:
+                dist_pct = abs(info.price - mid_price) / mid_price * 100
+                drift_stale = dist_pct > drift_threshold
+            range_stale = False
+            if range_low is not None and range_high is not None and info.price > 0:
+                range_stale = info.price < range_low or info.price > range_high
+            if not drift_stale and not range_stale:
+                continue
+            handled_ts = self._pilot_stale_handled.get(order_id)
+            if handled_ts is not None and now - handled_ts < STALE_COOLDOWN_SEC:
+                last_log = self._pilot_stale_skip_log_ts.get(order_id)
+                if last_log is None or now - last_log >= STALE_LOG_DEDUP_SEC:
+                    self._append_log(
+                        (
+                            "[STALE] skip already-handled "
+                            f"orderId={order_id} cooldown={STALE_COOLDOWN_SEC}s"
+                        ),
+                        kind="INFO",
+                    )
+                    self._pilot_stale_skip_log_ts[order_id] = now
+                continue
+            last_seen = self._pilot_stale_seen_ids.get(order_id)
+            if last_seen is not None and now - last_seen < STALE_COOLDOWN_SEC:
+                continue
+            self._pilot_stale_seen_ids[order_id] = now
+            reason = "drift" if drift_stale else "range"
+            if drift_stale and range_stale:
+                reason = "drift,range"
+            dist_text = f"{dist_pct:.2f}%" if dist_pct is not None else "—"
+            mid_text = f"{mid_price:.8f}" if mid_price is not None else "—"
+            price_text = f"{info.price:.8f}" if info.price > 0 else "—"
+            self._append_log(
+                (
+                    f"[STALE] check orderId={order_id} side={info.side} price={price_text} "
+                    f"dist={dist_text} mid={mid_text} reason={reason}"
+                ),
+                kind="INFO",
+            )
+            stale.append(
+                StaleOrderCandidate(
+                    info=info,
+                    order=order,
+                    age_s=age_sec,
+                    reason=reason,
+                    dist_pct=dist_pct,
+                )
+            )
         return stale, oldest_info, oldest_age_sec
 
     def _collect_stale_orders_from_snapshot(
         self,
         orders: list[dict[str, Any]],
         *,
-        threshold_sec: int,
+        mid_price: float | None,
+        range_low: float | None,
+        range_high: float | None,
     ) -> list[StaleOrderCandidate]:
         if not orders:
             return []
         now = time()
+        drift_threshold = self._stale_drift_pct()
         stale: list[StaleOrderCandidate] = []
         for order in orders:
             if not isinstance(order, dict):
@@ -2731,12 +2897,31 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             if not info:
                 continue
             age_sec = int(max(now - info.created_ts, 0))
-            if age_sec <= threshold_sec:
+            dist_pct = None
+            drift_stale = False
+            if mid_price is not None and mid_price > 0 and info.price > 0:
+                dist_pct = abs(info.price - mid_price) / mid_price * 100
+                drift_stale = dist_pct > drift_threshold
+            range_stale = False
+            if range_low is not None and range_high is not None and info.price > 0:
+                range_stale = info.price < range_low or info.price > range_high
+            if not drift_stale and not range_stale:
                 continue
             handled_ts = self._pilot_stale_handled.get(order_id)
             if handled_ts is not None and now - handled_ts < STALE_COOLDOWN_SEC:
                 continue
-            stale.append(StaleOrderCandidate(info=info, order=order, age_s=age_sec))
+            reason = "drift" if drift_stale else "range"
+            if drift_stale and range_stale:
+                reason = "drift,range"
+            stale.append(
+                StaleOrderCandidate(
+                    info=info,
+                    order=order,
+                    age_s=age_sec,
+                    reason=reason,
+                    dist_pct=dist_pct,
+                )
+            )
         return stale
 
     def _update_order_info_from_snapshot(self, orders: list[dict[str, Any]]) -> None:
@@ -2811,8 +2996,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_orders_buy_value.setText("—")
             self._pilot_orders_sell_value.setText("—")
             self._pilot_orders_oldest_value.setText("—")
+            drift_pct = self._stale_drift_pct()
+            threshold_text = f"дрейф>{drift_pct:.2f}% или вне диапазона"
+            self._pilot_orders_threshold_value.setText(threshold_text)
             self._pilot_orders_stale_value.setText(
-                f"— / порог {MAX_ORDER_AGE_SEC}с (policy={self._pilot_stale_policy.value})"
+                f"— (policy={self._pilot_stale_policy.value})"
             )
             if self._pilot_warning_override and self._pilot_warning_override_until:
                 if time() <= self._pilot_warning_override_until:
@@ -2836,10 +3024,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_orders_oldest_value.setText("—")
         else:
             self._pilot_orders_oldest_value.setText(self._format_order_age_value(oldest_age_sec))
-        oldest_age_display = f"{oldest_age_sec}с" if oldest_age_sec is not None else "—"
-        self._pilot_orders_stale_value.setText(
-            f"{oldest_age_display} / порог {MAX_ORDER_AGE_SEC}с (policy={self._pilot_stale_policy.value})"
-        )
+        drift_pct = self._stale_drift_pct()
+        threshold_text = f"дрейф>{drift_pct:.2f}% или вне диапазона"
+        self._pilot_orders_threshold_value.setText(threshold_text)
+        self._pilot_orders_stale_value.setText(f"0 (policy={self._pilot_stale_policy.value})")
 
         if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
             self._pilot_orders_warning_value.setText("Снимок ордеров устарел")
@@ -2849,8 +3037,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         self._pilot_snapshot_stale_active = False
 
+        mid_price, _anchor_price, range_low, range_high = self._stale_context()
         stale_orders, oldest_info, oldest_age_sec = self._collect_stale_orders(
-            threshold_sec=MAX_ORDER_AGE_SEC
+            mid_price=mid_price,
+            range_low=range_low,
+            range_high=range_high,
         )
         last_seen_age = self._last_seen_age_sec(oldest_info)
         if last_seen_age is not None and last_seen_age > STALE_SNAPSHOT_MAX_AGE_SEC:
@@ -2860,11 +3051,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_stale_active = False
             return
         is_stale = bool(stale_orders)
-        if is_stale and oldest_age_sec is not None:
-            mins = max(1, int(ceil(oldest_age_sec / 60)))
-            self._pilot_orders_warning_value.setText(f"Ордеров не трогали {mins} мин")
+        if is_stale:
+            self._pilot_orders_stale_value.setText(
+                f"{len(stale_orders)} (policy={self._pilot_stale_policy.value})"
+            )
+            self._pilot_orders_warning_value.setText("Ордера ушли от mid / диапазона")
             self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
-            self._maybe_log_stale_orders(total, oldest_age_sec, oldest_info)
+            self._maybe_log_stale_orders(total, stale_orders[0] if stale_orders else None)
             self._maybe_handle_stale_auto_action(stale_orders)
         else:
             now = time()
@@ -2885,28 +3078,31 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _maybe_log_stale_orders(
         self,
         total: int,
-        oldest_age_sec: int | None,
-        oldest_info: OrderInfo | None,
+        candidate: StaleOrderCandidate | None,
     ) -> None:
-        if oldest_age_sec is None or oldest_info is None:
+        if candidate is None:
             return
         now = monotonic()
         if not self._pilot_stale_active:
-            seen_age = max(1, int(max(time() - oldest_info.last_seen_ts, 0)))
             gate_state = "ok" if self._trade_gate == TradeGate.TRADE_OK else "ro"
-            price_text = f"{oldest_info.price:.8f}" if oldest_info.price > 0 else "—"
+            info = candidate.info
+            price_text = f"{info.price:.8f}" if info.price > 0 else "—"
+            dist_text = f"{candidate.dist_pct:.2f}%" if candidate.dist_pct is not None else "—"
+            mid_price = self._stale_mid_price()
+            mid_text = f"{mid_price:.8f}" if mid_price is not None else "—"
+            drift_threshold = self._stale_drift_pct()
             self._append_log(
                 (
                     "[WARN] [ALGO_PILOT] stale detected "
-                    f"total={total} oldest_age={oldest_age_sec} threshold={MAX_ORDER_AGE_SEC} "
-                    f"oldest={oldest_info.order_id} {oldest_info.side} {price_text} "
-                    f"last_seen_age={seen_age} policy={self._pilot_stale_policy.value} "
+                    f"total={total} orderId={info.order_id} side={info.side} price={price_text} "
+                    f"dist={dist_text} mid={mid_text} threshold={drift_threshold:.2f}% "
+                    f"reason={candidate.reason} policy={self._pilot_stale_policy.value} "
                     f"auto=on gate={gate_state}"
                 ),
                 kind="WARN",
             )
             self._pilot_stale_last_log_ts = now
-            self._pilot_stale_last_log_order_id = oldest_info.order_id
+            self._pilot_stale_last_log_order_id = info.order_id
             self._pilot_stale_last_log_total = total
         self._pilot_stale_active = True
 
