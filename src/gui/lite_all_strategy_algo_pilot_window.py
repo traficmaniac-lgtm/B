@@ -161,6 +161,7 @@ STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 STALE_COOLDOWN_SEC = 120
+STALE_AUTO_ACTION_PAUSE_SEC = 300
 PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.10
 PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.10
 PROFIT_GUARD_SLIPPAGE_BPS = 1.5
@@ -176,9 +177,17 @@ VOL_CONFIRM_TICKS = 3
 VOL_CONFIRM_TIME_MS = 1000
 KPI_TIMEOUT_MS = 5000
 KPI_BOOK_REQUEST_INTERVAL_MS = 1000
+KPI_DEBOUNCE_SEC = 5
+KPI_VOL_SAMPLE_MAXLEN = 60
+KPI_VOL_MIN_SAMPLES = 10
+KPI_VOL_WINDOW_SEC = 60
+KPI_VOL_TTL_SEC = 120
 KPI_STATE_OK = "OK"
 KPI_STATE_UNKNOWN = "UNKNOWN"
 KPI_STATE_INVALID = "INVALID"
+SPREAD_DISPLAY_EPS_PCT = 0.0001
+REGISTRY_GC_INTERVAL_MS = 60_000
+REGISTRY_GC_TTL_SEC = 600
 SPREAD_ZERO_OK_SYMBOLS = {
     "BTCUSDT",
     "ETHUSDT",
@@ -813,6 +822,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_stale_policy = StalePolicy.NONE
         self._pilot_pending_cancel_ids: set[str] = set()
         self._pilot_stale_seen_ids: dict[str, float] = {}
+        self._pilot_stale_handled: dict[str, float] = {}
+        self._pilot_stale_skip_log_ts: dict[str, float] = {}
+        self._pilot_auto_actions_paused_until: float | None = None
         self._last_price_update: PriceUpdate | None = None
         self._feed_ok = False
         self._feed_last_ok: bool | None = None
@@ -829,8 +841,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._kpi_missing_bidask_since_ts: float | None = None
         self._kpi_last_book_request_ts: float | None = None
         self._kpi_missing_bidask_active = False
+        self._kpi_vol_samples: deque[tuple[float, float]] = deque(maxlen=KPI_VOL_SAMPLE_MAXLEN)
+        self._kpi_last_good_vol: float | None = None
+        self._kpi_last_good_ts: float | None = None
+        self._kpi_last_state_ts: float | None = None
+        self._kpi_last_reason: str | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
+        self._registry_key_last_seen_ts: dict[str, float] = {}
+        self._registry_gc_last_ts: float | None = None
         self._position_state = PositionState(
             position_qty=0.0,
             avg_entry_price=None,
@@ -854,6 +873,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._market_kpi_timer = QTimer(self)
         self._market_kpi_timer.setInterval(500)
         self._market_kpi_timer.timeout.connect(self.update_market_kpis)
+        self._registry_gc_timer = QTimer(self)
+        self._registry_gc_timer.setInterval(REGISTRY_GC_INTERVAL_MS)
+        self._registry_gc_timer.timeout.connect(self._gc_registry_keys)
 
         self.setWindowTitle(f"Lite All Strategy Terminal — ALGO PILOT — {self._symbol}")
         self.resize(1050, 720)
@@ -870,6 +892,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._apply_trade_gate()
         self._pilot_ui_timer.start()
         self._market_kpi_timer.start()
+        self._registry_gc_timer.start()
 
         self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
@@ -886,7 +909,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.3 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.5 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1924,6 +1947,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             canceled = 0
             placed = 0
             errors: list[str] = []
+            open_orders_before: list[dict[str, Any]] = []
+            open_orders_after: list[dict[str, Any]] = []
+            open_orders_retry: list[dict[str, Any]] = []
+            stuck_ids: list[str] = []
             ignore_keys = {
                 self._order_key(
                     candidate.info.side,
@@ -1932,24 +1959,77 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 )
                 for candidate in valid_orders
             }
-            for candidate in valid_orders:
+            if self._account_client:
+                open_orders_before = self._account_client.get_open_orders(self._symbol)
+                bot_orders_before = self._filter_bot_orders(
+                    [order for order in open_orders_before if isinstance(order, dict)]
+                )
+                self._update_order_info_from_snapshot(bot_orders_before)
+                valid_orders_snapshot = self._collect_stale_orders_from_snapshot(
+                    bot_orders_before,
+                    threshold_sec=MAX_ORDER_AGE_SEC,
+                )
+            else:
+                valid_orders_snapshot = list(valid_orders)
+            if not valid_orders_snapshot:
+                return {"canceled": 0, "placed": 0, "errors": errors, "stuck": []}
+            for candidate in valid_orders_snapshot:
                 order_id = candidate.info.order_id
                 ok, error = self._cancel_order_idempotent(order_id)
                 if ok:
                     canceled += 1
+                    self._pilot_stale_handled[order_id] = time()
                 if error:
                     errors.append(error)
-            open_orders_after: list[dict[str, Any]] = []
             if self._account_client:
                 open_orders_after = self._account_client.get_open_orders(self._symbol)
-                bot_orders = self._filter_bot_orders(
+                bot_orders_after = self._filter_bot_orders(
                     [order for order in open_orders_after if isinstance(order, dict)]
                 )
-                self._rebuild_registry_from_open_orders(bot_orders)
-            for candidate in valid_orders:
+                stale_ids = {candidate.info.order_id for candidate in valid_orders_snapshot}
+                still_open = [
+                    order
+                    for order in bot_orders_after
+                    if str(order.get("orderId", "")) in stale_ids
+                ]
+                for order in still_open:
+                    order_id = str(order.get("orderId", ""))
+                    if not order_id:
+                        continue
+                    ok, error = self._cancel_order_idempotent(order_id)
+                    if ok:
+                        canceled += 1
+                        self._pilot_stale_handled[order_id] = time()
+                    if error:
+                        errors.append(error)
+                open_orders_retry = self._account_client.get_open_orders(self._symbol)
+                bot_orders_retry = self._filter_bot_orders(
+                    [order for order in open_orders_retry if isinstance(order, dict)]
+                )
+                stuck_ids = [
+                    str(order.get("orderId", ""))
+                    for order in bot_orders_retry
+                    if str(order.get("orderId", "")) in stale_ids
+                ]
+                self._rebuild_registry_from_open_orders(bot_orders_retry)
+            else:
+                bot_orders_retry = []
+            open_keys = {
+                key
+                for order in (bot_orders_retry or bot_orders_after)
+                if isinstance(order, dict)
+                for key in (self._order_key_from_order(order),)
+                if key
+            }
+            for candidate in valid_orders_snapshot:
                 side = candidate.info.side
                 price = self.as_decimal(candidate.info.price)
                 qty = self.as_decimal(candidate.info.qty)
+                order_key = self._order_key(side, price, qty)
+                if candidate.info.order_id in stuck_ids:
+                    continue
+                if order_key in open_keys:
+                    continue
                 client_id = self._next_client_order_id("STALE")
                 response, error, _status = self._place_limit(
                     side,
@@ -1959,14 +2039,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     reason="stale",
                     ignore_order_id=candidate.info.order_id,
                     ignore_keys=ignore_keys,
-                    skip_open_order_duplicate=False,
+                    skip_open_order_duplicate=True,
                 )
                 if response:
                     placed += 1
                 if error:
                     errors.append(error)
                 self._sleep_ms(200)
-            return {"canceled": canceled, "placed": placed, "errors": errors}
+            return {
+                "canceled": canceled,
+                "placed": placed,
+                "errors": errors,
+                "stuck": stuck_ids,
+            }
 
         worker = _Worker(_cancel_and_replace, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_pilot_cancel_replace_stale)
@@ -2320,10 +2405,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         canceled = int(result.get("canceled", 0) or 0)
         placed = int(result.get("placed", 0) or 0)
         errors = result.get("errors", [])
+        stuck = result.get("stuck", [])
         if isinstance(errors, list):
             for message in errors:
                 if message:
                     self._append_log(str(message), kind="WARN")
+        if isinstance(stuck, list) and stuck:
+            self._pilot_auto_actions_paused_until = monotonic() + STALE_AUTO_ACTION_PAUSE_SEC
+            for order_id in stuck:
+                if order_id:
+                    self._append_log(
+                        f"[STALE] stuck orderId={order_id} -> auto_actions paused {STALE_AUTO_ACTION_PAUSE_SEC}s",
+                        kind="WARN",
+                    )
         self._append_log(
             f"[INFO] [ALGO_PILOT] stale cancel/replace done cancel_n={canceled} place_n={placed}",
             kind="INFO",
@@ -2597,12 +2691,53 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 oldest_age_sec = age_sec
                 oldest_info = info
             if age_sec > threshold_sec:
+                handled_ts = self._pilot_stale_handled.get(order_id)
+                if handled_ts is not None and now - handled_ts < STALE_COOLDOWN_SEC:
+                    last_log = self._pilot_stale_skip_log_ts.get(order_id)
+                    if last_log is None or now - last_log >= STALE_LOG_DEDUP_SEC:
+                        self._append_log(
+                            (
+                                "[STALE] skip already-handled "
+                                f"orderId={order_id} age={age_sec} cooldown={STALE_COOLDOWN_SEC}s"
+                            ),
+                            kind="INFO",
+                        )
+                        self._pilot_stale_skip_log_ts[order_id] = now
+                    continue
                 last_seen = self._pilot_stale_seen_ids.get(order_id)
                 if last_seen is not None and now - last_seen < STALE_COOLDOWN_SEC:
                     continue
                 self._pilot_stale_seen_ids[order_id] = now
                 stale.append(StaleOrderCandidate(info=info, order=order, age_s=age_sec))
         return stale, oldest_info, oldest_age_sec
+
+    def _collect_stale_orders_from_snapshot(
+        self,
+        orders: list[dict[str, Any]],
+        *,
+        threshold_sec: int,
+    ) -> list[StaleOrderCandidate]:
+        if not orders:
+            return []
+        now = time()
+        stale: list[StaleOrderCandidate] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            order_id = str(order.get("orderId", ""))
+            if not order_id or order_id in self._pilot_pending_cancel_ids:
+                continue
+            info = self._order_info_map.get(order_id)
+            if not info:
+                continue
+            age_sec = int(max(now - info.created_ts, 0))
+            if age_sec <= threshold_sec:
+                continue
+            handled_ts = self._pilot_stale_handled.get(order_id)
+            if handled_ts is not None and now - handled_ts < STALE_COOLDOWN_SEC:
+                continue
+            stale.append(StaleOrderCandidate(info=info, order=order, age_s=age_sec))
+        return stale
 
     def _update_order_info_from_snapshot(self, orders: list[dict[str, Any]]) -> None:
         now = time()
@@ -2639,12 +2774,16 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._order_info_map.pop(order_id, None)
             self._pilot_pending_cancel_ids.discard(order_id)
             self._pilot_stale_seen_ids.pop(order_id, None)
+            self._pilot_stale_handled.pop(order_id, None)
+            self._pilot_stale_skip_log_ts.pop(order_id, None)
 
     def _clear_order_info(self) -> None:
         self._open_orders_snapshot_ts = None
         self._order_info_map = {}
         self._pilot_pending_cancel_ids.clear()
         self._pilot_stale_seen_ids.clear()
+        self._pilot_stale_handled.clear()
+        self._pilot_stale_skip_log_ts.clear()
 
     @staticmethod
     def _format_order_age_value(age_sec: int) -> str:
@@ -2794,6 +2933,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         if not self._pilot_auto_actions_enabled:
             return
+        if self._pilot_auto_actions_paused_until and monotonic() < self._pilot_auto_actions_paused_until:
+            return
         if self._pilot_stale_policy == StalePolicy.NONE:
             return
         if self._trade_gate != TradeGate.TRADE_OK:
@@ -2871,6 +3012,37 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return None
         return (best_ask - best_bid) / mid * 100
 
+    @staticmethod
+    def _format_spread_display(spread_pct: float | None) -> str:
+        if spread_pct is None:
+            return "—"
+        bps = spread_pct * 100
+        if spread_pct < SPREAD_DISPLAY_EPS_PCT:
+            pct_text = f"<{SPREAD_DISPLAY_EPS_PCT:.4f}%"
+        else:
+            pct_text = f"{spread_pct:.4f}%"
+        return f"{pct_text} ({bps:.2f} bps)"
+
+    def _record_kpi_vol_sample(self, mid: float, now_ts: float) -> None:
+        if mid <= 0:
+            return
+        self._kpi_vol_samples.append((now_ts, mid))
+        cutoff = now_ts - KPI_VOL_WINDOW_SEC
+        while self._kpi_vol_samples and self._kpi_vol_samples[0][0] < cutoff:
+            self._kpi_vol_samples.popleft()
+
+    def _compute_kpi_volatility_pct(self, now_ts: float) -> tuple[float | None, int]:
+        cutoff = now_ts - KPI_VOL_WINDOW_SEC
+        samples = [price for ts, price in self._kpi_vol_samples if ts >= cutoff]
+        count = len(samples)
+        if count < KPI_VOL_MIN_SAMPLES:
+            return None, count
+        low = min(samples)
+        high = max(samples)
+        if low <= 0:
+            return None, count
+        return (high - low) / low * 100, count
+
     def _request_book_ticker(self) -> None:
         now_ts = monotonic()
         if self._kpi_last_book_request_ts and (
@@ -2917,13 +3089,26 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
         best_bid, best_ask, book_source = self._resolve_book_bid_ask()
         spread_pct = self._compute_spread_pct_from_book(best_bid, best_ask)
-        spread_text = f"{spread_pct:.4f}%" if spread_pct is not None else "—"
+        spread_text = self._format_spread_display(spread_pct)
         self._market_spread.setText(spread_text)
         self._set_market_label_state(self._market_spread, active=spread_text != "—")
 
-        volatility_pct = self._compute_recent_volatility_pct()
-        if volatility_pct is not None and volatility_pct <= 0:
-            volatility_pct = None
+        sample_ts = time()
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2
+            self._record_kpi_vol_sample(mid, sample_ts)
+        volatility_pct, sample_count = self._compute_kpi_volatility_pct(sample_ts)
+        cache_used = False
+        cache_ttl = None
+        if volatility_pct is not None:
+            self._kpi_last_good_vol = volatility_pct
+            self._kpi_last_good_ts = sample_ts
+        elif self._kpi_last_good_vol is not None and self._kpi_last_good_ts is not None:
+            age_sec = sample_ts - self._kpi_last_good_ts
+            if age_sec < KPI_VOL_TTL_SEC:
+                volatility_pct = self._kpi_last_good_vol
+                cache_used = True
+                cache_ttl = int(max(KPI_VOL_TTL_SEC - age_sec, 0))
         volatility_text = f"{volatility_pct:.2f}%" if volatility_pct is not None else "—"
         self._market_volatility.setText(volatility_text)
         self._set_market_label_state(self._market_volatility, active=volatility_text != "—")
@@ -2969,7 +3154,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._kpi_zero_vol_ticks = 0
             self._kpi_zero_vol_start_ts = None
             vol_state = KPI_STATE_OK
-            vol_reason = "vol>0"
+            if cache_used and cache_ttl is not None:
+                vol_reason = "vol_cached"
+            else:
+                vol_reason = "vol>0"
         spread_log = spread_text if spread_text != "—" else "—"
         vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
         bidask_missing = best_bid is None or best_ask is None
@@ -3010,16 +3198,29 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         else:
             kpi_state = KPI_STATE_OK
             kpi_reason = vol_reason
-        if self._kpi_last_state != kpi_state:
+        if (
+            kpi_state == KPI_STATE_UNKNOWN
+            and self._kpi_last_state == KPI_STATE_OK
+            and self._kpi_last_state_ts is not None
+            and now_ts - self._kpi_last_state_ts < KPI_DEBOUNCE_SEC
+        ):
+            kpi_state = KPI_STATE_OK
+            kpi_reason = "debounce"
+        log_reason = kpi_reason
+        if cache_used and cache_ttl is not None and kpi_reason == "vol_cached":
+            log_reason = f"{kpi_reason} ttl={cache_ttl}s"
+        if self._kpi_last_state != kpi_state or self._kpi_last_reason != kpi_reason:
             kind = "WARN" if kpi_state == KPI_STATE_INVALID else "INFO"
             self._append_log(
                 (
                     f"[KPI] state={kpi_state} spread={spread_log} vol={vol_text} "
-                    f"src={book_source} reason={kpi_reason}"
+                    f"src={book_source} reason={log_reason}"
                 ),
                 kind=kind,
             )
             self._kpi_last_state = kpi_state
+            self._kpi_last_reason = kpi_reason
+            self._kpi_last_state_ts = now_ts
         if kpi_state == KPI_STATE_INVALID:
             self._kpi_invalid_reason = kpi_reason
         else:
@@ -4471,6 +4672,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._active_order_keys.clear()
         self._recent_order_keys.clear()
         self._order_id_to_registry_key.clear()
+        self._registry_key_last_seen_ts.clear()
 
     def _rebuild_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
         self._clear_local_order_registry()
@@ -4480,6 +4682,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _sync_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
+        now = time()
         for order in orders:
             if not isinstance(order, dict):
                 continue
@@ -4498,6 +4701,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             registry_key = self._order_registry_key(side, price_key, qty_key, order_type)
             if registry_key not in self._active_order_keys:
                 self._register_order_key(registry_key)
+            self._registry_key_last_seen_ts[registry_key] = now
             if order_id:
                 self._order_id_to_registry_key[order_id] = registry_key
 
@@ -4558,10 +4762,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
     def _register_order_key(self, key: str, ttl_s: float | None = None) -> None:
         self._active_order_keys.add(key)
+        self._registry_key_last_seen_ts[key] = time()
         self._mark_recent_order_key(key, ttl_s or self._recent_key_ttl_s)
 
     def _discard_order_registry_key(self, key: str, *, drop_recent: bool = False) -> None:
         self._active_order_keys.discard(key)
+        self._registry_key_last_seen_ts.pop(key, None)
         if drop_recent:
             self._recent_order_keys.pop(key, None)
 
@@ -4592,6 +4798,32 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         qty = self._coerce_float(str(order.get("origQty", ""))) or 0.0
         if price > 0 and qty > 0:
             self._discard_registry_for_values(side, self.as_decimal(price), self.as_decimal(qty))
+
+    def _gc_registry_keys(self) -> None:
+        now = time()
+        if self._registry_gc_last_ts and now - self._registry_gc_last_ts < REGISTRY_GC_INTERVAL_MS / 1000:
+            return
+        self._registry_gc_last_ts = now
+        expired_keys = [
+            key
+            for key, last_seen in self._registry_key_last_seen_ts.items()
+            if now - last_seen > REGISTRY_GC_TTL_SEC
+        ]
+        for key in expired_keys:
+            self._discard_order_registry_key(key, drop_recent=True)
+        for order_id, key in list(self._order_id_to_registry_key.items()):
+            if order_id in self._open_orders_map:
+                continue
+            last_seen = self._registry_key_last_seen_ts.get(key)
+            if last_seen is None or now - last_seen > REGISTRY_GC_TTL_SEC:
+                self._discard_registry_for_order_id(order_id)
+        stale_cutoff = now - STALE_COOLDOWN_SEC
+        self._pilot_stale_handled = {
+            order_id: ts for order_id, ts in self._pilot_stale_handled.items() if ts >= stale_cutoff
+        }
+        self._pilot_stale_skip_log_ts = {
+            order_id: ts for order_id, ts in self._pilot_stale_skip_log_ts.items() if ts >= stale_cutoff
+        }
 
     @staticmethod
     def _classify_2010_reason(message: str) -> str:
@@ -5015,7 +5247,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if decision == "REQUEST_DATA":
             return "REQUEST_DATA"
         if decision == "HOLD":
-            spread_text = f"{spread_pct:.4f}%" if spread_pct is not None else "—"
+            spread_text = self._format_spread_display(spread_pct)
             vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
             self._append_log(
                 (
