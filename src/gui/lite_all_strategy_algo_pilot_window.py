@@ -160,6 +160,7 @@ MAX_ORDER_AGE_SEC = 180
 STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
+STALE_COOLDOWN_SEC = 120
 PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.10
 PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.10
 PROFIT_GUARD_SLIPPAGE_BPS = 1.5
@@ -775,8 +776,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._auto_fix_tp_enabled = True
         self._stop_in_progress = False
         self._pilot_state = PilotState.OFF
-        self._pilot_auto_actions_enabled = False
-        self._pilot_confirm_dry_run = True
+        self._pilot_auto_actions_enabled = True
+        self._pilot_confirm_dry_run = False
         self._pilot_allow_market = False
         self._pilot_action_in_progress = False
         self._current_action: str | None = None
@@ -795,12 +796,20 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_snapshot_stale_active = False
         self._pilot_snapshot_stale_last_log_ts: float | None = None
         self._pilot_stale_policy = StalePolicy.NONE
+        self._pilot_pending_cancel_ids: set[str] = set()
+        self._pilot_stale_seen_ids: dict[str, float] = {}
         self._last_price_update: PriceUpdate | None = None
+        self._feed_ok = False
+        self._feed_last_ok: bool | None = None
+        self._feed_last_source: str | None = None
         self._kpi_has_data = False
         self._kpi_last_source: str | None = None
         self._kpi_valid = False
         self._kpi_last_valid: bool | None = None
         self._kpi_invalid_reason: str | None = None
+        self._kpi_vol_state: str | None = None
+        self._kpi_last_vol_state: str | None = None
+        self._kpi_last_spread_text: str | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._position_state = PositionState(
@@ -858,7 +867,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.0 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.1 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1149,7 +1158,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             "Проверить ордера по возрасту и предложить действие"
         )
         self._pilot_auto_actions_toggle = QCheckBox("Авто-действия пилота")
-        self._pilot_auto_actions_toggle.setChecked(False)
+        self._pilot_auto_actions_toggle.setChecked(True)
+        self._pilot_auto_actions_toggle.setEnabled(False)
         self._pilot_auto_actions_toggle.setToolTip(
             "Если включено — пилот может сам выполнять Перестроить/Recovery по триггерам (с подтверждением в LIVE)"
         )
@@ -1164,7 +1174,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         )
         self._pilot_stale_policy_combo.currentIndexChanged.connect(self._handle_pilot_stale_policy_change)
         self._pilot_confirm_dry_run_toggle = QCheckBox("Всегда спрашивать (DRY)")
-        self._pilot_confirm_dry_run_toggle.setChecked(True)
+        self._pilot_confirm_dry_run_toggle.setChecked(False)
+        self._pilot_confirm_dry_run_toggle.setEnabled(False)
         self._pilot_confirm_dry_run_toggle.toggled.connect(self._handle_pilot_confirm_dry_run_toggle)
         self._pilot_allow_market_toggle = QCheckBox("Разрешить MARKET (закрытие)")
         self._pilot_allow_market_toggle.setChecked(False)
@@ -1562,14 +1573,20 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_execute(PilotAction.FLAG_STALE)
 
     def _handle_pilot_auto_actions_toggle(self, checked: bool) -> None:
-        self._pilot_auto_actions_enabled = checked
-        state = "enabled" if checked else "disabled"
-        self._append_log(f"[ALGO PILOT] auto-actions {state}", kind="INFO")
+        self._pilot_auto_actions_enabled = True
+        if hasattr(self, "_pilot_auto_actions_toggle"):
+            self._pilot_auto_actions_toggle.blockSignals(True)
+            self._pilot_auto_actions_toggle.setChecked(True)
+            self._pilot_auto_actions_toggle.blockSignals(False)
+        self._append_log("[ALGO PILOT] auto-actions FORCED", kind="INFO")
 
     def _handle_pilot_confirm_dry_run_toggle(self, checked: bool) -> None:
-        self._pilot_confirm_dry_run = checked
-        state = "enabled" if checked else "disabled"
-        self._append_log(f"[ALGO PILOT] dry-run confirm {state}", kind="INFO")
+        self._pilot_confirm_dry_run = False
+        if hasattr(self, "_pilot_confirm_dry_run_toggle"):
+            self._pilot_confirm_dry_run_toggle.blockSignals(True)
+            self._pilot_confirm_dry_run_toggle.setChecked(False)
+            self._pilot_confirm_dry_run_toggle.blockSignals(False)
+        self._append_log("[ALGO PILOT] dry-run confirm IGNORED", kind="INFO")
 
     def _handle_pilot_allow_market_toggle(self, checked: bool) -> None:
         self._pilot_allow_market = checked
@@ -1597,7 +1614,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             "_pilot_allow_market_toggle",
         ):
             if hasattr(self, name):
-                getattr(self, name).setEnabled(enabled)
+                control = getattr(self, name)
+                if name in {"_pilot_auto_actions_toggle", "_pilot_confirm_dry_run_toggle"}:
+                    control.setEnabled(False)
+                else:
+                    control.setEnabled(enabled)
 
     def _set_pilot_action_in_progress(self, enabled: bool, *, status: str | None = None) -> None:
         self._pilot_action_in_progress = enabled
@@ -1669,22 +1690,15 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         action: PilotAction,
         summary_lines: list[str],
     ) -> bool:
-        needs_confirm = self._live_enabled() or self._pilot_confirm_dry_run
-        if not needs_confirm:
-            return True
-        title = "Подтвердить действие пилота"
-        action_label = self._pilot_action_label(action)
-        details = "\n".join(summary_lines)
-        confirm = QMessageBox.question(
-            self,
-            title,
-            f"Действие: {action_label}\n{details}",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        return confirm == QMessageBox.Yes
+        return True
 
-    def _pilot_execute(self, action: PilotAction, *, auto: bool = False) -> None:
+    def _pilot_execute(
+        self,
+        action: PilotAction,
+        *,
+        auto: bool = False,
+        reason: str | None = None,
+    ) -> None:
         action_key = {
             PilotAction.RECENTER: "recenter",
             PilotAction.RECOVERY: "recovery",
@@ -1699,6 +1713,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if self._pilot_action_in_progress:
             self._pilot_block_action(action, "in_progress")
             return
+        if auto:
+            exec_reason = reason or "auto"
+            self._append_log(
+                f"[ALGO_PILOT] auto-exec action={requested} reason={exec_reason}",
+                kind="INFO",
+            )
         if action == PilotAction.TOGGLE:
             next_state = PilotState.NORMAL if self._pilot_state == PilotState.OFF else PilotState.OFF
             if next_state == PilotState.NORMAL:
@@ -1737,15 +1757,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 self._pilot_set_warning("Устаревших ордеров нет")
                 return
             self._pilot_set_warning("УСТАРЕВШИЕ ОРДЕРА")
-            confirm = QMessageBox.question(
-                self,
-                "Устаревшие ордера",
-                "Отменить и перестроить?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if confirm == QMessageBox.Yes:
-                self._pilot_execute(PilotAction.RECENTER)
+            self._pilot_execute(PilotAction.RECENTER, auto=True, reason="flag_stale")
             return
         if action == PilotAction.CANCEL_REPLACE_STALE:
             stale_orders, oldest_info, _oldest_age = self._collect_stale_orders(
@@ -1761,7 +1773,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 return
             if not self._pilot_trade_gate_ready(action):
                 return
-            self._pilot_execute_cancel_replace_stale(stale_orders, auto=auto)
+            self._pilot_execute_cancel_replace_stale(stale_orders, auto=auto, reason=reason)
             return
         if action not in {PilotAction.RECENTER, PilotAction.RECOVERY, PilotAction.FLATTEN_BE}:
             return
@@ -1845,6 +1857,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         stale_orders: list[StaleOrderCandidate],
         *,
         auto: bool = False,
+        reason: str | None = None,
     ) -> None:
         if not self._pilot_trade_gate_ready(PilotAction.CANCEL_REPLACE_STALE):
             return
@@ -1865,6 +1878,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f"mode={'LIVE' if self._live_enabled() else 'DRY'}",
             f"auto={'yes' if auto else 'no'}",
         ]
+        if auto:
+            exec_reason = reason or "auto"
+            self._append_log(
+                f"[ALGO_PILOT] auto-exec action=cancel_replace_stale reason={exec_reason}",
+                kind="INFO",
+            )
         if not self._pilot_confirm_action(PilotAction.CANCEL_REPLACE_STALE, summary):
             return
         self._set_pilot_action_in_progress(True, status="Выполняю…")
@@ -2109,14 +2128,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return self._last_price
         if self._pilot_anchor_price is None or self._pilot_anchor_price == self._last_price:
             return self._last_price
-        confirm = QMessageBox.question(
-            self,
-            "Якорь пилота",
-            "Использовать текущую цену как якорь?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        return self._last_price if confirm == QMessageBox.Yes else self._pilot_anchor_price
+        return self._last_price
 
     def _pilot_recenter_break_even_guard(self, plan: list[GridPlannedOrder]) -> tuple[bool, str]:
         position_qty = self._pilot_position_qty()
@@ -2456,7 +2468,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 kind="INFO",
             )
             if self._pilot_auto_actions_enabled:
-                self._pilot_execute(PilotAction.RECENTER, auto=True)
+                self._pilot_execute(PilotAction.RECENTER, auto=True, reason="distance")
             else:
                 self._pilot_set_warning("Рекомендуется перестроить")
 
@@ -2553,6 +2565,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             order_id = str(order.get("orderId", ""))
             if not order_id:
                 continue
+            if order_id in self._pilot_pending_cancel_ids:
+                continue
             info = self._order_info_map.get(order_id)
             if not info:
                 continue
@@ -2561,6 +2575,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 oldest_age_sec = age_sec
                 oldest_info = info
             if age_sec > threshold_sec:
+                last_seen = self._pilot_stale_seen_ids.get(order_id)
+                if last_seen is not None and now - last_seen < STALE_COOLDOWN_SEC:
+                    continue
+                self._pilot_stale_seen_ids[order_id] = now
                 stale.append(StaleOrderCandidate(info=info, order=order, age_s=age_sec))
         return stale, oldest_info, oldest_age_sec
 
@@ -2597,10 +2615,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         missing_ids = [order_id for order_id in self._order_info_map if order_id not in seen_ids]
         for order_id in missing_ids:
             self._order_info_map.pop(order_id, None)
+            self._pilot_pending_cancel_ids.discard(order_id)
+            self._pilot_stale_seen_ids.pop(order_id, None)
 
     def _clear_order_info(self) -> None:
         self._open_orders_snapshot_ts = None
         self._order_info_map = {}
+        self._pilot_pending_cancel_ids.clear()
+        self._pilot_stale_seen_ids.clear()
 
     @staticmethod
     def _format_order_age_value(age_sec: int) -> str:
@@ -2708,22 +2730,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if oldest_age_sec is None or oldest_info is None:
             return
         now = monotonic()
-        should_log = False
         if not self._pilot_stale_active:
-            should_log = True
-        elif self._pilot_stale_last_log_order_id != oldest_info.order_id:
-            should_log = True
-        elif self._pilot_stale_last_log_total != total:
-            should_log = True
-        elif self._pilot_stale_last_log_ts is None:
-            should_log = True
-        elif now - self._pilot_stale_last_log_ts >= STALE_LOG_DEDUP_SEC:
-            should_log = True
-        if should_log:
             seen_age = max(1, int(max(time() - oldest_info.last_seen_ts, 0)))
-            auto_state = "on" if self._pilot_auto_actions_enabled else "off"
             gate_state = "ok" if self._trade_gate == TradeGate.TRADE_OK else "ro"
-            confirm_state = "on" if (self._live_enabled() or self._pilot_confirm_dry_run) else "off"
             price_text = f"{oldest_info.price:.8f}" if oldest_info.price > 0 else "—"
             self._append_log(
                 (
@@ -2731,7 +2740,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     f"total={total} oldest_age={oldest_age_sec} threshold={MAX_ORDER_AGE_SEC} "
                     f"oldest={oldest_info.order_id} {oldest_info.side} {price_text} "
                     f"last_seen_age={seen_age} policy={self._pilot_stale_policy.value} "
-                    f"auto={auto_state} gate={gate_state} confirm={confirm_state}"
+                    f"auto=on gate={gate_state}"
                 ),
                 kind="WARN",
             )
@@ -2774,9 +2783,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         self._pilot_stale_last_action_ts = now
         if self._pilot_stale_policy == StalePolicy.RECENTER:
-            self._pilot_execute(PilotAction.RECENTER, auto=True)
+            self._pilot_execute(PilotAction.RECENTER, auto=True, reason="stale")
         elif self._pilot_stale_policy == StalePolicy.CANCEL_REPLACE_STALE:
-            self._pilot_execute_cancel_replace_stale(stale_orders, auto=True)
+            self._pilot_execute_cancel_replace_stale(stale_orders, auto=True, reason="stale")
 
     def _emit_price_update(self, update: PriceUpdate) -> None:
         self._signals.price_update.emit(update)
@@ -2856,38 +2865,64 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._market_source.setText(source_age_text)
         self._set_market_label_state(self._market_source, active=source_age_text != "—")
 
-        kpi_valid = True
-        invalid_reasons: list[str] = []
-        if source == "WS" and (age_ms is None or age_ms > WS_STALE_MS):
-            kpi_valid = False
-            invalid_reasons.append("ws_stale")
+        feed_ok = bool(source == "WS" and age_ms is not None and age_ms < WS_STALE_MS)
+        self._feed_ok = feed_ok
+        feed_age_text = f"{age_ms}ms" if age_ms is not None else "—"
+        if (
+            self._feed_last_ok is None
+            or self._feed_last_ok != feed_ok
+            or self._feed_last_source != source
+        ):
+            self._append_log(
+                f"[FEED] src={source or '—'} age={feed_age_text} ok={str(feed_ok).lower()}",
+                kind="INFO",
+            )
+            self._feed_last_ok = feed_ok
+            self._feed_last_source = source
+
         spread_value: float | None = None
         if micro is not None:
             if micro.spread_pct is not None:
                 spread_value = float(micro.spread_pct)
             elif micro.spread_abs is not None:
                 spread_value = float(micro.spread_abs)
-        if spread_value == 0:
-            kpi_valid = False
-            invalid_reasons.append("spread=0")
-        if volatility_pct == 0:
-            kpi_valid = False
-            invalid_reasons.append("vol=0")
-        invalid_reason_text = ",".join(invalid_reasons) if invalid_reasons else None
-        if not kpi_valid and invalid_reason_text:
-            if self._kpi_invalid_reason != invalid_reason_text or self._kpi_valid:
-                self._append_log(f"[KPI] invalid reason={invalid_reason_text}", kind="WARN")
-            self._kpi_invalid_reason = invalid_reason_text
+        if volatility_pct is None:
+            vol_state = "UNKNOWN"
+        elif volatility_pct == 0:
+            vol_state = "INVALID"
+        else:
+            vol_state = "OK"
+        spread_log = spread_text if spread_text != "—" else "—"
+        if self._kpi_last_vol_state != vol_state or self._kpi_last_spread_text != spread_log:
+            self._append_log(
+                f"[KPI] vol_state={vol_state} spread={spread_log}",
+                kind="INFO",
+            )
+            self._kpi_last_vol_state = vol_state
+            self._kpi_last_spread_text = spread_log
+
+        kpi_invalid = bool(
+            feed_ok
+            and spread_value is not None
+            and volatility_pct is not None
+            and spread_value == 0
+            and volatility_pct == 0
+        )
+        kpi_valid = not kpi_invalid
+        kpi_reason = "spread=0,vol=0" if kpi_invalid else "ok"
+        if self._kpi_last_valid is None or self._kpi_last_valid != kpi_valid:
+            kind = "WARN" if not kpi_valid else "INFO"
+            self._append_log(
+                f"[KPI] ok={str(kpi_valid).lower()} reason={kpi_reason}",
+                kind=kind,
+            )
+        if not kpi_valid:
+            self._kpi_invalid_reason = kpi_reason
         else:
             self._kpi_invalid_reason = None
-        if source is not None and age_ms is not None:
-            if self._kpi_last_source != source or self._kpi_last_valid != kpi_valid:
-                self._append_log(
-                    f"[PRICE] source={source} age={age_ms} valid={str(kpi_valid).lower()}",
-                    kind="INFO",
-                )
+        self._kpi_vol_state = vol_state
         self._kpi_valid = kpi_valid
-        self._kpi_last_valid = kpi_valid if source is not None else None
+        self._kpi_last_valid = kpi_valid
 
         if price is not None and source is not None:
             should_log = False
@@ -4778,17 +4813,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[str, float | None, float | None]:
         spread_pct = self._current_spread_pct()
         volatility_pct = self._compute_recent_volatility_pct()
-        if not self._kpi_valid:
-            return "REQUEST_DATA", spread_pct, volatility_pct
-        if spread_pct is None or volatility_pct is None:
+        if self._kpi_vol_state == "UNKNOWN":
             return "OK", spread_pct, volatility_pct
-        if spread_pct <= 0:
-            return "OK", spread_pct, volatility_pct
-        if volatility_pct <= PROFIT_GUARD_MIN_VOL_PCT:
-            return "OK", spread_pct, volatility_pct
-        fee_cost = self._profit_guard_round_trip_cost_pct()
-        required_edge = spread_pct + fee_cost + PROFIT_GUARD_BUFFER_PCT
-        if min_profit_pct > required_edge:
+        if self._feed_ok and not self._kpi_valid:
             return "HOLD", spread_pct, volatility_pct
         return "OK", spread_pct, volatility_pct
 
@@ -4890,7 +4917,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
             self._append_log(
                 (
-                    "[GUARD] HOLD reason=thin_edge "
+                    "[GUARD] HOLD reason=kpi_invalid "
                     f"spread={spread_text} min_profit={min_profit_pct:.4f}% vol={vol_text}"
                 ),
                 kind="WARN",
@@ -5792,6 +5819,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     f"[INFO] cancel unknown -> treated as done orderId={order_id}",
                     "INFO",
                 )
+                self._pilot_pending_cancel_ids.add(order_id)
                 self._closed_order_ids.add(order_id)
                 self._discard_registry_for_order_id(order_id)
                 self._open_orders_map.pop(order_id, None)
@@ -5799,6 +5827,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 self._bot_order_ids.discard(order_id)
                 return True, None
             return False, self._format_cancel_exception(exc, order_id)
+        self._pilot_pending_cancel_ids.add(order_id)
         self._closed_order_ids.add(order_id)
         self._discard_registry_for_order_id(order_id)
         self._open_orders_map.pop(order_id, None)
