@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import faulthandler
 import os
 import sys
@@ -8,6 +9,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
 from math import ceil, floor
@@ -66,7 +68,7 @@ from src.services.price_feed_manager import (
 _NC_MICRO_CRASH_HANDLES: list[object] = []
 
 
-def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> str:
+def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> tuple[str, object]:
     base_dir = os.getcwd()
     crash_dir = os.path.join(base_dir, "logs", "crash")
     os.makedirs(crash_dir, exist_ok=True)
@@ -76,6 +78,22 @@ def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> str:
     crash_file = open(crash_log_path, "a", buffering=1, encoding="utf-8")
     _NC_MICRO_CRASH_HANDLES.append(crash_file)
     faulthandler.enable(crash_file, all_threads=True)
+    faulthandler.dump_traceback_later(30, repeat=True, file=crash_file)
+
+    def _write_line(message: str) -> None:
+        try:
+            crash_file.write(f"{message}\n")
+            crash_file.flush()
+        except Exception:
+            return
+
+    pid = os.getpid()
+    _write_line(f"=== START pid={pid} ts={datetime.now().isoformat()} ===")
+
+    def _on_clean_exit() -> None:
+        _write_line(f"=== CLEAN EXIT pid={pid} ts={datetime.now().isoformat()} ===")
+
+    atexit.register(_on_clean_exit)
 
     def _write_traceback(prefix: str, exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
         try:
@@ -105,7 +123,7 @@ def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> str:
     sys.excepthook = _sys_hook
     if hasattr(threading, "excepthook"):
         threading.excepthook = _thread_hook
-    return crash_log_path
+    return crash_log_path, crash_file
 
 
 class _WorkerSignals(QObject):
@@ -746,12 +764,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._signals.log_append.connect(self._append_log)
         self._signals.api_error.connect(self._handle_live_api_error)
         self._log_entries: list[tuple[str, str]] = []
-        self._crash_log_path = _install_nc_micro_crash_catcher(self._logger, self._symbol)
+        self._crash_log_path, self._crash_file = _install_nc_micro_crash_catcher(
+            self._logger, self._symbol
+        )
         self._crash_notified = False
         self._append_log(
             f"[NC_MICRO] crash catcher installed path={self._crash_log_path}",
             kind="INFO",
         )
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._handle_about_to_quit)
         self._state = "IDLE"
         self._engine_state = "WAITING"
         self._ws_status = ""
@@ -993,7 +1016,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.3 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.4 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1652,10 +1675,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         filter_label.setStyleSheet("font-weight: 600;")
         self._clear_logs_button = QPushButton("Clear")
         self._copy_logs_button = QPushButton("Copy all")
+        self._dump_threads_button = QPushButton("Dump threads")
         self._toggle_logs_button = QPushButton("↕")
         self._toggle_logs_button.setFixedWidth(28)
         self._clear_logs_button.setFixedHeight(24)
         self._copy_logs_button.setFixedHeight(24)
+        self._dump_threads_button.setFixedHeight(24)
         self._toggle_logs_button.setFixedHeight(24)
         self._log_filter = QComboBox()
         self._log_filter.addItems(
@@ -1666,6 +1691,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         filter_row.addStretch()
         filter_row.addWidget(self._clear_logs_button)
         filter_row.addWidget(self._copy_logs_button)
+        filter_row.addWidget(self._dump_threads_button)
         filter_row.addWidget(self._log_filter)
         filter_row.addWidget(self._toggle_logs_button)
 
@@ -1676,6 +1702,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._clear_logs_button.clicked.connect(self._log_view.clear)
         self._copy_logs_button.clicked.connect(self._copy_all_logs)
+        self._dump_threads_button.clicked.connect(self._handle_dump_threads)
         self._toggle_logs_button.clicked.connect(self._toggle_logs_panel)
         layout.addWidget(self._trades_summary_label)
         layout.addLayout(filter_row)
@@ -7335,6 +7362,25 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not hasattr(self, "_log_view"):
             return
         QApplication.clipboard().setText(self._log_view.toPlainText())
+
+    def _write_crash_log_line(self, message: str) -> None:
+        try:
+            self._crash_file.write(f"{message}\n")
+            self._crash_file.flush()
+        except Exception:
+            return
+
+    def _handle_dump_threads(self) -> None:
+        timestamp = datetime.now().isoformat()
+        self._write_crash_log_line(f"=== DUMP THREADS ts={timestamp} ===")
+        try:
+            faulthandler.dump_traceback(file=self._crash_file, all_threads=True)
+        except Exception:
+            return
+
+    def _handle_about_to_quit(self) -> None:
+        self._logger.info("[NC_MICRO] aboutToQuit received")
+        self._write_crash_log_line(f"[NC_MICRO] aboutToQuit received ts={datetime.now().isoformat()}")
 
     def _toggle_logs_panel(self) -> None:
         if not hasattr(self, "_right_splitter"):
