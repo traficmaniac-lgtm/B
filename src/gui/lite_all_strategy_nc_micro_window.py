@@ -51,6 +51,7 @@ from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
+from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
 from src.gui.i18n import TEXT, tr
 from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
@@ -3703,6 +3704,21 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             self._snapshot_refresh_suppressed_log_ts = now
 
+    def _request_snapshot_refresh_if_stale(self) -> bool:
+        now = monotonic()
+        cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
+        if self._snapshot_refresh_inflight:
+            self._maybe_log_snapshot_refresh_suppressed("inflight")
+            return False
+        if now - self._last_snapshot_refresh_ts < cooldown_sec:
+            remaining_ms = max(int((cooldown_sec - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
+            self._maybe_log_snapshot_refresh_suppressed("cooldown", f"{remaining_ms} ms")
+            return False
+        self._last_snapshot_refresh_ts = now
+        self._snapshot_refresh_inflight = True
+        self._append_log("[ORDERS] snapshot stale -> refresh (start)", kind="INFO")
+        return True
+
     def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
         now = monotonic()
         should_log = False
@@ -4447,10 +4463,21 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if not self._fees_last_fetch_ts:
                     self._refresh_trade_fees(force=True)
                 guard_mode = self._current_profit_guard_mode()
-                self._append_log(
-                    f"[GUARD] mode={guard_mode.value} fee_unverified={str(self._fee_unverified).lower()}",
-                    kind="INFO",
-                )
+                guard_reason = self._current_profit_guard_reason()
+                if guard_reason == "fees_override":
+                    self._append_log(
+                        f"[GUARD] mode={guard_mode.value} reason=fees_override",
+                        kind="INFO",
+                    )
+                else:
+                    reason_suffix = f" reason={guard_reason}" if guard_reason else ""
+                    self._append_log(
+                        (
+                            f"[GUARD] mode={guard_mode.value} "
+                            f"fee_unverified={str(self._fee_unverified).lower()}{reason_suffix}"
+                        ),
+                        kind="INFO",
+                    )
                 guard_decision = self._apply_profit_guard(
                     settings,
                     anchor_price,
@@ -5363,16 +5390,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if not force:
                 snapshot_age_sec = self._snapshot_age_sec()
                 if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
-                    now = monotonic()
-                    cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
-                    if self._snapshot_refresh_inflight:
+                    if self._orders_in_flight:
                         self._maybe_log_snapshot_refresh_suppressed("inflight")
-                    elif now - self._last_snapshot_refresh_ts < cooldown_sec:
-                        remaining_ms = max(int((cooldown_sec - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
-                        self._maybe_log_snapshot_refresh_suppressed("cooldown", f"{remaining_ms} ms")
-                    else:
-                        self._append_log("[ORDERS] snapshot stale -> refresh (start)", kind="INFO")
-                        self._last_snapshot_refresh_ts = now
+                    elif self._request_snapshot_refresh_if_stale():
                         stale_force = True
                         force = True
                     if not force:
@@ -5380,11 +5400,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if self._orders_in_flight:
                 if not force:
                     return
-                if stale_force and self._snapshot_refresh_inflight:
-                    return
             self._orders_in_flight = True
-            if stale_force:
-                self._snapshot_refresh_inflight = True
             worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
             worker.signals.success.connect(self._handle_open_orders)
             worker.signals.error.connect(self._handle_open_orders_error)
@@ -6068,7 +6084,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         fee_rate = max(maker_rate, taker_rate, 0.0)
         return self.as_decimal(fee_rate)
 
+    def _fee_override_roundtrip(self, symbol: str | None) -> float | None:
+        if not symbol:
+            return None
+        return FEE_OVERRIDES_ROUNDTRIP.get(symbol.upper())
+
     def get_effective_fees_pct(self, symbol: str | None = None) -> float:
+        override = self._fee_override_roundtrip(symbol or self._symbol)
+        if override is not None:
+            return override
         maker, taker = self._trade_fees
         maker_pct = (maker or 0.0) * 100
         taker_pct = (taker or 0.0) * 100
@@ -6078,9 +6102,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return 2 * maker_pct
 
     def _current_profit_guard_mode(self) -> ProfitGuardMode:
+        if self._fee_source == "OVERRIDE":
+            return ProfitGuardMode.WARN_ONLY
         return ProfitGuardMode.WARN_ONLY if self._fee_unverified else self._profit_guard_mode
 
+    def _current_profit_guard_reason(self) -> str | None:
+        if self._fee_source == "OVERRIDE":
+            return "fees_override"
+        if self._fee_unverified:
+            return "fees_unverified"
+        return None
+
     def _fee_display_text(self) -> str:
+        if self._fee_source == "OVERRIDE":
+            return "0.00%/0.00% (override)"
         maker, taker = self._trade_fees
         unverified = self._fee_unverified
         maker_pct = (maker or 0.0) * 100
@@ -6089,7 +6124,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return f"{maker_pct:.2f}%/{taker_pct:.2f}%{suffix}"
 
     def _log_fee_source(self, source: str) -> None:
-        if source == "ACCOUNT":
+        if source == "OVERRIDE":
+            roundtrip = self.get_effective_fees_pct(self._symbol)
+            self._append_log(
+                (
+                    "[FEES] source=OVERRIDE "
+                    f"symbol={self._symbol} roundtrip={roundtrip:.4f}%"
+                ),
+                kind="INFO",
+            )
+        elif source == "ACCOUNT":
             maker, taker = self._trade_fees
             maker_pct = (maker or 0.0) * 100
             taker_pct = (taker or 0.0) * 100
@@ -6112,6 +6156,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._trade_fees = (maker, taker)
         fee_unverified = maker is None or taker is None or source != "ACCOUNT"
         source_value = source if not fee_unverified else "DEFAULT_UNVERIFIED"
+        if self._fee_override_roundtrip(self._symbol) is not None:
+            source_value = "OVERRIDE"
+            fee_unverified = False
         if source_value != self._fee_source or fee_unverified != self._fee_unverified:
             self._fee_source = source_value
             self._fee_unverified = fee_unverified
@@ -6131,6 +6178,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         }
 
     def _profit_guard_fee_inputs(self) -> tuple[float, float, bool]:
+        if self._fee_source == "OVERRIDE":
+            return 0.0, 0.0, False
         maker, taker = self._trade_fees
         used_default = self._fee_unverified or maker is None or taker is None
         maker_pct = (maker * 100) if maker is not None else PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT
@@ -6309,8 +6358,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         profile = get_profile_preset(self._profit_profile_name())
         inputs = self._runtime_profit_inputs()
         maker, taker = self._trade_fees
-        maker_fee_pct = (maker * 100) if maker is not None else 0.0
-        taker_fee_pct = (taker * 100) if taker is not None else 0.0
+        if self._fee_source == "OVERRIDE":
+            maker_fee_pct = 0.0
+            taker_fee_pct = 0.0
+        else:
+            maker_fee_pct = (maker * 100) if maker is not None else 0.0
+            taker_fee_pct = (taker * 100) if taker is not None else 0.0
         fee_total_pct = compute_fee_total_pct(
             maker_fee_pct,
             taker_fee_pct,
