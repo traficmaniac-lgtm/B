@@ -1,5 +1,8 @@
 ## Technical Report
 
+### NC MICRO v1.0.5
+- Hardened NC_MICRO HTTP book success handlers with bound callbacks, self guards, and payload safety to prevent runtime crashes.
+
 ### NC MICRO v1.0
 - Added NC MICRO mode with a cloned Lite All Strategy window and routing entry in the pair dialog.
 
