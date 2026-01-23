@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import faulthandler
 import os
+import random
 import sys
 import threading
 import time
@@ -3696,6 +3697,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_active = True
 
     def _maybe_log_snapshot_refresh_suppressed(self, reason: str, detail: str | None = None) -> None:
+        if self._stop_in_progress:
+            return
         now = monotonic()
         cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
         last_log = self._snapshot_refresh_suppressed_log_ts
@@ -3738,6 +3741,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return True
 
     def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
+        if self._stop_in_progress:
+            return
         now = monotonic()
         should_log = False
         if not self._pilot_snapshot_stale_active:
@@ -4708,9 +4713,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._change_state("PAUSED")
 
     def _handle_stop(self) -> None:
-        if self._stop_in_progress:
-            self._append_log("[STOP] ignored: already in progress", kind="WARN")
-            return
         self._stop_in_progress = True
         self._closing = True
         if self._start_cancel_event:
@@ -4720,6 +4722,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._append_log("Stop pressed.", kind="ORDERS")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("STOPPING")
+        self._orders_in_flight = True
         self._start_in_progress = False
         self._start_in_progress_logged = False
         self._start_button.setEnabled(True)
@@ -4765,61 +4768,54 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_restore_ids.clear()
         self._stop_in_progress = False
         self._closing = False
+        self._orders_in_flight = False
+        self._snapshot_refresh_inflight = False
         self._resume_local_timers()
         self._render_open_orders()
-        self._change_state("STOPPED")
+        self._change_state("IDLE")
 
     def _cancel_bot_orders_on_stop(self) -> None:
         if not self._account_client:
             self._finalize_stop()
             return
-        owned_ids = sorted(self._owned_order_ids)
-        if not owned_ids:
-            self._append_log("[STOP] owned orders: 0", kind="INFO")
-            self._finalize_stop(keep_open_orders=bool(self._open_orders_all))
-            return
-        self._append_log(f"[STOP] canceling owned orders n={len(owned_ids)}...", kind="INFO")
+        symbol = self._symbol
 
         def _cancel() -> dict[str, Any]:
+            events: list[tuple[str, str]] = []
             errors: list[str] = []
-            canceled = 0
-            failed = 0
-            failed_ids: list[str] = []
-            planned = len(owned_ids)
-            for order_id in owned_ids:
-                if not order_id:
-                    continue
+            open_orders_after: list[dict[str, Any]] = []
+            for attempt in range(1, 4):
+                events.append(("INFO", f"[STOP] cancel_all symbol={symbol} attempt={attempt}"))
+                ok = True
+                err_text: str | None = None
                 try:
-                    self._account_client.cancel_order(self._symbol, order_id)
-                    canceled += 1
+                    self._account_client.cancel_open_orders(symbol)
                 except Exception as exc:  # noqa: BLE001
-                    failed += 1
-                    failed_ids.append(order_id)
-                    errors.append(self._format_cancel_exception(exc, order_id))
-            open_orders_after = self._account_client.get_open_orders(self._symbol)
-            final_remaining_ids = {
-                str(order.get("orderId", ""))
-                for order in open_orders_after
-                if isinstance(order, dict) and str(order.get("orderId", ""))
-            }
-            remaining_owned = [order_id for order_id in owned_ids if order_id in final_remaining_ids]
-            deadline = monotonic() + 5.0
-            while remaining_owned and monotonic() < deadline:
-                self._sleep_ms(500)
-                open_orders_after = self._account_client.get_open_orders(self._symbol)
-                final_remaining_ids = {
-                    str(order.get("orderId", ""))
-                    for order in open_orders_after
-                    if isinstance(order, dict) and str(order.get("orderId", ""))
-                }
-                remaining_owned = [order_id for order_id in owned_ids if order_id in final_remaining_ids]
+                    ok = False
+                    err_text = str(exc)
+                    errors.append(self._format_cancel_exception(exc, "cancel_all"))
+                err_log = err_text if err_text is not None else "None"
+                events.append(("INFO", f"[STOP] cancel_all result ok={ok} err={err_log}"))
+                self._sleep_ms(random.randint(300, 500))
+                verify_ok = True
+                try:
+                    open_orders_after = self._account_client.get_open_orders(symbol)
+                    if not isinstance(open_orders_after, list):
+                        verify_ok = False
+                        open_orders_after = []
+                except Exception as exc:  # noqa: BLE001
+                    verify_ok = False
+                    open_orders_after = []
+                    errors.append(f"[STOP] verify open_orders failed: {exc}")
+                verify_count = len(open_orders_after) if verify_ok else -1
+                events.append(("INFO", f"[STOP] verify open_orders n={verify_count}"))
+                if verify_ok and not open_orders_after:
+                    break
+                if attempt < 3:
+                    events.append(("WARN", f"[STOP] retry cancel_all attempt={attempt + 1}"))
             return {
-                "planned": planned,
-                "canceled": canceled,
-                "failed": failed,
-                "failed_ids": failed_ids,
+                "events": events,
                 "open_orders_after": open_orders_after,
-                "remaining_after": len(remaining_owned),
                 "errors": errors,
             }
 
@@ -4829,30 +4825,26 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_stop_cancel_result(self, result: object, latency_ms: int) -> None:
+        self._orders_in_flight = False
+        self._snapshot_refresh_inflight = False
         if not isinstance(result, dict):
             self._handle_cancel_error("Unexpected cancel response")
+            self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
+            self._force_refresh_balances_and_wait(timeout_ms=2_000)
             self._finalize_stop()
+            self._append_log("[STOP] done", kind="INFO")
             return
-        planned = int(result.get("planned", 0) or 0)
-        canceled = int(result.get("canceled", 0) or 0)
-        failed = int(result.get("failed", 0) or 0)
-        self._append_log(
-            f"Cancel owned orders: planned={planned} cancelled={canceled} failed={failed}",
-            kind="INFO",
-        )
-        failed_ids = result.get("failed_ids", [])
-        if isinstance(failed_ids, list) and failed_ids:
-            failed_list = ", ".join(str(entry) for entry in failed_ids)
-            self._append_log(f"[STOP] failed orderIds: {failed_list}", kind="WARN")
-        remaining_after = int(result.get("remaining_after", 0) or 0)
-        if remaining_after:
-            self._append_log(
-                f"[STOP] remaining owned orders after cancel={remaining_after}",
-                kind="WARN",
-            )
+        events = result.get("events", [])
+        if isinstance(events, list):
+            for entry in events:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    level, message = entry
+                    kind = "WARN" if level == "WARN" else "INFO"
+                    self._append_log(str(message), kind=kind)
+                elif isinstance(entry, str):
+                    self._append_log(entry, kind="INFO")
         open_orders_after = result.get("open_orders_after", [])
         if isinstance(open_orders_after, list):
-            self._append_log(f"[STOP] open_orders_after n={len(open_orders_after)}", kind="INFO")
             self._open_orders_all = [item for item in open_orders_after if isinstance(item, dict)]
             self._open_orders = self._filter_bot_orders(self._open_orders_all)
             self._open_orders_map = {
@@ -4865,12 +4857,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(str(message), kind="WARN")
-        self._refresh_open_orders(force=True)
+        self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
+        self._force_refresh_balances_and_wait(timeout_ms=2_000)
         self._finalize_stop(keep_open_orders=bool(self._open_orders))
+        self._append_log("[STOP] done", kind="INFO")
 
     def _handle_stop_cancel_error(self, message: str) -> None:
+        self._orders_in_flight = False
+        self._snapshot_refresh_inflight = False
         self._handle_cancel_error(message)
+        self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
+        self._force_refresh_balances_and_wait(timeout_ms=2_000)
         self._finalize_stop(keep_open_orders=True)
+        self._append_log("[STOP] done", kind="INFO")
 
     def _handle_cancel_selected(self) -> None:
         selected_rows = sorted({index.row() for index in self._orders_table.selectionModel().selectedRows()})
@@ -5474,6 +5473,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _refresh_open_orders(self, force: bool = False) -> None:
         try:
+            if self._stop_in_progress:
+                force = True
             self._orders_tick_count += 1
             if self._orders_tick_count % 30 == 0:
                 self._logger.debug("orders refresh tick")
@@ -5503,7 +5504,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
                     self._maybe_log_open_orders_snapshot_stale(snapshot_age_sec, skip_actions=True)
             if self._orders_in_flight:
-                if not force:
+                if not force and not self._stop_in_progress:
                     return
             self._orders_in_flight = True
             worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
