@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import faulthandler
+import os
+import sys
+import threading
+import time
+import traceback
 from collections import deque
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
 from math import ceil, floor
-from time import monotonic, perf_counter, sleep, time
+from time import monotonic, perf_counter, sleep, time as time_fn
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -56,6 +62,50 @@ from src.services.price_feed_manager import (
     WS_LOST,
     WS_STALE_MS,
 )
+
+_NC_MICRO_CRASH_HANDLES: list[object] = []
+
+
+def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> str:
+    base_dir = os.getcwd()
+    crash_dir = os.path.join(base_dir, "logs", "crash")
+    os.makedirs(crash_dir, exist_ok=True)
+    safe_symbol = symbol.replace("/", "_")
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    crash_log_path = os.path.join(crash_dir, f"NC_MICRO_{safe_symbol}_{timestamp}.log")
+    crash_file = open(crash_log_path, "a", buffering=1, encoding="utf-8")
+    _NC_MICRO_CRASH_HANDLES.append(crash_file)
+    faulthandler.enable(crash_file, all_threads=True)
+
+    def _write_traceback(prefix: str, exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        try:
+            crash_file.write(f"\n[{prefix}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            crash_file.writelines(traceback.format_exception(exc_type, exc, tb))
+            crash_file.flush()
+        except Exception:
+            return
+
+    def _sys_hook(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        _write_traceback("SYS", exc_type, exc, tb)
+        try:
+            logger.exception("[NC_MICRO][CRASH] unhandled exception", exc_info=(exc_type, exc, tb))
+        except Exception:
+            return
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        _write_traceback(f"THREAD:{args.thread.name}", args.exc_type, args.exc_value, args.exc_traceback)
+        try:
+            logger.exception(
+                "[NC_MICRO][CRASH] unhandled thread exception",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+        except Exception:
+            return
+
+    sys.excepthook = _sys_hook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_hook
+    return crash_log_path
 
 
 class _WorkerSignals(QObject):
@@ -695,6 +745,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._signals.status_update.connect(self._apply_status_update)
         self._signals.log_append.connect(self._append_log)
         self._signals.api_error.connect(self._handle_live_api_error)
+        self._log_entries: list[tuple[str, str]] = []
+        self._crash_log_path = _install_nc_micro_crash_catcher(self._logger, self._symbol)
+        self._crash_notified = False
+        self._append_log(
+            f"[NC_MICRO] crash catcher installed path={self._crash_log_path}",
+            kind="INFO",
+        )
         self._state = "IDLE"
         self._engine_state = "WAITING"
         self._ws_status = ""
@@ -707,7 +764,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids: set[str] = set()
         self._pending_restore_ids: set[str] = set()
         self._settings_state = GridSettingsState()
-        self._log_entries: list[tuple[str, str]] = []
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
         self._manual_grid_step_pct = self._settings_state.grid_step_pct
         self._thread_pool = QThreadPool.globalInstance()
@@ -937,7 +993,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.2 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.3 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1711,7 +1767,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _pilot_set_warning(self, message: str) -> None:
         self._pilot_warning_override = message
-        self._pilot_warning_override_until = time() + 6
+        self._pilot_warning_override_until = time_fn() + 6
         if hasattr(self, "_pilot_orders_warning_value"):
             self._pilot_orders_warning_value.setText(message)
             self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
@@ -1977,7 +2033,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not action_candidates:
             self._pilot_set_warning("Устаревших GRID ордеров нет")
             return
-        now_ts = time()
+        now_ts = time_fn()
         last_action_ts = self._pilot_stale_action_ts.get(self._symbol)
         if last_action_ts and now_ts - last_action_ts < STALE_ACTION_COOLDOWN_SEC:
             remaining = max(0, int(STALE_ACTION_COOLDOWN_SEC - (now_ts - last_action_ts)))
@@ -2016,7 +2072,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
         if not self._pilot_confirm_action(PilotAction.CANCEL_REPLACE_STALE, summary):
             return
-        self._pilot_stale_action_ts[self._symbol] = time()
+        self._pilot_stale_action_ts[self._symbol] = time_fn()
         self._set_pilot_action_in_progress(True, status="Выполняю…")
         if self._dry_run_toggle.isChecked():
             self._append_log(
@@ -2156,7 +2212,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 ok, error = self._cancel_order_idempotent(order_id)
                 if ok:
                     canceled += 1
-                    self._pilot_stale_handled[order_id] = time()
+                    self._pilot_stale_handled[order_id] = time_fn()
                 if error:
                     errors.append(error)
             if self._account_client:
@@ -2177,7 +2233,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     ok, error = self._cancel_order_idempotent(order_id)
                     if ok:
                         canceled += 1
-                        self._pilot_stale_handled[order_id] = time()
+                        self._pilot_stale_handled[order_id] = time_fn()
                     if error:
                         errors.append(error)
                 open_orders_retry = self._account_client.get_open_orders(self._symbol)
@@ -2759,80 +2815,85 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return mapping.get(state, state.value)
 
     def _update_pilot_panel(self) -> None:
-        if not hasattr(self, "_pilot_state_value"):
-            return
-        self._pilot_state_value.setText(self._pilot_state_label(self._pilot_state))
-        regime = "Диапазон"
-        if len(self._price_history) >= 10:
-            first_price = self._price_history[0]
-            last_price = self._price_history[-1]
-            if first_price:
-                if last_price > first_price * 1.001:
-                    regime = "Тренд вверх"
-                elif last_price < first_price * 0.999:
-                    regime = "Тренд вниз"
-        self._pilot_regime_value.setText(regime)
+        try:
+            if not hasattr(self, "_pilot_state_value"):
+                return
+            self._pilot_state_value.setText(self._pilot_state_label(self._pilot_state))
+            regime = "Диапазон"
+            if len(self._price_history) >= 10:
+                first_price = self._price_history[0]
+                last_price = self._price_history[-1]
+                if first_price:
+                    if last_price > first_price * 1.001:
+                        regime = "Тренд вверх"
+                    elif last_price < first_price * 0.999:
+                        regime = "Тренд вниз"
+            self._pilot_regime_value.setText(regime)
 
-        tick = self._rule_decimal(self._exchange_rules.get("tick"))
-        step = self._rule_decimal(self._exchange_rules.get("step"))
-        anchor_text = "—"
-        if self._pilot_anchor_price is not None:
-            anchor_text = self.fmt_price(self.as_decimal(self._pilot_anchor_price), tick)
-        self._pilot_anchor_value.setText(anchor_text)
+            tick = self._rule_decimal(self._exchange_rules.get("tick"))
+            step = self._rule_decimal(self._exchange_rules.get("step"))
+            anchor_text = "—"
+            if self._pilot_anchor_price is not None:
+                anchor_text = self.fmt_price(self.as_decimal(self._pilot_anchor_price), tick)
+            self._pilot_anchor_value.setText(anchor_text)
 
-        distance_text = "—"
-        distance_pct: float | None = None
-        if self._pilot_anchor_price and self._last_price is not None:
-            distance_pct = abs(self._last_price - self._pilot_anchor_price) / self._pilot_anchor_price * 100
-            distance_text = f"{distance_pct:.2f} %"
-        self._pilot_distance_value.setText(distance_text)
+            distance_text = "—"
+            distance_pct: float | None = None
+            if self._pilot_anchor_price and self._last_price is not None:
+                distance_pct = abs(self._last_price - self._pilot_anchor_price) / self._pilot_anchor_price * 100
+                distance_text = f"{distance_pct:.2f} %"
+            self._pilot_distance_value.setText(distance_text)
 
-        if (
-            self._pilot_state == PilotState.NORMAL
-            and distance_pct is not None
-            and distance_pct > RECENTER_THRESHOLD_PCT
-        ):
-            self._append_log(
-                f"[NC MICRO] auto-recenter trigger distance={distance_pct:.2f}% symbol={self._symbol}",
-                kind="INFO",
-            )
-            if self._pilot_auto_actions_enabled:
-                self._pilot_execute(PilotAction.RECENTER, auto=True, reason="distance")
+            if (
+                self._pilot_state == PilotState.NORMAL
+                and distance_pct is not None
+                and distance_pct > RECENTER_THRESHOLD_PCT
+            ):
+                self._append_log(
+                    f"[NC MICRO] auto-recenter trigger distance={distance_pct:.2f}% symbol={self._symbol}",
+                    kind="INFO",
+                )
+                if self._pilot_auto_actions_enabled:
+                    self._pilot_execute(PilotAction.RECENTER, auto=True, reason="distance")
+                else:
+                    self._pilot_set_warning("Рекомендуется перестроить")
+
+            position_state = self._pilot_position_state()
+            position_qty = self.as_decimal(position_state.position_qty)
+            position_qty_text = self.fmt_qty(position_qty, step) if position_qty > 0 else "—"
+            self._pilot_position_qty_value.setText(position_qty_text)
+
+            avg_entry = self._pilot_average_entry_price()
+            avg_entry_text = "—"
+            if avg_entry is not None and avg_entry > 0:
+                avg_entry_text = self.fmt_price(avg_entry, tick)
+            self._pilot_avg_entry_value.setText(avg_entry_text)
+
+            break_even = self._pilot_break_even_price()
+            break_even_text = "—"
+            if break_even is not None and break_even > 0:
+                break_even_text = self.fmt_price(break_even, tick)
+            self._pilot_break_even_value.setText(break_even_text)
+            if break_even is None or position_state.position_qty <= 0:
+                self._pilot_break_even_value.setToolTip("")
             else:
-                self._pilot_set_warning("Рекомендуется перестроить")
+                self._pilot_break_even_value.setToolTip("")
+            has_position = position_qty > 0
+            be_actions_enabled = has_position and break_even is not None and break_even > 0
+            if hasattr(self, "_pilot_recovery_button"):
+                self._pilot_recovery_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
+            if hasattr(self, "_pilot_flatten_button"):
+                self._pilot_flatten_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
 
-        position_state = self._pilot_position_state()
-        position_qty = self.as_decimal(position_state.position_qty)
-        position_qty_text = self.fmt_qty(position_qty, step) if position_qty > 0 else "—"
-        self._pilot_position_qty_value.setText(position_qty_text)
-
-        avg_entry = self._pilot_average_entry_price()
-        avg_entry_text = "—"
-        if avg_entry is not None and avg_entry > 0:
-            avg_entry_text = self.fmt_price(avg_entry, tick)
-        self._pilot_avg_entry_value.setText(avg_entry_text)
-
-        break_even = self._pilot_break_even_price()
-        break_even_text = "—"
-        if break_even is not None and break_even > 0:
-            break_even_text = self.fmt_price(break_even, tick)
-        self._pilot_break_even_value.setText(break_even_text)
-        if break_even is None or position_state.position_qty <= 0:
-            self._pilot_break_even_value.setToolTip("")
-        else:
-            self._pilot_break_even_value.setToolTip("")
-        has_position = position_qty > 0
-        be_actions_enabled = has_position and break_even is not None and break_even > 0
-        if hasattr(self, "_pilot_recovery_button"):
-            self._pilot_recovery_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
-        if hasattr(self, "_pilot_flatten_button"):
-            self._pilot_flatten_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
-
-        pnl_text = "—"
-        if self._last_price is not None and self._base_asset:
-            base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
-            pnl_text = self.fmt_price(self.as_decimal(base_free), None)
-        self._pilot_unrealized_value.setText(pnl_text)
+            pnl_text = "—"
+            if self._last_price is not None and self._base_asset:
+                base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
+                pnl_text = self.fmt_price(self.as_decimal(base_free), None)
+            self._pilot_unrealized_value.setText(pnl_text)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _update_pilot_panel")
+            self._notify_crash("_update_pilot_panel")
+            return
 
     def _collect_order_metrics(self) -> tuple[int, int, int, int | None, OrderInfo | None, int | None]:
         total = self._orders_table.rowCount() if hasattr(self, "_orders_table") else 0
@@ -2852,13 +2913,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _snapshot_age_sec(self) -> int | None:
         if self._open_orders_snapshot_ts is None:
             return None
-        return int(max(time() - self._open_orders_snapshot_ts, 0))
+        return int(max(time_fn() - self._open_orders_snapshot_ts, 0))
 
     @staticmethod
     def _last_seen_age_sec(info: OrderInfo | None) -> int | None:
         if info is None:
             return None
-        return int(max(time() - info.last_seen_ts, 0))
+        return int(max(time_fn() - info.last_seen_ts, 0))
 
     def _stale_drift_pct(self) -> float:
         symbol = self._symbol.replace("/", "").upper()
@@ -3035,7 +3096,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _calculate_oldest_order_age_sec(self) -> tuple[int | None, OrderInfo | None]:
         if not self._open_orders:
             return None, None
-        now = time()
+        now = time_fn()
         oldest_age_sec: int | None = None
         oldest_info: OrderInfo | None = None
         for order in self._open_orders:
@@ -3061,7 +3122,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> tuple[list[StaleOrderCandidate], OrderInfo | None, int | None]:
         if not self._open_orders:
             return [], None, None
-        now = time()
+        now = time_fn()
         now_mono = monotonic()
         drift_threshold = self._stale_grid_threshold_pct(settings)
         stale: list[StaleOrderCandidate] = []
@@ -3162,7 +3223,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> list[StaleOrderCandidate]:
         if not orders:
             return []
-        now = time()
+        now = time_fn()
         drift_threshold = self._stale_grid_threshold_pct(settings)
         stale: list[StaleOrderCandidate] = []
         for order in orders:
@@ -3216,7 +3277,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return stale
 
     def _update_order_info_from_snapshot(self, orders: list[dict[str, Any]]) -> None:
-        now = time()
+        now = time_fn()
         self._open_orders_snapshot_ts = now
         seen_ids: set[str] = set()
         for order in orders:
@@ -3304,7 +3365,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 f"— (policy={self._pilot_stale_policy.value})"
             )
             if self._pilot_warning_override and self._pilot_warning_override_until:
-                if time() <= self._pilot_warning_override_until:
+                if time_fn() <= self._pilot_warning_override_until:
                     self._pilot_orders_warning_value.setText(self._pilot_warning_override)
                     self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
                 else:
@@ -3366,7 +3427,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._maybe_log_stale_orders(total, stale_orders[0] if stale_orders else None)
             self._maybe_handle_stale_auto_action(stale_orders)
         else:
-            now = time()
+            now = time_fn()
             if self._pilot_warning_override and self._pilot_warning_override_until:
                 if now <= self._pilot_warning_override_until:
                     self._pilot_orders_warning_value.setText(self._pilot_warning_override)
@@ -3471,10 +3532,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_execute_cancel_replace_stale(stale_orders, auto=True, reason="stale")
 
     def _emit_price_update(self, update: PriceUpdate) -> None:
-        self._signals.price_update.emit(update)
+        try:
+            self._signals.price_update.emit(update)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _emit_price_update")
+            self._notify_crash("_emit_price_update")
+            return
 
     def _emit_status_update(self, status: str, message: str) -> None:
-        self._signals.status_update.emit(status, message)
+        try:
+            self._signals.status_update.emit(status, message)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _emit_status_update")
+            self._notify_crash("_emit_status_update")
+            return
 
     def _kpi_allows_start(self) -> bool:
         if self._kpi_state != KPI_STATE_INVALID:
@@ -3620,28 +3691,33 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def update_market_kpis(self) -> None:
-        if self._closing:
-            return
-        if not hasattr(self, "_market_price"):
-            return
-        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
-        price = snapshot.last_price if snapshot else None
-        source = snapshot.source if snapshot else None
-        age_ms = snapshot.price_age_ms if snapshot else None
-        micro = snapshot
-        if self._last_price_update:
-            if price is None and self._last_price_update.last_price is not None:
-                price = self._last_price_update.last_price
-            if source is None and self._last_price_update.source is not None:
-                source = self._last_price_update.source
-            if age_ms is None and self._last_price_update.price_age_ms is not None:
-                age_ms = self._last_price_update.price_age_ms
-            if micro is None:
-                micro = self._last_price_update.microstructure
+        try:
+            if self._closing:
+                return
+            if not hasattr(self, "_market_price"):
+                return
+            snapshot = (
+                self._price_feed_manager.get_snapshot(self._symbol)
+                if hasattr(self, "_price_feed_manager")
+                else None
+            )
+            price = snapshot.last_price if snapshot else None
+            source = snapshot.source if snapshot else None
+            age_ms = snapshot.price_age_ms if snapshot else None
+            micro = snapshot
+            if self._last_price_update:
+                if price is None and self._last_price_update.last_price is not None:
+                    price = self._last_price_update.last_price
+                if source is None and self._last_price_update.source is not None:
+                    source = self._last_price_update.source
+                if age_ms is None and self._last_price_update.price_age_ms is not None:
+                    age_ms = self._last_price_update.price_age_ms
+                if micro is None:
+                    micro = self._last_price_update.microstructure
 
-        now_ts = monotonic()
-        price_cache_used = False
-        price_cache_age_ms = None
+            now_ts = monotonic()
+            price_cache_used = False
+            price_cache_age_ms = None
         if not isinstance(price, (int, float)) or price <= 0:
             price = None
         if price is not None:
@@ -3686,7 +3762,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._market_spread.setText(spread_text)
         self._set_market_label_state(self._market_spread, active=spread_text != "—")
 
-        sample_ts = time()
+        sample_ts = time_fn()
         if best_bid is not None and best_ask is not None:
             mid = (best_bid + best_ask) / 2
             self._record_kpi_vol_sample(mid, sample_ts)
@@ -3841,6 +3917,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._kpi_zero_vol_ticks = 0
             self._kpi_zero_vol_start_ts = None
             self._kpi_missing_bidask_since_ts = None
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in update_market_kpis")
+            self._notify_crash("update_market_kpis")
+            return
 
     def _compute_recent_volatility_pct(self) -> float | None:
         if len(self._price_history) < 2:
@@ -4942,22 +5022,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_grid_preview()
 
     def _refresh_balances(self, force: bool = False) -> None:
-        self._balances_tick_count += 1
-        if self._balances_tick_count % 30 == 0:
-            self._logger.debug("balances refresh tick")
-        if not self._account_client:
-            self._balances_loaded = False
-            self._set_account_status("no_keys")
-            self._apply_trade_gate()
-            self._update_runtime_balances()
+        try:
+            self._balances_tick_count += 1
+            if self._balances_tick_count % 30 == 0:
+                self._logger.debug("balances refresh tick")
+            if not self._account_client:
+                self._balances_loaded = False
+                self._set_account_status("no_keys")
+                self._apply_trade_gate()
+                self._update_runtime_balances()
+                return
+            if self._balances_in_flight and not force:
+                return
+            self._balances_in_flight = True
+            worker = _Worker(self._account_client.get_account_info, self._can_emit_worker_results)
+            worker.signals.success.connect(self._handle_account_info)
+            worker.signals.error.connect(self._handle_account_error)
+            self._thread_pool.start(worker)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_balances")
+            self._notify_crash("_refresh_balances")
             return
-        if self._balances_in_flight and not force:
-            return
-        self._balances_in_flight = True
-        worker = _Worker(self._account_client.get_account_info, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_account_info)
-        worker.signals.error.connect(self._handle_account_error)
-        self._thread_pool.start(worker)
 
     def _handle_account_info(self, result: object, latency_ms: int) -> None:
         self._balances_in_flight = False
@@ -5030,37 +5115,42 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._signals.balances_refresh.emit(False)
 
     def _refresh_open_orders(self, force: bool = False) -> None:
-        self._orders_tick_count += 1
-        if self._orders_tick_count % 30 == 0:
-            self._logger.debug("orders refresh tick")
-        if not self._account_client:
-            self._set_account_status("no_keys")
-            self._open_orders_all = []
-            self._open_orders = []
-            self._open_orders_map = {}
-            self._clear_order_info()
-            self._bot_client_ids.clear()
-            self._bot_order_keys = set()
-            self._active_order_keys.clear()
-            self._recent_order_keys.clear()
-            self._order_id_to_registry_key.clear()
-            self._active_tp_ids.clear()
-            self._active_restore_ids.clear()
-            self._render_open_orders()
-            self._apply_trade_gate()
+        try:
+            self._orders_tick_count += 1
+            if self._orders_tick_count % 30 == 0:
+                self._logger.debug("orders refresh tick")
+            if not self._account_client:
+                self._set_account_status("no_keys")
+                self._open_orders_all = []
+                self._open_orders = []
+                self._open_orders_map = {}
+                self._clear_order_info()
+                self._bot_client_ids.clear()
+                self._bot_order_keys = set()
+                self._active_order_keys.clear()
+                self._recent_order_keys.clear()
+                self._order_id_to_registry_key.clear()
+                self._active_tp_ids.clear()
+                self._active_restore_ids.clear()
+                self._render_open_orders()
+                self._apply_trade_gate()
+                return
+            if not force:
+                snapshot_age_sec = self._snapshot_age_sec()
+                if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
+                    self._append_log("[ORDERS] snapshot stale -> refresh", kind="INFO")
+                    force = True
+            if self._orders_in_flight and not force:
+                return
+            self._orders_in_flight = True
+            worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
+            worker.signals.success.connect(self._handle_open_orders)
+            worker.signals.error.connect(self._handle_open_orders_error)
+            self._thread_pool.start(worker)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_open_orders")
+            self._notify_crash("_refresh_open_orders")
             return
-        if not force:
-            snapshot_age_sec = self._snapshot_age_sec()
-            if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
-                self._append_log("[ORDERS] snapshot stale -> refresh", kind="INFO")
-                force = True
-        if self._orders_in_flight and not force:
-            return
-        self._orders_in_flight = True
-        worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_open_orders)
-        worker.signals.error.connect(self._handle_open_orders_error)
-        self._thread_pool.start(worker)
 
     def _prime_bot_registry_from_exchange(self) -> None:
         if not self._account_client:
@@ -5096,22 +5186,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._sync_registry_from_open_orders(self._open_orders)
 
     def _refresh_fills(self) -> None:
-        if self._dry_run_toggle.isChecked():
+        try:
+            if self._dry_run_toggle.isChecked():
+                return
+            if self._state != "RUNNING":
+                return
+            if not self._account_client:
+                return
+            if self._fills_in_flight:
+                return
+            self._fills_in_flight = True
+            worker = _Worker(
+                lambda: self._account_client.get_my_trades(self._symbol, limit=50),
+                self._can_emit_worker_results,
+            )
+            worker.signals.success.connect(self._handle_fill_poll)
+            worker.signals.error.connect(self._handle_fill_poll_error)
+            self._thread_pool.start(worker)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_fills")
+            self._notify_crash("_refresh_fills")
             return
-        if self._state != "RUNNING":
-            return
-        if not self._account_client:
-            return
-        if self._fills_in_flight:
-            return
-        self._fills_in_flight = True
-        worker = _Worker(
-            lambda: self._account_client.get_my_trades(self._symbol, limit=50),
-            self._can_emit_worker_results,
-        )
-        worker.signals.success.connect(self._handle_fill_poll)
-        worker.signals.error.connect(self._handle_fill_poll_error)
-        self._thread_pool.start(worker)
 
     def _handle_fill_poll(self, result: object, latency_ms: int) -> None:
         self._fills_in_flight = False
@@ -5278,7 +5373,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _sync_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
-        now = time()
+        now = time_fn()
         for order in orders:
             if not isinstance(order, dict):
                 continue
@@ -5358,7 +5453,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _register_order_key(self, key: str, ttl_s: float | None = None) -> None:
         self._active_order_keys.add(key)
-        self._registry_key_last_seen_ts[key] = time()
+        self._registry_key_last_seen_ts[key] = time_fn()
         self._mark_recent_order_key(key, ttl_s or self._recent_key_ttl_s)
 
     def _discard_order_registry_key(self, key: str, *, drop_recent: bool = False) -> None:
@@ -5396,36 +5491,41 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._discard_registry_for_values(side, self.as_decimal(price), self.as_decimal(qty))
 
     def _gc_registry_keys(self) -> None:
-        now = time()
-        if self._registry_gc_last_ts and now - self._registry_gc_last_ts < REGISTRY_GC_INTERVAL_MS / 1000:
+        try:
+            now = time_fn()
+            if self._registry_gc_last_ts and now - self._registry_gc_last_ts < REGISTRY_GC_INTERVAL_MS / 1000:
+                return
+            self._registry_gc_last_ts = now
+            expired_keys = [
+                key
+                for key, last_seen in self._registry_key_last_seen_ts.items()
+                if now - last_seen > REGISTRY_GC_TTL_SEC
+            ]
+            for key in expired_keys:
+                self._discard_order_registry_key(key, drop_recent=True)
+            for order_id, key in list(self._order_id_to_registry_key.items()):
+                if order_id in self._open_orders_map:
+                    continue
+                last_seen = self._registry_key_last_seen_ts.get(key)
+                if last_seen is None or now - last_seen > REGISTRY_GC_TTL_SEC:
+                    self._discard_registry_for_order_id(order_id)
+            stale_cutoff = now - STALE_COOLDOWN_SEC
+            self._pilot_stale_handled = {
+                order_id: ts for order_id, ts in self._pilot_stale_handled.items() if ts >= stale_cutoff
+            }
+            self._pilot_stale_skip_log_ts = {
+                order_id: ts for order_id, ts in self._pilot_stale_skip_log_ts.items() if ts >= stale_cutoff
+            }
+            self._pilot_stale_order_log_ts = {
+                order_id: ts for order_id, ts in self._pilot_stale_order_log_ts.items() if ts >= stale_cutoff
+            }
+            self._pilot_stale_check_log_ts = {
+                order_id: ts for order_id, ts in self._pilot_stale_check_log_ts.items() if ts >= stale_cutoff
+            }
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _gc_registry_keys")
+            self._notify_crash("_gc_registry_keys")
             return
-        self._registry_gc_last_ts = now
-        expired_keys = [
-            key
-            for key, last_seen in self._registry_key_last_seen_ts.items()
-            if now - last_seen > REGISTRY_GC_TTL_SEC
-        ]
-        for key in expired_keys:
-            self._discard_order_registry_key(key, drop_recent=True)
-        for order_id, key in list(self._order_id_to_registry_key.items()):
-            if order_id in self._open_orders_map:
-                continue
-            last_seen = self._registry_key_last_seen_ts.get(key)
-            if last_seen is None or now - last_seen > REGISTRY_GC_TTL_SEC:
-                self._discard_registry_for_order_id(order_id)
-        stale_cutoff = now - STALE_COOLDOWN_SEC
-        self._pilot_stale_handled = {
-            order_id: ts for order_id, ts in self._pilot_stale_handled.items() if ts >= stale_cutoff
-        }
-        self._pilot_stale_skip_log_ts = {
-            order_id: ts for order_id, ts in self._pilot_stale_skip_log_ts.items() if ts >= stale_cutoff
-        }
-        self._pilot_stale_order_log_ts = {
-            order_id: ts for order_id, ts in self._pilot_stale_order_log_ts.items() if ts >= stale_cutoff
-        }
-        self._pilot_stale_check_log_ts = {
-            order_id: ts for order_id, ts in self._pilot_stale_check_log_ts.items() if ts >= stale_cutoff
-        }
 
     @staticmethod
     def _classify_2010_reason(message: str) -> str:
@@ -6077,7 +6177,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if allow_tp:
             profitability = self._evaluate_tp_min_profit(fill.side, fill_price, tp_price)
             if not profitability.get("is_profitable", True):
-                now_ts = time()
+                now_ts = time_fn()
                 min_profit_key = tp_client_order_id or fill.order_id or fill_order_key
                 last_action_ts = self._tp_min_profit_action_ts.get(min_profit_key)
                 if last_action_ts and now_ts - last_action_ts < TP_MIN_PROFIT_COOLDOWN_SEC:
@@ -6967,7 +7067,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _refresh_trade_fees(self, force: bool = False) -> None:
         if not self._account_client or self._fees_in_flight:
             return
-        now = time()
+        now = time_fn()
         if not force and self._fees_last_fetch_ts and now - self._fees_last_fetch_ts < 1800:
             return
         self._fees_in_flight = True
@@ -6986,7 +7086,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             maker = self._coerce_float(str(entry.get("makerCommission", "")))
             taker = self._coerce_float(str(entry.get("takerCommission", "")))
             self._trade_fees = (maker, taker)
-        self._fees_last_fetch_ts = time()
+        self._fees_last_fetch_ts = time_fn()
         self._update_rules_label()
         self._append_log(f"Trade fees loaded ({latency_ms}ms).", kind="INFO")
 
@@ -7007,7 +7107,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if maker is None or taker is None:
             return
         self._trade_fees = (maker / 10_000, taker / 10_000)
-        self._fees_last_fetch_ts = time()
+        self._fees_last_fetch_ts = time_fn()
         self._update_rules_label()
 
     def _apply_trade_gate(self) -> None:
@@ -7279,7 +7379,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _render_open_orders(self) -> None:
         self._orders_table.setRowCount(len(self._open_orders))
-        now_ms = int(time() * 1000)
+        now_ms = int(time_fn() * 1000)
         for row, order in enumerate(self._open_orders):
             order_id = str(order.get("orderId", "—"))
             side = str(order.get("side", "—"))
@@ -7299,7 +7399,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _render_sim_orders(self, planned: list[GridPlannedOrder]) -> None:
         self._orders_table.setRowCount(len(planned))
-        now_ms = int(time() * 1000)
+        now_ms = int(time_fn() * 1000)
         for row, order in enumerate(planned):
             order_id = f"SIM-{row + 1}"
             age_text = self._format_age(now_ms, now_ms)
@@ -7847,6 +7947,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._log_entries.append(entry)
         self._apply_log_filter()
         self._logger.info("%s | %s | %s", self._symbol, entry[0], entry[1])
+
+    def _notify_crash(self, source: str) -> None:
+        if not self._crash_log_path:
+            return
+        if self._crash_notified:
+            return
+        self._crash_notified = True
+        self._append_log(
+            f"[NC_MICRO][CRASH] see crash log: {self._crash_log_path} (source={source})",
+            kind="ERR",
+        )
 
     def _apply_log_filter(self) -> None:
         if not hasattr(self, "_log_view"):
