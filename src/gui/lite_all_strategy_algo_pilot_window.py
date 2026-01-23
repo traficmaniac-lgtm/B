@@ -706,6 +706,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._recent_order_keys: dict[str, float] = {}
         self._order_id_to_registry_key: dict[str, str] = {}
         self._order_id_to_level_index: dict[str, int] = {}
+        self._closed_order_ids: set[str] = set()
         self._recent_key_ttl_s = 8.0
         self._recent_key_insufficient_ttl_s = 2.0
         self._bot_session_id: str | None = None
@@ -841,7 +842,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=1.3 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version=1.4 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1676,12 +1677,17 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 buy_count,
                 sell_count,
                 oldest_age_sec,
-                _oldest_info,
+                oldest_info,
                 snapshot_age_sec,
             ) = self._collect_order_metrics()
             if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
                 self._pilot_set_warning("Снимок ордеров устарел")
                 self._maybe_log_open_orders_snapshot_stale(snapshot_age_sec)
+                return
+            last_seen_age = self._last_seen_age_sec(oldest_info)
+            if last_seen_age is not None and last_seen_age > STALE_SNAPSHOT_MAX_AGE_SEC:
+                self._pilot_set_warning("Снимок ордеров устарел")
+                self._maybe_log_open_orders_snapshot_stale(last_seen_age, skip_actions=True)
                 return
             oldest_value = oldest_age_sec if oldest_age_sec is not None else 0
             self._append_log(
@@ -1706,11 +1712,16 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 self._pilot_execute(PilotAction.RECENTER)
             return
         if action == PilotAction.CANCEL_REPLACE_STALE:
-            stale_orders, _oldest_info, _oldest_age = self._collect_stale_orders(
+            stale_orders, oldest_info, _oldest_age = self._collect_stale_orders(
                 threshold_sec=MAX_ORDER_AGE_SEC
             )
             if not stale_orders:
                 self._pilot_set_warning("Устаревших ордеров нет")
+                return
+            last_seen_age = self._last_seen_age_sec(oldest_info)
+            if last_seen_age is not None and last_seen_age > STALE_SNAPSHOT_MAX_AGE_SEC:
+                self._pilot_set_warning("Снимок ордеров устарел")
+                self._maybe_log_open_orders_snapshot_stale(last_seen_age, skip_actions=True)
                 return
             if not self._pilot_trade_gate_ready(action):
                 return
@@ -1837,11 +1848,18 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             }
             for candidate in valid_orders:
                 order_id = candidate.info.order_id
-                try:
-                    self._account_client.cancel_order(self._symbol, order_id)
+                ok, error = self._cancel_order_idempotent(order_id)
+                if ok:
                     canceled += 1
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(self._format_cancel_exception(exc, order_id))
+                if error:
+                    errors.append(error)
+            open_orders_after: list[dict[str, Any]] = []
+            if self._account_client:
+                open_orders_after = self._account_client.get_open_orders(self._symbol)
+                bot_orders = self._filter_bot_orders(
+                    [order for order in open_orders_after if isinstance(order, dict)]
+                )
+                self._rebuild_registry_from_open_orders(bot_orders)
             for candidate in valid_orders:
                 side = candidate.info.side
                 price = self.as_decimal(candidate.info.price)
@@ -1978,10 +1996,16 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     order_id = str(order.get("orderId", ""))
                     if not order_id:
                         continue
-                    try:
-                        self._account_client.cancel_order(self._symbol, order_id)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(self._format_cancel_exception(exc, order_id))
+                    ok, error = self._cancel_order_idempotent(order_id)
+                    if ok:
+                        continue
+                    if error:
+                        errors.append(error)
+                open_orders_after = self._account_client.get_open_orders(self._symbol)
+                bot_orders = self._filter_bot_orders(
+                    [order for order in open_orders_after if isinstance(order, dict)]
+                )
+                self._rebuild_registry_from_open_orders(bot_orders)
             response = None
             error = None
             status = ""
@@ -2051,11 +2075,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     order_id = str(order.get("orderId", ""))
                     if not order_id:
                         continue
-                    try:
-                        self._account_client.cancel_order(self._symbol, order_id)
+                    ok, error = self._cancel_order_idempotent(order_id)
+                    if ok:
                         canceled += 1
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(self._format_cancel_exception(exc, order_id))
+                    if error:
+                        errors.append(error)
             open_orders_after: list[dict[str, Any]] = []
             if self._account_client:
                 deadline = monotonic() + 5.0
@@ -2102,7 +2126,17 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                         f"[ALGO PILOT] recenter cancel wait timeout open_orders={open_count}",
                         kind="WARN",
                     )
-            self._clear_local_order_registry()
+                self._open_orders_all = [item for item in open_orders_after if isinstance(item, dict)]
+                self._open_orders = self._filter_bot_orders(self._open_orders_all)
+                self._open_orders_map = {
+                    str(order.get("orderId", "")): order
+                    for order in self._open_orders
+                    if str(order.get("orderId", ""))
+                }
+                self._update_order_info_from_snapshot(self._open_orders)
+                self._rebuild_registry_from_open_orders(self._open_orders)
+            else:
+                self._rebuild_registry_from_open_orders([])
         self._place_live_orders(plan)
 
     def _pilot_wait_for_recenter_open_orders(self, expected_min: int) -> None:
@@ -2390,6 +2424,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return None
         return int(max(time() - self._open_orders_snapshot_ts, 0))
 
+    @staticmethod
+    def _last_seen_age_sec(info: OrderInfo | None) -> int | None:
+        if info is None:
+            return None
+        return int(max(time() - info.last_seen_ts, 0))
+
     def _calculate_oldest_order_age_sec(self) -> tuple[int | None, OrderInfo | None]:
         if not self._open_orders:
             return None, None
@@ -2540,6 +2580,13 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         stale_orders, oldest_info, oldest_age_sec = self._collect_stale_orders(
             threshold_sec=MAX_ORDER_AGE_SEC
         )
+        last_seen_age = self._last_seen_age_sec(oldest_info)
+        if last_seen_age is not None and last_seen_age > STALE_SNAPSHOT_MAX_AGE_SEC:
+            self._pilot_orders_warning_value.setText("Снимок ордеров устарел")
+            self._pilot_orders_warning_value.setStyleSheet("color: #dc2626; font-weight: 600;")
+            self._maybe_log_open_orders_snapshot_stale(last_seen_age, skip_actions=True)
+            self._pilot_stale_active = False
+            return
         is_stale = bool(stale_orders)
         if is_stale and oldest_age_sec is not None:
             mins = max(1, int(ceil(oldest_age_sec / 60)))
@@ -2594,7 +2641,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     "[WARN] [ALGO_PILOT] stale detected "
                     f"total={total} oldest_age={oldest_age_sec} threshold={MAX_ORDER_AGE_SEC} "
                     f"oldest={oldest_info.order_id} {oldest_info.side} {price_text} "
-                    f"last_seen={seen_age} policy={self._pilot_stale_policy.value} "
+                    f"last_seen_age={seen_age} policy={self._pilot_stale_policy.value} "
                     f"auto={auto_state} gate={gate_state} confirm={confirm_state}"
                 ),
                 kind="WARN",
@@ -2604,7 +2651,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_stale_last_log_total = total
         self._pilot_stale_active = True
 
-    def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int) -> None:
+    def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
         now = monotonic()
         should_log = False
         if not self._pilot_snapshot_stale_active:
@@ -2614,8 +2661,9 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         elif now - self._pilot_snapshot_stale_last_log_ts >= STALE_LOG_DEDUP_SEC:
             should_log = True
         if should_log:
+            suffix = " -> skip stale actions" if skip_actions else ""
             self._append_log(
-                f"[WARN] [ALGO_PILOT] open_orders snapshot stale age={snapshot_age_sec}s",
+                f"[WARN] [ALGO_PILOT] open_orders snapshot stale age={snapshot_age_sec}s{suffix}",
                 kind="WARN",
             )
             self._pilot_snapshot_stale_last_log_ts = now
@@ -3221,8 +3269,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._fill_keys.clear()
         self._fill_accumulator = FillAccumulator()
         self._active_action_keys.clear()
-        if not keep_open_orders:
-            self._clear_local_order_registry()
+        self._clear_local_order_registry()
+        self._closed_order_ids.clear()
         self._order_id_to_level_index.clear()
         self._open_orders_map = {}
         self._bot_session_id = None
@@ -3267,7 +3315,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     continue
                 try:
                     if order_id:
-                        self._account_client.cancel_order(self._symbol, order_id=order_id)
+                        ok, error = self._cancel_order_idempotent(order_id)
+                        if error:
+                            failed += 1
+                            failed_ids.append(order_id)
+                            errors.append(error)
+                            continue
                     else:
                         self._account_client.cancel_order(
                             self._symbol,
@@ -3363,8 +3416,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 if str(order.get("orderId", ""))
             }
             self._clear_local_order_registry()
-            if self._open_orders:
-                self._sync_registry_from_open_orders(self._open_orders)
         errors = result.get("errors", [])
         if isinstance(errors, list):
             for message in errors:
@@ -4064,6 +4115,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             if order_id and order_id not in self._open_orders_map
         ]
         for order_id in closed_order_ids:
+            self._closed_order_ids.add(order_id)
             self._discard_registry_for_order_id(order_id)
         self._render_open_orders()
         self._grid_engine.sync_open_orders(self._open_orders)
@@ -4132,6 +4184,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._active_order_keys.clear()
         self._recent_order_keys.clear()
         self._order_id_to_registry_key.clear()
+
+    def _rebuild_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
+        self._clear_local_order_registry()
+        if orders:
+            self._sync_registry_from_open_orders(orders)
 
     def _sync_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
@@ -4362,6 +4419,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     self._pending_tp_ids.discard(client_order_id)
                     self._pending_restore_ids.discard(client_order_id)
                 if order_id:
+                    self._closed_order_ids.add(order_id)
                     self._discard_registry_for_order_id(order_id)
                 continue
             if status in {"CANCELED", "EXPIRED", "REJECTED"}:
@@ -4372,6 +4430,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     self._pending_tp_ids.discard(client_order_id)
                     self._pending_restore_ids.discard(client_order_id)
                 self._discard_registry_for_order(order)
+                if order_id and order_id in self._closed_order_ids:
+                    continue
+                if order_id:
+                    self._closed_order_ids.add(order_id)
                 self._append_log(
                     f"[LIVE] order closed orderId={order_id} status={status}",
                     kind="ORDERS",
@@ -5394,6 +5456,34 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             f"orderId={order_id} status={status} code={code} msg={message} response={response_body}"
         )
 
+    def _cancel_order_idempotent(self, order_id: str) -> tuple[bool, str | None]:
+        if not order_id or not self._account_client:
+            return False, None
+        if order_id in self._closed_order_ids:
+            return False, None
+        try:
+            self._account_client.cancel_order(self._symbol, order_id)
+        except Exception as exc:  # noqa: BLE001
+            _status, code, _message, _response = self._parse_binance_exception(exc)
+            if code == -2011:
+                self._signals.log_append.emit(
+                    f"[INFO] cancel unknown -> treated as done orderId={order_id}",
+                    "INFO",
+                )
+                self._closed_order_ids.add(order_id)
+                self._discard_registry_for_order_id(order_id)
+                self._open_orders_map.pop(order_id, None)
+                self._order_info_map.pop(order_id, None)
+                self._bot_order_ids.discard(order_id)
+                return True, None
+            return False, self._format_cancel_exception(exc, order_id)
+        self._closed_order_ids.add(order_id)
+        self._discard_registry_for_order_id(order_id)
+        self._open_orders_map.pop(order_id, None)
+        self._order_info_map.pop(order_id, None)
+        self._bot_order_ids.discard(order_id)
+        return True, None
+
     def find_matching_order(
         self,
         side: str,
@@ -6162,33 +6252,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             responses: list[dict[str, Any]] = []
             batch_size = 4
             for idx, order_id in enumerate(filtered_ids, start=1):
-                attempts = 3
-                for attempt in range(attempts):
-                    try:
-                        response = self._account_client.cancel_order(self._symbol, order_id)
-                        responses.append(response)
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        status, code, message, response_body = self._parse_binance_exception(exc)
-                        lower_message = str(message).lower()
-                        if code == -2011 or "unknown order" in lower_message:
-                            self._signals.log_append.emit(
-                                (
-                                    "[LIVE] cancel skipped: unknown order "
-                                    f"orderId={order_id} status={status} code={code} msg={message} response={response_body}"
-                                ),
-                                "WARN",
-                            )
-                            break
-                        if not self._is_rate_limit_or_server_error(message) or attempt == attempts - 1:
-                            error_text = (
-                                "[LIVE] cancel failed "
-                                f"orderId={order_id} status={status} code={code} msg={message} response={response_body}"
-                            )
-                            self._signals.log_append.emit(error_text, "ERROR")
-                            self._signals.api_error.emit(error_text)
-                            break
-                        self._sleep_ms(300)
+                ok, error = self._cancel_order_idempotent(order_id)
+                if ok:
+                    responses.append({"orderId": order_id})
+                elif error:
+                    self._signals.log_append.emit(error, "ERROR")
+                    self._signals.api_error.emit(error)
                 if idx % batch_size == 0:
                     self._sleep_ms(250)
             return responses
