@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ai.operator_math import compute_fee_total_pct, evaluate_tp_profitability
+from src.ai.operator_math import compute_break_even_tp_pct, compute_fee_total_pct, evaluate_tp_profitability
 from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
@@ -167,6 +167,7 @@ STALE_SNAPSHOT_MAX_AGE_SEC = 5
 STALE_COOLDOWN_SEC = 120
 STALE_ACTION_COOLDOWN_SEC = 120
 STALE_AUTO_ACTION_PAUSE_SEC = 300
+TP_MIN_PROFIT_COOLDOWN_SEC = 30
 PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.10
 PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.10
 PROFIT_GUARD_SLIPPAGE_BPS = 1.5
@@ -832,11 +833,12 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_stale_handled: dict[str, float] = {}
         self._pilot_stale_skip_log_ts: dict[str, float] = {}
         self._pilot_stale_action_ts: dict[str, float] = {}
-        self._pilot_stale_order_log_ts: dict[str, float] = {}
-        self._pilot_stale_check_log_ts: dict[str, float] = {}
+        self._pilot_stale_order_log_ts: dict[tuple[str, str], float] = {}
+        self._pilot_stale_check_log_ts: dict[tuple[str, str], float] = {}
         self._pilot_stale_warmup_until: float | None = None
         self._pilot_stale_warmup_last_log_ts: float | None = None
         self._pilot_auto_actions_paused_until: float | None = None
+        self._tp_min_profit_action_ts: dict[str, float] = {}
         self._last_price_update: PriceUpdate | None = None
         self._feed_ok = False
         self._feed_last_ok: bool | None = None
@@ -2842,22 +2844,24 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_stale_warmup_last_log_ts = now
         return True
 
-    def _should_log_stale_order(self, order_id: str, now: float) -> bool:
+    def _should_log_stale_order(self, order_id: str, reason: str, now: float) -> bool:
         if not order_id:
             return False
-        last_log = self._pilot_stale_order_log_ts.get(order_id)
+        key = (order_id, reason)
+        last_log = self._pilot_stale_order_log_ts.get(key)
         if last_log is not None and now - last_log < STALE_ORDER_LOG_DEDUP_SEC:
             return False
-        self._pilot_stale_order_log_ts[order_id] = now
+        self._pilot_stale_order_log_ts[key] = now
         return True
 
-    def _should_log_stale_check(self, order_id: str, now: float) -> bool:
+    def _should_log_stale_check(self, order_id: str, reason: str, now: float) -> bool:
         if not order_id:
             return False
-        last_log = self._pilot_stale_check_log_ts.get(order_id)
+        key = (order_id, reason)
+        last_log = self._pilot_stale_check_log_ts.get(key)
         if last_log is not None and now - last_log < STALE_ORDER_LOG_DEDUP_SEC:
             return False
-        self._pilot_stale_check_log_ts[order_id] = now
+        self._pilot_stale_check_log_ts[key] = now
         return True
 
     def _price_key(self, side: str, price: Decimal) -> str:
@@ -2927,7 +2931,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         now = time()
         now_mono = monotonic()
         drift_threshold = self._stale_grid_threshold_pct(settings)
-        tp_profitability = self._stale_tp_profitability(settings)
         stale: list[StaleOrderCandidate] = []
         oldest_info: OrderInfo | None = None
         oldest_age_sec: int | None = None
@@ -2953,11 +2956,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             range_stale = False
             if range_low is not None and range_high is not None and info.price > 0:
                 range_stale = info.price < range_low or info.price > range_high
-            tp_profit_stale = False
-            if order_type == "TP" and tp_profitability is not None:
-                tp_profit_stale = not bool(tp_profitability.get("is_profitable", True))
             if order_type == "TP":
-                if not range_stale and not tp_profit_stale:
+                if not range_stale:
                     continue
             elif not drift_stale and not range_stale:
                 continue
@@ -2982,13 +2982,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             if drift_stale and range_stale:
                 reason = "drift,range"
             if order_type == "TP":
-                if range_stale and tp_profit_stale:
-                    reason = "range,tp_min_profit"
-                elif tp_profit_stale:
-                    reason = "tp_min_profit"
-                else:
-                    reason = "range"
-            if self._should_log_stale_check(order_id, now_mono):
+                reason = "range"
+            if self._should_log_stale_check(order_id, reason, now_mono):
                 dist_text = f"{dist_pct:.2f}%" if dist_pct is not None else "—"
                 mid_text = f"{mid_price:.8f}" if mid_price is not None else "—"
                 price_text = f"{info.price:.8f}" if info.price > 0 else "—"
@@ -3023,7 +3018,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return []
         now = time()
         drift_threshold = self._stale_grid_threshold_pct(settings)
-        tp_profitability = self._stale_tp_profitability(settings)
         stale: list[StaleOrderCandidate] = []
         for order in orders:
             if not isinstance(order, dict):
@@ -3044,11 +3038,8 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             range_stale = False
             if range_low is not None and range_high is not None and info.price > 0:
                 range_stale = info.price < range_low or info.price > range_high
-            tp_profit_stale = False
-            if order_type == "TP" and tp_profitability is not None:
-                tp_profit_stale = not bool(tp_profitability.get("is_profitable", True))
             if order_type == "TP":
-                if not range_stale and not tp_profit_stale:
+                if not range_stale:
                     continue
             elif not drift_stale and not range_stale:
                 continue
@@ -3059,12 +3050,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             if drift_stale and range_stale:
                 reason = "drift,range"
             if order_type == "TP":
-                if range_stale and tp_profit_stale:
-                    reason = "range,tp_min_profit"
-                elif tp_profit_stale:
-                    reason = "tp_min_profit"
-                else:
-                    reason = "range"
+                reason = "range"
             stale.append(
                 StaleOrderCandidate(
                     info=info,
@@ -3113,8 +3099,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._pilot_stale_seen_ids.pop(order_id, None)
             self._pilot_stale_handled.pop(order_id, None)
             self._pilot_stale_skip_log_ts.pop(order_id, None)
-            self._pilot_stale_order_log_ts.pop(order_id, None)
-            self._pilot_stale_check_log_ts.pop(order_id, None)
+            self._purge_stale_log_keys(order_id)
 
     def _clear_order_info(self) -> None:
         self._open_orders_snapshot_ts = None
@@ -3125,6 +3110,14 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._pilot_stale_skip_log_ts.clear()
         self._pilot_stale_order_log_ts.clear()
         self._pilot_stale_check_log_ts.clear()
+
+    def _purge_stale_log_keys(self, order_id: str) -> None:
+        if not order_id:
+            return
+        for key in [key for key in self._pilot_stale_order_log_ts if key[0] == order_id]:
+            self._pilot_stale_order_log_ts.pop(key, None)
+        for key in [key for key in self._pilot_stale_check_log_ts if key[0] == order_id]:
+            self._pilot_stale_check_log_ts.pop(key, None)
 
     @staticmethod
     def _format_order_age_value(age_sec: int) -> str:
@@ -3244,11 +3237,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             return
         now = monotonic()
         info = candidate.info
-        order_type = self._order_registry_type_from_client_id(str(candidate.order.get("clientOrderId", "")))
         policy_value = self._pilot_stale_policy.value
-        if order_type == "TP" and "tp_min_profit" in candidate.reason:
-            policy_value = "CANCEL_REPLACE_TP"
-        if not self._pilot_stale_active and self._should_log_stale_order(info.order_id, now):
+        if not self._pilot_stale_active and self._should_log_stale_order(
+            info.order_id, candidate.reason, now
+        ):
             gate_state = "ok" if self._trade_gate == TradeGate.TRADE_OK else "ro"
             price_text = f"{info.price:.8f}" if info.price > 0 else "—"
             dist_text = f"{candidate.dist_pct:.2f}%" if candidate.dist_pct is not None else "—"
@@ -5650,6 +5642,41 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             target_profit_pct=profile.target_profit_pct,
         )
 
+    def _evaluate_tp_min_profit(
+        self, entry_side: str, entry_price: Decimal, tp_price: Decimal
+    ) -> dict[str, float | bool]:
+        if entry_price <= 0 or tp_price <= 0:
+            return {"is_profitable": False}
+        entry_side = entry_side.upper()
+        if entry_side == "SELL":
+            profit_pct = (entry_price - tp_price) / entry_price * Decimal("100")
+        elif entry_side == "BUY":
+            profit_pct = (tp_price - entry_price) / entry_price * Decimal("100")
+        else:
+            return {"is_profitable": False}
+        inputs = self._runtime_profit_inputs()
+        maker, taker = self._trade_fees
+        maker_fee_pct = (maker * 100) if maker is not None else 0.0
+        taker_fee_pct = (taker * 100) if taker is not None else 0.0
+        fee_total_pct = compute_fee_total_pct(
+            maker_fee_pct,
+            taker_fee_pct,
+            fill_mode=inputs.get("expected_fill_mode") or "MAKER",
+            fee_discount_pct=inputs.get("fee_discount_pct"),
+        )
+        min_profit_pct = compute_break_even_tp_pct(
+            fee_total_pct=fee_total_pct,
+            slippage_pct=inputs.get("slippage_pct"),
+            safety_edge_pct=inputs.get("safety_edge_pct"),
+        )
+        net_profit_pct = float(profit_pct) - min_profit_pct
+        return {
+            "profit_pct": round(float(profit_pct), 6),
+            "min_profit_pct": round(min_profit_pct, 6),
+            "net_profit_pct": round(net_profit_pct, 6),
+            "is_profitable": float(profit_pct) >= min_profit_pct,
+        }
+
     def _apply_sell_fee_buffer(self, qty: Decimal, step: Decimal | None) -> Decimal:
         fee_rate = self._effective_fee_rate()
         if fee_rate > 0:
@@ -5769,18 +5796,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if tp_pct <= 0:
             return
         self._rebuild_registry_from_open_orders(self._open_orders)
-        profitability = self._evaluate_tp_profitability(tp_pct)
-        if not profitability.get("is_profitable", True):
-            min_tp = profitability.get("min_tp_pct")
-            break_even = profitability.get("break_even_tp_pct")
-            self._append_log(
-                (
-                    "[LIVE] TP skipped: tp_pct below break-even "
-                    f"tp_pct={tp_pct:.4f}% min_tp={min_tp:.4f}% break_even={break_even:.4f}%"
-                ),
-                kind="WARN",
-            )
-            return
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
         tp_dec = self.as_decimal(tp_pct) / Decimal("100")
@@ -5795,6 +5810,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         tp_notional = Decimal("0")
         tp_reason = "ok"
         allow_tp = True
+        tp_min_profit_detail = ""
         tp_qty_cap = Decimal("0")
         tp_required_qty = fill_qty
         tp_required_quote = Decimal("0")
@@ -5815,15 +5831,31 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             else:
                 quote_cap = quote_free / tp_price if tp_price > 0 else Decimal("0")
                 tp_qty_cap = min(fill_qty, quote_cap)
+        fill_order_key = fill.order_id or fill.trade_id or self._fill_key(fill)
+        tp_client_order_id = self._limit_client_order_id(
+            f"BBOT_LAS_v1_{self._symbol}_TP_{fill.side}_{fill_order_key}"
+        )
+        if allow_tp:
+            profitability = self._evaluate_tp_min_profit(fill.side, fill_price, tp_price)
+            if not profitability.get("is_profitable", True):
+                now_ts = time()
+                min_profit_key = tp_client_order_id or fill.order_id or fill_order_key
+                last_action_ts = self._tp_min_profit_action_ts.get(min_profit_key)
+                if last_action_ts and now_ts - last_action_ts < TP_MIN_PROFIT_COOLDOWN_SEC:
+                    tp_reason = "skip_tp_min_profit_cooldown"
+                else:
+                    self._tp_min_profit_action_ts[min_profit_key] = now_ts
+                    tp_reason = "skip_tp_min_profit"
+                    tp_min_profit_detail = (
+                        f"profit={profitability.get('profit_pct', 0.0):.4f}% "
+                        f"min_profit={profitability.get('min_profit_pct', 0.0):.4f}%"
+                    )
+                allow_tp = False
         if allow_tp and (tp_price <= 0 or tp_qty_cap <= 0):
             tp_reason = "skip_unknown"
             allow_tp = False
         intended_tp_price = tp_price
         intended_tp_qty = tp_qty_cap
-        fill_order_key = fill.order_id or fill.trade_id or self._fill_key(fill)
-        tp_client_order_id = self._limit_client_order_id(
-            f"BBOT_LAS_v1_{self._symbol}_TP_{fill.side}_{fill_order_key}"
-        )
         if allow_tp and (
             self._has_open_order_client_id(tp_client_order_id)
             or tp_client_order_id in self._active_tp_ids
@@ -5899,15 +5931,18 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     f"clientId={tp_client_order_id} "
                     f"local_key={build_action_key('TP', fill.order_id, intended_tp_price, intended_tp_qty, step)} "
                 )
-            self._append_log(
-                (
-                    "[SKIP] TP "
-                    f"side={tp_side} price={self.fmt_price(intended_tp_price, tick)} "
-                    f"qty={self.fmt_qty(intended_tp_qty, step)} "
-                    f"reason={tp_reason} {tp_key_detail}{tp_detail}"
-                ),
-                kind="WARN",
-            )
+            if tp_reason == "skip_tp_min_profit" and tp_min_profit_detail:
+                tp_key_detail = f"{tp_key_detail}{tp_min_profit_detail} "
+            if tp_reason != "skip_tp_min_profit_cooldown":
+                self._append_log(
+                    (
+                        "[SKIP] TP "
+                        f"side={tp_side} price={self.fmt_price(intended_tp_price, tick)} "
+                        f"qty={self.fmt_qty(intended_tp_qty, step)} "
+                        f"reason={tp_reason} {tp_key_detail}{tp_detail}"
+                    ),
+                    kind="WARN",
+                )
 
         step_pct = settings.grid_step_pct or 0.0
         reference_price = self._last_price or fill.price
