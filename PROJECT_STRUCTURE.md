@@ -9,9 +9,8 @@
 ├── README.md — quickstart and usage instructions.
 ├── REPORT.md — project report/notes.
 ├── SYSTEM_OVERVIEW_RU.md — detailed system overview in Russian.
+├── ALGO_PILOT_v1.5.md — detailed description of the ALGO PILOT mode (RU).
 ├── _link_test.txt — link test artifact.
-├── config.json — main application configuration (env, endpoints, limits).
-├── config.user.yaml — user state (auto-created at first run).
 ├── requirements.txt — Python dependencies.
 ├── requirements.txt.txt — duplicate dependency list (legacy).
 ├── run_gui.bat — Windows batch launcher for the GUI.
@@ -46,9 +45,6 @@
 │   │   ├── timeutil.py — time/TTL/backoff utilities.
 │   │   └── strategies
 │   │       ├── __init__.py — package marker for strategy helpers.
-│   │       ├── defs
-│   │       │   ├── __init__.py — built-in strategy definition helpers.
-│   │       │   └── grid_classic.py — classic grid strategy definition.
 │   │       ├── manual_runtime.py — manual strategy runtime logic.
 │   │       ├── manual_strategies.py — manual strategy definitions.
 │   │       └── registry.py — strategy registry utilities.
@@ -56,7 +52,8 @@
 │   │   ├── __init__.py — package marker for GUI.
 │   │   ├── ai_operator_grid_window.py — AI operator grid window.
 │   │   ├── i18n.py — GUI translations/localization helpers.
-│   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI, trade-gate readiness).
+│   │   ├── lite_all_strategy_algo_pilot_window.py — Lite All Strategy Terminal with ALGO PILOT.
+│   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI).
 │   │   ├── lite_grid_math.py — math helpers for lite grid UI.
 │   │   ├── lite_grid_window.py — lite grid trading window.
 │   │   ├── main_window.py — main application window and menu.
@@ -69,11 +66,6 @@
 │   │   ├── trade_ready_mode_window.py — trade-ready mode window.
 │   │   ├── trading_runtime_window.py — runtime execution UI.
 │   │   ├── trading_workspace_window.py — trading workspace UI for AI.
-│   │   ├── modes
-│   │   │   ├── ai_full_strateg_v2
-│   │   │   │   ├── __init__.py — package marker for AI full strategy mode.
-│   │   │   │   ├── controller.py — controller helpers for the mode.
-│   │   │   │   └── window.py — AI full strategy V2 window.
 │   │   ├── models
 │   │   │   ├── __init__.py — package marker for GUI state models.
 │   │   │   ├── app_state.py — persisted application settings/state.
@@ -107,8 +99,6 @@
 │       ├── price_hub.py — Qt hub for price updates.
 │       ├── price_service.py — price caching and TTL checks.
 │       └── rate_limiter.py — rate limiter utility.
-├── data
-│   └── exchange_info_*.json — cached Binance exchange info (created at runtime).
 └── tests
     ├── __init__.py — test package marker.
     ├── test_app_state.py — tests for AppState persistence.
@@ -116,28 +106,38 @@
     └── test_markets_service.py — tests for MarketsService.
 ```
 
+## Runtime/Generated artifacts
+
+These files are created at runtime and are not tracked in the repo:
+
+- `config.json` — main application configuration (env, endpoints, limits). Expected by `src/app/main.py` and `core/config.py`.
+- `config.user.yaml` — user state (auto-created at first run) for GUI settings and API keys.
+- `data/exchange_info_*.json` — cached Binance exchange info payloads (MarketsService cache).
+
 ## Modules overview (expanded)
 
 - **core**: configuration loading/validation, logging setup, shared models, time utilities, and strategy registry helpers.
-- **core/strategies/defs**: built-in strategy metadata used by advanced manual/AI modes.
+- **core/strategies**: manual strategy definitions and runtime helpers used by advanced/manual modes.
 - **app**: GUI entry point (`python -m src.app.main`) and startup state wiring.
 - **gui**: main window, dialogs, tabs, widgets, and UI state models for the PySide6 UI.
 - **gui/models**: UI state containers such as `AppState` and pair/workspace models.
-- **gui/modes**: experimental/advanced UI modes (e.g., AI full strategy V2).
-- **gui/lite_all_strategy_terminal_window.py**: enhanced Lite terminal focused on multi-strategy grid experimentation.
+- **gui/lite_all_strategy_terminal_window.py**: Lite All Strategy Terminal (grid experimentation and trade gating).
+- **gui/lite_all_strategy_algo_pilot_window.py**: Lite All Strategy Terminal with ALGO PILOT automation panel.
 - **services**: application services for prices, markets, caching, and rate limiting.
 - **binance**: HTTP, websocket, and account client wrappers for Binance endpoints.
 - **ai**: AI operator schemas, datapack building, validation, and OpenAI client wrapper.
 - **runtime**: local runtime engine and virtual order simulation.
 - **tests**: unit tests for config loading, service behavior, and GUI import smoke checks.
-- **data**: runtime cache artifacts and exchange info snapshots.
 
 ## Runtime data flow (high-level)
 
-1. `src/app/main.py` reads `config.json` via `core/config.py` and loads `config.user.yaml` via `gui/models/app_state.py`.
-2. `MainWindow` creates `PriceFeedManager` and `PairModeManager`, then initializes UI tabs.
+1. `src/app/main.py` loads runtime config (expected `config.json`) and `config.user.yaml` via `gui/models/app_state.py`.
+2. `MainWindow` creates `PriceFeedManager`, `PairModeManager`, then initializes UI tabs.
 3. `OverviewTab` loads markets through `services/markets_service.py` and uses `PriceFeedManager` for live prices.
-4. Selecting a pair opens `LiteGridWindow` or `LiteAllStrategyTerminalWindow` through `gui/pair_mode_manager.py`.
+4. Selecting a pair opens one of:
+   - `LiteGridWindow` (legacy grid terminal),
+   - `LiteAllStrategyTerminalWindow` (multi-strategy grid experiments),
+   - `LiteAllStrategyAlgoPilotWindow` (ALGO PILOT automation + grid runtime).
 5. Optional AI modes build datapacks in `ai/operator_datapack.py` and validate patches in `ai/operator_validation.py`.
 
 ## Run
@@ -157,7 +157,7 @@ Batch (Windows):
 run_gui.bat
 ```
 
-## User config
+## User config (runtime)
 
 - File: `<project_root>/config.user.yaml`
 - Created automatically on first run (if missing).
@@ -168,7 +168,7 @@ run_gui.bat
   - `price_ttl_ms`, `price_refresh_ms`
   - `default_quote`, `pnl_period`
 
-## Cached data
+## Cached data (runtime)
 
 - `data/exchange_info_*.json` caches Binance `exchangeInfo` payloads for faster startup and offline reuse.
 - Cache freshness is evaluated by `MarketsService` and can be invalidated by TTL or explicit refresh.
