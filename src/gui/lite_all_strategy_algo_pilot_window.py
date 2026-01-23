@@ -159,7 +159,17 @@ RECENTER_THRESHOLD_PCT = 0.7
 MAX_ORDER_AGE_SEC = 180
 STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
-STALE_SNAPSHOT_MAX_AGE_SEC = 120
+STALE_SNAPSHOT_MAX_AGE_SEC = 5
+PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.10
+PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.10
+PROFIT_GUARD_SLIPPAGE_BPS = 1.5
+PROFIT_GUARD_EXTRA_BUFFER_PCT = 0.02
+PROFIT_GUARD_BUFFER_PCT = 0.03
+PROFIT_GUARD_MIN_FLOOR_PCT = 0.10
+PROFIT_GUARD_EXIT_BUFFER_PCT = 0.02
+PROFIT_GUARD_THIN_SPREAD_FACTOR = 0.25
+PROFIT_GUARD_LOW_VOL_FACTOR = 0.5
+PROFIT_GUARD_LOW_VOL_FLOOR_PCT = 0.05
 
 
 @dataclass
@@ -707,6 +717,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._order_id_to_registry_key: dict[str, str] = {}
         self._order_id_to_level_index: dict[str, int] = {}
         self._closed_order_ids: set[str] = set()
+        self._closed_order_statuses: set[tuple[str, str]] = set()
         self._recent_key_ttl_s = 8.0
         self._recent_key_insufficient_ttl_s = 2.0
         self._bot_session_id: str | None = None
@@ -977,7 +988,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
         def make_summary_key(text: str) -> QLabel:
             label = QLabel(text)
-            label.setStyleSheet("color: #6b7280; font-size: 10px;")
+            label.setStyleSheet("color: #d1d5db; font-size: 10px;")
             label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             return label
 
@@ -996,7 +1007,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._set_market_label_state(self._market_volatility, active=False)
         self._set_market_label_state(self._market_fee, active=False)
         self._set_market_label_state(self._market_source, active=False)
-        self._rules_label.setStyleSheet("color: #6b7280; font-size: 10px;")
+        self._rules_label.setStyleSheet("color: #d1d5db; font-size: 10px;")
 
         summary_rows = [
             ("Последняя цена:", self._market_price),
@@ -1743,12 +1754,19 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         if anchor_price is None:
             self._pilot_block_action(PilotAction.RECENTER, "no anchor price")
             return
-        plan, _settings = self._pilot_build_grid_plan(anchor_price)
+        plan, _settings, guard_hold = self._pilot_build_grid_plan(anchor_price, action_label="recenter")
+        if guard_hold:
+            self._pilot_block_action(PilotAction.RECENTER, "profit guard HOLD")
+            return
         if plan is None or _settings is None:
             self._pilot_block_action(PilotAction.RECENTER, "grid plan failed")
             return
         if not plan:
             self._pilot_block_action(PilotAction.RECENTER, "empty grid plan")
+            return
+        allowed, reason = self._pilot_recenter_break_even_guard(plan)
+        if not allowed:
+            self._pilot_block_action(PilotAction.RECENTER, reason)
             return
         cancel_count = len(self._open_orders)
         buy_count = sum(1 for order in plan if order.side == "BUY")
@@ -2031,21 +2049,25 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
     def _pilot_build_grid_plan(
         self,
         anchor_price: float,
-    ) -> tuple[list[GridPlannedOrder] | None, GridSettingsState | None]:
+        *,
+        action_label: str,
+    ) -> tuple[list[GridPlannedOrder] | None, GridSettingsState | None, bool]:
         snapshot = self._collect_strategy_snapshot()
         settings = self._resolve_start_settings(snapshot)
         self._apply_auto_clamps(settings, anchor_price)
+        if self._apply_profit_guard(settings, anchor_price, action_label=action_label, update_ui=False):
+            return None, settings, True
         try:
             planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
         except ValueError as exc:
             self._append_log(f"[ALGO PILOT] recenter plan failed: {exc}", kind="WARN")
-            return None, None
+            return None, None, False
         if not self._dry_run_toggle.isChecked():
             balance_snapshot = self._balance_snapshot()
             base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
             planned = self._limit_sell_plan_by_balance(planned, base_free)
         planned = planned[: settings.max_active_orders]
-        return planned, settings
+        return planned, settings, False
 
     def _pilot_select_anchor(self, *, auto: bool = False) -> float | None:
         if self._last_price is None:
@@ -2062,6 +2084,24 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             QMessageBox.Yes,
         )
         return self._last_price if confirm == QMessageBox.Yes else self._pilot_anchor_price
+
+    def _pilot_recenter_break_even_guard(self, plan: list[GridPlannedOrder]) -> tuple[bool, str]:
+        position_qty = self._pilot_position_qty()
+        if position_qty == 0:
+            return True, ""
+        break_even = self._pilot_break_even_price()
+        if break_even is None:
+            return False, "break-even unknown (soft actions only)"
+        be_price = float(break_even)
+        if position_qty > 0:
+            violations = [order for order in plan if order.side == "SELL" and order.price < be_price]
+            if violations:
+                return False, f"sell_below_be be={be_price:.8f} n={len(violations)}"
+        else:
+            violations = [order for order in plan if order.side == "BUY" and order.price > be_price]
+            if violations:
+                return False, f"buy_above_be be={be_price:.8f} n={len(violations)}"
+        return True, ""
 
     def _pilot_cancel_orders_then_place(self, plan: list[GridPlannedOrder]) -> None:
         planned_cancel = len(self._open_orders)
@@ -2134,7 +2174,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     if str(order.get("orderId", ""))
                 }
                 self._update_order_info_from_snapshot(self._open_orders)
-                self._rebuild_registry_from_open_orders(self._open_orders)
+                if open_count:
+                    self._rebuild_registry_from_open_orders(self._open_orders)
+                else:
+                    self._clear_local_order_registry()
             else:
                 self._rebuild_registry_from_open_orders([])
         self._place_live_orders(plan)
@@ -2285,7 +2328,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             Decimal(str(lot.qty)) * Decimal(str(lot.cost_per_unit)) for lot in self._base_lots
         )
         avg_entry = total_cost / total_qty if total_qty > 0 else Decimal("0")
-        break_even = (total_cost + self.as_decimal(fees_paid)) / total_qty
+        break_even_paid = (total_cost + self.as_decimal(fees_paid)) / total_qty
+        maker_pct, _taker_pct, _used_default = self._profit_guard_fee_inputs()
+        exit_fee_pct = maker_pct + PROFIT_GUARD_EXIT_BUFFER_PCT
+        break_even_exit = avg_entry * (Decimal("1") + self.as_decimal(exit_fee_pct) / Decimal("100"))
+        break_even = max(break_even_paid, break_even_exit)
         return PositionState(
             position_qty=float(total_qty),
             avg_entry_price=float(avg_entry),
@@ -2631,7 +2678,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         elif now - self._pilot_stale_last_log_ts >= STALE_LOG_DEDUP_SEC:
             should_log = True
         if should_log:
-            seen_age = int(max(time() - oldest_info.last_seen_ts, 0))
+            seen_age = max(1, int(max(time() - oldest_info.last_seen_ts, 0)))
             auto_state = "on" if self._pilot_auto_actions_enabled else "off"
             gate_state = "ok" if self._trade_gate == TradeGate.TRADE_OK else "ro"
             confirm_state = "on" if (self._live_enabled() or self._pilot_confirm_dry_run) else "off"
@@ -2818,7 +2865,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
 
     @staticmethod
     def _set_market_label_state(label: QLabel, active: bool) -> None:
-        label.setStyleSheet("color: #111827; font-size: 11px;")
+        label.setStyleSheet("color: #f3f4f6; font-size: 11px;")
 
     def _update_runtime_balances(self) -> None:
         if self._balances_loaded and self._quote_asset and self._base_asset:
@@ -3067,6 +3114,10 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 balance_snapshot = self._balance_snapshot()
                 settings = self._resolve_start_settings(snapshot)
                 self._apply_auto_clamps(settings, anchor_price)
+                if self._apply_profit_guard(settings, anchor_price, action_label="start", update_ui=True):
+                    self._append_log("[START] blocked: profit guard HOLD", kind="WARN")
+                    self._mark_preflight_blocked()
+                    return
                 if settings.take_profit_pct <= 0:
                     raise ValueError("Invalid take_profit_pct")
                 profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
@@ -3209,6 +3260,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._closed_trades = 0
             self._win_trades = 0
             self._replacement_counter = 0
+            self._closed_order_statuses.clear()
             self._update_pnl(None, None)
             self._update_trade_summary()
             self._live_settings = settings
@@ -3271,6 +3323,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._active_action_keys.clear()
         self._clear_local_order_registry()
         self._closed_order_ids.clear()
+        self._closed_order_statuses.clear()
         self._order_id_to_level_index.clear()
         self._open_orders_map = {}
         self._bot_session_id = None
@@ -4430,9 +4483,11 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                     self._pending_tp_ids.discard(client_order_id)
                     self._pending_restore_ids.discard(client_order_id)
                 self._discard_registry_for_order(order)
-                if order_id and order_id in self._closed_order_ids:
-                    continue
                 if order_id:
+                    status_key = (order_id, status)
+                    if status_key in self._closed_order_statuses:
+                        continue
+                    self._closed_order_statuses.add(status_key)
                     self._closed_order_ids.add(order_id)
                 self._append_log(
                     f"[LIVE] order closed orderId={order_id} status={status}",
@@ -4577,6 +4632,171 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             "fee_discount_pct": None,
         }
 
+    def _profit_guard_fee_inputs(self) -> tuple[float, float, bool]:
+        maker, taker = self._trade_fees
+        used_default = False
+        if maker is None:
+            maker_pct = PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT
+            used_default = True
+        else:
+            maker_pct = maker * 100
+        if taker is None:
+            taker_pct = PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT
+            used_default = True
+        else:
+            taker_pct = taker * 100
+        return maker_pct, taker_pct, used_default
+
+    def _profit_guard_round_trip_cost_pct(self) -> float:
+        maker_pct, taker_pct, _used_default = self._profit_guard_fee_inputs()
+        fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
+        if fill_mode == "TAKER":
+            fee_cost = maker_pct + taker_pct
+        else:
+            fee_cost = 2 * maker_pct
+        slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
+        return fee_cost + slippage_pct + PROFIT_GUARD_EXTRA_BUFFER_PCT
+
+    def _profit_guard_min_profit_pct(self) -> float:
+        round_trip_cost = self._profit_guard_round_trip_cost_pct()
+        return max(round_trip_cost + PROFIT_GUARD_BUFFER_PCT, PROFIT_GUARD_MIN_FLOOR_PCT)
+
+    def _current_spread_pct(self) -> float | None:
+        snapshot = self._price_feed_manager.get_snapshot(self._symbol) if hasattr(self, "_price_feed_manager") else None
+        micro = snapshot
+        if self._last_price_update:
+            if micro is None:
+                micro = self._last_price_update.microstructure
+        if micro is None:
+            return None
+        if micro.spread_pct is not None:
+            return float(micro.spread_pct)
+        if micro.spread_abs is not None and self._last_price:
+            return float(micro.spread_abs / self._last_price * 100)
+        return None
+
+    def _min_tick_step_pct(self, anchor_price: float) -> float:
+        tick = self._exchange_rules.get("tick")
+        if not tick or anchor_price <= 0:
+            return 0.0
+        return tick / anchor_price * 100
+
+    def _profit_guard_should_hold(self, min_profit_pct: float) -> tuple[bool, float | None, float | None]:
+        spread_pct = self._current_spread_pct()
+        volatility_pct = self._compute_recent_volatility_pct()
+        if spread_pct is None or volatility_pct is None:
+            return False, spread_pct, volatility_pct
+        if spread_pct >= min_profit_pct * PROFIT_GUARD_THIN_SPREAD_FACTOR:
+            return False, spread_pct, volatility_pct
+        low_vol_threshold = max(min_profit_pct * PROFIT_GUARD_LOW_VOL_FACTOR, PROFIT_GUARD_LOW_VOL_FLOOR_PCT)
+        if volatility_pct >= low_vol_threshold:
+            return False, spread_pct, volatility_pct
+        return True, spread_pct, volatility_pct
+
+    def _apply_profit_guard(
+        self,
+        settings: GridSettingsState,
+        anchor_price: float,
+        *,
+        action_label: str,
+        update_ui: bool,
+    ) -> bool:
+        min_profit_pct = self._profit_guard_min_profit_pct()
+        tp_old = settings.take_profit_pct
+        step_old = settings.grid_step_pct
+        range_low_old = settings.range_low_pct
+        range_high_old = settings.range_high_pct
+        min_tick_step_pct = self._min_tick_step_pct(anchor_price)
+        min_step_pct = max(min_tick_step_pct, min_profit_pct / 2)
+        if settings.take_profit_pct < min_profit_pct:
+            settings.take_profit_pct = min_profit_pct
+        if settings.grid_step_pct < min_step_pct:
+            settings.grid_step_pct = min_step_pct
+        if settings.take_profit_pct < settings.grid_step_pct:
+            settings.take_profit_pct = settings.grid_step_pct
+        min_range_pct = settings.grid_step_pct * max(settings.grid_count, 1) / 2
+        if settings.range_low_pct < min_range_pct:
+            settings.range_low_pct = min_range_pct
+        if settings.range_high_pct < min_range_pct:
+            settings.range_high_pct = min_range_pct
+        if settings.take_profit_pct != tp_old:
+            self._append_log(
+                (
+                    f"[GUARD] tp raised {tp_old:.4f}% -> {settings.take_profit_pct:.4f}% "
+                    f"min_profit={min_profit_pct:.4f}% action={action_label}"
+                ),
+                kind="INFO",
+            )
+        if settings.grid_step_pct != step_old:
+            self._append_log(
+                (
+                    f"[GUARD] step raised {step_old:.4f}% -> {settings.grid_step_pct:.4f}% "
+                    f"min_step={min_step_pct:.4f}% action={action_label}"
+                ),
+                kind="INFO",
+            )
+        if settings.range_low_pct != range_low_old or settings.range_high_pct != range_high_old:
+            self._append_log(
+                (
+                    "[GUARD] range widened "
+                    f"low {range_low_old:.4f}% -> {settings.range_low_pct:.4f}% "
+                    f"high {range_high_old:.4f}% -> {settings.range_high_pct:.4f}%"
+                ),
+                kind="INFO",
+            )
+        if update_ui:
+            if settings.take_profit_pct != tp_old:
+                self._take_profit_input.blockSignals(True)
+                self._take_profit_input.setValue(settings.take_profit_pct)
+                self._take_profit_input.blockSignals(False)
+                self._settings_state.take_profit_pct = settings.take_profit_pct
+            if settings.grid_step_pct != step_old:
+                self._grid_step_input.blockSignals(True)
+                self._grid_step_input.setValue(settings.grid_step_pct)
+                self._grid_step_input.blockSignals(False)
+                self._settings_state.grid_step_pct = settings.grid_step_pct
+                if self._settings_state.grid_step_mode == "MANUAL":
+                    self._manual_grid_step_pct = settings.grid_step_pct
+            if settings.range_low_pct != range_low_old:
+                self._range_low_input.blockSignals(True)
+                self._range_low_input.setValue(settings.range_low_pct)
+                self._range_low_input.blockSignals(False)
+                self._settings_state.range_low_pct = settings.range_low_pct
+            if settings.range_high_pct != range_high_old:
+                self._range_high_input.blockSignals(True)
+                self._range_high_input.setValue(settings.range_high_pct)
+                self._range_high_input.blockSignals(False)
+                self._settings_state.range_high_pct = settings.range_high_pct
+            if (
+                settings.take_profit_pct != tp_old
+                or settings.grid_step_pct != step_old
+                or settings.range_low_pct != range_low_old
+                or settings.range_high_pct != range_high_old
+            ):
+                self._update_grid_preview()
+        hold, spread_pct, volatility_pct = self._profit_guard_should_hold(min_profit_pct)
+        maker_pct, taker_pct, used_default = self._profit_guard_fee_inputs()
+        if used_default:
+            self._append_log(
+                (
+                    f"[GUARD] fees defaulted maker={maker_pct:.4f}% taker={taker_pct:.4f}% "
+                    f"round_trip={self._profit_guard_round_trip_cost_pct():.4f}%"
+                ),
+                kind="INFO",
+            )
+        if hold:
+            spread_text = f"{spread_pct:.4f}%" if spread_pct is not None else "—"
+            vol_text = f"{volatility_pct:.4f}%" if volatility_pct is not None else "—"
+            self._append_log(
+                (
+                    "[GUARD] HOLD reason=thin_edge "
+                    f"spread={spread_text} min_profit={min_profit_pct:.4f}% vol={vol_text}"
+                ),
+                kind="WARN",
+            )
+            return True
+        return False
+
     def _evaluate_tp_profitability(self, tp_pct: float) -> dict[str, float | bool]:
         profile = get_profile_preset(self._profit_profile_name())
         inputs = self._runtime_profit_inputs()
@@ -4715,6 +4935,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         tp_pct = settings.take_profit_pct or settings.grid_step_pct
         if tp_pct <= 0:
             return
+        self._rebuild_registry_from_open_orders(self._open_orders)
         profitability = self._evaluate_tp_profitability(tp_pct)
         if not profitability.get("is_profitable", True):
             min_tp = profitability.get("min_tp_pct")
@@ -5999,6 +6220,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
                 "[LIVE] sell orders skipped: base balance is 0.",
                 kind="INFO",
             )
+        self._rebuild_registry_from_open_orders(self._open_orders)
 
         def _place() -> dict[str, Any]:
             results: list[dict[str, Any]] = []
