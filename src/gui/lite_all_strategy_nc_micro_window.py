@@ -278,6 +278,7 @@ BIDASK_FAIL_SOFT_MS = 1500
 BIDASK_STALE_MS = 4000
 PRICE_STALE_MS = 4000
 SPREAD_DISPLAY_EPS_PCT = 0.0001
+WAIT_EDGE_LOG_COOLDOWN_SEC = 5.0
 REGISTRY_GC_INTERVAL_MS = 60_000
 REGISTRY_GC_TTL_SEC = 600
 SPREAD_ZERO_OK_SYMBOLS = {
@@ -916,6 +917,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._sell_retry_limit = 5
         self._start_in_progress = False
         self._start_in_progress_logged = False
+        self._profit_guard_override_pending = False
+        self._wait_edge_last_log_ts: float | None = None
         self._start_run_id = 0
         self._start_cancel_event: threading.Event | None = None
         self._last_preflight_hash: str | None = None
@@ -4162,6 +4165,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._feed_indicator.setText(
                 f"HTTP ✓ | WS {self._ws_indicator_symbol()} | CLOCK {clock_status}"
             )
+            self._handle_wait_edge_tick()
             self._grid_engine.on_price(price)
             self._update_runtime_balances()
             self._refresh_unrealized_pnl()
@@ -4270,6 +4274,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_grid_preview()
 
     def _handle_manual_override(self) -> None:
+        self._profit_guard_override_pending = True
+        if self._state == "WAIT_EDGE":
+            self._append_log("[EDGE] ok -> placing orders", kind="INFO")
+            self._handle_start()
+            return
         self._grid_step_mode_combo.setCurrentIndex(self._grid_step_mode_combo.findData("MANUAL"))
 
     def _apply_range_mode(self, value: str) -> None:
@@ -4533,10 +4542,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     action_label="start",
                     update_ui=True,
                 )
-                if guard_decision == "HOLD":
-                    self._append_log("[START] blocked: profit guard HOLD", kind="WARN")
-                    self._mark_preflight_blocked()
+                override_guard = self._profit_guard_override_pending
+                if guard_decision == "HOLD" and not override_guard:
+                    self._append_log("[START] blocked -> WAIT_EDGE", kind="WARN")
+                    self._wait_edge_last_log_ts = None
+                    self._change_state("WAIT_EDGE")
                     return
+                if guard_decision == "HOLD" and override_guard:
+                    self._append_log("[START] guard override: profit guard ignored", kind="INFO")
+                if override_guard:
+                    self._profit_guard_override_pending = False
                 if settings.take_profit_pct <= 0:
                     raise ValueError("Invalid take_profit_pct")
                 profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
@@ -4932,7 +4947,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _change_state(self, new_state: str) -> None:
         self._state = new_state
-        self._state_badge.setText(f"{tr('state')}: {self._state}")
+        self._state_badge.setText(f"{tr('state')}: {self._state_display_text(self._state)}")
         self._engine_state = self._engine_state_from_status(new_state)
         self._engine_state_label.setText(f"{tr('engine')}: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
@@ -8400,6 +8415,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             "PLACING_GRID": "#2563eb",
             "RUNNING": "#16a34a",
             "WAITING_FILLS": "#16a34a",
+            "WAITING FOR EDGE": "#d97706",
             "PAUSED": "#d97706",
             "STOPPING": "#f97316",
             "ERROR": "#dc2626",
@@ -8533,12 +8549,56 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             "IDLE": "IDLE",
             "RUNNING": "RUNNING",
             "WAITING_FILLS": "WAITING_FILLS",
+            "WAIT_EDGE": "WAITING FOR EDGE",
             "PAUSED": "PAUSED",
             "STOPPING": "STOPPING",
             "PLACING_GRID": "PLACING_GRID",
             "ERROR": "ERROR",
         }
         return mapping.get(state, state)
+
+    @staticmethod
+    def _state_display_text(state: str) -> str:
+        if state == "WAIT_EDGE":
+            return "WAITING FOR EDGE"
+        return state
+
+    def _profit_guard_hold(self, settings: GridSettingsState) -> bool:
+        guard_mode = self._current_profit_guard_mode()
+        if guard_mode != ProfitGuardMode.BLOCK:
+            return False
+        min_profit_pct = self._profit_guard_min_profit_pct(settings)
+        decision, _spread_pct, _expected, _fee, _slip, _pad = self._profit_guard_should_hold(
+            min_profit_pct
+        )
+        return decision == "HOLD"
+
+    def _handle_wait_edge_tick(self) -> None:
+        if self._state != "WAIT_EDGE":
+            return
+        if self._start_in_progress:
+            return
+        anchor_price = self.get_anchor_price(self._symbol)
+        if anchor_price is None:
+            return
+        snapshot = self._collect_strategy_snapshot()
+        settings = self._resolve_start_settings(snapshot)
+        self._apply_auto_clamps(settings, anchor_price)
+        if self._profit_guard_override_pending:
+            self._append_log("[EDGE] ok -> placing orders", kind="INFO")
+            self._handle_start()
+            return
+        if self._profit_guard_hold(settings):
+            now = monotonic()
+            if (
+                self._wait_edge_last_log_ts is None
+                or now - self._wait_edge_last_log_ts >= WAIT_EDGE_LOG_COOLDOWN_SEC
+            ):
+                self._append_log("[EDGE] still thin -> waiting", kind="INFO")
+                self._wait_edge_last_log_ts = now
+            return
+        self._append_log("[EDGE] ok -> placing orders", kind="INFO")
+        self._handle_start()
 
     def _update_grid_preview(self) -> None:
         levels = int(self._grid_count_input.value())
