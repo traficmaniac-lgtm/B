@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import atexit
 import logging
+import os
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
+
+import faulthandler
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -42,15 +48,55 @@ def _load_app_state(config: Config, root_path: Path) -> AppState:
     return app_state
 
 
-def _configure_exception_hook(logger: logging.LoggerAdapter) -> None:
-    def handle_exception(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
-        message = "".join(traceback.format_exception(exc_type, exc, tb))
-        logger.error("Unhandled exception:\n%s", message)
+def _install_crash_catcher(logger: logging.LoggerAdapter, root_path: Path) -> None:
+    crash_dir = root_path / "logs" / "crash"
+    crash_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    crash_path = crash_dir / f"APP_{timestamp}.log"
+    crash_file = crash_path.open("a", buffering=1, encoding="utf-8")
+    faulthandler.enable(crash_file, all_threads=True)
+    logger.info("Crash log enabled: %s", os.fspath(crash_path))
+
+    def _write_line(message: str) -> None:
+        try:
+            crash_file.write(f"{message}\n")
+            crash_file.flush()
+        except Exception:
+            return
+
+    pid = os.getpid()
+    _write_line(f"=== START pid={pid} ts={time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+
+    def _on_clean_exit() -> None:
+        _write_line(f"=== CLEAN EXIT pid={pid} ts={time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+
+    atexit.register(_on_clean_exit)
+
+    def _write_traceback(prefix: str, exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+        try:
+            crash_file.write(f"\n[{prefix}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            crash_file.writelines(traceback.format_exception(exc_type, exc, tb))
+            crash_file.flush()
+        except Exception:
+            return
+
+    def _sys_hook(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+        _write_traceback("SYS", exc_type, exc, tb)
+        logger.error("Unhandled exception:\n%s", "".join(traceback.format_exception(exc_type, exc, tb)))
         app = QApplication.instance()
         if app:
             QMessageBox.critical(None, "Unhandled exception", str(exc))
 
-    sys.excepthook = handle_exception
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        _write_traceback(f"THREAD:{args.thread.name}", args.exc_type, args.exc_value, args.exc_traceback)
+        logger.error(
+            "Unhandled thread exception:\n%s",
+            "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+        )
+
+    sys.excepthook = _sys_hook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_hook
 
 
 def main() -> int:
@@ -65,7 +111,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow(config, app_state)
     logging.getLogger().addHandler(window.log_handler)
-    _configure_exception_hook(logger)
+    _install_crash_catcher(logger, root_path)
 
     logger.info("application starting")
     window.show()
