@@ -24,6 +24,7 @@ class AppState:
     default_quote: str = "USDT"
     pnl_period: str = "24h"
     zero_fee_symbols: list[str] = field(default_factory=lambda: ["USDTUSDC", "EURIUSDT"])
+    nc_micro_legacy_policy: str = "CANCEL"
     ai_connected: bool = False
     ai_checked: bool = False
     user_config_path: Path | None = None
@@ -50,6 +51,9 @@ class AppState:
         default_quote = str(data.get("default_quote", defaults.default_quote)).upper()
         pnl_period = str(data.get("pnl_period", defaults.pnl_period))
         zero_fee_symbols = _parse_symbol_list(data.get("zero_fee_symbols", defaults.zero_fee_symbols))
+        nc_micro_legacy_policy = str(
+            data.get("nc_micro_legacy_policy", defaults.nc_micro_legacy_policy)
+        ).upper()
         return cls(
             env=env,
             log_level=log_level,
@@ -66,6 +70,7 @@ class AppState:
             default_quote=default_quote,
             pnl_period=pnl_period,
             zero_fee_symbols=zero_fee_symbols,
+            nc_micro_legacy_policy=nc_micro_legacy_policy,
             user_config_path=path,
         )
 
@@ -86,6 +91,7 @@ class AppState:
             "default_quote": self.default_quote,
             "pnl_period": self.pnl_period,
             "zero_fee_symbols": list(self.zero_fee_symbols),
+            "nc_micro_legacy_policy": self.nc_micro_legacy_policy,
         }
 
     def save(self, path: Path) -> None:
