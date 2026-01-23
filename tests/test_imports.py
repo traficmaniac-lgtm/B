@@ -34,6 +34,7 @@ def test_openai_client_import() -> None:
 @pytest.mark.skipif(not PYSIDE_AVAILABLE, reason="PySide6 dependencies unavailable")
 def test_imports() -> None:
     from src.app.main import main
+    from src.gui.lite_all_strategy_nc_micro_window import LiteAllStrategyNcMicroWindow
     from src.gui.lite_all_strategy_terminal_window import LiteAllStrategyTerminalWindow
     from src.gui.main_window import MainWindow
     from src.gui.models.pair_state import BotState, PairState
@@ -41,6 +42,7 @@ def test_imports() -> None:
     from src.gui.pair_workspace_tab import PairWorkspaceTab
 
     assert callable(main)
+    assert LiteAllStrategyNcMicroWindow.__name__ == "LiteAllStrategyNcMicroWindow"
     assert LiteAllStrategyTerminalWindow.__name__ == "LiteAllStrategyTerminalWindow"
     assert MainWindow.__name__ == "MainWindow"
     assert OverviewTab.__name__ == "OverviewTab"

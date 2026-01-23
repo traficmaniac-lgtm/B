@@ -1,5 +1,8 @@
 ## Technical Report
 
+### NC MICRO v1.0
+- Added NC MICRO mode with a cloned Lite All Strategy window and routing entry in the pair dialog.
+
 ### Step 1 - Skeleton + config + logging + models
 - Added core configuration loader with environment overrides and validation.
 - Added shared logging setup and logger adapter helper.
