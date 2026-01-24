@@ -2812,16 +2812,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     for order in bot_orders_after
                     if str(order.get("orderId", "")) in stale_ids
                 ]
-                    for order in still_open:
-                        order_id = str(order.get("orderId", ""))
-                        if not order_id:
-                            continue
-                        ok, error, _outcome = self._cancel_order_idempotent(order_id)
-                        if ok:
-                            canceled += 1
-                            self._pilot_stale_handled[order_id] = time_fn()
-                        if error:
-                            errors.append(error)
+                for order in still_open:
+                    order_id = str(order.get("orderId", ""))
+                    if not order_id:
+                        continue
+                    ok, error, _outcome = self._cancel_order_idempotent(order_id)
+                    if ok:
+                        canceled += 1
+                        self._pilot_stale_handled[order_id] = time_fn()
+                    if error:
+                        errors.append(error)
                 open_orders_retry = self._account_client.get_open_orders(self._symbol)
                 bot_orders_retry = self._filter_bot_orders(
                     [order for order in open_orders_retry if isinstance(order, dict)]
