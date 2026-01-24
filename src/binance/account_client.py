@@ -239,7 +239,8 @@ class BinanceAccountClient:
         for attempt in range(attempts):
             try:
                 data = dict(params or {})
-                data["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+                timestamp_ms = int(time.time() * 1000) + self._time_offset_ms
+                data["timestamp"] = timestamp_ms
                 data["recvWindow"] = self._recv_window
                 query = urlencode(data, doseq=True)
                 signature = hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -260,6 +261,20 @@ class BinanceAccountClient:
                         payload = response.json()
                     except Exception:  # noqa: BLE001
                         payload = None
+                    if response.status_code == 400:
+                        code = payload.get("code") if isinstance(payload, dict) else None
+                        msg = payload.get("msg") if isinstance(payload, dict) else response.text
+                        hint = " time sync likely wrong" if code == -1021 else ""
+                        self._logger.warning(
+                            "[BINANCE][400] endpoint=%s code=%s msg=%s ts=%s recvWindow=%s offset_ms=%s%s",
+                            path,
+                            code,
+                            msg,
+                            timestamp_ms,
+                            self._recv_window,
+                            self._time_offset_ms,
+                            hint,
+                        )
                     if isinstance(payload, dict) and payload.get("code") == -1021:
                         self.sync_time_offset()
                         if retry_on_timestamp and not retried_time_sync:

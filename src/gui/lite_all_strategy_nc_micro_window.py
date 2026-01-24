@@ -270,6 +270,8 @@ STALE_REFRESH_HARD_MAX_MS = 90_000
 STALE_REFRESH_HASH_STABLE_CYCLES = 3
 STALE_REFRESH_LOG_DEDUP_SEC = 20
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
+STOP_DEADLINE_MS = 8000
+LOG_DEDUP_HEARTBEAT_SEC = 10.0
 ORDERS_POLL_IDLE_MS = 1500
 ORDERS_POLL_RUNNING_MS = 1500
 ORDERS_POLL_STOPPING_MS = 500
@@ -877,6 +879,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         self._stop_inflight = False
         self._stop_done_with_errors = False
+        self._stop_last_error: str | None = None
+        self._stop_watchdog_token = 0
+        self._stop_watchdog_started_ts: float | None = None
         self._settings_save_timer: QTimer | None = None
         self._last_price: float | None = None
         self._last_price_ts: float | None = None
@@ -995,6 +1000,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._orders_event_refresh_ts: dict[str, float] = {}
         self._stale_refresh_last_ts: dict[str, float] = {}
         self._stale_refresh_last_log_ts: float | None = None
+        self._stale_refresh_last_state: tuple[str, bool] | None = None
         self._stale_refresh_hits = 0
         self._stale_refresh_calls = 0
         self._stale_refresh_skipped_rate_limit = 0
@@ -1047,6 +1053,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._last_snapshot_refresh_ts = 0.0
         self._snapshot_refresh_inflight = False
         self._snapshot_refresh_suppressed_log_ts: float | None = None
+        self._snapshot_refresh_suppressed_state: tuple[str, str | None] | None = None
         self._orders_snapshot: OrdersSnapshot | None = None
         self._last_orders_fingerprint: str | None = None
         self._orders_refresh_reason: str = "bootstrap"
@@ -1065,6 +1072,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_warmup_last_log_ts: float | None = None
         self._pilot_auto_actions_paused_until: float | None = None
         self._tp_min_profit_action_ts: dict[str, float] = {}
+        self._pilot_budget_cap_last_value: float | None = None
+        self._pilot_budget_cap_last_reason: str | None = None
+        self._pilot_budget_cap_last_log_ts: float | None = None
         self._last_price_update: PriceUpdate | None = None
         self._feed_ok = False
         self._feed_last_ok: bool | None = None
@@ -1098,6 +1108,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._market_health: MarketHealth | None = None
         self._market_health_last_reason: str | None = None
         self._market_health_last_log_ts: float | None = None
+        self._market_health_last_values: tuple[float, float, float, str] | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._registry_key_last_seen_ts: dict[str, float] = {}
@@ -1168,7 +1179,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.19 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.20 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -4121,15 +4132,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._stop_in_progress:
             return
         now = monotonic()
-        cooldown_sec = SNAPSHOT_REFRESH_COOLDOWN_MS / 1000
+        state = (reason, detail)
         last_log = self._snapshot_refresh_suppressed_log_ts
-        if last_log is None or now - last_log >= cooldown_sec:
+        if (
+            self._snapshot_refresh_suppressed_state != state
+            or last_log is None
+            or now - last_log >= LOG_DEDUP_HEARTBEAT_SEC
+        ):
             suffix = f" ({detail})" if detail else ""
             self._append_log(
                 f"[ORDERS] stale -> suppressed {reason}{suffix}",
                 kind="INFO",
             )
             self._snapshot_refresh_suppressed_log_ts = now
+            self._snapshot_refresh_suppressed_state = state
 
     @staticmethod
     def _is_critical_refresh_reason(reason: str) -> bool:
@@ -4190,14 +4206,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             f"skip_rate={self._stale_refresh_skipped_rate_limit} "
             f"skip_no_change={self._stale_refresh_skipped_no_change}"
         )
-        throttle_key = f"orders_stale_refresh:{reason}:{allowed}:{why_text}"
-        self._append_log_throttled(
-            message,
-            kind="INFO",
-            key=throttle_key,
-            cooldown_sec=STALE_REFRESH_LOG_DEDUP_SEC,
-        )
-        self._stale_refresh_last_log_ts = monotonic()
+        now = monotonic()
+        state = (reason, allowed)
+        last_log = self._stale_refresh_last_log_ts
+        if self._stale_refresh_last_state != state or last_log is None or now - last_log >= LOG_DEDUP_HEARTBEAT_SEC:
+            self._append_log(message, kind="INFO")
+            self._stale_refresh_last_log_ts = now
+            self._stale_refresh_last_state = state
 
     def _ensure_open_orders_snapshot_fresh(
         self,
@@ -4639,21 +4654,30 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             if expected_profit_bps is not None:
                 edge_reason = "thin_edge" if expected_profit_bps <= 0 else "ok"
-                if (
-                    self._market_health_last_reason != edge_reason
-                    or self._market_health_last_log_ts is None
-                    or now_ts - self._market_health_last_log_ts >= MARKET_HEALTH_LOG_COOLDOWN_SEC
+                edge_raw_round = round(edge_raw_bps or 0.0, 2)
+                expected_round = round(expected_profit_bps, 2)
+                risk_round = round(risk_buffer_bps or 0.0, 2)
+                edge_state = (edge_raw_round, expected_round, risk_round, edge_reason)
+                should_log = False
+                if self._market_health_last_values != edge_state:
+                    should_log = True
+                elif (
+                    self._market_health_last_log_ts is None
+                    or now_ts - self._market_health_last_log_ts >= LOG_DEDUP_HEARTBEAT_SEC
                 ):
+                    should_log = True
+                if should_log:
                     self._append_log(
                         (
                             "[KPI] edge_raw_bps="
-                            f"{edge_raw_bps:.2f} expected_profit_bps={expected_profit_bps:.2f} "
-                            f"risk_buffer_bps={risk_buffer_bps:.2f} reason={edge_reason}"
+                            f"{edge_raw_round:.2f} expected_profit_bps={expected_round:.2f} "
+                            f"risk_buffer_bps={risk_round:.2f} reason={edge_reason}"
                         ),
                         kind="INFO",
                     )
-                    self._market_health_last_reason = edge_reason
                     self._market_health_last_log_ts = now_ts
+                self._market_health_last_reason = edge_reason
+                self._market_health_last_values = edge_state
 
             is_spread_zero = spread_pct is not None and spread_pct == 0
             spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
@@ -5350,7 +5374,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._cancel_reconcile_pending = 2
 
         def _run_followup() -> None:
-            if not self._cancel_inflight:
+            if self._cancel_reconcile_pending <= 0:
                 return
             self._refresh_orders(force=True, reason="after_cancel_backoff")
 
@@ -5402,6 +5426,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._snapshot_refresh_inflight = False
             if not isinstance(result, CancelResult):
                 self._handle_cancel_error("Unexpected cancel response")
+                self._record_stop_error("Unexpected cancel response")
                 self._cancel_inflight = False
                 if finalize_stop:
                     self._stop_done_with_errors = True
@@ -5411,6 +5436,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._append_log(message, kind="INFO")
             for message in result.errors:
                 self._append_log(str(message), kind="WARN")
+            if result.errors:
+                self._record_stop_error(str(result.errors[-1]))
             if result.open_orders:
                 self._apply_open_orders_snapshot(result.open_orders, reason="after_cancel")
             after_count = len(self._open_orders)
@@ -5425,9 +5452,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             if remaining != 0:
                 self._schedule_cancel_reconcile_followups()
-            else:
-                self._cancel_inflight = False
-                self._update_orders_timer_interval()
+            self._cancel_inflight = False
+            self._update_orders_timer_interval()
             self._set_cancel_buttons_enabled(True)
             self._request_orders_refresh("cancel_all_finalize")
             self._append_log("orders refreshed after cancel", kind="INFO")
@@ -5440,8 +5466,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._orders_in_flight = False
             self._snapshot_refresh_inflight = False
             self._cancel_inflight = False
+            self._cancel_reconcile_pending = 0
             self._update_orders_timer_interval()
             self._handle_cancel_error(message)
+            self._record_stop_error(message)
             self._set_cancel_buttons_enabled(True)
             self._request_orders_refresh("cancel_all_error")
             self._append_log("orders refreshed after cancel", kind="INFO")
@@ -5454,6 +5482,35 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._thread_pool.start(worker)
         return True
 
+    def _start_stop_watchdog(self) -> None:
+        self._stop_watchdog_token += 1
+        token = self._stop_watchdog_token
+        self._stop_watchdog_started_ts = monotonic()
+
+        def _on_timeout() -> None:
+            if token != self._stop_watchdog_token:
+                return
+            if not self._stop_in_progress or self._state != "STOPPING":
+                return
+            pending = len(self._open_orders)
+            last_error = self._stop_last_error or "—"
+            self._append_log(
+                f"[STOP] forced finalize after timeout; pending={pending}; last_error={last_error}",
+                kind="WARN",
+            )
+            self._stop_done_with_errors = True
+            self._stop_inflight = False
+            self._cancel_inflight = False
+            self._orders_in_flight = False
+            self._snapshot_refresh_inflight = False
+            self._finalize_stop(keep_open_orders=bool(self._open_orders))
+
+        QTimer.singleShot(STOP_DEADLINE_MS, self, _on_timeout)
+
+    def _cancel_stop_watchdog(self) -> None:
+        self._stop_watchdog_token += 1
+        self._stop_watchdog_started_ts = None
+
     def _handle_stop(self) -> None:
         self._append_log("[STOP] requested", kind="INFO")
         if self._stop_in_progress:
@@ -5462,11 +5519,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_in_progress = True
         self._stop_inflight = True
         self._stop_requested = True
+        self._stop_last_error = None
         self._closing = True
         self._stop_done_with_errors = False
         if self._start_cancel_event:
             self._start_cancel_event.set()
         self._start_run_id += 1
+        self._start_stop_watchdog()
         self._stop_local_timers()
         self._append_log("Stop pressed.", kind="ORDERS")
         cancel_all = bool(self._cancel_all_on_stop_toggle.isChecked())
@@ -5520,6 +5579,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._finalize_stop(keep_open_orders=keep_open_orders_on_finalize)
 
     def _finalize_stop(self, *, keep_open_orders: bool = False) -> None:
+        self._cancel_stop_watchdog()
         self._bot_order_ids.clear()
         self._bot_client_ids.clear()
         self._bot_order_keys.clear()
@@ -5566,6 +5626,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
         self._stop_done_with_errors = False
         self._set_cancel_buttons_enabled(True)
+        self._stop_last_error = None
 
     def _cancel_bot_orders_on_stop(self) -> None:
         if not self._account_client:
@@ -6082,10 +6143,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if max_budget <= 0:
             return
         if settings.budget > max_budget:
-            self._append_log(
-                f"[PILOT] budget capped {settings.budget:.2f} -> {max_budget:.2f} (50% equity)",
-                kind="INFO",
-            )
+            now = monotonic()
+            reason = "50% equity"
+            should_log = False
+            if self._pilot_budget_cap_last_value is None:
+                should_log = True
+            elif self._pilot_budget_cap_last_reason != reason:
+                should_log = True
+            elif abs(max_budget - self._pilot_budget_cap_last_value) >= 0.01:
+                should_log = True
+            elif (
+                self._pilot_budget_cap_last_log_ts is None
+                or now - self._pilot_budget_cap_last_log_ts >= LOG_DEDUP_HEARTBEAT_SEC
+            ):
+                should_log = True
+            if should_log:
+                self._append_log(
+                    f"[PILOT] budget capped {settings.budget:.2f} -> {max_budget:.2f} ({reason})",
+                    kind="INFO",
+                )
+                self._pilot_budget_cap_last_value = max_budget
+                self._pilot_budget_cap_last_reason = reason
+                self._pilot_budget_cap_last_log_ts = now
             settings.budget = max_budget
 
     def _balance_snapshot(self) -> dict[str, Decimal]:
@@ -9535,7 +9614,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._request_orders_refresh("cancel_all")
         self._schedule_force_open_orders_refresh("cancel_all")
 
+    def _record_stop_error(self, message: str) -> None:
+        if self._stop_in_progress:
+            self._stop_last_error = message
+
     def _handle_cancel_error(self, message: str) -> None:
+        self._record_stop_error(message)
         self._append_log(f"[LIVE] cancel failed: {message}", kind="WARN")
         self._set_cancel_buttons_enabled(True)
         self._request_orders_refresh("cancel_error")

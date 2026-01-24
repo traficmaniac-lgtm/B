@@ -1,5 +1,10 @@
 ## Technical Report
 
+### NC MICRO v1.0.20
+- Added STOP watchdog timeout to force finalize and re-enable Start after cancellation hangs.
+- Deduplicated PILOT/KPI/ORDERS stale logs with heartbeat suppression.
+- Added Binance signed 400 response logging with code/msg and timestamp context.
+
 ### NC MICRO v1.0.19
 - Fixed Stop/CANCEL deadlock by forcing REST reconcile, overriding inflight suppression, and guaranteeing Stop finalization.
 - Softened WS heartbeat handling with a higher idle threshold and symbol-stale HTTP fallback logging (no restart flaps).
