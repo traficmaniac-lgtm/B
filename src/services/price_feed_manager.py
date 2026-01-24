@@ -82,11 +82,11 @@ class SafeLoopCaller:
 
     def call_soon_threadsafe(self, fn: Callable[..., Any], *args: Any) -> bool:
         if self._is_closing_fn():
-            self._log_skip("[WS] skip enqueue: closing")
+            self._log_skip("[WS] skip enqueue: closing/loop closed")
             return False
         loop = self._loop_fn()
         if not loop or loop.is_closed():
-            self._log_skip("[WS] skip enqueue: loop closed")
+            self._log_skip("[WS] skip enqueue: closing/loop closed")
             return False
         try:
             loop.call_soon_threadsafe(fn, *args)
@@ -97,11 +97,11 @@ class SafeLoopCaller:
 
     def run_coroutine_threadsafe(self, coro: asyncio.Future, *, timeout_s: float | None = None) -> bool:
         if self._is_closing_fn():
-            self._log_skip("[WS] skip coroutine: closing")
+            self._log_skip("[WS] skip coroutine: closing/loop closed")
             return False
         loop = self._loop_fn()
         if not loop or loop.is_closed():
-            self._log_skip("[WS] skip coroutine: loop closed")
+            self._log_skip("[WS] skip coroutine: closing/loop closed")
             return False
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -465,6 +465,7 @@ class _BinanceBookTickerWsThread:
 
     def _enqueue_command(self, command: dict[str, Any]) -> None:
         if self._is_closing():
+            self._log_skip_enqueue()
             return
         if self._loop and self._command_queue and not self._loop.is_closed():
             try:
@@ -701,7 +702,7 @@ class _BinanceBookTickerWsThread:
         last_log = self._skip_enqueue_log_ts
         if last_log is not None and now - last_log < 5.0:
             return
-        self._logger.info("[WS] skip enqueue: loop closed")
+        self._logger.debug("[WS] skip enqueue: closing/loop closed")
         self._skip_enqueue_log_ts = now
 
     def _get_loop(self) -> asyncio.AbstractEventLoop | None:

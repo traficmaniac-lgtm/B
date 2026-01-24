@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,26 @@ class BinanceAccountClient:
         self._backoff_max_s = backoff_max_s
         self._logger = get_logger("binance.account")
         self._time_offset_ms = 0
+        self._time_lock = threading.Lock()
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def _get_time_offset_ms(self) -> int:
+        with self._time_lock:
+            return self._time_offset_ms
+
+    def _set_time_offset_ms(self, offset_ms: int) -> None:
+        with self._time_lock:
+            self._time_offset_ms = offset_ms
+
+    def _get_recv_window(self) -> int:
+        with self._time_lock:
+            return self._recv_window
+
+    def _set_recv_window(self, value: int) -> None:
+        with self._time_lock:
+            self._recv_window = value
 
     def get_account_info(self) -> dict[str, Any]:
         payload = self._request_signed("GET", "/api/v3/account")
@@ -183,10 +204,11 @@ class BinanceAccountClient:
     def sync_time_offset(self) -> dict[str, int]:
         payload = self.get_server_time()
         server_time = int(payload.get("serverTime", 0) or 0)
-        local_time = int(time.time() * 1000)
-        self._time_offset_ms = server_time - local_time
-        self._logger.info("Time sync offset=%sms", self._time_offset_ms)
-        return {"server_time": server_time, "local_time": local_time, "offset_ms": self._time_offset_ms}
+        local_time = self._now_ms()
+        offset_ms = server_time - local_time
+        self._set_time_offset_ms(offset_ms)
+        self._logger.info("Time sync offset=%sms", offset_ms)
+        return {"server_time": server_time, "local_time": local_time, "offset_ms": offset_ms}
 
     def _log_order_error(
         self,
@@ -208,7 +230,7 @@ class BinanceAccountClient:
                 response_text = response.json()
             except Exception:  # noqa: BLE001
                 response_text = response.text
-        timestamp = int(time.time() * 1000) + self._time_offset_ms
+        timestamp = self._now_ms() + self._get_time_offset_ms()
         self._logger.error(
             "Binance %s error status=%s response=%s symbol=%s side=%s price=%s qty=%s orderId=%s clientOrderId=%s recvWindow=%s timestamp=%s",
             action,
@@ -236,12 +258,13 @@ class BinanceAccountClient:
         last_exc: Exception | None = None
         attempts = self._retries + 1
         retried_time_sync = False
+        increased_recv_window = False
         for attempt in range(attempts):
             try:
                 data = dict(params or {})
-                timestamp_ms = int(time.time() * 1000) + self._time_offset_ms
+                timestamp_ms = self._now_ms() + self._get_time_offset_ms()
                 data["timestamp"] = timestamp_ms
-                data["recvWindow"] = self._recv_window
+                data["recvWindow"] = self._get_recv_window()
                 query = urlencode(data, doseq=True)
                 signature = hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
                 signed_query = f"{query}&signature={signature}"
@@ -271,8 +294,8 @@ class BinanceAccountClient:
                             code,
                             msg,
                             timestamp_ms,
-                            self._recv_window,
-                            self._time_offset_ms,
+                            self._get_recv_window(),
+                            self._get_time_offset_ms(),
                             hint,
                         )
                     if isinstance(payload, dict) and payload.get("code") == -1021:
@@ -280,6 +303,18 @@ class BinanceAccountClient:
                         if retry_on_timestamp and not retried_time_sync:
                             retried_time_sync = True
                             continue
+                        if not increased_recv_window:
+                            current_window = self._get_recv_window()
+                            next_window = min(max(current_window * 2, 10_000), 20_000)
+                            if next_window != current_window:
+                                self._set_recv_window(next_window)
+                                increased_recv_window = True
+                                self._logger.warning(
+                                    "[BINANCE] recvWindow increased after -1021: %s -> %s (offset_ms=%s)",
+                                    current_window,
+                                    next_window,
+                                    self._get_time_offset_ms(),
+                                )
                 response.raise_for_status()
                 return response.json()
             except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as exc:

@@ -1,5 +1,10 @@
 ## Technical Report
 
+### NC MICRO v1.0.21
+- Safe WS shutdown with closing/loop-closed enqueue guards.
+- Time sync fix for signed requests with -1021 resync retry and recvWindow bump.
+- Micro TP gate calibration for low spreads and break-even unwind support.
+
 ### NC MICRO v1.0.20
 - Added STOP watchdog timeout to force finalize and re-enable Start after cancellation hangs.
 - Deduplicated PILOT/KPI/ORDERS stale logs with heartbeat suppression.

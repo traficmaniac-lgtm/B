@@ -888,6 +888,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_last_error: str | None = None
         self._stop_watchdog_token = 0
         self._stop_watchdog_started_ts: float | None = None
+        self._inflight_watchdog_started_ts: float | None = None
+        self._inflight_watchdog_last_log_ts: float | None = None
         self._settings_save_timer: QTimer | None = None
         self._last_price: float | None = None
         self._last_price_ts: float | None = None
@@ -1122,6 +1124,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._order_info_map: dict[str, OrderInfo] = {}
         self._registry_key_last_seen_ts: dict[str, float] = {}
         self._registry_gc_last_ts: float | None = None
+        self._tp_micro_gate_log_ts: float | None = None
         self._position_state = PositionState(
             position_qty=0.0,
             avg_entry_price=None,
@@ -1188,7 +1191,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.20 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.21 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -5556,6 +5559,33 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_watchdog_token += 1
         self._stop_watchdog_started_ts = None
 
+    def _check_inflight_watchdog(self) -> None:
+        if self._stop_in_progress:
+            self._inflight_watchdog_started_ts = None
+            return
+        inflight_active = self._orders_in_flight or self._snapshot_refresh_inflight or self._cancel_inflight
+        if not inflight_active:
+            self._inflight_watchdog_started_ts = None
+            return
+        now = monotonic()
+        if self._inflight_watchdog_started_ts is None:
+            self._inflight_watchdog_started_ts = now
+            return
+        if now - self._inflight_watchdog_started_ts < 5.0:
+            return
+        last_log = self._inflight_watchdog_last_log_ts
+        if last_log is not None and now - last_log < 15.0:
+            return
+        self._inflight_watchdog_last_log_ts = now
+        self._orders_in_flight = False
+        self._snapshot_refresh_inflight = False
+        self._cancel_inflight = False
+        self._append_log("[WATCHDOG] inflight reset >5s; forcing refresh + HOLD", kind="WARN")
+        if self.pilot_enabled:
+            self._pilot_hold_reason = "inflight_watchdog"
+            self._set_pilot_state(PilotState.HOLD, reason="inflight_watchdog")
+        self._schedule_force_open_orders_refresh("inflight_watchdog")
+
     def _handle_stop(self, *, reason: str = "user") -> None:
         self._append_log("[STOP] requested", kind="INFO")
         if self._stop_in_progress:
@@ -7520,12 +7550,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _profit_guard_should_hold(
         self,
         min_profit_bps: float,
-    ) -> tuple[str, float | None, float | None, float | None, float | None, float | None, float | None]:
+    ) -> tuple[
+        str,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        float,
+        bool,
+    ]:
         spread_pct = self._current_spread_pct()
         if self._kpi_state != KPI_STATE_OK:
-            return "OK", None, None, None, None, None, None
+            return "OK", None, None, None, None, None, None, min_profit_bps, False
         if spread_pct is None or spread_pct <= 0:
-            return "OK", None, None, None, None, None, None
+            return "OK", None, None, None, None, None, None, min_profit_bps, False
         spread_bps = spread_pct * 100
         fee_cost_pct = self.get_effective_fees_pct(self._symbol)
         fees_roundtrip_bps = fee_cost_pct * 100
@@ -7533,6 +7573,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         safety_pad_bps = self._profit_guard_pad_pct() * 100
         vol_bps = self._market_health.vol_bps if self._market_health else None
         risk_buffer_bps = (vol_bps or 0.0) * MARKET_HEALTH_RISK_BUFFER_MULT
+        adaptive_min_profit = False
+        min_profit_bps_used = min_profit_bps
+        if self._is_micro_profile() and fees_roundtrip_bps <= 0.01 and spread_bps <= 3.0:
+            slip_pad_bps = slippage_bps + safety_pad_bps
+            min_profit_bps_used = min(max(2.0, spread_bps + slip_pad_bps), 6.0)
+            adaptive_min_profit = True
+            now = monotonic()
+            if self._tp_micro_gate_log_ts is None or now - self._tp_micro_gate_log_ts >= 15.0:
+                self._append_log(
+                    f"[TP] micro gate min_profit_bps={min_profit_bps_used:.2f} spread_bps={spread_bps:.2f}",
+                    kind="INFO",
+                )
+                self._tp_micro_gate_log_ts = now
         edge = compute_expected_edge_bps(
             spread_bps=spread_bps,
             fees_roundtrip_bps=fees_roundtrip_bps,
@@ -7540,7 +7593,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             pad_bps=safety_pad_bps,
             risk_buffer_bps=risk_buffer_bps,
         )
-        if edge.expected_profit_bps < min_profit_bps:
+        if edge.expected_profit_bps < min_profit_bps_used:
             return (
                 "HOLD",
                 spread_bps,
@@ -7549,6 +7602,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 slippage_bps,
                 safety_pad_bps,
                 risk_buffer_bps,
+                min_profit_bps_used,
+                adaptive_min_profit,
             )
         return (
             "OK",
@@ -7558,6 +7613,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             slippage_bps,
             safety_pad_bps,
             risk_buffer_bps,
+            min_profit_bps_used,
+            adaptive_min_profit,
         )
 
     def _profit_guard_autofix(
@@ -7677,6 +7734,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             slippage_bps,
             safety_pad_bps,
             risk_buffer_bps,
+            min_profit_bps_used,
+            adaptive_min_profit,
         ) = self._profit_guard_should_hold(min_profit_bps)
         maker_pct, taker_pct, used_default = self._profit_guard_fee_inputs()
         if used_default:
@@ -7695,15 +7754,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             pad_text = f"{safety_pad_bps:.2f}bps" if safety_pad_bps is not None else "—"
             risk_text = f"{risk_buffer_bps:.2f}bps" if risk_buffer_bps is not None else "—"
             guard_prefix = "HOLD" if guard_mode == ProfitGuardMode.BLOCK else "WARN_ONLY"
-            self._append_log(
-                (
-                    f"[GUARD] {guard_prefix} thin_edge "
-                    f"raw_spread={spread_text} expected_profit_bps={expected_text} "
-                    f"min_profit_bps={min_profit_bps:.2f} fees={fee_text} "
-                    f"slip={slip_text} pad={pad_text} risk={risk_text}"
-                ),
-                kind="WARN",
-            )
+            if not (adaptive_min_profit and guard_mode == ProfitGuardMode.WARN_ONLY):
+                self._append_log(
+                    (
+                        f"[GUARD] {guard_prefix} thin_edge "
+                        f"raw_spread={spread_text} expected_profit_bps={expected_text} "
+                        f"min_profit_bps={min_profit_bps_used:.2f} fees={fee_text} "
+                        f"slip={slip_text} pad={pad_text} risk={risk_text}"
+                    ),
+                    kind="WARN",
+                )
             if self.pilot_enabled:
                 self._pilot_hold_reason = "guard"
                 self._pilot_hold_until = monotonic() + max(self.pilot_config.hold_timeout_sec, 0)
@@ -7784,12 +7844,33 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             slippage_pct=inputs.get("slippage_pct"),
             safety_edge_pct=inputs.get("safety_edge_pct"),
         )
+        spread_pct = self._current_spread_pct()
+        if self._is_micro_profile() and fee_total_pct <= 0.0001 and spread_pct is not None and spread_pct > 0:
+            spread_bps = spread_pct * 100
+            if spread_bps <= 3.0:
+                slip_pad_bps = (inputs.get("slippage_pct") or 0.0) * 100 + (inputs.get("safety_edge_pct") or 0.0) * 100
+                min_profit_bps = min(max(2.0, spread_bps + slip_pad_bps), 6.0)
+                min_profit_pct = min_profit_bps / 100
+                now = monotonic()
+                if self._tp_micro_gate_log_ts is None or now - self._tp_micro_gate_log_ts >= 15.0:
+                    self._append_log(
+                        f"[TP] micro gate min_profit_bps={min_profit_bps:.2f} spread_bps={spread_bps:.2f}",
+                        kind="INFO",
+                    )
+                    self._tp_micro_gate_log_ts = now
+        allow_break_even = (
+            self._is_micro_profile()
+            and fee_total_pct <= 0.0001
+            and entry_side == "BUY"
+            and self._pilot_position_qty() > 0
+        )
         net_profit_pct = float(profit_pct) - min_profit_pct
+        is_profitable = float(profit_pct) >= min_profit_pct or (allow_break_even and float(profit_pct) >= 0.0)
         return {
             "profit_pct": round(float(profit_pct), 6),
             "min_profit_pct": round(min_profit_pct, 6),
             "net_profit_pct": round(net_profit_pct, 6),
-            "is_profitable": float(profit_pct) >= min_profit_pct,
+            "is_profitable": is_profitable,
         }
 
     def _apply_sell_fee_buffer(self, qty: Decimal, step: Decimal | None) -> Decimal:
@@ -9777,6 +9858,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return f"{seconds}s"
 
     def _tick_order_ages(self) -> None:
+        self._check_inflight_watchdog()
         if not hasattr(self, "_orders_table"):
             return
         if self._orders_table.rowCount() == 0:
