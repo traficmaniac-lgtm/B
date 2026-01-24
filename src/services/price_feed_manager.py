@@ -60,6 +60,62 @@ WS_ROUTER_NO_FIRST_TICK = "WS_STALE_NO_FIRST_TICK"
 WS_ROUTER_STALE = "WS_STALE"
 
 
+class SafeLoopCaller:
+    def __init__(
+        self,
+        loop_fn: Callable[[], asyncio.AbstractEventLoop | None],
+        is_closing_fn: Callable[[], bool],
+        logger: logging.Logger,
+    ) -> None:
+        self._loop_fn = loop_fn
+        self._is_closing_fn = is_closing_fn
+        self._logger = logger
+        self._last_skip_log_ts: float | None = None
+
+    def _log_skip(self, message: str) -> None:
+        now = time.monotonic()
+        last_log = self._last_skip_log_ts
+        if last_log is not None and now - last_log < 5.0:
+            return
+        self._logger.debug(message)
+        self._last_skip_log_ts = now
+
+    def call_soon_threadsafe(self, fn: Callable[..., Any], *args: Any) -> bool:
+        if self._is_closing_fn():
+            self._log_skip("[WS] skip enqueue: closing")
+            return False
+        loop = self._loop_fn()
+        if not loop or loop.is_closed():
+            self._log_skip("[WS] skip enqueue: loop closed")
+            return False
+        try:
+            loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            self._log_skip("[WS] skip enqueue: runtime error")
+            return False
+        return True
+
+    def run_coroutine_threadsafe(self, coro: asyncio.Future, *, timeout_s: float | None = None) -> bool:
+        if self._is_closing_fn():
+            self._log_skip("[WS] skip coroutine: closing")
+            return False
+        loop = self._loop_fn()
+        if not loop or loop.is_closed():
+            self._log_skip("[WS] skip coroutine: loop closed")
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            if timeout_s is not None:
+                future.result(timeout=timeout_s)
+        except (asyncio.TimeoutError, RuntimeError):
+            self._log_skip("[WS] skip coroutine: runtime error")
+            return False
+        except Exception:  # noqa: BLE001
+            self._logger.debug("[WS] skip coroutine: unexpected error", exc_info=True)
+            return False
+        return True
+
+
 @dataclass(frozen=True)
 class RouterConfig:
     warmup_ms: int = WARMUP_MS
@@ -343,6 +399,7 @@ class _BinanceBookTickerWsThread:
         self._closed = False
         self._skip_enqueue_log_ts: float | None = None
         self._last_heartbeat_log_ms: int | None = None
+        self._loop_caller = SafeLoopCaller(self._get_loop, self._is_closing, self._logger)
 
     def _log_heartbeat_ok(self, idle_ms: int) -> None:
         if idle_ms < self._dead_after_ms:
@@ -357,22 +414,31 @@ class _BinanceBookTickerWsThread:
     def start(self) -> None:
         if self._thread.is_alive():
             return
+        if self._closed:
+            self._thread = threading.Thread(target=self._run_loop, name="price-feed-ws", daemon=True)
+            self._loop = None
+            self._command_queue = None
+            self._connect_task = None
+            self._websocket = None
+            self._closed = False
         self._stop_event.clear()
         self._stopping = False
         self._closed = False
+        self._closing = False
         self._thread.start()
 
     def stop(self) -> None:
         if self._stopping:
             return
         self._stopping = True
+        self._closing = True
         self._set_state(WS_STATE_STOPPING, "stopping")
         self._stop_event.set()
         if self._loop and self._loop.is_running() and not self._loop.is_closed():
             try:
                 if self._connect_task:
                     self._safe_call(self._connect_task.cancel)
-                asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop).result(timeout=5.0)
+                self._loop_caller.run_coroutine_threadsafe(self._shutdown(), timeout_s=5.0)
             except TimeoutError:
                 self._logger.warning("WS shutdown timeout; continuing stop.")
             except Exception:  # noqa: BLE001
@@ -388,7 +454,7 @@ class _BinanceBookTickerWsThread:
         return self._closed
 
     def set_symbols(self, symbols: list[str]) -> None:
-        if self._stopping or self._closed:
+        if self._is_closing():
             return
         cleaned = {symbol.strip().lower() for symbol in symbols if symbol.strip()}
         with self._symbols_lock:
@@ -398,22 +464,25 @@ class _BinanceBookTickerWsThread:
         self._enqueue_command({"type": "sync_symbols"})
 
     def _enqueue_command(self, command: dict[str, Any]) -> None:
-        if self._stopping:
+        if self._is_closing():
             return
         if self._loop and self._command_queue and not self._loop.is_closed():
             try:
                 self._safe_call(self._command_queue.put_nowait, command)
             except RuntimeError:
-                if self._stopping:
+                if self._is_closing():
                     return
                 self._log_skip_enqueue()
                 return
         else:
-            if not self._stopping:
+            if not self._is_closing():
                 self._pending_commands.append(command)
 
     def is_running(self) -> bool:
         return bool(self._loop and self._loop.is_running() and not self._stopping)
+
+    def is_closing(self) -> bool:
+        return self._is_closing()
 
     def get_subscribed_symbols(self) -> set[str]:
         with self._symbols_lock:
@@ -624,12 +693,7 @@ class _BinanceBookTickerWsThread:
             await asyncio.sleep(min(sleep_s, 5.0))
 
     def _safe_call(self, fn: Callable[..., Any], *args: Any) -> None:
-        if not self._loop or self._loop.is_closed() or self._stopping:
-            self._log_skip_enqueue()
-            return
-        try:
-            self._loop.call_soon_threadsafe(fn, *args)
-        except RuntimeError:
+        if not self._loop_caller.call_soon_threadsafe(fn, *args):
             self._log_skip_enqueue()
 
     def _log_skip_enqueue(self) -> None:
@@ -639,6 +703,12 @@ class _BinanceBookTickerWsThread:
             return
         self._logger.info("[WS] skip enqueue: loop closed")
         self._skip_enqueue_log_ts = now
+
+    def _get_loop(self) -> asyncio.AbstractEventLoop | None:
+        return self._loop
+
+    def _is_closing(self) -> bool:
+        return self._stopping or self._closed or self._closing
 
 
 class PriceFeedManager:
@@ -748,10 +818,34 @@ class PriceFeedManager:
             self._router_config.ws_stale_ms,
         )
         self._stop_event.clear()
+        self._stopping = False
+        if not self._monitor_thread.is_alive():
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                name="price-feed-monitor",
+                daemon=True,
+            )
         self._ws_thread.start()
         self._monitor_thread.start()
         if self._transport_test_enabled:
             self._start_selftest_once()
+
+    def stop(self) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        self._stop_event.set()
+        with self._symbols_update_lock:
+            if self._symbols_update_timer and self._symbols_update_timer.is_alive():
+                self._symbols_update_timer.cancel()
+                self._symbols_update_timer = None
+        for timer in self._transport_test_timers:
+            if timer.is_alive():
+                timer.cancel()
+        self._transport_test_timers.clear()
+        self._ws_thread.stop()
+        if self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=5.0)
 
     def _resolve_transport_test_enabled(self) -> bool:
         env_flag = os.getenv("BBOT_TRANSPORT_TEST", "").strip()
@@ -1042,7 +1136,12 @@ class PriceFeedManager:
         def _flush() -> None:
             if self._stopping or self._shutting_down:
                 return
-            if not self._ws_thread or not self._ws_thread.is_running() or self._ws_thread.is_closed():
+            if (
+                not self._ws_thread
+                or not self._ws_thread.is_running()
+                or self._ws_thread.is_closed()
+                or self._ws_thread.is_closing()
+            ):
                 return
             symbols = self._get_ws_subscription_symbols()
             self._ws_thread.set_symbols(symbols)

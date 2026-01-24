@@ -77,3 +77,88 @@ def cancel_all_with_reconcile(
         passes=passes,
         log_entries=log_entries,
     )
+
+
+def cancel_all_open_orders(
+    *,
+    account_client: Any,
+    symbol: str,
+    reason: str,
+    timeout_s: float = 8.0,
+    poll_interval_s: float = 0.25,
+) -> CancelResult:
+    start_ts = time.monotonic()
+    cancelled_ids: set[str] = set()
+    remaining_ids: list[str] = []
+    open_orders: list[dict[str, Any]] = []
+    errors: list[str] = []
+    log_entries: list[str] = []
+
+    def _log(message: str) -> None:
+        log_entries.append(message)
+
+    def _fetch_open_orders() -> list[dict[str, Any]]:
+        try:
+            fetched = account_client.get_open_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"[CANCEL] list open_orders failed: {exc}")
+            return []
+        if not isinstance(fetched, list):
+            errors.append("[CANCEL] list open_orders failed: response not list")
+            return []
+        return [order for order in fetched if isinstance(order, dict)]
+
+    open_orders = _fetch_open_orders()
+    remaining_ids = [
+        str(order.get("orderId", ""))
+        for order in open_orders
+        if str(order.get("orderId", ""))
+    ]
+    _log(f"[CANCEL] open_orders fetched n={len(remaining_ids)} reason={reason}")
+    if not remaining_ids:
+        _log("[CANCEL] done canceled=0 remaining=0 errors=0")
+        return CancelResult(
+            cancelled_ids=[],
+            remaining_ids=[],
+            errors=errors,
+            open_orders=open_orders,
+            passes=0,
+            log_entries=log_entries,
+        )
+    for order_id in remaining_ids:
+        _log(f"[CANCEL] cancel send order_id={order_id}")
+        try:
+            account_client.cancel_order(symbol, order_id)
+            cancelled_ids.add(order_id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"[CANCEL] cancel failed order_id={order_id} error={exc}")
+    passes = 0
+    while time.monotonic() - start_ts < timeout_s:
+        remaining = timeout_s - (time.monotonic() - start_ts)
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_s, remaining))
+        passes += 1
+        open_orders = _fetch_open_orders()
+        remaining_ids = [
+            str(order.get("orderId", ""))
+            for order in open_orders
+            if str(order.get("orderId", ""))
+        ]
+        _log(f"[CANCEL] poll pass={passes} remaining={len(remaining_ids)}")
+        if not remaining_ids:
+            break
+    if remaining_ids:
+        _log(f"[CANCEL] timeout remaining_ids={remaining_ids}")
+    _log(
+        f"[CANCEL] done canceled={len(cancelled_ids)} "
+        f"remaining={len(remaining_ids)} errors={len(errors)}"
+    )
+    return CancelResult(
+        cancelled_ids=sorted(cancelled_ids),
+        remaining_ids=remaining_ids,
+        errors=errors,
+        open_orders=open_orders,
+        passes=passes,
+        log_entries=log_entries,
+    )
