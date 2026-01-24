@@ -53,7 +53,7 @@ from src.ai.operator_math import compute_break_even_tp_pct, compute_fee_total_pc
 from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
-from src.core.cancel_reconcile import CancelResult, cancel_all_with_reconcile
+from src.core.cancel_reconcile import CancelResult, cancel_all_open_orders
 from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
@@ -269,6 +269,8 @@ STALE_REFRESH_POLL_HARD_MAX_SEC = 10
 STALE_REFRESH_HARD_MAX_MS = 90_000
 STALE_REFRESH_HASH_STABLE_CYCLES = 3
 STALE_REFRESH_LOG_DEDUP_SEC = 20
+STALE_REFRESH_POLL_LOG_MIN_SEC = 10.0
+STALE_REFRESH_POLL_SUPPRESS_LOG_SEC = 30.0
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 STOP_DEADLINE_MS = 8000
 LOG_DEDUP_HEARTBEAT_SEC = 10.0
@@ -866,6 +868,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._engine_state = "WAITING"
         self._ws_status = ""
         self._closing = False
+        self._close_pending = False
+        self._close_finalizing = False
+        self._shutdown_started = False
+        self._feed_active = True
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
         self._sell_side_enabled = False
@@ -1006,6 +1012,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stale_refresh_skipped_rate_limit = 0
         self._stale_refresh_skipped_no_change = 0
         self._stale_refresh_last_force_ts_ms: int | None = None
+        self._stale_refresh_poll_log_ts: dict[str, float] = {}
+        self._stale_refresh_poll_suppressed: dict[str, int] = {}
+        self._stale_refresh_poll_suppressed_log_ts: dict[str, float] = {}
         self._orders_snapshot_hash_value: int | None = None
         self._orders_snapshot_hash_changed = False
         self._orders_snapshot_hash_stable_cycles = 0
@@ -4207,6 +4216,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             f"skip_no_change={self._stale_refresh_skipped_no_change}"
         )
         now = monotonic()
+        if reason == "poll":
+            symbol = self._symbol
+            last_log = self._stale_refresh_poll_log_ts.get(symbol)
+            if last_log is not None and now - last_log < STALE_REFRESH_POLL_LOG_MIN_SEC:
+                suppressed = self._stale_refresh_poll_suppressed.get(symbol, 0) + 1
+                self._stale_refresh_poll_suppressed[symbol] = suppressed
+                last_suppressed_log = self._stale_refresh_poll_suppressed_log_ts.get(symbol)
+                if (
+                    last_suppressed_log is None
+                    or now - last_suppressed_log >= STALE_REFRESH_POLL_SUPPRESS_LOG_SEC
+                ):
+                    self._append_log(
+                        (
+                            "[ORDERS] stale storm suppressed "
+                            f"(n={suppressed} interval={int(STALE_REFRESH_POLL_LOG_MIN_SEC)}s)"
+                        ),
+                        kind="INFO",
+                    )
+                    self._stale_refresh_poll_suppressed_log_ts[symbol] = now
+                    self._stale_refresh_poll_suppressed[symbol] = 0
+                return
+            self._stale_refresh_poll_log_ts[symbol] = now
         state = (reason, allowed)
         last_log = self._stale_refresh_last_log_ts
         if self._stale_refresh_last_state != state or last_log is None or now - last_log >= LOG_DEDUP_HEARTBEAT_SEC:
@@ -5029,6 +5060,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             reason = "STOPPING" if self._engine_state == "STOPPING" or self._stop_in_progress else "INFIGHT"
             self._append_log(f"[START] blocked reason={reason}", kind="WARN")
             return
+        self._start_price_feed_if_needed()
+        if self._account_client:
+            if not self._balances_timer.isActive():
+                self._balances_timer.start(10_000)
+            if not self._orders_timer.isActive():
+                self._orders_timer.start()
+            if not self._fills_timer.isActive():
+                self._fills_timer.start()
+            self._update_orders_timer_interval()
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
@@ -5411,12 +5451,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
 
         def _cancel() -> CancelResult:
-            return cancel_all_with_reconcile(
+            return cancel_all_open_orders(
                 account_client=self._account_client,
                 symbol=self._symbol,
                 reason=reason,
-                timeout_s=4.0,
-                max_passes=3,
+                timeout_s=8.0,
+                poll_interval_s=0.25,
             )
 
         worker = _Worker(_cancel, self._can_emit_worker_results)
@@ -5443,6 +5483,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             after_count = len(self._open_orders)
             canceled = len(result.cancelled_ids)
             remaining = len(result.remaining_ids)
+            if finalize_stop:
+                cancel_status = "ok" if remaining == 0 and not result.errors else "partial"
+                self._append_log(f"[STOP] cancel orders: {cancel_status}", kind="INFO")
             self._append_log(
                 (
                     f"[ORDERS][CANCEL] done reason={reason} "
@@ -5470,6 +5513,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._update_orders_timer_interval()
             self._handle_cancel_error(message)
             self._record_stop_error(message)
+            if finalize_stop:
+                self._append_log("[STOP] cancel orders: partial", kind="WARN")
             self._set_cancel_buttons_enabled(True)
             self._request_orders_refresh("cancel_all_error")
             self._append_log("orders refreshed after cancel", kind="INFO")
@@ -5511,7 +5556,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_watchdog_token += 1
         self._stop_watchdog_started_ts = None
 
-    def _handle_stop(self) -> None:
+    def _handle_stop(self, *, reason: str = "user") -> None:
         self._append_log("[STOP] requested", kind="INFO")
         if self._stop_in_progress:
             self._append_log("[STOP] ignored (already stopping)", kind="INFO")
@@ -5520,13 +5565,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_inflight = True
         self._stop_requested = True
         self._stop_last_error = None
-        self._closing = True
         self._stop_done_with_errors = False
         if self._start_cancel_event:
             self._start_cancel_event.set()
         self._start_run_id += 1
         self._start_stop_watchdog()
-        self._stop_local_timers()
+        self._begin_shutdown(reason=reason)
         self._append_log("Stop pressed.", kind="ORDERS")
         cancel_all = bool(self._cancel_all_on_stop_toggle.isChecked())
         self._append_log(
@@ -5552,17 +5596,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pending_restore_ids.clear()
             if self._dry_run_toggle.isChecked():
                 self._append_log("[STOP] cancel done", kind="INFO")
+                self._append_log("[STOP] cancel orders: ok", kind="INFO")
                 self._refresh_orders(reason="stop_dry_run", force=True)
                 keep_open_orders_on_finalize = False
                 return
             if not self._account_client:
                 self._append_log("[STOP] cancel skipped: no account client.", kind="WARN")
                 self._append_log("[STOP] cancel done", kind="INFO")
+                self._append_log("[STOP] cancel orders: ok", kind="INFO")
                 self._refresh_orders(reason="stop_no_client", force=True)
                 return
             if not cancel_all:
                 self._append_log("[STOP] cancel skipped: toggle disabled.", kind="INFO")
                 self._append_log("[STOP] cancel done", kind="INFO")
+                self._append_log("[STOP] cancel orders: ok", kind="INFO")
                 self._refresh_orders(reason="stop_no_cancel", force=True)
                 return
             cancel_required = True
@@ -5606,10 +5653,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_in_progress = False
         self._stop_inflight = False
         self._stop_requested = False
-        self._closing = False
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
-        self._resume_local_timers()
+        should_resume = not self._close_pending
+        if should_resume:
+            self._closing = False
+            self._shutdown_started = False
+            self._resume_local_timers()
         if keep_open_orders:
             self._set_orders_snapshot(self._build_orders_snapshot(self._open_orders), reason="stop_finalize")
         else:
@@ -5627,6 +5677,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_done_with_errors = False
         self._set_cancel_buttons_enabled(True)
         self._stop_last_error = None
+        if self._close_pending:
+            self._complete_close_if_pending()
 
     def _cancel_bot_orders_on_stop(self) -> None:
         if not self._account_client:
@@ -5746,6 +5798,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._snapshot_refresh_inflight = False
         self._handle_cancel_error(message)
         self._append_log("[STOP] cancel done", kind="INFO")
+        self._append_log("[STOP] cancel orders: partial", kind="WARN")
         self._append_log("[STOP] force gui refresh", kind="INFO")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
@@ -6350,6 +6403,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _refresh_balances(self, force: bool = False) -> None:
         try:
+            if self._closing and not self._stop_in_progress and not force:
+                return
             self._balances_tick_count += 1
             if self._balances_tick_count % 30 == 0:
                 self._logger.debug("balances refresh tick")
@@ -6493,6 +6548,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> None:
         try:
             critical_reason = self._is_critical_refresh_reason(reason)
+            if self._closing and not self._stop_in_progress and not critical_reason and not force:
+                return
             if force_refresh:
                 force = True
                 self._snapshot_refresh_inflight = False
@@ -6588,6 +6645,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _refresh_fills(self) -> None:
         try:
+            if self._closing and not self._stop_in_progress:
+                return
             if self._dry_run_toggle.isChecked():
                 return
             if self._state != "RUNNING":
@@ -9128,6 +9187,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_about_to_quit(self) -> None:
         self._logger.info("[NC_MICRO] aboutToQuit received")
         self._write_crash_log_line(f"[NC_MICRO] aboutToQuit received ts={datetime.now().isoformat()}")
+        if not self._stop_in_progress and not self._close_pending:
+            self._close_pending = True
+            self._handle_stop(reason="close")
 
     def _toggle_logs_panel(self) -> None:
         if not hasattr(self, "_right_splitter"):
@@ -10060,7 +10122,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_auto_values_label(self._settings_state.grid_step_mode == "AUTO_ATR")
 
     def _can_emit_worker_results(self) -> bool:
-        return not self._closing
+        return not self._closing or self._stop_in_progress
 
     def _stop_local_timers(self) -> None:
         if self._market_kpi_timer.isActive():
@@ -10072,6 +10134,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._order_age_timer.isActive():
             self._order_age_timer.stop()
 
+    def _stop_runtime_timers(self) -> None:
+        if self._balances_timer.isActive():
+            self._balances_timer.stop()
+        if self._orders_timer.isActive():
+            self._orders_timer.stop()
+        if self._fills_timer.isActive():
+            self._fills_timer.stop()
+        if self._order_age_timer.isActive():
+            self._order_age_timer.stop()
+        self._stop_local_timers()
+
     def _resume_local_timers(self) -> None:
         if not self._market_kpi_timer.isActive():
             self._market_kpi_timer.start()
@@ -10082,16 +10155,65 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._order_age_timer.isActive():
             self._order_age_timer.start()
 
-    def closeEvent(self, event: object) -> None:  # noqa: N802
+    def _stop_price_feed(self, *, shutdown: bool) -> None:
+        if not self._feed_active and not shutdown:
+            return
+        self._feed_active = False
+        try:
+            self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
+            self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
+            self._price_feed_manager.unregister_symbol(self._symbol)
+            if shutdown and not self._price_feed_manager.is_shutting_down:
+                self._price_feed_manager.shutdown()
+            elif not shutdown and not self._price_feed_manager.is_shutting_down:
+                self._price_feed_manager.stop()
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception stopping price feed")
+        self._append_log("[STOP] feed stopped", kind="INFO")
+
+    def _start_price_feed_if_needed(self) -> None:
+        if self._feed_active or self._price_feed_manager.is_shutting_down:
+            return
+        self._feed_active = True
+        self._price_feed_manager.start()
+        self._price_feed_manager.register_symbol(self._symbol)
+        self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
+        self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
+
+    def _begin_shutdown(self, *, reason: str) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
         self._closing = True
-        self._balances_timer.stop()
-        self._orders_timer.stop()
-        self._fills_timer.stop()
-        self._order_age_timer.stop()
-        self._stop_local_timers()
-        self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
-        self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
-        self._price_feed_manager.unregister_symbol(self._symbol)
+        self._stop_runtime_timers()
+        self._stop_price_feed(shutdown=(reason == "close"))
+        self._append_log(f"[STOP] begin reason={reason}", kind="INFO")
+
+    def _complete_close_if_pending(self) -> None:
+        if not self._close_pending or self._close_finalizing:
+            return
+        self._close_finalizing = True
+        QTimer.singleShot(0, self, self.close)
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802
+        if self._close_finalizing:
+            self._closing = True
+            self._stop_runtime_timers()
+            self._stop_price_feed(shutdown=True)
+        elif not self._stop_in_progress:
+            self._close_pending = True
+            self._handle_stop(reason="close")
+            try:
+                event.ignore()
+            except Exception:
+                return
+            return
+        else:
+            self._close_pending = True
+            try:
+                event.ignore()
+            except Exception:
+                return
         self._append_log("Lite Grid Terminal closed.", kind="INFO")
         super().closeEvent(event)
 
