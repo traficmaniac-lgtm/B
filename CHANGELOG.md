@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.22
+- Fixed min profit bps units and TP gating for spread-capture mode.
+- Aligned tick-based BUY/SELL quantities and clamped sell sizing to inventory.
+- Blocked order placement on stale bid/ask; added coverage tests.
+
 ## v1.0.21
 - Safe WS shutdown (skip enqueue on closing/loop closed).
 - Time sync fix for signed requests with -1021 retry + recvWindow bump.

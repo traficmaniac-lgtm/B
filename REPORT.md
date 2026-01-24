@@ -1,5 +1,10 @@
 ## Technical Report
 
+### NC MICRO v1.0.22
+- Fixed min profit bps conversions and TP gate logging in spread-capture mode.
+- Ensured tick-based spread-capture plans align BUY/SELL quantities and clamp sell sizing to inventory.
+- Blocked order placement/reprice when bid/ask feed is stale; added coverage tests.
+
 ### NC MICRO v1.0.21
 - Safe WS shutdown with closing/loop-closed enqueue guards.
 - Time sync fix for signed requests with -1021 resync retry and recvWindow bump.
