@@ -6900,7 +6900,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             safety_pad_bps,
             risk_buffer_bps,
         ) = self._profit_guard_should_hold(min_profit_bps)
-        )
         maker_pct, taker_pct, used_default = self._profit_guard_fee_inputs()
         if used_default:
             self._append_log(
