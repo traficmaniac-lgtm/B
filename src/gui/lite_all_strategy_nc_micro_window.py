@@ -856,6 +856,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         self._stop_inflight = False
         self._settings_save_timer: QTimer | None = None
+        self._last_price: float | None = None
+        self._last_price_ts: float | None = None
         self._load_settings_from_disk()
         self._apply_profile_defaults_if_pristine()
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
@@ -917,8 +919,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._recent_key_ttl_s = 8.0
         self._recent_key_insufficient_ttl_s = 2.0
         self._bot_session_id: str | None = None
-        self._last_price: float | None = None
-        self._last_price_ts: float | None = None
         self._price_history: list[float] = []
         self.book_snapshot: dict[str, float] | None = None
         self._ws_last_tick_ts: float | None = None
