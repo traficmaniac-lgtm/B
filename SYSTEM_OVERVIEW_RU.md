@@ -4,7 +4,7 @@
 
 ## 1. Цели и общая логика
 
-BBOT Desktop Terminal — настольный GUI‑терминал для работы с рынками Binance: обзор пар, лайв‑цены, экспериментальные grid‑режимы, режимы AI‑анализа и локальный runtime для симуляций. Центральный поток приложения:
+BBOT Desktop Terminal — настольный GUI‑терминал для работы с рынками Binance: обзор пар, лайв‑цены, экспериментальные grid‑режимы, режимы AI‑анализа и локальный runtime для симуляций, включая отдельный режим NC MICRO. Центральный поток приложения:
 
 1. Запуск GUI и загрузка конфигурации.
 2. Инициализация сервисов цен/рынков.
@@ -39,7 +39,7 @@ src/
   core/       — конфигурация, модели, логирование, стратегии
   binance/    — HTTP/WS/Account клиенты
   services/   — рынки, цены, кэши, rate‑limiter
-  gui/        — окна/вкладки/диалоги/модели UI
+  gui/        — окна/вкладки/диалоги/модели UI (Lite, Lite All Strategy, ALGO PILOT, NC MICRO)
   ai/         — AI‑схемы и OpenAI‑клиент
   runtime/    — локальный runtime и виртуальные ордера
 ```
@@ -158,6 +158,14 @@ src/
 - Profit guard повышает TP/шаг/диапазон до минимально прибыльных значений с учётом комиссий, спреда и волатильности.
 - Break‑even guard блокирует перестроение, если сетка пересекает цену безубытка в неверную сторону.
 
+### Lite All Strategy — NC MICRO
+
+- `src/gui/lite_all_strategy_nc_micro_window.py` — отдельное окно NC MICRO с фокусом на HTTP‑источники, защитные проверки и обработку нестабильных данных.
+- Включает crash‑catcher (логирование падений в `logs/crash/NC_MICRO_*`), расширенный контроль состояния ордеров и защитные авто‑действия.
+- Использует `TradeGate` и `TradeGateState` для блокировки live‑торговли при отсутствии ключей, API‑ошибках, read‑only или неподтверждённой торговле.
+- Реализует политики stale‑ордеров (`NONE`, `RECENTER`, `CANCEL_REPLACE_STALE`) и авто‑действия с кулдаунами для защиты от дрейфа/устаревания сетки.
+- Встроен profit‑guard и break‑even логика для контроля минимальной прибыльности сетки и действиях в режиме восстановления.
+
 ## 9. AI модуль
 
 ### `src/ai/models.py`
@@ -180,12 +188,16 @@ src/
 1. **Конфиг**: `load_config()` → `AppState.load()` → настройки GUI.
 2. **Список пар**: `OverviewTab` → `MarketsService` → Binance HTTP → кэш → таблица.
 3. **Цены**: `PriceFeedManager` (WS/HTTP) → `PriceFeedService` → сигналы → UI.
-4. **Режимы пары**: `PairModeManager` → окно режима (Lite/Lite All Strategy/ALGO PILOT).
+4. **Режимы пары**: `PairModeManager` → окно режима (Lite/Lite All Strategy/ALGO PILOT/NC MICRO).
 5. **ALGO PILOT**:
    - обновляет KPI (спред, волатильность, источник),
    - строит сетку через GridEngine и применяет profit/break‑even guards,
    - управляет ордерами, stale‑детектором и безопасностью через TradeGate.
-6. **AI режимы**: Pair Workspace/AI Operator собирает datapack → `OpenAIClient` → JSON → UI.
+6. **NC MICRO**:
+   - берёт цены из `PriceFeedManager`, HTTP book‑ticker и кэширует их через `DataCache`,
+   - контролирует статус WS и stale‑политику ордеров,
+   - защищает торговые действия через `TradeGate` и profit/break‑even guard.
+7. **AI режимы**: Pair Workspace/AI Operator собирает datapack → `OpenAIClient` → JSON → UI.
 
 ## 12. Тесты
 
