@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import faulthandler
+import json
 import os
 import random
 import sys
@@ -14,6 +15,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
 from math import ceil, floor, isfinite
+from pathlib import Path
 from time import monotonic, perf_counter, sleep, time as time_fn
 from typing import Any, Callable
 from uuid import uuid4
@@ -277,8 +279,8 @@ STALE_AUTO_ACTION_PAUSE_SEC = 300
 TP_MIN_PROFIT_COOLDOWN_SEC = 30
 PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.0
 PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.0
-PILOT_SLIPPAGE_BPS = 0.30
-PILOT_PAD_BPS = 0.50
+PILOT_SLIPPAGE_BPS = 0.10
+PILOT_PAD_BPS = 0.10
 PROFIT_GUARD_SLIPPAGE_BPS = 1.5
 PROFIT_GUARD_EXTRA_BUFFER_PCT = 0.02
 PROFIT_GUARD_BUFFER_PCT = 0.03
@@ -320,10 +322,13 @@ SPREAD_ZERO_OK_SYMBOLS = {
     "ADAUSDT",
 }
 MICRO_STABLECOIN_SYMBOLS = {"EURIUSDT", "USDCUSDT"}
-MICRO_STABLECOIN_STEP_PCT_DEFAULT = 0.03
-MICRO_STABLECOIN_STEP_PCT_MIN = 0.02
+MICRO_STABLECOIN_STEP_ABS_DEFAULT = 0.0001
+MICRO_STABLECOIN_RANGE_ABS_DEFAULT = 0.0010
+MICRO_STABLECOIN_TP_ABS_DEFAULT = 0.0001
+MICRO_STABLECOIN_STEP_PCT_DEFAULT = 0.01
+MICRO_STABLECOIN_STEP_PCT_MIN = 0.005
 MICRO_STABLECOIN_STEP_PCT_MAX = 0.06
-MICRO_STABLECOIN_RANGE_PCT_DEFAULT = 0.20
+MICRO_STABLECOIN_RANGE_PCT_DEFAULT = 0.10
 MICRO_STABLECOIN_RANGE_PCT_MAX = 0.40
 MICRO_STABLECOIN_TP_PCT_MAX = 0.15
 MICRO_STABLECOIN_THIN_EDGE_MIN_PROFIT_PCT = 0.02
@@ -846,6 +851,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids: set[str] = set()
         self._pending_restore_ids: set[str] = set()
         self._settings_state = GridSettingsState()
+        self.pilot_config = PilotConfig()
+        self._pilot_allow_market = self.pilot_config.allow_market_close
+        self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
+        self._stop_inflight = False
+        self._settings_save_timer: QTimer | None = None
+        self._load_settings_from_disk()
         self._apply_profile_defaults_if_pristine()
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
         self._manual_grid_step_pct = self._settings_state.grid_step_pct
@@ -992,9 +1003,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_requested = False
         self._pilot_state = PilotState.OFF
         self.pilot_enabled = False
-        self.pilot_config = PilotConfig()
         self._pilot_confirm_dry_run = False
-        self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_action_in_progress = False
         self._current_action: str | None = None
         self._pilot_pending_action: PilotAction | None = None
@@ -1016,7 +1025,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._last_snapshot_refresh_ts = 0.0
         self._snapshot_refresh_inflight = False
         self._snapshot_refresh_suppressed_log_ts: float | None = None
-        self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         self._pilot_pending_cancel_ids: set[str] = set()
         self._pilot_stale_seen_ids: dict[str, float] = {}
         self._pilot_stale_handled: dict[str, float] = {}
@@ -1128,7 +1136,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.11 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.15 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1365,14 +1373,34 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _is_micro_profile(self) -> bool:
         return self._symbol.replace("/", "").upper() in MICRO_STABLECOIN_SYMBOLS
 
+    def _settings_anchor_price(self) -> float:
+        anchor_price = self._last_price
+        if anchor_price is None or anchor_price <= 0:
+            return 1.0
+        return anchor_price
+
+    def _abs_to_pct(self, value_abs: float, anchor_price: float) -> float:
+        if anchor_price <= 0:
+            return 0.0
+        return value_abs / anchor_price * 100
+
+    def _pct_to_abs(self, value_pct: float, anchor_price: float) -> float:
+        return anchor_price * value_pct / 100
+
     def _micro_grid_defaults(self) -> GridSettingsState:
-        tp_default = min(MICRO_STABLECOIN_STEP_PCT_DEFAULT * 2, MICRO_STABLECOIN_TP_PCT_MAX)
+        anchor_price = self._settings_anchor_price()
+        step_pct = self._abs_to_pct(MICRO_STABLECOIN_STEP_ABS_DEFAULT, anchor_price) or MICRO_STABLECOIN_STEP_PCT_DEFAULT
+        range_pct = self._abs_to_pct(MICRO_STABLECOIN_RANGE_ABS_DEFAULT, anchor_price) or MICRO_STABLECOIN_RANGE_PCT_DEFAULT
+        tp_default = self._abs_to_pct(MICRO_STABLECOIN_TP_ABS_DEFAULT, anchor_price) or step_pct
+        tp_default = min(tp_default, MICRO_STABLECOIN_TP_PCT_MAX)
         return GridSettingsState(
-            grid_step_pct=MICRO_STABLECOIN_STEP_PCT_DEFAULT,
+            grid_step_pct=step_pct,
             take_profit_pct=tp_default,
-            range_low_pct=MICRO_STABLECOIN_RANGE_PCT_DEFAULT,
-            range_high_pct=MICRO_STABLECOIN_RANGE_PCT_DEFAULT,
-            grid_count=8,
+            range_low_pct=range_pct,
+            range_high_pct=range_pct,
+            grid_count=10,
+            grid_step_mode="MANUAL",
+            range_mode="Manual",
             order_size_mode="Equal",
         )
 
@@ -1381,8 +1409,173 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._settings_state != defaults:
             return
         if self._is_micro_profile():
-            self._settings_state = self._micro_grid_defaults()
+            self._apply_micro_defaults(reason="pristine_settings")
+
+    def _resolve_settings_path(self) -> Path:
+        base_path = Path(self._app_state.user_config_path or "config.user.yaml")
+        return base_path.with_name("nc_micro_settings.json")
+
+    def _load_settings_from_disk(self) -> None:
+        if not self._is_micro_profile():
+            return
+        path = self._resolve_settings_path()
+        if not path.exists():
+            self._apply_micro_defaults(reason="missing_settings")
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            self._apply_micro_defaults(reason="invalid_settings_or_crash")
+            return
+        if not isinstance(payload, dict):
+            self._apply_micro_defaults(reason="invalid_settings_or_crash")
+            return
+        grid = payload.get("grid", {}) if isinstance(payload.get("grid"), dict) else {}
+        pilot = payload.get("pilot", {}) if isinstance(payload.get("pilot"), dict) else {}
+        anchor_price = self._settings_anchor_price()
+        step_abs = self._coerce_float(grid.get("step_abs") or grid.get("grid_step_abs"))
+        range_low_abs = self._coerce_float(grid.get("range_low_abs") or grid.get("range_abs"))
+        range_high_abs = self._coerce_float(grid.get("range_high_abs") or grid.get("range_abs"))
+        tp_abs = self._coerce_float(grid.get("tp_abs") or grid.get("take_profit_abs"))
+        if (
+            step_abs is None
+            or range_low_abs is None
+            or range_high_abs is None
+            or tp_abs is None
+            or not isfinite(step_abs)
+            or not isfinite(range_low_abs)
+            or not isfinite(range_high_abs)
+            or not isfinite(tp_abs)
+            or step_abs <= 0
+            or range_low_abs <= 0
+            or range_high_abs <= 0
+            or tp_abs <= 0
+        ):
+            self._apply_micro_defaults(reason="invalid_settings_or_crash")
+            return
+        grid_count = int(grid.get("grid_count", 10))
+        if grid_count < 2:
+            self._apply_micro_defaults(reason="invalid_settings_or_crash")
+            return
+        budget = self._coerce_float(grid.get("budget")) or GridSettingsState.budget
+        stop_loss_pct = self._coerce_float(grid.get("stop_loss_pct")) or GridSettingsState.stop_loss_pct
+        max_active_orders = grid.get("max_active_orders", grid_count)
+        try:
+            max_active_orders = int(max_active_orders)
+        except (TypeError, ValueError):
+            max_active_orders = grid_count
+        settings = GridSettingsState(
+            budget=budget,
+            direction=str(grid.get("direction", GridSettingsState.direction)),
+            grid_count=grid_count,
+            grid_step_pct=self._abs_to_pct(step_abs, anchor_price),
+            grid_step_mode=str(grid.get("grid_step_mode", "MANUAL")),
+            range_mode=str(grid.get("range_mode", "Manual")),
+            range_low_pct=self._abs_to_pct(range_low_abs, anchor_price),
+            range_high_pct=self._abs_to_pct(range_high_abs, anchor_price),
+            take_profit_pct=self._abs_to_pct(tp_abs, anchor_price),
+            stop_loss_enabled=bool(grid.get("stop_loss_enabled", GridSettingsState.stop_loss_enabled)),
+            stop_loss_pct=stop_loss_pct,
+            max_active_orders=max_active_orders,
+            order_size_mode=str(grid.get("order_size_mode", GridSettingsState.order_size_mode)),
+        )
+        if settings.grid_step_pct <= 0 or settings.range_low_pct <= 0 or settings.range_high_pct <= 0:
+            self._apply_micro_defaults(reason="invalid_settings_or_crash")
+            return
+        self._settings_state = settings
+        self._manual_grid_step_pct = settings.grid_step_pct
+        self.pilot_config.min_profit_bps = (
+            self._coerce_float(pilot.get("min_profit_bps")) or self.pilot_config.min_profit_bps
+        )
+        self.pilot_config.max_step_pct = (
+            self._coerce_float(pilot.get("max_step_pct")) or self.pilot_config.max_step_pct
+        )
+        self.pilot_config.max_range_pct = (
+            self._coerce_float(pilot.get("max_range_pct")) or self.pilot_config.max_range_pct
+        )
+        hold_timeout_raw = pilot.get("hold_timeout_sec", self.pilot_config.hold_timeout_sec)
+        try:
+            self.pilot_config.hold_timeout_sec = int(hold_timeout_raw)
+        except (TypeError, ValueError):
+            self.pilot_config.hold_timeout_sec = self.pilot_config.hold_timeout_sec
+        self.pilot_config.stale_policy = str(pilot.get("stale_policy", self.pilot_config.stale_policy))
+        self.pilot_config.allow_market_close = bool(
+            pilot.get("allow_market_close", self.pilot_config.allow_market_close)
+        )
+        if hasattr(self.pilot_config, "allow_guard_autofix"):
+            self.pilot_config.allow_guard_autofix = bool(
+                pilot.get("allow_guard_autofix", getattr(self.pilot_config, "allow_guard_autofix", False))
+            )
+        self._pilot_allow_market = self.pilot_config.allow_market_close
+        self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
+
+    def _apply_micro_defaults(self, *, reason: str) -> None:
+        self._settings_state = self._micro_grid_defaults()
+        self._manual_grid_step_pct = self._settings_state.grid_step_pct
+        self._apply_pilot_defaults()
+        self._append_log(f"[SETTINGS] defaults applied reason={reason}", kind="INFO")
+        if self._is_micro_profile():
             self._append_log("[PILOT] micro_defaults_applied=true", kind="INFO")
+        self._save_settings_to_disk()
+
+    def _apply_pilot_defaults(self) -> None:
+        self.pilot_config.min_profit_bps = 0.05
+        self.pilot_config.stale_policy = "CANCEL_REPLACE"
+        self.pilot_config.allow_market_close = True
+        if hasattr(self.pilot_config, "allow_guard_autofix"):
+            self.pilot_config.allow_guard_autofix = False
+        self._pilot_allow_market = self.pilot_config.allow_market_close
+        self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
+
+    def _save_settings_to_disk(self) -> None:
+        if not self._is_micro_profile():
+            return
+        path = self._resolve_settings_path()
+        anchor_price = self._settings_anchor_price()
+        grid = self._settings_state
+        range_low_abs = self._pct_to_abs(grid.range_low_pct, anchor_price)
+        range_high_abs = self._pct_to_abs(grid.range_high_pct, anchor_price)
+        payload = {
+            "grid": {
+                "step_abs": self._pct_to_abs(grid.grid_step_pct, anchor_price),
+                "range_low_abs": range_low_abs,
+                "range_high_abs": range_high_abs,
+                "tp_abs": self._pct_to_abs(grid.take_profit_pct, anchor_price),
+                "grid_count": grid.grid_count,
+                "grid_step_mode": grid.grid_step_mode,
+                "range_mode": grid.range_mode,
+                "direction": grid.direction,
+                "order_size_mode": grid.order_size_mode,
+                "budget": grid.budget,
+                "max_active_orders": grid.max_active_orders,
+                "stop_loss_enabled": grid.stop_loss_enabled,
+                "stop_loss_pct": grid.stop_loss_pct,
+            },
+            "pilot": {
+                "min_profit_bps": self.pilot_config.min_profit_bps,
+                "max_step_pct": self.pilot_config.max_step_pct,
+                "max_range_pct": self.pilot_config.max_range_pct,
+                "hold_timeout_sec": self.pilot_config.hold_timeout_sec,
+                "stale_policy": self.pilot_config.stale_policy,
+                "allow_market_close": self.pilot_config.allow_market_close,
+                "allow_guard_autofix": getattr(self.pilot_config, "allow_guard_autofix", False),
+                "slippage_bps": PILOT_SLIPPAGE_BPS,
+                "pad_bps": PILOT_PAD_BPS,
+                "thin_edge_action": "HOLD",
+                "auto_anchor_enabled": True,
+                "step_expand_factor": 1.20,
+                "range_expand_factor": 1.10,
+            },
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _schedule_settings_save(self) -> None:
+        if self._settings_save_timer is None:
+            self._settings_save_timer = QTimer(self)
+            self._settings_save_timer.setSingleShot(True)
+            self._settings_save_timer.timeout.connect(self._save_settings_to_disk)
+        self._settings_save_timer.start(500)
 
     def _profit_guard_slippage_pct(self) -> float:
         return max(PILOT_SLIPPAGE_BPS, 0.0) * 0.01
@@ -1982,6 +2175,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             ),
             kind="INFO",
         )
+        self._save_settings_to_disk()
 
     @staticmethod
     def _resolve_pilot_stale_policy(value: str) -> StalePolicy:
@@ -4750,6 +4944,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_start(self) -> None:
         if self._action_lock_blocked("start"):
             return
+        if self._stop_in_progress or self._stop_inflight or self._engine_state == "STOPPING":
+            reason = "STOPPING" if self._engine_state == "STOPPING" or self._stop_in_progress else "INFIGHT"
+            self._append_log(f"[START] blocked reason={reason}", kind="WARN")
+            return
         if self._state in {"RUNNING", "PLACING_GRID", "PAUSED", "WAITING_FILLS"}:
             self._append_log("Start ignored: engine already running.", kind="WARN")
             return
@@ -5092,9 +5290,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_stop(self) -> None:
         self._append_log("[STOP] requested", kind="INFO")
         if self._stop_in_progress:
-            self._stop_requested = True
+            self._append_log("[STOP] ignored (already stopping)", kind="INFO")
             return
         self._stop_in_progress = True
+        self._stop_inflight = True
         self._stop_requested = True
         self._closing = True
         if self._start_cancel_event:
@@ -5102,12 +5301,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._start_run_id += 1
         self._stop_local_timers()
         self._append_log("Stop pressed.", kind="ORDERS")
-        self._grid_engine.stop(cancel_all=True)
+        cancel_all = bool(self._cancel_all_on_stop_toggle.isChecked())
+        self._append_log(
+            f"[STOP] begin cancel_all={str(cancel_all).lower()} inflight={str(self._stop_inflight).lower()}",
+            kind="INFO",
+        )
+        self._grid_engine.stop(cancel_all=cancel_all)
         self._change_state("STOPPING")
         self._orders_in_flight = True
         self._start_in_progress = False
         self._start_in_progress_logged = False
-        self._start_button.setEnabled(True)
+        self._start_button.setEnabled(False)
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
         self._sell_side_enabled = False
@@ -5116,11 +5320,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids.clear()
         self._pending_restore_ids.clear()
         if self._dry_run_toggle.isChecked():
+            self._append_log("[STOP] cancel done", kind="INFO")
+            self._force_refresh_open_orders_and_wait(timeout_ms=1_000)
+            self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
+            self._schedule_force_open_orders_refresh("stop")
             self._finalize_stop()
             return
         if not self._account_client:
             self._append_log("[STOP] cancel skipped: no account client.", kind="WARN")
-            self._finalize_stop()
+            self._append_log("[STOP] cancel done", kind="INFO")
+            self._force_refresh_open_orders_and_wait(timeout_ms=1_000)
+            self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
+            self._schedule_force_open_orders_refresh("stop")
+            self._finalize_stop(keep_open_orders=True)
+            return
+        if not cancel_all:
+            self._append_log("[STOP] cancel skipped: toggle disabled.", kind="INFO")
+            self._append_log("[STOP] cancel done", kind="INFO")
+            self._force_refresh_open_orders_and_wait(timeout_ms=1_000)
+            self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
+            self._schedule_force_open_orders_refresh("stop")
+            self._finalize_stop(keep_open_orders=True)
             return
         self._cancel_bot_orders_on_stop()
 
@@ -5149,6 +5369,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids.clear()
         self._pending_restore_ids.clear()
         self._stop_in_progress = False
+        self._stop_inflight = False
         self._stop_requested = False
         self._closing = False
         self._orders_in_flight = False
@@ -5156,6 +5377,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._resume_local_timers()
         self._render_open_orders()
         self._change_state("IDLE")
+        self._start_button.setEnabled(True)
 
     def _cancel_bot_orders_on_stop(self) -> None:
         if not self._account_client:
@@ -5213,9 +5435,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._snapshot_refresh_inflight = False
         if not isinstance(result, dict):
             self._handle_cancel_error("Unexpected cancel response")
+            self._append_log("[STOP] cancel done", kind="INFO")
             self._append_log("[STOP] force gui refresh", kind="INFO")
             self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
             self._force_refresh_balances_and_wait(timeout_ms=2_000)
+            self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
+            self._schedule_force_open_orders_refresh("stop")
             self._finalize_stop()
             self._append_log("[STOP] gui orders cleared (n=0)", kind="INFO")
             self._append_log("[STOP] done", kind="INFO")
@@ -5250,9 +5475,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(str(message), kind="WARN")
+        self._append_log("[STOP] cancel done", kind="INFO")
         self._append_log("[STOP] force gui refresh", kind="INFO")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
+        self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
+        self._schedule_force_open_orders_refresh("stop")
         keep_open_orders = (not verify_ok) or bool(self._open_orders)
         self._finalize_stop(keep_open_orders=keep_open_orders)
         if not keep_open_orders:
@@ -5263,9 +5491,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
         self._handle_cancel_error(message)
+        self._append_log("[STOP] cancel done", kind="INFO")
         self._append_log("[STOP] force gui refresh", kind="INFO")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
+        self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
+        self._schedule_force_open_orders_refresh("stop")
         self._finalize_stop(keep_open_orders=True)
         self._append_log("[STOP] done", kind="INFO")
 
@@ -5345,6 +5576,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._refresh_orders_metrics()
         self._on_strategy_changed()
         self._update_grid_preview()
+        self._schedule_settings_save()
 
     def _on_strategy_changed(self) -> None:
         if self._start_locked_until_change or self._last_preflight_blocked:
@@ -5794,10 +6026,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return max(age_ms / 1000.0, 0.0)
 
     def _reset_defaults(self) -> None:
-        defaults = self._micro_grid_defaults() if self._is_micro_profile() else GridSettingsState()
-        if self._settings_state == defaults:
-            return
-        self._settings_state = defaults
+        if self._is_micro_profile():
+            defaults = self._micro_grid_defaults()
+            if self._settings_state == defaults:
+                return
+            self._apply_micro_defaults(reason="reset_button")
+        else:
+            defaults = GridSettingsState()
+            if self._settings_state == defaults:
+                return
+            self._settings_state = defaults
         self._manual_grid_step_pct = defaults.grid_step_pct
         self._budget_input.setValue(defaults.budget)
         self._direction_combo.setCurrentIndex(
@@ -5821,8 +6059,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._order_size_combo.findData(defaults.order_size_mode)
         )
         self._append_log("Settings reset to defaults.", kind="INFO")
-        if self._is_micro_profile():
-            self._append_log("[PILOT] micro_defaults_applied=true", kind="INFO")
         self._apply_grid_step_mode(defaults.grid_step_mode)
         self._update_grid_preview()
 
@@ -5939,6 +6175,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._reset_orders_poll_backoff()
         self._refresh_open_orders(force=True, event_key=event)
 
+    def _schedule_force_open_orders_refresh(self, reason: str) -> None:
+        if not self._account_client:
+            return
+
+        def _kick() -> None:
+            self._refresh_open_orders(force=True, force_refresh=True, reason=reason)
+
+        QTimer.singleShot(400, self, _kick)
+        QTimer.singleShot(800, self, _kick)
+
     def _refresh_open_orders(
         self,
         force: bool = False,
@@ -6000,6 +6246,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_open_orders")
             self._notify_crash("_refresh_open_orders")
+            self._orders_in_flight = False
+            self._snapshot_refresh_inflight = False
             return
 
     def _prime_bot_registry_from_exchange(self) -> None:
@@ -7079,7 +7327,18 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._set_pilot_state(PilotState.HOLD, reason="guard")
             if guard_mode == ProfitGuardMode.BLOCK:
                 return "HOLD"
-        if self.enable_guard_autofix and self.pilot_enabled:
+        allow_autofix = self.enable_guard_autofix and self.pilot_enabled
+        if (
+            self.pilot_enabled
+            and settings.grid_step_mode == "MANUAL"
+            and not getattr(self.pilot_config, "allow_guard_autofix", False)
+        ):
+            allow_autofix = False
+            self._append_log(
+                "[GUARD] autofix skipped: manual mode (allow_guard_autofix=false)",
+                kind="WARN",
+            )
+        if allow_autofix:
             changed = self._profit_guard_autofix(
                 settings,
                 anchor_price,
@@ -8605,6 +8864,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_order_cell(row, 4, str(filled_raw), align=Qt.AlignRight)
             self._set_order_cell(row, 5, age_text, align=Qt.AlignRight)
             self._set_order_row_tooltip(row)
+        self._append_log(f"[UI] orders_table updated rows={len(self._open_orders)}", kind="INFO")
         self._refresh_orders_metrics()
 
     def _render_sim_orders(self, planned: list[GridPlannedOrder]) -> None:
@@ -8920,6 +9180,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel selected: {len(result)}", kind="ORDERS")
         self._request_orders_refresh("cancel_selected")
+        self._schedule_force_open_orders_refresh("cancel_selected")
 
     def _cancel_all_live_orders(self) -> None:
         self._cancel_bot_orders()
@@ -8936,6 +9197,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel all: {len(result)}", kind="ORDERS")
         self._request_orders_refresh("cancel_all")
+        self._schedule_force_open_orders_refresh("cancel_all")
 
     def _handle_cancel_error(self, message: str) -> None:
         self._append_log(f"[LIVE] cancel failed: {message}", kind="WARN")
@@ -9055,6 +9317,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         for row in range(self._orders_table.rowCount()):
             self._set_order_row_tooltip(row)
         self._update_pilot_orders_metrics()
+        if self._orders_table.rowCount() > 0 and not self._open_orders and self._account_client:
+            self._schedule_force_open_orders_refresh("ui_drift")
 
     def _apply_pnl_style(self, label: QLabel, value: float | None) -> None:
         if value is None:
