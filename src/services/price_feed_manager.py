@@ -31,7 +31,7 @@ WS_GRACE_FIRST_TICK_MS = 8000
 WARMUP_MS = WS_GRACE_FIRST_TICK_MS
 WS_GRACE_MS = WARMUP_MS
 WS_DEGRADED_AFTER_MS = 3000
-WS_LOST_AFTER_MS = 10000
+WS_LOST_AFTER_MS = 60_000
 WS_OK_AFTER_MS = 2000
 WS_STABLE_MS = 2000
 WS_LOST_MS = 3000
@@ -342,6 +342,17 @@ class _BinanceBookTickerWsThread:
         self._has_received_message = False
         self._closed = False
         self._skip_enqueue_log_ts: float | None = None
+        self._last_heartbeat_log_ms: int | None = None
+
+    def _log_heartbeat_ok(self, idle_ms: int) -> None:
+        if idle_ms < self._dead_after_ms:
+            return
+        now_ms = self._now_ms()
+        last_log = self._last_heartbeat_log_ms
+        if last_log is not None and now_ms - last_log < 15_000:
+            return
+        self._logger.info("[WS] heartbeat ok idle_ms=%s", idle_ms)
+        self._last_heartbeat_log_ms = now_ms
 
     def start(self) -> None:
         if self._thread.is_alive():
@@ -505,8 +516,10 @@ class _BinanceBookTickerWsThread:
                     break
                 await self._drain_commands(websocket)
                 now_ms = self._now_ms()
-                if self._last_message_ms is not None and now_ms - self._last_message_ms > self._dead_after_ms:
-                    raise RuntimeError(f"heartbeat: no messages > {self._dead_after_ms}ms")
+                if self._last_message_ms is not None:
+                    idle_ms = now_ms - self._last_message_ms
+                    if idle_ms > self._dead_after_ms:
+                        self._log_heartbeat_ok(idle_ms)
                 if now_ms >= next_ping_ms:
                     try:
                         pong_waiter = websocket.ping()
@@ -1671,6 +1684,15 @@ class PriceFeedManager:
             ws_allowed=ws_allowed,
             trigger="heartbeat",
         )
+        if router_status == WS_ROUTER_STALE:
+            age_ms = max(now_ms - router.ws_last_tick_ts, 0) if router.ws_last_tick_ts is not None else None
+            age_text = str(age_ms) if age_ms is not None else "—"
+            self._log_rate_limited(
+                cleaned,
+                "ws_symbol_stale",
+                "warning",
+                f"[WS] symbol_stale symbol={cleaned} stale_ms={age_text} -> fallback HTTP (no restart)",
+            )
         desired_status = WS_CONNECTED if router.ws_active else WS_LOST
         if ws_allowed and desired_status != current_status:
             if desired_status == WS_LOST:

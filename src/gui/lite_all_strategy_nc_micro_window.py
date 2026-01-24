@@ -53,10 +53,12 @@ from src.ai.operator_math import compute_break_even_tp_pct, compute_fee_total_pc
 from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
+from src.core.cancel_reconcile import CancelResult, cancel_all_with_reconcile
 from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
 from src.core.micro_edge import compute_expected_edge_bps
+from src.core.nc_micro_stop import finalize_stop_state
 from src.core.nc_micro_refresh import compute_refresh_allowed
 from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
 from src.gui.i18n import TEXT, tr
@@ -874,6 +876,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         self._stop_inflight = False
+        self._stop_done_with_errors = False
         self._settings_save_timer: QTimer | None = None
         self._last_price: float | None = None
         self._last_price_ts: float | None = None
@@ -1165,7 +1168,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.18 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.19 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -4128,6 +4131,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             self._snapshot_refresh_suppressed_log_ts = now
 
+    @staticmethod
+    def _is_critical_refresh_reason(reason: str) -> bool:
+        if reason.startswith(("stop", "cancel")):
+            return True
+        return reason in {"reconcile", "after_cancel_backoff", "cancel_all_finalize", "cancel_all_error"}
+
     def _should_allow_stale_refresh(
         self,
         reason: str,
@@ -4205,10 +4214,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return False
         self._stale_refresh_hits += 1
         now = monotonic()
-        if self._orders_in_flight:
+        critical_reason = self._is_critical_refresh_reason(reason)
+        if self._orders_in_flight and not critical_reason:
             self._maybe_log_snapshot_refresh_suppressed("inflight")
             return False
-        if self._snapshot_refresh_inflight:
+        if self._snapshot_refresh_inflight and not critical_reason:
             self._maybe_log_snapshot_refresh_suppressed("inflight")
             return False
         allowed, why, dt_since_last_ms = self._should_allow_stale_refresh(reason, age_ms)
@@ -5353,113 +5363,67 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         reason: str,
         finalize_stop: bool = False,
         order_ids: list[str] | None = None,
-    ) -> None:
-        if self._cancel_inflight:
-            return
+    ) -> bool:
+        allow_inflight_override = reason in {"stop", "cancel_all", "reconcile"}
+        if self._cancel_inflight and not allow_inflight_override:
+            return False
+        if self._cancel_inflight and allow_inflight_override:
+            self._append_log(
+                f"[ORDERS][CANCEL] inflight override reason={reason}",
+                kind="WARN",
+            )
         if not self._account_client:
             self._append_log("[ORDERS][CANCEL] skipped: no account client", kind="WARN")
             if finalize_stop:
+                self._stop_done_with_errors = True
                 self._finalize_stop(keep_open_orders=True)
-            return
-        if order_ids is None:
-            order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
-        order_ids = [order_id for order_id in order_ids if order_id and order_id != "—"]
-        known_rows = len(order_ids)
+            return False
         self._cancel_inflight = True
         self._cancel_reconcile_pending = 0
         self._update_orders_timer_interval()
         self._append_log(
-            f"[ORDERS][CANCEL] start reason={reason} known_rows={known_rows}",
+            f"[ORDERS][CANCEL] start reason={reason}",
             kind="INFO",
         )
 
-        def _cancel() -> dict[str, Any]:
-            errors: list[str] = []
-            canceled = 0
-            missing = 0
-            failed = 0
-
-            def _fetch_open_orders() -> list[dict[str, Any]]:
-                try:
-                    open_orders = self._account_client.get_open_orders(self._symbol)
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"[ORDERS][CANCEL] reconcile failed: {exc}")
-                    return []
-                if not isinstance(open_orders, list):
-                    return []
-                return [order for order in open_orders if isinstance(order, dict)]
-
-            for order_id in order_ids:
-                ok, error, outcome = self._cancel_order_idempotent(order_id)
-                if not ok and error:
-                    self._sleep_ms(120)
-                    ok_retry, error_retry, outcome_retry = self._cancel_order_idempotent(order_id)
-                    if ok_retry:
-                        ok = True
-                        outcome = outcome_retry
-                        error = None
-                    else:
-                        error = error_retry or error
-                        outcome = outcome_retry
-                if ok:
-                    if outcome == "missing":
-                        missing += 1
-                    else:
-                        canceled += 1
-                else:
-                    failed += 1
-                    if error:
-                        errors.append(error)
-
-            open_orders_immediate = _fetch_open_orders()
-            self._sleep_ms(250)
-            open_orders_delayed = _fetch_open_orders()
-            return {
-                "errors": errors,
-                "open_orders_immediate": open_orders_immediate,
-                "open_orders_delayed": open_orders_delayed,
-                "known_rows": known_rows,
-                "canceled": canceled,
-                "missing": missing,
-                "failed": failed,
-                "reason": reason,
-            }
+        def _cancel() -> CancelResult:
+            return cancel_all_with_reconcile(
+                account_client=self._account_client,
+                symbol=self._symbol,
+                reason=reason,
+                timeout_s=4.0,
+                max_passes=3,
+            )
 
         worker = _Worker(_cancel, self._can_emit_worker_results)
 
         def _handle_cancel_result(result: object, latency_ms: int) -> None:
             self._orders_in_flight = False
             self._snapshot_refresh_inflight = False
-            if not isinstance(result, dict):
+            if not isinstance(result, CancelResult):
                 self._handle_cancel_error("Unexpected cancel response")
                 self._cancel_inflight = False
                 if finalize_stop:
+                    self._stop_done_with_errors = True
                     self._finalize_stop(keep_open_orders=True)
                 return
-            errors = result.get("errors", [])
-            if isinstance(errors, list):
-                for message in errors:
-                    self._append_log(str(message), kind="WARN")
-            open_orders_immediate = result.get("open_orders_immediate", [])
-            open_orders_delayed = result.get("open_orders_delayed", [])
-            if isinstance(open_orders_immediate, list):
-                self._apply_open_orders_snapshot(open_orders_immediate, reason="after_cancel")
-            if isinstance(open_orders_delayed, list):
-                self._apply_open_orders_snapshot(open_orders_delayed, reason="after_cancel_delayed")
+            for message in result.log_entries:
+                self._append_log(message, kind="INFO")
+            for message in result.errors:
+                self._append_log(str(message), kind="WARN")
+            if result.open_orders:
+                self._apply_open_orders_snapshot(result.open_orders, reason="after_cancel")
             after_count = len(self._open_orders)
-            removed = max(int(result.get("known_rows", known_rows)) - after_count, 0)
-            canceled = int(result.get("canceled", 0) or 0)
-            missing = int(result.get("missing", 0) or 0)
-            failed = int(result.get("failed", 0) or 0)
-            reason = str(result.get("reason", "cancel_all"))
+            canceled = len(result.cancelled_ids)
+            remaining = len(result.remaining_ids)
             self._append_log(
                 (
-                    f"[ORDERS][CANCEL] done reason={reason} planned={known_rows} "
-                    f"canceled={canceled} missing={missing} failed={failed} remaining={after_count}"
+                    f"[ORDERS][CANCEL] done reason={reason} "
+                    f"canceled={canceled} remaining={remaining} open_orders={after_count}"
                 ),
                 kind="INFO",
             )
-            if after_count != 0:
+            if remaining != 0:
                 self._schedule_cancel_reconcile_followups()
             else:
                 self._cancel_inflight = False
@@ -5468,6 +5432,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._request_orders_refresh("cancel_all_finalize")
             self._append_log("orders refreshed after cancel", kind="INFO")
             if finalize_stop:
+                if result.errors or remaining:
+                    self._stop_done_with_errors = True
                 self._finalize_stop(keep_open_orders=bool(self._open_orders))
 
         def _handle_cancel_failure(message: str) -> None:
@@ -5480,11 +5446,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._request_orders_refresh("cancel_all_error")
             self._append_log("orders refreshed after cancel", kind="INFO")
             if finalize_stop:
+                self._stop_done_with_errors = True
                 self._finalize_stop(keep_open_orders=True)
 
         worker.signals.success.connect(_handle_cancel_result)
         worker.signals.error.connect(_handle_cancel_failure)
         self._thread_pool.start(worker)
+        return True
 
     def _handle_stop(self) -> None:
         self._append_log("[STOP] requested", kind="INFO")
@@ -5495,6 +5463,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_inflight = True
         self._stop_requested = True
         self._closing = True
+        self._stop_done_with_errors = False
         if self._start_cancel_event:
             self._start_cancel_event.set()
         self._start_run_id += 1
@@ -5505,44 +5474,50 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             f"[STOP] begin cancel_all={str(cancel_all).lower()} inflight={str(self._stop_inflight).lower()}",
             kind="INFO",
         )
-        self._grid_engine.stop(cancel_all=cancel_all)
-        self._change_state("STOPPING")
-        self._orders_in_flight = True
-        self._start_in_progress = False
-        self._start_in_progress_logged = False
-        self._start_button.setEnabled(False)
-        self._bootstrap_mode = False
-        self._bootstrap_sell_enabled = False
-        self._sell_side_enabled = False
-        self._active_tp_ids.clear()
-        self._active_restore_ids.clear()
-        self._pending_tp_ids.clear()
-        self._pending_restore_ids.clear()
-        if self._dry_run_toggle.isChecked():
-            self._append_log("[STOP] cancel done", kind="INFO")
-            self._refresh_orders(reason="stop_dry_run", force=True)
-            self._finalize_stop()
-            return
-        if not self._account_client:
-            self._append_log("[STOP] cancel skipped: no account client.", kind="WARN")
-            self._append_log("[STOP] cancel done", kind="INFO")
-            self._refresh_orders(reason="stop_no_client", force=True)
-            self._finalize_stop(keep_open_orders=True)
-            return
-        if not cancel_all:
-            self._append_log("[STOP] cancel skipped: toggle disabled.", kind="INFO")
-            self._append_log("[STOP] cancel done", kind="INFO")
-            self._refresh_orders(reason="stop_no_cancel", force=True)
-            self._finalize_stop(keep_open_orders=True)
-            return
-        order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
-        removed = self._mark_orders_cancelling(None, reason="stop")
-        self._append_log(
-            f"[ORDERS][CANCEL] ui_marked reason=stop rows={removed}",
-            kind="INFO",
-        )
-        self._set_cancel_buttons_enabled(False)
-        self._cancel_all_and_reconcile(reason="stop", finalize_stop=True, order_ids=order_ids)
+        cancel_scheduled = False
+        keep_open_orders_on_finalize = True
+        cancel_required = False
+        try:
+            self._grid_engine.stop(cancel_all=cancel_all)
+            self._change_state("STOPPING")
+            self._orders_in_flight = True
+            self._start_in_progress = False
+            self._start_in_progress_logged = False
+            self._start_button.setEnabled(False)
+            self._bootstrap_mode = False
+            self._bootstrap_sell_enabled = False
+            self._sell_side_enabled = False
+            self._active_tp_ids.clear()
+            self._active_restore_ids.clear()
+            self._pending_tp_ids.clear()
+            self._pending_restore_ids.clear()
+            if self._dry_run_toggle.isChecked():
+                self._append_log("[STOP] cancel done", kind="INFO")
+                self._refresh_orders(reason="stop_dry_run", force=True)
+                keep_open_orders_on_finalize = False
+                return
+            if not self._account_client:
+                self._append_log("[STOP] cancel skipped: no account client.", kind="WARN")
+                self._append_log("[STOP] cancel done", kind="INFO")
+                self._refresh_orders(reason="stop_no_client", force=True)
+                return
+            if not cancel_all:
+                self._append_log("[STOP] cancel skipped: toggle disabled.", kind="INFO")
+                self._append_log("[STOP] cancel done", kind="INFO")
+                self._refresh_orders(reason="stop_no_cancel", force=True)
+                return
+            cancel_required = True
+            removed = self._mark_orders_cancelling(None, reason="stop")
+            self._append_log(
+                f"[ORDERS][CANCEL] ui_marked reason=stop rows={removed}",
+                kind="INFO",
+            )
+            self._set_cancel_buttons_enabled(False)
+            cancel_scheduled = self._cancel_all_and_reconcile(reason="stop", finalize_stop=True)
+        finally:
+            if not cancel_scheduled:
+                self._stop_done_with_errors = cancel_required
+                self._finalize_stop(keep_open_orders=keep_open_orders_on_finalize)
 
     def _finalize_stop(self, *, keep_open_orders: bool = False) -> None:
         self._bot_order_ids.clear()
@@ -5579,8 +5554,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_orders_snapshot(self._build_orders_snapshot(self._open_orders), reason="stop_finalize")
         else:
             self._set_orders_snapshot(self._build_orders_snapshot([]), reason="stop_finalize")
-        self._change_state("IDLE")
-        self._start_button.setEnabled(True)
+        remaining = len(self._open_orders)
+        finalize_stop_state(
+            remaining=remaining,
+            done_with_errors=self._stop_done_with_errors,
+            set_inflight=lambda value: setattr(self, "_stop_inflight", value),
+            set_state=self._change_state,
+            set_start_enabled=self._start_button.setEnabled,
+            log_fn=self._append_log,
+            state="IDLE",
+        )
+        self._stop_done_with_errors = False
         self._set_cancel_buttons_enabled(True)
 
     def _cancel_bot_orders_on_stop(self) -> None:
@@ -5645,6 +5629,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._force_refresh_balances_and_wait(timeout_ms=2_000)
             self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
             self._schedule_force_open_orders_refresh("stop")
+            self._stop_done_with_errors = True
             self._finalize_stop()
             self._append_log("[STOP] gui orders cleared (n=0)", kind="INFO")
             self._append_log("[STOP] done", kind="INFO")
@@ -5679,6 +5664,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if isinstance(errors, list):
             for message in errors:
                 self._append_log(str(message), kind="WARN")
+            if errors:
+                self._stop_done_with_errors = True
         self._append_log("[STOP] cancel done", kind="INFO")
         self._append_log("[STOP] force gui refresh", kind="INFO")
         self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
@@ -5686,6 +5673,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
         self._schedule_force_open_orders_refresh("stop")
         keep_open_orders = (not verify_ok) or bool(self._open_orders)
+        if keep_open_orders:
+            self._stop_done_with_errors = True
         self._finalize_stop(keep_open_orders=keep_open_orders)
         if not keep_open_orders:
             self._append_log("[STOP] gui orders cleared (n=0)", kind="INFO")
@@ -5701,6 +5690,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._force_refresh_balances_and_wait(timeout_ms=2_000)
         self._append_log(f"[STOP] final sync open_orders={len(self._open_orders)}", kind="INFO")
         self._schedule_force_open_orders_refresh("stop")
+        self._stop_done_with_errors = True
         self._finalize_stop(keep_open_orders=True)
         self._append_log("[STOP] done", kind="INFO")
 
@@ -5753,14 +5743,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._account_client:
             self._append_log("Cancel all: no account client.", kind="WARN")
             return
-        order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
         removed = self._mark_orders_cancelling(None, reason="all")
         self._append_log(
             f"[ORDERS][CANCEL] ui_marked reason=cancel_all rows={removed}",
             kind="INFO",
         )
         self._set_cancel_buttons_enabled(False)
-        self._cancel_all_and_reconcile(reason="cancel_all", order_ids=order_ids)
+        self._cancel_all_and_reconcile(reason="cancel_all")
 
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested.", kind="INFO")
@@ -6424,13 +6413,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         event_key: str | None = None,
     ) -> None:
         try:
+            critical_reason = self._is_critical_refresh_reason(reason)
             if force_refresh:
                 force = True
                 self._snapshot_refresh_inflight = False
                 self._snapshot_refresh_suppressed_log_ts = None
             if self._stop_in_progress:
                 force = True
-            if self._cancel_inflight and not force:
+            if self._cancel_inflight and not force and not critical_reason:
                 return
             self._orders_tick_count += 1
             if self._orders_tick_count % 30 == 0:
@@ -6466,7 +6456,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if snapshot_age_sec is not None and snapshot_age_sec > STALE_SNAPSHOT_MAX_AGE_SEC:
                     self._maybe_log_open_orders_snapshot_stale(snapshot_age_sec, skip_actions=True)
             if self._orders_in_flight:
-                if not force and not self._stop_in_progress:
+                if not force and not self._stop_in_progress and not critical_reason:
                     return
             if not force:
                 self._orders_poll_last_ts = int(monotonic() * 1000)

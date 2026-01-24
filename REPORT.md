@@ -1,5 +1,9 @@
 ## Technical Report
 
+### NC MICRO v1.0.19
+- Fixed Stop/CANCEL deadlock by forcing REST reconcile, overriding inflight suppression, and guaranteeing Stop finalization.
+- Softened WS heartbeat handling with a higher idle threshold and symbol-stale HTTP fallback logging (no restart flaps).
+
 ### NC MICRO v1.6.6
 - Added stale refresh limiter with per-reason rate limits, poll change detection, and deduped logging counters.
 - Introduced per-symbol router hysteresis with deterministic source selection and compact router status fields for UI.
