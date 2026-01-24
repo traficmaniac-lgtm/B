@@ -112,3 +112,62 @@ def compute_order_qty(
         return Decimal("0"), Decimal("0"), "qty_zero"
     _ = fee_rate
     return qty, notional, "ok"
+
+
+def bps_to_frac(min_profit_bps: float) -> float:
+    return max(min_profit_bps, 0.0) / 10000.0
+
+
+def bps_to_pct(min_profit_bps: float) -> float:
+    return max(min_profit_bps, 0.0) / 100.0
+
+
+def evaluate_tp_min_profit_bps(
+    entry_price: Decimal,
+    tp_price: Decimal,
+    side: str,
+    min_profit_bps: float,
+) -> dict[str, float | bool]:
+    if entry_price <= 0 or tp_price <= 0:
+        return {"is_profitable": False}
+    side = side.upper()
+    if side == "BUY":
+        profit_bps = (tp_price - entry_price) / entry_price * Decimal("10000")
+    elif side == "SELL":
+        profit_bps = (entry_price - tp_price) / entry_price * Decimal("10000")
+    else:
+        return {"is_profitable": False}
+    min_profit_bps = max(min_profit_bps, 0.0)
+    profit_bps_value = float(profit_bps)
+    profit_pct = profit_bps_value / 100.0
+    min_profit_pct = bps_to_pct(min_profit_bps)
+    return {
+        "profit_bps": round(profit_bps_value, 6),
+        "profit_pct": round(profit_pct, 6),
+        "min_profit_bps": round(min_profit_bps, 6),
+        "min_profit_pct": round(min_profit_pct, 6),
+        "net_profit_bps": round(profit_bps_value - min_profit_bps, 6),
+        "is_profitable": profit_bps_value >= min_profit_bps,
+    }
+
+
+def align_tick_based_qty(
+    buy_qty: Decimal,
+    sell_qty: Decimal,
+    step: Decimal | None,
+) -> tuple[Decimal, Decimal, bool]:
+    tolerance = step if step is not None and step > 0 else Decimal("0")
+    diff = abs(buy_qty - sell_qty)
+    if diff <= tolerance:
+        return buy_qty, sell_qty, False
+    target = min(buy_qty, sell_qty)
+    target = floor_to_step(target, step)
+    return target, target, True
+
+
+def should_block_bidask_actions(feed_ok: bool, bidask_state: str | None) -> tuple[bool, str]:
+    if bidask_state == "stale_cache":
+        return True, "bidask_stale_cache"
+    if not feed_ok:
+        return True, "feed_not_ok"
+    return False, "ok"

@@ -62,7 +62,14 @@ from src.core.nc_micro_stop import finalize_stop_state
 from src.core.nc_micro_refresh import compute_refresh_allowed
 from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
 from src.gui.i18n import TEXT, tr
-from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
+from src.gui.lite_grid_math import (
+    FillAccumulator,
+    align_tick_based_qty,
+    build_action_key,
+    compute_order_qty,
+    evaluate_tp_min_profit_bps,
+    should_block_bidask_actions,
+)
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
 from src.services.price_feed_manager import (
@@ -1090,6 +1097,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._feed_ok = False
         self._feed_last_ok: bool | None = None
         self._feed_last_source: str | None = None
+        self._bidask_state: str | None = None
+        self._bidask_block_log_ts: float | None = None
+        self._bidask_block_reason: str | None = None
         self._kpi_has_data = False
         self._kpi_last_source: str | None = None
         self._kpi_valid = False
@@ -3166,7 +3176,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         settings.max_active_orders = min(settings.max_active_orders, 2)
         spread_ticks = context.get("spread_ticks")
         tp_ticks = self._micro_tp_ticks(spread_ticks if isinstance(spread_ticks, int) else None)
-        settings.take_profit_pct = self._abs_to_pct(tp_ticks * tick, mid)
+        settings.take_profit_pct = step_pct * tp_ticks
         settings.range_low_pct = max(settings.range_low_pct, step_pct)
         settings.range_high_pct = max(settings.range_high_pct, step_pct)
         self._grid_engine._plan_stats = GridPlanStats()
@@ -3191,6 +3201,30 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             min_qty=self._exchange_rules.get("min_qty"),
             max_qty=self._exchange_rules.get("max_qty"),
         )
+        if buy_order and sell_order:
+            step_dec = self._rule_decimal(self._exchange_rules.get("step"))
+            buy_qty = self.as_decimal(buy_order.qty)
+            sell_qty = self.as_decimal(sell_order.qty)
+            self._append_log(
+                (
+                    "[GRID] plan "
+                    f"qty_buy={self.fmt_qty(buy_qty, step_dec)} "
+                    f"qty_sell={self.fmt_qty(sell_qty, step_dec)} mode=TICK_BASED"
+                ),
+                kind="INFO",
+            )
+            aligned_buy, aligned_sell, fixed = align_tick_based_qty(buy_qty, sell_qty, step_dec)
+            if fixed:
+                buy_order.qty = float(aligned_buy)
+                sell_order.qty = float(aligned_sell)
+                self._append_log(
+                    (
+                        "[GRID] qty mismatch -> aligned "
+                        f"qty_buy={self.fmt_qty(aligned_buy, step_dec)} "
+                        f"qty_sell={self.fmt_qty(aligned_sell, step_dec)} mode=TICK_BASED"
+                    ),
+                    kind="WARN",
+                )
         plan = [order for order in (buy_order, sell_order) if order is not None]
         if not plan:
             self._append_log(
@@ -4702,6 +4736,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     bidask_state = "stale_cache" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
                 else:
                     bidask_state = "stale"
+            self._bidask_state = bidask_state
             if not self._validate_bid_ask(best_bid, best_ask, source="HTTP_BOOK"):
                 self._update_kpi_waiting_book(now_ts, book_source, bidask_age_ms)
                 return
@@ -7702,12 +7737,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _micro_tp_ticks(self, spread_ticks: int | None) -> int:
         if spread_ticks is None:
-            return 1
-        if spread_ticks >= 2:
-            return 1
-        if spread_ticks == 1:
             return 2
-        return 1
+        if spread_ticks < 1:
+            return 2
+        return 2
 
     def _micro_spread_capture_guard(self) -> tuple[bool, str, dict[str, float | int | bool | None]]:
         context = self._micro_spread_capture_context()
@@ -7991,58 +8024,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _evaluate_tp_min_profit(
         self, entry_side: str, entry_price: Decimal, tp_price: Decimal
     ) -> dict[str, float | bool]:
-        if entry_price <= 0 or tp_price <= 0:
-            return {"is_profitable": False}
-        entry_side = entry_side.upper()
-        if entry_side == "SELL":
-            profit_pct = (entry_price - tp_price) / entry_price * Decimal("100")
-        elif entry_side == "BUY":
-            profit_pct = (tp_price - entry_price) / entry_price * Decimal("100")
-        else:
-            return {"is_profitable": False}
-        inputs = self._runtime_profit_inputs()
-        maker, taker = self._trade_fees
-        maker_fee_pct = (maker * 100) if maker is not None else 0.0
-        taker_fee_pct = (taker * 100) if taker is not None else 0.0
-        fee_total_pct = compute_fee_total_pct(
-            maker_fee_pct,
-            taker_fee_pct,
-            fill_mode=inputs.get("expected_fill_mode") or "MAKER",
-            fee_discount_pct=inputs.get("fee_discount_pct"),
-        )
-        min_profit_pct = compute_break_even_tp_pct(
-            fee_total_pct=fee_total_pct,
-            slippage_pct=inputs.get("slippage_pct"),
-            safety_edge_pct=inputs.get("safety_edge_pct"),
-        )
-        spread_pct = self._current_spread_pct()
-        if self._is_micro_profile() and fee_total_pct <= 0.0001 and spread_pct is not None and spread_pct > 0:
-            spread_bps = spread_pct * 100
-            if spread_bps <= 3.0:
-                slip_pad_bps = (inputs.get("slippage_pct") or 0.0) * 100 + (inputs.get("safety_edge_pct") or 0.0) * 100
-                min_profit_bps = min(max(2.0, spread_bps + slip_pad_bps), 6.0)
-                min_profit_pct = min_profit_bps / 100
-                now = monotonic()
-                if self._tp_micro_gate_log_ts is None or now - self._tp_micro_gate_log_ts >= 15.0:
-                    self._append_log(
-                        f"[TP] micro gate min_profit_bps={min_profit_bps:.2f} spread_bps={spread_bps:.2f}",
-                        kind="INFO",
-                    )
-                    self._tp_micro_gate_log_ts = now
-        allow_break_even = (
-            self._is_micro_profile()
-            and fee_total_pct <= 0.0001
-            and entry_side == "BUY"
-            and self._pilot_position_qty() > 0
-        )
-        net_profit_pct = float(profit_pct) - min_profit_pct
-        is_profitable = float(profit_pct) >= min_profit_pct or (allow_break_even and float(profit_pct) >= 0.0)
-        return {
-            "profit_pct": round(float(profit_pct), 6),
-            "min_profit_pct": round(min_profit_pct, 6),
-            "net_profit_pct": round(net_profit_pct, 6),
-            "is_profitable": is_profitable,
-        }
+        min_profit_bps = max(self.pilot_config.min_profit_bps, 0.0)
+        return evaluate_tp_min_profit_bps(entry_price, tp_price, entry_side, min_profit_bps)
 
     def _apply_sell_fee_buffer(self, qty: Decimal, step: Decimal | None) -> Decimal:
         fee_rate = self._effective_fee_rate()
@@ -8249,8 +8232,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     self._tp_min_profit_action_ts[min_profit_key] = now_ts
                     tp_reason = "skip_tp_min_profit"
                     tp_min_profit_detail = (
-                        f"profit={profitability.get('profit_pct', 0.0):.4f}% "
-                        f"min_profit={profitability.get('min_profit_pct', 0.0):.4f}%"
+                        f"profit_bps={profitability.get('profit_bps', 0.0):.3f} "
+                        f"profit_pct={profitability.get('profit_pct', 0.0):.5f}% "
+                        f"min_profit_bps={profitability.get('min_profit_bps', 0.0):.3f} "
+                        f"min_profit_pct={profitability.get('min_profit_pct', 0.0):.5f}%"
                     )
                 allow_tp = False
         if allow_tp and (tp_price <= 0 or tp_qty_cap <= 0):
@@ -8642,6 +8627,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> tuple[dict[str, Any] | None, str | None, str]:
         if not self._account_client:
             return None, "[LIVE] place skipped: no account client", "skip_no_account"
+        blocked, reason = self._should_block_order_actions()
+        if blocked:
+            return None, f"[LIVE] place skipped: {reason}", "skip_bidask_stale"
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
         min_notional = self._rule_decimal(self._exchange_rules.get("min_notional"))
@@ -8879,10 +8867,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if stop_sells:
                 continue
             order_qty = self.as_decimal(order.qty)
-            if total_sell_qty + order_qty > max_sell_qty_total:
+            remaining_qty = max_sell_qty_total - total_sell_qty
+            if remaining_qty <= 0:
+                stop_sells = True
+                continue
+            if order_qty > remaining_qty:
+                order_qty = self.q_qty(remaining_qty, step)
+            if order_qty <= 0:
                 stop_sells = True
                 continue
             total_sell_qty += order_qty
+            order.qty = float(order_qty)
             trimmed.append(order)
         return trimmed
 
@@ -9593,9 +9588,32 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_order_row_tooltip(row)
         self._refresh_orders_metrics()
 
+    def _should_block_order_actions(self) -> tuple[bool, str]:
+        block, reason = should_block_bidask_actions(self._feed_ok, self._bidask_state)
+        if not block:
+            self._bidask_block_reason = None
+            return False, "ok"
+        now = monotonic()
+        should_log = False
+        if self._bidask_block_log_ts is None or now - self._bidask_block_log_ts >= LOG_DEDUP_HEARTBEAT_SEC:
+            should_log = True
+        if reason != self._bidask_block_reason:
+            should_log = True
+        if should_log:
+            self._append_log(
+                f"[FEED] order actions blocked reason={reason}",
+                kind="WARN",
+            )
+            self._bidask_block_log_ts = now
+            self._bidask_block_reason = reason
+        return True, reason
+
     def _place_live_orders(self, planned: list[GridPlannedOrder]) -> None:
         if not self._account_client:
             self._append_log("Live order placement skipped: no account client.", kind="WARN")
+            return
+        blocked, _reason = self._should_block_order_actions()
+        if blocked:
             return
         if not self._bot_session_id:
             self._bot_session_id = uuid4().hex[:8]
