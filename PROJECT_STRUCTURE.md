@@ -5,6 +5,7 @@
 ```
 .
 ├── AI_PROTOCOL.md — project notes for AI usage and expectations.
+├── NC MICRO.md — detailed NC MICRO mode overview (RU).
 ├── PROJECT_STRUCTURE.md — this file: layout reference and per-file overview.
 ├── README.md — quickstart and usage instructions.
 ├── REPORT.md — project report/notes.
@@ -53,6 +54,7 @@
 │   │   ├── ai_operator_grid_window.py — AI operator grid window.
 │   │   ├── i18n.py — GUI translations/localization helpers.
 │   │   ├── lite_all_strategy_algo_pilot_window.py — Lite All Strategy Terminal with ALGO PILOT (v1.6.5).
+│   │   ├── lite_all_strategy_nc_micro_window.py — Lite All Strategy Terminal with NC MICRO mode.
 │   │   ├── lite_all_strategy_terminal_window.py — Lite All Strategy Terminal (multi-strategy grid UI).
 │   │   ├── lite_grid_math.py — math helpers for lite grid UI and fills.
 │   │   ├── lite_grid_window.py — lite grid trading window.
@@ -101,9 +103,28 @@
 │       └── rate_limiter.py — rate limiter utility.
 └── tests
     ├── __init__.py — test package marker.
+    ├── manual
+    │   └── nc_micro_router_test.md — manual NC MICRO router stability checklist.
+    ├── test_ai_models.py — AI response model parsing tests.
+    ├── test_ai_operator_state_machine.py — AI operator state machine tests.
+    ├── test_ai_protocol_parse.py — AI protocol parsing tests.
     ├── test_app_state.py — tests for AppState persistence.
+    ├── test_cancel_on_pause_stop.py — cancel-on-pause/stop tests.
+    ├── test_fill_accumulator.py — fill accumulator tests.
     ├── test_imports.py — import smoke tests.
-    └── test_markets_service.py — tests for MarketsService.
+    ├── test_markets_service.py — tests for MarketsService.
+    ├── test_pair_state.py — pair state persistence tests.
+    ├── test_patch_validation.py — patch validation tests.
+    ├── test_price_feed_manager.py — price feed manager tests.
+    ├── test_price_feed_router.py — price feed router tests.
+    ├── test_profit_math.py — profit math tests.
+    ├── test_qty_calc.py — quantity calculation tests.
+    ├── test_request_data_loop.py — request loop tests.
+    ├── test_restore_affordability.py — restore affordability checks.
+    ├── test_start_gating.py — strategy start gating tests.
+    ├── test_strategies_build_orders.py — strategy order build tests.
+    ├── test_symbols.py — symbol helper tests.
+    └── test_transport_test_side_effects.py — transport test side effects.
 ```
 
 ## Runtime/Generated artifacts
@@ -123,6 +144,7 @@ These files are created at runtime and are not tracked in the repo:
 - **gui/models**: UI state containers such as `AppState` and pair/workspace models.
 - **gui/lite_all_strategy_terminal_window.py**: Lite All Strategy Terminal (grid experimentation and trade gating).
 - **gui/lite_all_strategy_algo_pilot_window.py**: ALGO PILOT v1.6.5 (grid automation, KPI checks, stale handling, profit guard).
+- **gui/lite_all_strategy_nc_micro_window.py**: NC MICRO mode (HTTP-only trade source, crash catcher, stale policies, profit guard).
 - **services**: application services for prices, markets, caching, and rate limiting.
 - **services/price_feed_manager.py**: WS/HTTP price orchestration and status reporting.
 - **services/price_feed_service.py**: per‑symbol feed used by the manager.
