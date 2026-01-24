@@ -54,6 +54,8 @@ from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
+from src.core.micro_edge import compute_expected_edge_bps
+from src.core.nc_micro_refresh import compute_refresh_allowed
 from src.gui.i18n import TEXT, tr
 from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
 from src.gui.models.app_state import AppState
@@ -258,8 +260,11 @@ STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 AUTO_EXEC_ACTION_COOLDOWN_SEC = 30
 SNAPSHOT_REFRESH_COOLDOWN_MS = 1500
 STALE_REFRESH_MIN_MS = 2000
+STALE_REFRESH_POLL_MIN_MS = 3000
 STALE_REFRESH_POLL_AGE_MS = 2000
 STALE_REFRESH_POLL_HARD_MAX_SEC = 10
+STALE_REFRESH_HARD_MAX_MS = 15_000
+STALE_REFRESH_HASH_STABLE_CYCLES = 3
 STALE_REFRESH_LOG_DEDUP_SEC = 5
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 ORDERS_POLL_IDLE_MS = 2500
@@ -295,12 +300,14 @@ KPI_VOL_TTL_SEC = 120
 KPI_STATE_OK = "OK"
 KPI_STATE_UNKNOWN = "UNKNOWN"
 KPI_STATE_INVALID = "INVALID"
+KPI_STATE_WAITING_BOOK = "WAITING_BOOK"
 BIDASK_POLL_MS = 700
 BIDASK_FAIL_SOFT_MS = 1500
 BIDASK_STALE_MS = 4000
 PRICE_STALE_MS = 4000
 SPREAD_DISPLAY_EPS_PCT = 0.0001
 WAIT_EDGE_LOG_COOLDOWN_SEC = 5.0
+NO_BIDASK_LOG_INTERVAL_SEC = 5.0
 REGISTRY_GC_INTERVAL_MS = 60_000
 REGISTRY_GC_TTL_SEC = 600
 SPREAD_ZERO_OK_SYMBOLS = {
@@ -311,6 +318,15 @@ SPREAD_ZERO_OK_SYMBOLS = {
     "XRPUSDT",
     "ADAUSDT",
 }
+MICRO_STABLECOIN_SYMBOLS = {"EURIUSDT", "USDCUSDT"}
+MICRO_STABLECOIN_TP_PCT_DEFAULT = 0.03
+MICRO_STABLECOIN_STEP_PCT_DEFAULT = 0.05
+MICRO_STABLECOIN_RANGE_LOW_PCT_DEFAULT = 0.25
+MICRO_STABLECOIN_RANGE_HIGH_PCT_DEFAULT = 0.25
+MICRO_STABLECOIN_THIN_EDGE_MIN_PROFIT_PCT = 0.02
+MICRO_STABLECOIN_SLIPPAGE_PCT = 0.003
+MICRO_STABLECOIN_PAD_PCT = 0.005
+MICRO_STABLECOIN_BUFFER_PCT = 0.0
 
 
 @dataclass
@@ -827,6 +843,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids: set[str] = set()
         self._pending_restore_ids: set[str] = set()
         self._settings_state = GridSettingsState()
+        self._apply_profile_defaults_if_pristine()
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
         self._manual_grid_step_pct = self._settings_state.grid_step_pct
         self._thread_pool = QThreadPool.globalInstance()
@@ -946,6 +963,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stale_refresh_calls = 0
         self._stale_refresh_skipped_rate_limit = 0
         self._stale_refresh_skipped_no_change = 0
+        self._stale_refresh_last_force_ts_ms: int | None = None
+        self._orders_snapshot_hash: int | None = None
+        self._orders_snapshot_hash_changed = False
+        self._orders_snapshot_hash_stable_cycles = 0
         self._registry_dirty = False
         self._fills_changed_since_refresh = False
         self._orders_snapshot_signature: tuple[tuple[str, str, str, str], ...] | None = None
@@ -1018,6 +1039,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._kpi_missing_bidask_since_ts: float | None = None
         self._kpi_last_book_request_ts: float | None = None
         self._kpi_missing_bidask_active = False
+        self._no_bidask_last_log_ts: float | None = None
+        self._no_bidask_warned = False
         self._bidask_last: tuple[float, float] | None = None
         self._bidask_ts: float | None = None
         self._bidask_src: str | None = None
@@ -1333,6 +1356,44 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         splitter.setStretchFactor(2, 1)
         return splitter
 
+    def _is_micro_profile(self) -> bool:
+        return self._symbol.replace("/", "").upper() in MICRO_STABLECOIN_SYMBOLS
+
+    def _micro_grid_defaults(self) -> GridSettingsState:
+        return GridSettingsState(
+            take_profit_pct=MICRO_STABLECOIN_TP_PCT_DEFAULT,
+            grid_step_pct=MICRO_STABLECOIN_STEP_PCT_DEFAULT,
+            range_low_pct=MICRO_STABLECOIN_RANGE_LOW_PCT_DEFAULT,
+            range_high_pct=MICRO_STABLECOIN_RANGE_HIGH_PCT_DEFAULT,
+        )
+
+    def _apply_profile_defaults_if_pristine(self) -> None:
+        defaults = GridSettingsState()
+        if self._settings_state != defaults:
+            return
+        if self._is_micro_profile():
+            self._settings_state = self._micro_grid_defaults()
+
+    def _profit_guard_slippage_pct(self) -> float:
+        if self._is_micro_profile():
+            return MICRO_STABLECOIN_SLIPPAGE_PCT
+        return PROFIT_GUARD_SLIPPAGE_BPS * 0.01
+
+    def _profit_guard_pad_pct(self) -> float:
+        if self._is_micro_profile():
+            return MICRO_STABLECOIN_PAD_PCT
+        return PROFIT_GUARD_EXTRA_BUFFER_PCT
+
+    def _profit_guard_buffer_pct(self) -> float:
+        if self._is_micro_profile():
+            return MICRO_STABLECOIN_BUFFER_PCT
+        return PROFIT_GUARD_BUFFER_PCT
+
+    def _profit_guard_min_floor_pct(self) -> float:
+        if self._is_micro_profile():
+            return MICRO_STABLECOIN_THIN_EDGE_MIN_PROFIT_PCT
+        return PROFIT_GUARD_MIN_FLOOR_PCT
+
     def _build_right_panel(self) -> QSplitter:
         self._right_splitter = QSplitter(Qt.Vertical)
         self._right_splitter.addWidget(self._build_runtime_panel())
@@ -1374,6 +1435,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._market_volatility = QLabel("—")
         self._market_fee = QLabel("—")
         self._market_source = QLabel("—")
+        self._market_mode = QLabel("—")
         self._rules_label = QLabel(tr("rules_line", rules="—"))
         self._rules_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._rules_label.setToolTip(tr("rules_line", rules="—"))
@@ -1384,7 +1446,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._set_market_label_state(self._market_volatility, active=False)
         self._set_market_label_state(self._market_fee, active=False)
         self._set_market_label_state(self._market_source, active=False)
+        self._set_market_label_state(self._market_mode, active=False)
         self._rules_label.setStyleSheet("color: #d1d5db; font-size: 10px;")
+        if self._is_micro_profile():
+            self._market_mode.setText("MICRO (spread-capture)")
+            self._set_market_label_state(self._market_mode, active=True)
 
         summary_rows = [
             ("Последняя цена:", self._market_price),
@@ -1392,6 +1458,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             ("Волатильность:", self._market_volatility),
             ("Комиссия (maker/taker):", self._market_fee),
             ("Источник + возраст:", self._market_source),
+            ("Режим:", self._market_mode),
         ]
         for row, (key_text, value_label) in enumerate(summary_rows):
             summary_layout.addWidget(make_summary_key(key_text), row, 0)
@@ -3756,36 +3823,61 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             self._snapshot_refresh_suppressed_log_ts = now
 
-    def _should_allow_stale_refresh(self, reason: str, age_ms: int | None) -> bool:
-        now = monotonic()
-        last_refresh = self._stale_refresh_last_ts.get(reason)
-        if last_refresh is not None and (now - last_refresh) * 1000 < STALE_REFRESH_MIN_MS:
+    def _should_allow_stale_refresh(
+        self,
+        reason: str,
+        age_ms: int | None,
+    ) -> tuple[bool, tuple[str, ...], int | None]:
+        now_ms = int(monotonic() * 1000)
+        last_refresh_ms = self._stale_refresh_last_ts.get(reason)
+        if reason != "poll":
+            if last_refresh_ms is not None and now_ms - last_refresh_ms < STALE_REFRESH_MIN_MS:
+                self._stale_refresh_skipped_rate_limit += 1
+                return False, (), None
+            self._stale_refresh_last_ts[reason] = now_ms
+            self._stale_refresh_calls += 1
+            return True, (), None
+        decision = compute_refresh_allowed(
+            now_ms=now_ms,
+            last_refresh_ms=last_refresh_ms,
+            last_force_refresh_ms=self._stale_refresh_last_force_ts_ms,
+            refresh_min_interval_ms=STALE_REFRESH_POLL_MIN_MS,
+            orders_age_ms=age_ms,
+            stale_ms=STALE_REFRESH_POLL_AGE_MS,
+            registry_dirty=self._registry_dirty or self._fills_changed_since_refresh,
+            hash_changed=self._orders_snapshot_hash_changed,
+            stable_hash_cycles=self._orders_snapshot_hash_stable_cycles,
+            stable_hash_limit=STALE_REFRESH_HASH_STABLE_CYCLES,
+            hard_max_age_ms=STALE_REFRESH_HARD_MAX_MS,
+        )
+        if decision.blocked_by_interval:
             self._stale_refresh_skipped_rate_limit += 1
-            return False
-        if reason == "poll":
-            should_refresh = False
-            if age_ms is not None and age_ms >= STALE_REFRESH_POLL_AGE_MS:
-                should_refresh = True
-            if self._registry_dirty or self._fills_changed_since_refresh:
-                should_refresh = True
-            if last_refresh is not None and now - last_refresh >= STALE_REFRESH_POLL_HARD_MAX_SEC:
-                should_refresh = True
-            if not should_refresh:
-                self._stale_refresh_skipped_no_change += 1
-                return False
-        self._stale_refresh_last_ts[reason] = now
-        self._stale_refresh_calls += 1
-        return True
+        elif not decision.allowed:
+            self._stale_refresh_skipped_no_change += 1
+        if decision.allowed:
+            self._stale_refresh_last_ts[reason] = now_ms
+            self._stale_refresh_last_force_ts_ms = now_ms
+            self._stale_refresh_calls += 1
+        return decision.allowed, decision.reasons, decision.dt_since_last_ms
 
-    def _maybe_log_stale_refresh(self, reason: str) -> None:
+    def _maybe_log_stale_refresh(
+        self,
+        reason: str,
+        allowed: bool,
+        why: tuple[str, ...],
+        dt_since_last_ms: int | None,
+    ) -> None:
         now = monotonic()
         last_log = self._stale_refresh_last_log_ts
         if last_log is not None and now - last_log < STALE_REFRESH_LOG_DEDUP_SEC:
             return
+        why_text = ",".join(why) if why else "none"
+        dt_text = f"{dt_since_last_ms}ms" if dt_since_last_ms is not None else "—"
         self._append_log(
             (
                 "[ORDERS] stale -> refresh "
-                f"reason={reason} hits={self._stale_refresh_hits} calls={self._stale_refresh_calls} "
+                f"reason={reason} allowed={str(allowed).lower()} why={why_text} "
+                f"dt_since_last={dt_text} hits={self._stale_refresh_hits} calls={self._stale_refresh_calls} "
                 f"skip_rate={self._stale_refresh_skipped_rate_limit} "
                 f"skip_no_change={self._stale_refresh_skipped_no_change}"
             ),
@@ -3814,7 +3906,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._snapshot_refresh_inflight:
             self._maybe_log_snapshot_refresh_suppressed("inflight")
             return False
-        if not self._should_allow_stale_refresh(reason, age_ms):
+        allowed, why, dt_since_last_ms = self._should_allow_stale_refresh(reason, age_ms)
+        if reason:
+            self._maybe_log_stale_refresh(reason, allowed, why, dt_since_last_ms)
+        if not allowed:
             return False
         if now - self._last_snapshot_refresh_ts < cooldown_s:
             remaining_ms = max(int((cooldown_s - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
@@ -3938,10 +4033,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self.bidask_ready = True
         return bid, ask
 
+    def _maybe_log_no_bidask(self) -> None:
+        now = monotonic()
+        if not self._no_bidask_warned:
+            self._append_log("[SKIP] no bid/ask", kind="WARN")
+            self._no_bidask_warned = True
+            self._no_bidask_last_log_ts = now
+            return
+        last_log = self._no_bidask_last_log_ts
+        if last_log is None or now - last_log >= NO_BIDASK_LOG_INTERVAL_SEC:
+            self._append_log("[SKIP] no bid/ask", kind="INFO")
+            self._no_bidask_last_log_ts = now
+
     def _validate_bid_ask(self, bid: float | None, ask: float | None, *, source: str) -> bool:
         if bid is None or ask is None:
             if not self.bidask_ready:
-                self._append_log("[SKIP] no bid/ask", kind="WARN")
+                self._maybe_log_no_bidask()
             return False
         if not isfinite(bid) or not isfinite(ask):
             return False
@@ -3956,6 +4063,37 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._validate_bid_ask(bid, ask, source="HTTP_BOOK"):
             return bid, ask, self.trade_source
         return None, None, "—"
+
+    def _update_kpi_waiting_book(
+        self,
+        now_ts: float,
+        book_source: str,
+        bidask_age_ms: int | None,
+    ) -> None:
+        if self._kpi_missing_bidask_since_ts is None:
+            self._kpi_missing_bidask_since_ts = now_ts
+        if not self._kpi_missing_bidask_active:
+            self._append_log(
+                "[KPI] state=WAITING_BOOK reason=no_bidask_yet",
+                kind="INFO",
+            )
+            self._kpi_missing_bidask_active = True
+        bidask_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
+        if self._kpi_last_state != KPI_STATE_WAITING_BOOK or self._kpi_last_reason != "no_bidask_yet":
+            self._append_log(
+                (
+                    f"[KPI] state=WAITING_BOOK spread=— vol=— "
+                    f"src={book_source} age={bidask_age_text} reason=no_bidask_yet"
+                ),
+                kind="INFO",
+            )
+            self._kpi_last_state = KPI_STATE_WAITING_BOOK
+            self._kpi_last_reason = "no_bidask_yet"
+            self._kpi_last_state_ts = now_ts
+        self._kpi_invalid_reason = None
+        self._kpi_vol_state = KPI_STATE_UNKNOWN
+        self._kpi_state = KPI_STATE_WAITING_BOOK
+        self._kpi_valid = False
 
     @staticmethod
     def _compute_spread_pct_from_book(best_bid: float | None, best_ask: float | None) -> float | None:
@@ -4092,6 +4230,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 else:
                     bidask_state = "stale"
             if not self._validate_bid_ask(best_bid, best_ask, source="HTTP_BOOK"):
+                self._update_kpi_waiting_book(now_ts, book_source, bidask_age_ms)
                 return
 
             price = (best_bid + best_ask) / 2
@@ -4154,15 +4293,23 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             maker_pct, taker_pct, _fee_defaulted = self._profit_guard_fee_inputs()
             fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
             fee_pct = taker_pct if fill_mode == "TAKER" else maker_pct
-            fees_bps = fee_pct * 100
-            slippage_bps = PROFIT_GUARD_SLIPPAGE_BPS
+            fees_roundtrip_bps = fee_pct * 200
+            slippage_bps = self._profit_guard_slippage_pct() * 100
+            pad_bps = self._profit_guard_pad_pct() * 100
             edge_raw_bps = None
             expected_profit_bps = None
             risk_buffer_bps = None
             if spread_bps is not None:
-                edge_raw_bps = spread_bps - (fees_bps * 2) - slippage_bps
                 risk_buffer_bps = (vol_bps or 0.0) * MARKET_HEALTH_RISK_BUFFER_MULT
-                expected_profit_bps = edge_raw_bps - risk_buffer_bps
+                edge_result = compute_expected_edge_bps(
+                    spread_bps=spread_bps,
+                    fees_roundtrip_bps=fees_roundtrip_bps,
+                    slippage_bps=slippage_bps,
+                    pad_bps=pad_bps,
+                    risk_buffer_bps=risk_buffer_bps,
+                )
+                edge_raw_bps = edge_result.edge_raw_bps
+                expected_profit_bps = edge_result.expected_profit_bps
             self._market_health = MarketHealth(
                 has_bidask=best_bid is not None and best_ask is not None,
                 spread_bps=spread_bps,
@@ -5520,7 +5667,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return max(age_ms / 1000.0, 0.0)
 
     def _reset_defaults(self) -> None:
-        defaults = GridSettingsState()
+        defaults = self._micro_grid_defaults() if self._is_micro_profile() else GridSettingsState()
         if self._settings_state == defaults:
             return
         self._settings_state = defaults
@@ -5721,8 +5868,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             worker.signals.success.connect(self._handle_open_orders)
             worker.signals.error.connect(self._handle_open_orders_error)
             self._thread_pool.start(worker)
-            if reason and not force_refresh:
-                self._maybe_log_stale_refresh(reason)
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_open_orders")
             self._notify_crash("_refresh_open_orders")
@@ -5859,6 +6004,28 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 signature.append((order_id, status, price, qty))
         return tuple(sorted(signature))
 
+    @staticmethod
+    def _orders_snapshot_hash(orders: list[dict[str, Any]]) -> int:
+        signature: list[tuple[str, str, str, str, str, str, str]] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            order_id = str(order.get("orderId", ""))
+            if not order_id:
+                continue
+            signature.append(
+                (
+                    order_id,
+                    str(order.get("side", "")),
+                    str(order.get("price", "")),
+                    str(order.get("origQty", "")),
+                    str(order.get("executedQty", "")),
+                    str(order.get("status", "")),
+                    str(order.get("updateTime", "")),
+                )
+            )
+        return hash(tuple(sorted(signature)))
+
     def _handle_open_orders(self, result: object, latency_ms: int) -> None:
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
@@ -5922,6 +6089,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._queue_reconcile_missing_orders(missing[:3])
         count = len(self._open_orders)
         self._orders_snapshot_signature = self._orders_signature(self._open_orders_all)
+        new_hash = self._orders_snapshot_hash(self._open_orders_all)
+        previous_hash = self._orders_snapshot_hash
+        self._orders_snapshot_hash_changed = previous_hash is None or new_hash != previous_hash
+        if self._orders_snapshot_hash_changed:
+            self._orders_snapshot_hash_stable_cycles = 0
+        else:
+            self._orders_snapshot_hash_stable_cycles += 1
+        self._orders_snapshot_hash = new_hash
         orders_changed = self._orders_snapshot_signature != previous_signature
         inflight_actions = bool(self._active_action_keys or self._pilot_action_in_progress)
         if orders_changed or inflight_actions or self._start_in_progress or self._stop_in_progress:
@@ -6543,8 +6718,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _runtime_profit_inputs(self) -> dict[str, Any]:
         return {
             "expected_fill_mode": "MAKER",
-            "slippage_pct": 0.02,
-            "safety_edge_pct": 0.02,
+            "slippage_pct": self._profit_guard_slippage_pct(),
+            "safety_edge_pct": self._profit_guard_pad_pct(),
             "fee_discount_pct": None,
         }
 
@@ -6559,12 +6734,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _profit_guard_round_trip_cost_pct(self) -> float:
         fee_cost = self.get_effective_fees_pct(self._symbol)
-        slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
-        return fee_cost + slippage_pct + PROFIT_GUARD_EXTRA_BUFFER_PCT
+        slippage_pct = self._profit_guard_slippage_pct()
+        return fee_cost + slippage_pct + self._profit_guard_pad_pct()
 
     def _profit_guard_min_profit_pct(self, settings: GridSettingsState) -> float:
         round_trip_cost = self._profit_guard_round_trip_cost_pct()
-        base_min_profit = max(round_trip_cost + PROFIT_GUARD_BUFFER_PCT, PROFIT_GUARD_MIN_FLOOR_PCT)
+        base_min_profit = max(
+            round_trip_cost + self._profit_guard_buffer_pct(),
+            self._profit_guard_min_floor_pct(),
+        )
         return max(base_min_profit, settings.take_profit_pct)
 
     def _current_spread_pct(self) -> float | None:
@@ -6579,20 +6757,46 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _profit_guard_should_hold(
         self,
-        min_profit_pct: float,
-    ) -> tuple[str, float | None, float | None, float | None, float | None, float | None]:
+        min_profit_bps: float,
+    ) -> tuple[str, float | None, float | None, float | None, float | None, float | None, float | None]:
         spread_pct = self._current_spread_pct()
         if self._kpi_state != KPI_STATE_OK:
-            return "OK", spread_pct, None, None, None, None
+            return "OK", None, None, None, None, None, None
         if spread_pct is None or spread_pct <= 0:
-            return "OK", spread_pct, None, None, None, None
+            return "OK", None, None, None, None, None, None
+        spread_bps = spread_pct * 100
         fee_cost_pct = self.get_effective_fees_pct(self._symbol)
-        slippage_pct = PROFIT_GUARD_SLIPPAGE_BPS * 0.01
-        safety_pad_pct = PROFIT_GUARD_EXTRA_BUFFER_PCT
-        expected_edge_pct = spread_pct - fee_cost_pct - slippage_pct - safety_pad_pct
-        if expected_edge_pct < min_profit_pct:
-            return "HOLD", spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct
-        return "OK", spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct
+        fees_roundtrip_bps = fee_cost_pct * 100
+        slippage_bps = self._profit_guard_slippage_pct() * 100
+        safety_pad_bps = self._profit_guard_pad_pct() * 100
+        vol_bps = self._market_health.vol_bps if self._market_health else None
+        risk_buffer_bps = (vol_bps or 0.0) * MARKET_HEALTH_RISK_BUFFER_MULT
+        edge = compute_expected_edge_bps(
+            spread_bps=spread_bps,
+            fees_roundtrip_bps=fees_roundtrip_bps,
+            slippage_bps=slippage_bps,
+            pad_bps=safety_pad_bps,
+            risk_buffer_bps=risk_buffer_bps,
+        )
+        if edge.expected_profit_bps < min_profit_bps:
+            return (
+                "HOLD",
+                spread_bps,
+                edge.expected_profit_bps,
+                fees_roundtrip_bps,
+                slippage_bps,
+                safety_pad_bps,
+                risk_buffer_bps,
+            )
+        return (
+            "OK",
+            spread_bps,
+            edge.expected_profit_bps,
+            fees_roundtrip_bps,
+            slippage_bps,
+            safety_pad_bps,
+            risk_buffer_bps,
+        )
 
     def _profit_guard_autofix(
         self,
@@ -6686,8 +6890,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> str:
         guard_mode = self._current_profit_guard_mode()
         min_profit_pct = self._profit_guard_min_profit_pct(settings)
-        decision, spread_pct, expected_edge_pct, fee_cost_pct, slippage_pct, safety_pad_pct = (
-            self._profit_guard_should_hold(min_profit_pct)
+        min_profit_bps = min_profit_pct * 100
+        (
+            decision,
+            spread_bps,
+            expected_profit_bps,
+            fees_roundtrip_bps,
+            slippage_bps,
+            safety_pad_bps,
+            risk_buffer_bps,
+        ) = self._profit_guard_should_hold(min_profit_bps)
         )
         maker_pct, taker_pct, used_default = self._profit_guard_fee_inputs()
         if used_default:
@@ -6699,17 +6911,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 kind="INFO",
             )
         if decision == "HOLD":
-            spread_text = f"{spread_pct:.6f}%" if spread_pct is not None else "—"
-            expected_text = f"{expected_edge_pct:.6f}%" if expected_edge_pct is not None else "—"
-            fee_text = f"{fee_cost_pct:.6f}%" if fee_cost_pct is not None else "—"
-            slip_text = f"{slippage_pct:.6f}%" if slippage_pct is not None else "—"
-            pad_text = f"{safety_pad_pct:.6f}%" if safety_pad_pct is not None else "—"
+            spread_text = f"{spread_bps:.2f}bps" if spread_bps is not None else "—"
+            expected_text = f"{expected_profit_bps:.2f}bps" if expected_profit_bps is not None else "—"
+            fee_text = f"{fees_roundtrip_bps:.2f}bps" if fees_roundtrip_bps is not None else "—"
+            slip_text = f"{slippage_bps:.2f}bps" if slippage_bps is not None else "—"
+            pad_text = f"{safety_pad_bps:.2f}bps" if safety_pad_bps is not None else "—"
+            risk_text = f"{risk_buffer_bps:.2f}bps" if risk_buffer_bps is not None else "—"
             guard_prefix = "HOLD" if guard_mode == ProfitGuardMode.BLOCK else "WARN_ONLY"
             self._append_log(
                 (
                     f"[GUARD] {guard_prefix} thin_edge "
-                    f"raw_spread={spread_text} expected_edge={expected_text} "
-                    f"min_profit={min_profit_pct:.4f}% fees={fee_text} slip={slip_text} pad={pad_text}"
+                    f"raw_spread={spread_text} expected_profit_bps={expected_text} "
+                    f"min_profit_bps={min_profit_bps:.2f} fees={fee_text} "
+                    f"slip={slip_text} pad={pad_text} risk={risk_text}"
                 ),
                 kind="WARN",
             )
@@ -8856,8 +9070,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if guard_mode != ProfitGuardMode.BLOCK:
             return False
         min_profit_pct = self._profit_guard_min_profit_pct(settings)
-        decision, _spread_pct, _expected, _fee, _slip, _pad = self._profit_guard_should_hold(
-            min_profit_pct
+        decision, _spread_bps, _expected_bps, _fee_bps, _slip_bps, _pad_bps, _risk_bps = (
+            self._profit_guard_should_hold(min_profit_pct * 100)
         )
         return decision == "HOLD"
 
