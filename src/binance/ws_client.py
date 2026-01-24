@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from typing import Any, Callable, Coroutine
 
 import websockets
@@ -20,6 +21,7 @@ class WsManager:
         self._shutdown_lock = threading.Lock()
         self._is_stopping = False
         self._is_closed = False
+        self._skip_enqueue_log_ts: float | None = None
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop | None:
@@ -53,9 +55,9 @@ class WsManager:
                     try:
                         self._loop.call_soon_threadsafe(self._loop.stop)
                     except RuntimeError:
-                        self._logger.info("[WS] skip enqueue: loop closed")
+                        self._log_skip_enqueue()
                 else:
-                    self._logger.info("[WS] skip enqueue: loop closed")
+                    self._log_skip_enqueue()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
         self._is_closed = True
@@ -78,6 +80,14 @@ class WsManager:
             self._is_closed = True
             self._logger.info("STOP_LOOP")
 
+    def _log_skip_enqueue(self) -> None:
+        now = time.monotonic()
+        last_log = self._skip_enqueue_log_ts
+        if last_log is not None and now - last_log < 5.0:
+            return
+        self._logger.info("[WS] skip enqueue: loop closed")
+        self._skip_enqueue_log_ts = now
+
 
 class BinanceWsClient:
     def __init__(
@@ -98,6 +108,10 @@ class BinanceWsClient:
     @property
     def last_message_ms(self) -> int | None:
         return self._last_message_ms
+
+    @property
+    def is_closed(self) -> bool:
+        return self._manager.is_closed
 
     def start(self) -> None:
         self._stop_event.clear()

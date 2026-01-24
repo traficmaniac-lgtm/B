@@ -14,6 +14,7 @@ class FakeExchange:
 def maybe_place_restore(
     client: FakeExchange,
     action_keys: set[str],
+    active_keys: set[str],
     balances: dict[str, Decimal],
     rules: dict[str, float | None],
     price: Decimal,
@@ -31,6 +32,10 @@ def maybe_place_restore(
     step = Decimal(str(rules["step"])) if rules.get("step") is not None else None
     if qty <= 0:
         return False, reason
+    registry_key = f"BUY:{price}:{qty}"
+    if registry_key in active_keys:
+        return False, "skip_duplicate_restore"
+    active_keys.add(registry_key)
     action_key = build_action_key("RESTORE", "order-1", price, qty, step)
     if action_key in action_keys:
         return False, "duplicate"
@@ -42,11 +47,13 @@ def maybe_place_restore(
 def test_restore_skipped_when_quote_insufficient() -> None:
     client = FakeExchange()
     action_keys: set[str] = set()
+    active_keys: set[str] = set()
     balances = {"quote_free": Decimal("0.5"), "base_free": Decimal("0")}
     rules = {"step": 0.01, "min_notional": 1.0, "min_qty": None, "max_qty": None}
     placed, reason = maybe_place_restore(
         client,
         action_keys,
+        active_keys,
         balances,
         rules,
         Decimal("10"),
@@ -57,6 +64,7 @@ def test_restore_skipped_when_quote_insufficient() -> None:
     placed_again, _ = maybe_place_restore(
         client,
         action_keys,
+        active_keys,
         balances,
         rules,
         Decimal("10"),
@@ -64,3 +72,34 @@ def test_restore_skipped_when_quote_insufficient() -> None:
     )
     assert not placed_again
     assert client.calls == []
+
+
+def test_restore_skips_duplicate_registry_key() -> None:
+    client = FakeExchange()
+    action_keys: set[str] = set()
+    active_keys: set[str] = set()
+    balances = {"quote_free": Decimal("100"), "base_free": Decimal("0")}
+    rules = {"step": 0.01, "min_notional": 1.0, "min_qty": None, "max_qty": None}
+    placed, reason = maybe_place_restore(
+        client,
+        action_keys,
+        active_keys,
+        balances,
+        rules,
+        Decimal("10"),
+        Decimal("1"),
+    )
+    assert placed
+    assert reason == "ok"
+    action_keys.clear()
+    placed_again, reason_again = maybe_place_restore(
+        client,
+        action_keys,
+        active_keys,
+        balances,
+        rules,
+        Decimal("10"),
+        Decimal("1"),
+    )
+    assert not placed_again
+    assert reason_again == "skip_duplicate_restore"

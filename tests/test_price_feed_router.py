@@ -4,6 +4,8 @@ import threading
 
 from src.core.config import Config
 from src.services.price_feed_manager import (
+    ROUTER_MIN_HOLD_MS,
+    WS_RECOVERY_HOLD_MS,
     RouterConfig,
     SymbolSubscriptionRegistry,
     WS_ROUTER_NO_FIRST_TICK,
@@ -94,6 +96,7 @@ def test_transport_test_waits_first_tick() -> None:
         return now_ms
 
     manager = PriceFeedManager(Config(), now_ms_fn=_now)
+    manager._transport_test_enabled = True
     symbol = "BTCUSDT"
     manager.register_symbol(symbol)
 
@@ -108,3 +111,43 @@ def test_transport_test_waits_first_tick() -> None:
     assert report
     entry = report[0]
     assert entry["ws_status"] == WS_ROUTER_OK
+
+
+def test_router_hysteresis_min_hold() -> None:
+    now_ms = 10_000
+
+    def _now() -> int:
+        return now_ms
+
+    manager = PriceFeedManager(Config(), now_ms_fn=_now)
+    symbol = "BTCUSDT"
+    manager.register_symbol(symbol)
+    with manager._lock:
+        state = manager._symbol_state[symbol]
+        router = state["router"]
+        router.active_source = "HTTP"
+        router.last_switch_ts = now_ms
+        router.ws_last_tick_ts = now_ms
+        router.ws_recovery_start_ts = now_ms - WS_RECOVERY_HOLD_MS - 1
+
+    now_ms += ROUTER_MIN_HOLD_MS - 500
+    manager._update_router_state(
+        symbol,
+        now_ms,
+        subscribed=True,
+        ws_allowed=True,
+        trigger="heartbeat",
+    )
+    with manager._lock:
+        assert state["router"].active_source == "HTTP"
+
+    now_ms += 1000
+    manager._update_router_state(
+        symbol,
+        now_ms,
+        subscribed=True,
+        ws_allowed=True,
+        trigger="heartbeat",
+    )
+    with manager._lock:
+        assert state["router"].active_source == "WS"

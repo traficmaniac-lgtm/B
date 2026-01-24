@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from src.ai.operator_runtime import cancel_all_bot_orders, pause_state, stop_state
+from src.services.price_feed_manager import _BinanceBookTickerWsThread
 
 
 class FakeAccountClient:
@@ -41,3 +43,20 @@ def test_cancel_on_pause_stop() -> None:
     stop_state_value, stop_result = stop_state(cancel_fn)
     assert stop_state_value == "STOPPED"
     assert stop_result.canceled_count == 0
+
+
+def test_ws_thread_skip_enqueue_on_closed_loop() -> None:
+    loop = asyncio.new_event_loop()
+    thread = _BinanceBookTickerWsThread(
+        ws_url="wss://example.invalid",
+        on_message=lambda _: None,
+        on_status=lambda *_: None,
+        now_ms_fn=lambda: 0,
+    )
+    thread._loop = loop
+    thread._command_queue = asyncio.Queue()
+    loop.close()
+
+    thread.set_symbols(["BTCUSDT"])
+    thread._safe_call(lambda: None)
+    assert thread._pending_commands
