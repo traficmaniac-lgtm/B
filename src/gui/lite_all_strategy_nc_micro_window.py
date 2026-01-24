@@ -220,9 +220,8 @@ class TradeGateState(Enum):
 class PilotState(Enum):
     OFF = "OFF"
     NORMAL = "NORMAL"
-    RECENTERING = "RECENTERING"
-    RECOVERY = "RECOVERY"
-    PAUSED_BY_RISK = "PAUSED_BY_RISK"
+    HOLD = "HOLD"
+    ACCUMULATE_BASE = "ACCUMULATE_BASE"
 
 
 class PilotAction(Enum):
@@ -259,11 +258,11 @@ STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 AUTO_EXEC_ACTION_COOLDOWN_SEC = 30
 SNAPSHOT_REFRESH_COOLDOWN_MS = 1500
-STALE_REFRESH_MIN_MS = 2000
-STALE_REFRESH_POLL_MIN_MS = 3000
+STALE_REFRESH_MIN_MS = 15_000
+STALE_REFRESH_POLL_MIN_MS = 15_000
 STALE_REFRESH_POLL_AGE_MS = 2000
 STALE_REFRESH_POLL_HARD_MAX_SEC = 10
-STALE_REFRESH_HARD_MAX_MS = 15_000
+STALE_REFRESH_HARD_MAX_MS = 90_000
 STALE_REFRESH_HASH_STABLE_CYCLES = 3
 STALE_REFRESH_LOG_DEDUP_SEC = 5
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
@@ -278,6 +277,8 @@ STALE_AUTO_ACTION_PAUSE_SEC = 300
 TP_MIN_PROFIT_COOLDOWN_SEC = 30
 PROFIT_GUARD_DEFAULT_MAKER_FEE_PCT = 0.0
 PROFIT_GUARD_DEFAULT_TAKER_FEE_PCT = 0.0
+PILOT_SLIPPAGE_BPS = 0.30
+PILOT_PAD_BPS = 0.50
 PROFIT_GUARD_SLIPPAGE_BPS = 1.5
 PROFIT_GUARD_EXTRA_BUFFER_PCT = 0.02
 PROFIT_GUARD_BUFFER_PCT = 0.03
@@ -319,10 +320,12 @@ SPREAD_ZERO_OK_SYMBOLS = {
     "ADAUSDT",
 }
 MICRO_STABLECOIN_SYMBOLS = {"EURIUSDT", "USDCUSDT"}
-MICRO_STABLECOIN_TP_PCT_DEFAULT = 0.03
-MICRO_STABLECOIN_STEP_PCT_DEFAULT = 0.05
-MICRO_STABLECOIN_RANGE_LOW_PCT_DEFAULT = 0.25
-MICRO_STABLECOIN_RANGE_HIGH_PCT_DEFAULT = 0.25
+MICRO_STABLECOIN_STEP_PCT_DEFAULT = 0.03
+MICRO_STABLECOIN_STEP_PCT_MIN = 0.02
+MICRO_STABLECOIN_STEP_PCT_MAX = 0.06
+MICRO_STABLECOIN_RANGE_PCT_DEFAULT = 0.20
+MICRO_STABLECOIN_RANGE_PCT_MAX = 0.40
+MICRO_STABLECOIN_TP_PCT_MAX = 0.15
 MICRO_STABLECOIN_THIN_EDGE_MIN_PROFIT_PCT = 0.02
 MICRO_STABLECOIN_SLIPPAGE_PCT = 0.003
 MICRO_STABLECOIN_PAD_PCT = 0.005
@@ -1001,6 +1004,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_anchor_price: float | None = None
         self._pilot_pending_anchor: float | None = None
         self._pilot_recenter_expected_min: int | None = None
+        self._pilot_hold_until: float | None = None
+        self._pilot_hold_reason: str | None = None
         self._pilot_stale_active = False
         self._pilot_stale_last_log_ts: float | None = None
         self._pilot_stale_last_log_order_id: str | None = None
@@ -1361,11 +1366,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return self._symbol.replace("/", "").upper() in MICRO_STABLECOIN_SYMBOLS
 
     def _micro_grid_defaults(self) -> GridSettingsState:
+        tp_default = min(MICRO_STABLECOIN_STEP_PCT_DEFAULT * 2, MICRO_STABLECOIN_TP_PCT_MAX)
         return GridSettingsState(
-            take_profit_pct=MICRO_STABLECOIN_TP_PCT_DEFAULT,
             grid_step_pct=MICRO_STABLECOIN_STEP_PCT_DEFAULT,
-            range_low_pct=MICRO_STABLECOIN_RANGE_LOW_PCT_DEFAULT,
-            range_high_pct=MICRO_STABLECOIN_RANGE_HIGH_PCT_DEFAULT,
+            take_profit_pct=tp_default,
+            range_low_pct=MICRO_STABLECOIN_RANGE_PCT_DEFAULT,
+            range_high_pct=MICRO_STABLECOIN_RANGE_PCT_DEFAULT,
+            grid_count=8,
+            order_size_mode="Equal",
         )
 
     def _apply_profile_defaults_if_pristine(self) -> None:
@@ -1374,12 +1382,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         if self._is_micro_profile():
             self._settings_state = self._micro_grid_defaults()
+            self._append_log("[PILOT] micro_defaults_applied=true", kind="INFO")
 
     def _profit_guard_slippage_pct(self) -> float:
-        return max(self.pilot_config.slippage_bps, 0.0) * 0.01
+        return max(PILOT_SLIPPAGE_BPS, 0.0) * 0.01
 
     def _profit_guard_pad_pct(self) -> float:
-        return max(self.pilot_config.pad_bps, 0.0) * 0.01
+        return max(PILOT_PAD_BPS, 0.0) * 0.01
 
     def _profit_guard_buffer_pct(self) -> float:
         if self._is_micro_profile():
@@ -1387,7 +1396,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return PROFIT_GUARD_BUFFER_PCT
 
     def _profit_guard_min_floor_pct(self) -> float:
-        return max(self.pilot_config.min_expected_profit_bps, 0.0) * 0.01
+        return max(self.pilot_config.min_profit_bps, 0.0) * 0.01
 
     def _build_right_panel(self) -> QSplitter:
         self._right_splitter = QSplitter(Qt.Vertical)
@@ -1965,7 +1974,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._append_log(
             (
                 "[PILOT] settings updated "
-                f"stale_policy={config.stale_policy} allow_market_close={str(config.allow_market_close).lower()}"
+                f"min_profit_bps={config.min_profit_bps:.2f} "
+                f"max_step_pct={config.max_step_pct:.2f} "
+                f"max_range_pct={config.max_range_pct:.2f} "
+                f"hold_timeout_sec={config.hold_timeout_sec} "
+                f"allow_market_close={str(config.allow_market_close).lower()}"
             ),
             kind="INFO",
         )
@@ -1986,11 +1999,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self.pilot_enabled = enabled
         if enabled:
             self._pilot_anchor_price = self._last_price
-            self._set_pilot_state(PilotState.NORMAL)
+            self._set_pilot_state(PilotState.NORMAL, reason="button_on")
             self._append_log("[PILOT] enabled", kind="INFO")
         else:
             self._pilot_anchor_price = None
-            self._set_pilot_state(PilotState.OFF)
+            self._pilot_hold_until = None
+            self._pilot_hold_reason = None
+            self._set_pilot_state(PilotState.OFF, reason="button_off")
             self._log_pilot_disabled()
         self._set_pilot_buttons_enabled(not self._pilot_action_in_progress)
 
@@ -1999,6 +2014,64 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _log_pilot_disabled(self) -> None:
         self._append_log("[PILOT] disabled, guard=warn_only", kind="INFO")
+
+    def _pilot_min_sell_qty(self) -> Decimal:
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        min_qty = self._rule_decimal(self._exchange_rules.get("min_qty")) or Decimal("0")
+        return min_qty + self._base_dust_buffer(step)
+
+    def _pilot_accumulate_base_active(self, base_free: Decimal | None = None) -> bool:
+        if base_free is None:
+            balance_snapshot = self._balance_snapshot()
+            base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
+        min_sell_qty = self._pilot_min_sell_qty()
+        if min_sell_qty <= 0:
+            return False
+        return base_free < min_sell_qty
+
+    def _pilot_expected_profit_bps(self) -> float | None:
+        if self._market_health and self._market_health.expected_profit_bps is not None:
+            return float(self._market_health.expected_profit_bps)
+        return None
+
+    def _pilot_thin_edge_active(self) -> bool:
+        expected_profit_bps = self._pilot_expected_profit_bps()
+        min_profit_bps = max(self.pilot_config.min_profit_bps, 0.0)
+        if expected_profit_bps is not None and expected_profit_bps < min_profit_bps:
+            return True
+        return self._market_health_last_reason == "thin_edge"
+
+    def _pilot_shift_anchor(self, *, reason: str) -> None:
+        if self._last_price is None:
+            return
+        if self._pilot_anchor_price == self._last_price:
+            return
+        self._pilot_anchor_price = self._last_price
+        self._append_log(
+            f"[PILOT] transition anchor -> {self._last_price:.8f} reason={reason}",
+            kind="INFO",
+        )
+
+    def _pilot_update_state_machine(self) -> None:
+        if not self.pilot_enabled:
+            return
+        balance_snapshot = self._balance_snapshot()
+        base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
+        if self._pilot_accumulate_base_active(base_free):
+            reason = f"base_free={self._format_balance_decimal(base_free)}"
+            self._set_pilot_state(PilotState.ACCUMULATE_BASE, reason=reason)
+            return
+        now = monotonic()
+        if self._pilot_thin_edge_active():
+            self._pilot_hold_reason = "thin_edge"
+            self._pilot_hold_until = now + max(self.pilot_config.hold_timeout_sec, 0)
+        if self._pilot_hold_until and now <= self._pilot_hold_until:
+            reason = self._pilot_hold_reason or "guard"
+            self._set_pilot_state(PilotState.HOLD, reason=reason)
+            return
+        self._pilot_hold_until = None
+        self._pilot_hold_reason = None
+        self._set_pilot_state(PilotState.NORMAL, reason="kpi_ok")
 
     def _log_pilot_auto_action(self, *, action: str, reason: str) -> None:
         expected_profit = None
@@ -2118,6 +2191,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._pilot_action_in_progress:
             self._pilot_block_action(action, "in_progress")
             return
+        if action in {PilotAction.RECENTER, PilotAction.CANCEL_REPLACE_STALE} and self._pilot_thin_edge_active():
+            self._pilot_block_action(action, "thin_edge")
+            if action == PilotAction.RECENTER:
+                self._pilot_shift_anchor(reason="thin_edge")
+            return
         if auto:
             exec_reason = reason or "auto"
             now = monotonic()
@@ -2186,6 +2264,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._pilot_set_warning("Устаревших GRID ордеров нет")
                 return
             self._pilot_set_warning("УСТАРЕВШИЕ ОРДЕРА")
+            if self._pilot_thin_edge_active():
+                self._pilot_shift_anchor(reason="thin_edge")
+                return
             self._pilot_execute(PilotAction.RECENTER, auto=True, reason="flag_stale")
             return
         if action == PilotAction.CANCEL_REPLACE_STALE:
@@ -2263,9 +2344,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._dry_run_toggle.isChecked():
             balance_snapshot = self._balance_snapshot()
             base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
-            if base_free <= 0:
+            if self._pilot_accumulate_base_active(base_free):
                 self._pilot_recenter_expected_min = sum(1 for order in plan if order.side == "BUY")
-        self._set_pilot_state(PilotState.RECENTERING)
         self._append_log(
             (
                 "[INFO] [NC_MICRO] recenter start "
@@ -2284,7 +2364,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_anchor_price = anchor_price
             self._pilot_pending_anchor = None
             self._pilot_recenter_expected_min = None
-            self._set_pilot_state(PilotState.NORMAL)
+            self._set_pilot_state(PilotState.NORMAL, reason="recenter_complete")
             self._set_pilot_action_in_progress(False)
             self._current_action = None
             return
@@ -2301,6 +2381,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> None:
         if not self.pilot_enabled:
             self._log_pilot_disabled()
+            return
+        if self._pilot_thin_edge_active():
+            self._pilot_set_warning("thin_edge")
+            self._pilot_shift_anchor(reason="thin_edge")
             return
         if not self._pilot_trade_gate_ready(PilotAction.CANCEL_REPLACE_STALE):
             return
@@ -2609,7 +2693,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         ]
         if not self._pilot_confirm_action(PilotAction.RECOVERY, summary):
             return
-        self._set_pilot_state(PilotState.RECOVERY)
+        self._set_pilot_state(PilotState.NORMAL, reason="recovery_start")
         self._append_log(
             f"[NC MICRO] recovery mode enabled symbol={self._symbol}",
             kind="INFO",
@@ -2745,7 +2829,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     ) -> tuple[list[GridPlannedOrder] | None, GridSettingsState | None, bool]:
         snapshot = self._collect_strategy_snapshot()
         settings = self._resolve_start_settings(snapshot)
-        self._apply_auto_clamps(settings, anchor_price)
+        self._apply_grid_clamps(settings, anchor_price)
         guard_decision = self._apply_profit_guard(
             settings,
             anchor_price,
@@ -2762,7 +2846,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._dry_run_toggle.isChecked():
             balance_snapshot = self._balance_snapshot()
             base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
-            planned = self._limit_sell_plan_by_balance(planned, base_free)
+            if self._pilot_accumulate_base_active(base_free):
+                planned = [order for order in planned if order.side == "BUY"]
+            else:
+                planned = self._limit_sell_plan_by_balance(planned, base_free)
         planned = planned[: settings.max_active_orders]
         return planned, settings, False
 
@@ -2770,9 +2857,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._last_price is None:
             return None
         if auto:
-            if self.pilot_config.auto_shift_anchor:
-                return self._last_price
-            return self._pilot_anchor_price or self._last_price
+            return self._last_price
         if self._pilot_anchor_price is None or self._pilot_anchor_price == self._last_price:
             return self._last_price
         return self._last_price
@@ -2927,7 +3012,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_anchor_price = self._pilot_pending_anchor
         self._pilot_pending_anchor = None
         self._pilot_recenter_expected_min = None
-        self._set_pilot_state(PilotState.NORMAL)
+        self._set_pilot_state(PilotState.NORMAL, reason="recenter_complete")
         self._append_log(
             f"[INFO] [NC_MICRO] recenter done open_orders={len(open_orders)}",
             kind="INFO",
@@ -3009,8 +3094,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._append_log(f"[NC MICRO] action error: {message}", kind="WARN")
         self._set_pilot_action_in_progress(False)
         self._current_action = None
-        if self._pilot_state == PilotState.RECENTERING:
-            self._set_pilot_state(PilotState.NORMAL)
+        if self._pilot_pending_anchor is not None:
             self._pilot_pending_anchor = None
             self._pilot_recenter_expected_min = None
         self._pilot_pending_action = None
@@ -3075,23 +3159,29 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return None
         return self.as_decimal(state.break_even_price)
 
-    def _set_pilot_state(self, state: PilotState) -> None:
+    def _set_pilot_state(self, state: PilotState, *, reason: str | None = None) -> None:
         if self._pilot_state == state:
             return
+        prev = self._pilot_state
         self._pilot_state = state
+        reason_text = reason or "unknown"
         self._append_log(
-            f"[NC MICRO] state={state.value} symbol={self._symbol}",
+            f"[PILOT] transition {prev.value} -> {state.value} reason={reason_text}",
             kind="INFO",
         )
+        self._append_log(f"[PILOT] state={state.value}", kind="INFO")
+        if state == PilotState.HOLD and reason:
+            self._append_log(f"[PILOT] HOLD reason={reason}", kind="INFO")
+        if state == PilotState.ACCUMULATE_BASE and reason:
+            self._append_log(f"[PILOT] ACCUMULATE_BASE {reason}", kind="INFO")
 
     @staticmethod
     def _pilot_state_label(state: PilotState) -> str:
         mapping = {
             PilotState.OFF: "Выключен",
             PilotState.NORMAL: "Нормальный",
-            PilotState.RECENTERING: "Перестроение",
-            PilotState.RECOVERY: "Безубыток",
-            PilotState.PAUSED_BY_RISK: "Пауза риска",
+            PilotState.HOLD: "Ожидание",
+            PilotState.ACCUMULATE_BASE: "Накопление базы",
         }
         return mapping.get(state, state.value)
 
@@ -3099,6 +3189,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         try:
             if not hasattr(self, "_pilot_state_value"):
                 return
+            self._pilot_update_state_machine()
             self._pilot_state_value.setText(self._pilot_state_label(self._pilot_state))
             if hasattr(self, "_pilot_status_label"):
                 self._pilot_status_label.setText(self._pilot_status_text())
@@ -3219,7 +3310,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return None, None, None
         snapshot = self._collect_strategy_snapshot()
         settings = self._resolve_start_settings(snapshot)
-        self._apply_auto_clamps(settings, anchor_price)
+        self._apply_grid_clamps(settings, anchor_price)
         range_low = settings.range_low_pct
         range_high = settings.range_high_pct
         if range_low <= 0 or range_high <= 0:
@@ -3699,6 +3790,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             range_high=range_high,
             settings=settings,
         )
+        if self._pilot_thin_edge_active():
+            self._pilot_orders_warning_value.setText("—")
+            self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
+            self._pilot_stale_active = False
+            return
         last_seen_age = self._last_seen_age_sec(oldest_info)
         if last_seen_age is not None and last_seen_age > STALE_SNAPSHOT_MAX_AGE_SEC:
             self._pilot_orders_warning_value.setText("Снимок ордеров устарел")
@@ -3927,6 +4023,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._pilot_stale_last_action_ts and now - self._pilot_stale_last_action_ts < STALE_AUTO_ACTION_COOLDOWN_SEC:
             return
         if self._pilot_action_in_progress:
+            return
+        if self._pilot_thin_edge_active():
+            self._pilot_shift_anchor(reason="thin_edge")
             return
         self._pilot_stale_last_action_ts = now
         if self._pilot_stale_policy == StalePolicy.RECENTER:
@@ -4779,7 +4878,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     )
                     balance_snapshot = last_good_snapshot
                 settings = self._resolve_start_settings(snapshot)
-                self._apply_auto_clamps(settings, anchor_price)
+                self._apply_grid_clamps(settings, anchor_price)
                 if not self._fees_last_fetch_ts:
                     self._refresh_trade_fees(force=True)
                 guard_mode = self._current_profit_guard_mode()
@@ -4868,14 +4967,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._bootstrap_sell_enabled = False
             if not dry_run:
                 base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
-                planned = self._limit_sell_plan_by_balance(planned, base_free)
-                if base_free <= 0:
+                if self._pilot_accumulate_base_active(base_free):
                     self._bootstrap_mode = True
                     planned = [order for order in planned if order.side == "BUY"]
                     self._append_log(
-                        "[START] BUY-only mode: sells postponed (base_free insufficient)",
+                        f"[PILOT] mode=ACCUMULATE_BASE base_free={self._format_balance_decimal(base_free)}",
                         kind="INFO",
                     )
+                else:
+                    planned = self._limit_sell_plan_by_balance(planned, base_free)
             planned = planned[: settings.max_active_orders]
             buy_count = sum(1 for order in planned if order.side == "BUY")
             sell_count = sum(1 for order in planned if order.side == "SELL")
@@ -5370,6 +5470,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         fee_candidates = [fee for fee in self._trade_fees if fee is not None]
         fee_pct = max(fee_candidates) * 100 if fee_candidates else 0.0
         tp_pct = max(grid_step_pct * 1.1, fee_pct * 2 + 0.01)
+        if self._is_micro_profile():
+            grid_step_pct = self._clamp(
+                grid_step_pct,
+                MICRO_STABLECOIN_STEP_PCT_MIN,
+                MICRO_STABLECOIN_STEP_PCT_MAX,
+            )
+            range_pct = self._clamp(range_pct, 0.0, MICRO_STABLECOIN_RANGE_PCT_MAX)
+            tp_pct = min(max(grid_step_pct * 2, tp_pct), MICRO_STABLECOIN_TP_PCT_MAX)
         return {
             "grid_step_pct": grid_step_pct,
             "range_pct": range_pct,
@@ -5489,6 +5597,57 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 settings.grid_step_pct = min_step_pct
         if settings.take_profit_pct < settings.grid_step_pct:
             settings.take_profit_pct = settings.grid_step_pct
+
+    def _apply_grid_clamps(self, settings: GridSettingsState, anchor_price: float) -> None:
+        self._apply_auto_clamps(settings, anchor_price)
+        self._apply_micro_grid_clamps(settings, anchor_price)
+        self._apply_micro_budget_limit(settings, anchor_price)
+
+    def _apply_micro_grid_clamps(self, settings: GridSettingsState, anchor_price: float) -> None:
+        if not self._is_micro_profile():
+            return
+        settings.grid_count = int(self._clamp(settings.grid_count, 6, 10))
+        settings.grid_step_pct = self._clamp(
+            settings.grid_step_pct,
+            MICRO_STABLECOIN_STEP_PCT_MIN,
+            MICRO_STABLECOIN_STEP_PCT_MAX,
+        )
+        settings.range_low_pct = self._clamp(
+            settings.range_low_pct,
+            0.0,
+            MICRO_STABLECOIN_RANGE_PCT_MAX,
+        )
+        settings.range_high_pct = self._clamp(
+            settings.range_high_pct,
+            0.0,
+            MICRO_STABLECOIN_RANGE_PCT_MAX,
+        )
+        tp_default = settings.grid_step_pct * 2
+        settings.take_profit_pct = max(settings.take_profit_pct, tp_default)
+        settings.take_profit_pct = min(settings.take_profit_pct, MICRO_STABLECOIN_TP_PCT_MAX)
+        settings.order_size_mode = "Equal"
+        settings.max_active_orders = min(settings.max_active_orders, settings.grid_count)
+
+    def _apply_micro_budget_limit(self, settings: GridSettingsState, anchor_price: float) -> None:
+        if not self._is_micro_profile():
+            return
+        if anchor_price <= 0:
+            return
+        quote_asset = self._quote_asset or ""
+        if not quote_asset:
+            return
+        quote_total = self._asset_total(quote_asset)
+        base_total = self._asset_total(self._base_asset) if self._base_asset else 0.0
+        equity = quote_total + (base_total * anchor_price)
+        max_budget = equity * 0.5
+        if max_budget <= 0:
+            return
+        if settings.budget > max_budget:
+            self._append_log(
+                f"[PILOT] budget capped {settings.budget:.2f} -> {max_budget:.2f} (50% equity)",
+                kind="INFO",
+            )
+            settings.budget = max_budget
 
     def _balance_snapshot(self) -> dict[str, Decimal]:
         balances = dict(self._balances)
@@ -5662,6 +5821,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._order_size_combo.findData(defaults.order_size_mode)
         )
         self._append_log("Settings reset to defaults.", kind="INFO")
+        if self._is_micro_profile():
+            self._append_log("[PILOT] micro_defaults_applied=true", kind="INFO")
         self._apply_grid_step_mode(defaults.grid_step_mode)
         self._update_grid_preview()
 
@@ -6789,11 +6950,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             settings.grid_step_pct = min_step_pct
         if settings.take_profit_pct < settings.grid_step_pct:
             settings.take_profit_pct = settings.grid_step_pct
+        max_step_pct = max(self.pilot_config.max_step_pct, 0.0)
+        if max_step_pct > 0:
+            settings.grid_step_pct = min(settings.grid_step_pct, max_step_pct)
         min_range_pct = settings.grid_step_pct * max(settings.grid_count, 1) / 2
         if settings.range_low_pct < min_range_pct:
             settings.range_low_pct = min_range_pct
         if settings.range_high_pct < min_range_pct:
             settings.range_high_pct = min_range_pct
+        max_range_pct = max(self.pilot_config.max_range_pct, 0.0)
+        if max_range_pct > 0:
+            settings.range_low_pct = min(settings.range_low_pct, max_range_pct)
+            settings.range_high_pct = min(settings.range_high_pct, max_range_pct)
+        if self._is_micro_profile():
+            settings.take_profit_pct = min(settings.take_profit_pct, MICRO_STABLECOIN_TP_PCT_MAX)
         changed = (
             settings.take_profit_pct != tp_old
             or settings.grid_step_pct != step_old
@@ -6903,6 +7073,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 ),
                 kind="WARN",
             )
+            if self.pilot_enabled:
+                self._pilot_hold_reason = "guard"
+                self._pilot_hold_until = monotonic() + max(self.pilot_config.hold_timeout_sec, 0)
+                self._set_pilot_state(PilotState.HOLD, reason="guard")
             if guard_mode == ProfitGuardMode.BLOCK:
                 return "HOLD"
         if self.enable_guard_autofix and self.pilot_enabled:
@@ -7109,6 +7283,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         tp_notional = Decimal("0")
         tp_reason = "ok"
         allow_tp = True
+        if tp_side == "SELL" and self._pilot_state == PilotState.ACCUMULATE_BASE:
+            tp_reason = "skip_accumulate_base"
+            allow_tp = False
         tp_min_profit_detail = ""
         tp_qty_cap = Decimal("0")
         tp_required_qty = fill_qty
@@ -7259,8 +7436,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         restore_notional = Decimal("0")
         restore_reason = "ok"
         target_qty = fill_qty
-        if self._pilot_state == PilotState.RECOVERY and restore_side == "BUY":
-            restore_reason = "skip_recovery_no_buy"
+        if restore_side == "SELL" and self._pilot_state == PilotState.ACCUMULATE_BASE:
+            restore_reason = "skip_accumulate_base"
             target_qty = Decimal("0")
 
         def _validate_restore_plan() -> tuple[str, Decimal, str, dict[str, Decimal]]:
@@ -7445,6 +7622,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _maybe_enable_bootstrap_sell_side(self, fill: TradeFill) -> None:
         if fill.side != "BUY":
+            return
+        if self._pilot_state == PilotState.ACCUMULATE_BASE:
             return
         balance_snapshot = self._balance_snapshot()
         base_free = self.as_decimal(balance_snapshot.get("base_free", Decimal("0")))
@@ -8693,8 +8872,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._change_state("RUNNING")
         if self._pilot_pending_action is not None:
             self._set_pilot_action_in_progress(False)
-            if self._pilot_state == PilotState.RECENTERING:
-                self._set_pilot_state(PilotState.NORMAL)
+            if self._pilot_pending_anchor is not None:
                 self._pilot_pending_anchor = None
                 self._pilot_recenter_expected_min = None
             self._pilot_pending_action = None
@@ -9063,7 +9241,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         snapshot = self._collect_strategy_snapshot()
         settings = self._resolve_start_settings(snapshot)
-        self._apply_auto_clamps(settings, anchor_price)
+        self._apply_grid_clamps(settings, anchor_price)
         if self._profit_guard_override_pending:
             self._append_log("[EDGE] ok -> placing orders", kind="INFO")
             self._handle_start()
