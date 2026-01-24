@@ -964,7 +964,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stale_refresh_skipped_rate_limit = 0
         self._stale_refresh_skipped_no_change = 0
         self._stale_refresh_last_force_ts_ms: int | None = None
-        self._orders_snapshot_hash: int | None = None
+        self._orders_snapshot_hash_value: int | None = None
         self._orders_snapshot_hash_changed = False
         self._orders_snapshot_hash_stable_cycles = 0
         self._registry_dirty = False
@@ -6090,13 +6090,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         count = len(self._open_orders)
         self._orders_snapshot_signature = self._orders_signature(self._open_orders_all)
         new_hash = self._orders_snapshot_hash(self._open_orders_all)
-        previous_hash = self._orders_snapshot_hash
+        previous_hash = self._orders_snapshot_hash_value
         self._orders_snapshot_hash_changed = previous_hash is None or new_hash != previous_hash
         if self._orders_snapshot_hash_changed:
             self._orders_snapshot_hash_stable_cycles = 0
         else:
             self._orders_snapshot_hash_stable_cycles += 1
-        self._orders_snapshot_hash = new_hash
+        self._orders_snapshot_hash_value = new_hash
         orders_changed = self._orders_snapshot_signature != previous_signature
         inflight_actions = bool(self._active_action_keys or self._pilot_action_in_progress)
         if orders_changed or inflight_actions or self._start_in_progress or self._stop_in_progress:
