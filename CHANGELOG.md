@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.20
+- Add STOP watchdog timeout to force finalize and re-enable Start after cancellation hangs.
+- Deduplicate noisy PILOT/KPI/ORDERS stale logs with heartbeat logging.
+- Log Binance signed 400 response body details (code/msg) with timestamp context.
+
 ## v1.0.19
 - Fix NC_MICRO Stop/CANCEL deadlock with forced REST reconcile and guaranteed finalization.
 - Soften WS heartbeat handling to prevent reconnect storms on quiet symbols.
