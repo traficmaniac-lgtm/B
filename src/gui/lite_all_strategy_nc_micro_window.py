@@ -266,7 +266,7 @@ STALE_REFRESH_POLL_AGE_MS = 2000
 STALE_REFRESH_POLL_HARD_MAX_SEC = 10
 STALE_REFRESH_HARD_MAX_MS = 90_000
 STALE_REFRESH_HASH_STABLE_CYCLES = 3
-STALE_REFRESH_LOG_DEDUP_SEC = 5
+STALE_REFRESH_LOG_DEDUP_SEC = 20
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 ORDERS_POLL_IDLE_MS = 1500
 ORDERS_POLL_RUNNING_MS = 1500
@@ -846,6 +846,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._signals.log_append.connect(self._append_log)
         self._signals.api_error.connect(self._handle_live_api_error)
         self._log_entries: list[tuple[str, str]] = []
+        self._log_throttle_ts: dict[str, float] = {}
         self._crash_log_path, self._crash_file = _install_nc_micro_crash_catcher(
             self._logger, self._symbol
         )
@@ -1049,6 +1050,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._cancel_inflight = False
         self._cancel_reconcile_pending = 0
         self._pilot_pending_cancel_ids: set[str] = set()
+        self._order_age_registry: dict[str, float] = {}
         self._pilot_stale_seen_ids: dict[str, float] = {}
         self._pilot_stale_handled: dict[str, float] = {}
         self._pilot_stale_skip_log_ts: dict[str, float] = {}
@@ -1126,6 +1128,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._registry_gc_timer = QTimer(self)
         self._registry_gc_timer.setInterval(REGISTRY_GC_INTERVAL_MS)
         self._registry_gc_timer.timeout.connect(self._gc_registry_keys)
+        self._order_age_timer = QTimer(self)
+        self._order_age_timer.setInterval(1_000)
+        self._order_age_timer.timeout.connect(self._tick_order_ages)
 
         self.setWindowTitle(f"Lite All Strategy Terminal — NC MICRO — {self._symbol}")
         self.resize(1050, 720)
@@ -1143,6 +1148,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_ui_timer.start()
         self._market_kpi_timer.start()
         self._registry_gc_timer.start()
+        self._order_age_timer.start()
 
         self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
@@ -1159,7 +1165,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.15 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.18 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -2789,7 +2795,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             }
             for candidate in cancel_candidates:
                 order_id = candidate.info.order_id
-                ok, error = self._cancel_order_idempotent(order_id)
+                ok, error, _outcome = self._cancel_order_idempotent(order_id)
                 if ok:
                     canceled += 1
                     self._pilot_stale_handled[order_id] = time_fn()
@@ -2806,16 +2812,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     for order in bot_orders_after
                     if str(order.get("orderId", "")) in stale_ids
                 ]
-                for order in still_open:
-                    order_id = str(order.get("orderId", ""))
-                    if not order_id:
-                        continue
-                    ok, error = self._cancel_order_idempotent(order_id)
-                    if ok:
-                        canceled += 1
-                        self._pilot_stale_handled[order_id] = time_fn()
-                    if error:
-                        errors.append(error)
+                    for order in still_open:
+                        order_id = str(order.get("orderId", ""))
+                        if not order_id:
+                            continue
+                        ok, error, _outcome = self._cancel_order_idempotent(order_id)
+                        if ok:
+                            canceled += 1
+                            self._pilot_stale_handled[order_id] = time_fn()
+                        if error:
+                            errors.append(error)
                 open_orders_retry = self._account_client.get_open_orders(self._symbol)
                 bot_orders_retry = self._filter_bot_orders(
                     [order for order in open_orders_retry if isinstance(order, dict)]
@@ -3006,7 +3012,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     order_id = str(order.get("orderId", ""))
                     if not order_id:
                         continue
-                    ok, error = self._cancel_order_idempotent(order_id)
+                    ok, error, _outcome = self._cancel_order_idempotent(order_id)
                     if ok:
                         continue
                     if error:
@@ -3109,7 +3115,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     order_id = str(order.get("orderId", ""))
                     if not order_id:
                         continue
-                    ok, error = self._cancel_order_idempotent(order_id)
+                    ok, error, _outcome = self._cancel_order_idempotent(order_id)
                     if ok:
                         canceled += 1
                     if error:
@@ -3693,7 +3699,21 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _calculate_oldest_order_age_sec(self) -> tuple[int | None, OrderInfo | None]:
         if not self._open_orders:
-            return None, None
+            if not hasattr(self, "_orders_table") or not self._order_age_registry:
+                return None, None
+            now = time_fn()
+            oldest_age_sec: int | None = None
+            for row in range(self._orders_table.rowCount()):
+                order_id = self._order_id_for_row(row)
+                if not order_id:
+                    continue
+                created_ts = self._order_age_registry.get(order_id)
+                if created_ts is None:
+                    continue
+                age_sec = int(max(now - created_ts, 0))
+                if oldest_age_sec is None or age_sec > oldest_age_sec:
+                    oldest_age_sec = age_sec
+            return oldest_age_sec, None
         now = time_fn()
         oldest_age_sec: int | None = None
         oldest_info: OrderInfo | None = None
@@ -3904,9 +3924,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 created_ts=created_ts,
                 last_seen_ts=now,
             )
+            self._remember_order_created_ts(order_id, created_ts)
         missing_ids = [order_id for order_id in self._order_info_map if order_id not in seen_ids]
         for order_id in missing_ids:
             self._order_info_map.pop(order_id, None)
+            self._order_age_registry.pop(order_id, None)
             self._pilot_pending_cancel_ids.discard(order_id)
             self._pilot_stale_seen_ids.pop(order_id, None)
             self._pilot_stale_handled.pop(order_id, None)
@@ -3916,6 +3938,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _clear_order_info(self) -> None:
         self._open_orders_snapshot_ts = None
         self._order_info_map = {}
+        self._order_age_registry = {}
         self._pilot_pending_cancel_ids.clear()
         self._pilot_stale_seen_ids.clear()
         self._pilot_stale_handled.clear()
@@ -4149,23 +4172,23 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         why: tuple[str, ...],
         dt_since_last_ms: int | None,
     ) -> None:
-        now = monotonic()
-        last_log = self._stale_refresh_last_log_ts
-        if last_log is not None and now - last_log < STALE_REFRESH_LOG_DEDUP_SEC:
-            return
         why_text = ",".join(why) if why else "none"
         dt_text = f"{dt_since_last_ms}ms" if dt_since_last_ms is not None else "—"
-        self._append_log(
-            (
-                "[ORDERS] stale -> refresh "
-                f"reason={reason} allowed={str(allowed).lower()} why={why_text} "
-                f"dt_since_last={dt_text} hits={self._stale_refresh_hits} calls={self._stale_refresh_calls} "
-                f"skip_rate={self._stale_refresh_skipped_rate_limit} "
-                f"skip_no_change={self._stale_refresh_skipped_no_change}"
-            ),
-            kind="INFO",
+        message = (
+            "[ORDERS] stale -> refresh "
+            f"reason={reason} allowed={str(allowed).lower()} why={why_text} "
+            f"dt_since_last={dt_text} hits={self._stale_refresh_hits} calls={self._stale_refresh_calls} "
+            f"skip_rate={self._stale_refresh_skipped_rate_limit} "
+            f"skip_no_change={self._stale_refresh_skipped_no_change}"
         )
-        self._stale_refresh_last_log_ts = now
+        throttle_key = f"orders_stale_refresh:{reason}:{allowed}:{why_text}"
+        self._append_log_throttled(
+            message,
+            kind="INFO",
+            key=throttle_key,
+            cooldown_sec=STALE_REFRESH_LOG_DEDUP_SEC,
+        )
+        self._stale_refresh_last_log_ts = monotonic()
 
     def _ensure_open_orders_snapshot_fresh(
         self,
@@ -5324,7 +5347,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         QTimer.singleShot(300, self, _run_followup)
         QTimer.singleShot(700, self, _run_followup)
 
-    def _cancel_all_and_reconcile(self, *, reason: str, finalize_stop: bool = False) -> None:
+    def _cancel_all_and_reconcile(
+        self,
+        *,
+        reason: str,
+        finalize_stop: bool = False,
+        order_ids: list[str] | None = None,
+    ) -> None:
         if self._cancel_inflight:
             return
         if not self._account_client:
@@ -5332,7 +5361,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if finalize_stop:
                 self._finalize_stop(keep_open_orders=True)
             return
-        known_rows = len(self._open_orders)
+        if order_ids is None:
+            order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
+        order_ids = [order_id for order_id in order_ids if order_id and order_id != "—"]
+        known_rows = len(order_ids)
         self._cancel_inflight = True
         self._cancel_reconcile_pending = 0
         self._update_orders_timer_interval()
@@ -5343,6 +5375,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
         def _cancel() -> dict[str, Any]:
             errors: list[str] = []
+            canceled = 0
+            missing = 0
+            failed = 0
 
             def _fetch_open_orders() -> list[dict[str, Any]]:
                 try:
@@ -5354,14 +5389,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     return []
                 return [order for order in open_orders if isinstance(order, dict)]
 
-            for attempt in range(1, 4):
-                try:
-                    self._account_client.cancel_open_orders(self._symbol)
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(self._format_cancel_exception(exc, "cancel_all"))
-                    if attempt < 3:
-                        self._sleep_ms(150 + attempt * 100)
+            for order_id in order_ids:
+                ok, error, outcome = self._cancel_order_idempotent(order_id)
+                if not ok and error:
+                    self._sleep_ms(120)
+                    ok_retry, error_retry, outcome_retry = self._cancel_order_idempotent(order_id)
+                    if ok_retry:
+                        ok = True
+                        outcome = outcome_retry
+                        error = None
+                    else:
+                        error = error_retry or error
+                        outcome = outcome_retry
+                if ok:
+                    if outcome == "missing":
+                        missing += 1
+                    else:
+                        canceled += 1
+                else:
+                    failed += 1
+                    if error:
+                        errors.append(error)
 
             open_orders_immediate = _fetch_open_orders()
             self._sleep_ms(250)
@@ -5371,6 +5419,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 "open_orders_immediate": open_orders_immediate,
                 "open_orders_delayed": open_orders_delayed,
                 "known_rows": known_rows,
+                "canceled": canceled,
+                "missing": missing,
+                "failed": failed,
+                "reason": reason,
             }
 
         worker = _Worker(_cancel, self._can_emit_worker_results)
@@ -5396,8 +5448,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._apply_open_orders_snapshot(open_orders_delayed, reason="after_cancel_delayed")
             after_count = len(self._open_orders)
             removed = max(int(result.get("known_rows", known_rows)) - after_count, 0)
+            canceled = int(result.get("canceled", 0) or 0)
+            missing = int(result.get("missing", 0) or 0)
+            failed = int(result.get("failed", 0) or 0)
+            reason = str(result.get("reason", "cancel_all"))
             self._append_log(
-                f"[ORDERS][CANCEL] done removed={removed} after={after_count}",
+                (
+                    f"[ORDERS][CANCEL] done reason={reason} planned={known_rows} "
+                    f"canceled={canceled} missing={missing} failed={failed} remaining={after_count}"
+                ),
                 kind="INFO",
             )
             if after_count != 0:
@@ -5405,6 +5464,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             else:
                 self._cancel_inflight = False
                 self._update_orders_timer_interval()
+            self._set_cancel_buttons_enabled(True)
+            self._request_orders_refresh("cancel_all_finalize")
+            self._append_log("orders refreshed after cancel", kind="INFO")
             if finalize_stop:
                 self._finalize_stop(keep_open_orders=bool(self._open_orders))
 
@@ -5414,6 +5476,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._cancel_inflight = False
             self._update_orders_timer_interval()
             self._handle_cancel_error(message)
+            self._set_cancel_buttons_enabled(True)
+            self._request_orders_refresh("cancel_all_error")
+            self._append_log("orders refreshed after cancel", kind="INFO")
             if finalize_stop:
                 self._finalize_stop(keep_open_orders=True)
 
@@ -5470,7 +5535,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._refresh_orders(reason="stop_no_cancel", force=True)
             self._finalize_stop(keep_open_orders=True)
             return
-        self._cancel_all_and_reconcile(reason="stop", finalize_stop=True)
+        order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
+        removed = self._mark_orders_cancelling(None, reason="stop")
+        self._append_log(
+            f"[ORDERS][CANCEL] ui_marked reason=stop rows={removed}",
+            kind="INFO",
+        )
+        self._set_cancel_buttons_enabled(False)
+        self._cancel_all_and_reconcile(reason="stop", finalize_stop=True, order_ids=order_ids)
 
     def _finalize_stop(self, *, keep_open_orders: bool = False) -> None:
         self._bot_order_ids.clear()
@@ -5509,6 +5581,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_orders_snapshot(self._build_orders_snapshot([]), reason="stop_finalize")
         self._change_state("IDLE")
         self._start_button.setEnabled(True)
+        self._set_cancel_buttons_enabled(True)
 
     def _cancel_bot_orders_on_stop(self) -> None:
         if not self._account_client:
@@ -5640,6 +5713,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             for row in reversed(selected_rows):
                 order_id = self._order_id_for_row(row)
                 self._orders_table.removeRow(row)
+                self._order_age_registry.pop(order_id, None)
                 self._append_log(f"Cancel selected: {order_id}", kind="ORDERS")
             self._refresh_orders_metrics()
             return
@@ -5647,7 +5721,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._append_log("Cancel selected: no account client.", kind="WARN")
             return
         order_ids = [self._order_id_for_row(row) for row in selected_rows]
-        self._cancel_live_orders(order_ids)
+        removed = self._mark_orders_cancelling(order_ids, reason="selected")
+        self._append_log(
+            f"[ORDERS][CANCEL] ui_marked reason=cancel_selected rows={removed}",
+            kind="INFO",
+        )
+        self._set_cancel_buttons_enabled(False)
+        self._cancel_live_orders(order_ids, reason="cancel_selected")
 
     def _cancel_bot_orders(self) -> None:
         if not self._account_client:
@@ -5658,7 +5738,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not order_ids:
             self._append_log("Cancel bot orders: 0", kind="ORDERS")
             return
-        self._cancel_live_orders(order_ids)
+        self._cancel_live_orders(order_ids, reason="cancel_all")
 
     def _handle_cancel_all(self) -> None:
         count = self._orders_table.rowCount()
@@ -5668,11 +5748,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._dry_run_toggle.isChecked():
             self._append_log(f"Cancel all: {count}", kind="ORDERS")
             self._set_orders_snapshot(self._build_orders_snapshot([]), reason="cancel_all_dry_run")
+            self._order_age_registry = {}
             return
         if not self._account_client:
             self._append_log("Cancel all: no account client.", kind="WARN")
             return
-        self._cancel_all_and_reconcile(reason="cancel_all")
+        order_ids = [str(order.get("orderId", "")) for order in self._open_orders]
+        removed = self._mark_orders_cancelling(None, reason="all")
+        self._append_log(
+            f"[ORDERS][CANCEL] ui_marked reason=cancel_all rows={removed}",
+            kind="INFO",
+        )
+        self._set_cancel_buttons_enabled(False)
+        self._cancel_all_and_reconcile(reason="cancel_all", order_ids=order_ids)
 
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested.", kind="INFO")
@@ -6273,9 +6361,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             age_text = "n/a"
             if self._last_good_ts is not None:
                 age_text = f"{max(monotonic() - self._last_good_ts, 0.0):.1f}s"
-            self._append_log(
+            self._append_log_throttled(
                 f"[BAL] rejected snapshot reason={reason} keep_last_good age={age_text}",
                 kind="WARN",
+                key=f"balances_rejected:{reason}",
+                cooldown_sec=20.0,
             )
             self._signals.balances_refresh.emit(False)
         if self._balances_ready_for_start() and not self._start_locked_until_change:
@@ -8464,11 +8554,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             f"orderId={order_id} status={status} code={code} msg={message} response={response_body}"
         )
 
-    def _cancel_order_idempotent(self, order_id: str) -> tuple[bool, str | None]:
+    def _cancel_order_idempotent(self, order_id: str) -> tuple[bool, str | None, str]:
         if not order_id or not self._account_client:
-            return False, None
+            return False, None, "skipped"
         if order_id in self._closed_order_ids:
-            return False, None
+            return False, None, "skipped"
         try:
             self._account_client.cancel_order(self._symbol, order_id)
         except Exception as exc:  # noqa: BLE001
@@ -8485,7 +8575,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                             if isinstance(order, dict)
                         )
                 except Exception as verify_exc:  # noqa: BLE001
-                    return False, f"[CANCEL] verify failed: {verify_exc}"
+                    return False, f"[CANCEL] verify failed: {verify_exc}", "failed"
                 self._signals.log_append.emit(
                     f"[CANCEL] verify present={str(present).lower()}",
                     "INFO",
@@ -8494,7 +8584,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     try:
                         self._account_client.cancel_open_orders(self._symbol)
                     except Exception as cancel_exc:  # noqa: BLE001
-                        return False, self._format_cancel_exception(cancel_exc, order_id)
+                        return False, self._format_cancel_exception(cancel_exc, order_id), "failed"
                     try:
                         open_orders_after = self._account_client.get_open_orders(self._symbol)
                         present_after = False
@@ -8505,9 +8595,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                                 if isinstance(order, dict)
                             )
                     except Exception as verify_exc:  # noqa: BLE001
-                        return False, f"[CANCEL] verify failed: {verify_exc}"
+                        return False, f"[CANCEL] verify failed: {verify_exc}", "failed"
                     if present_after:
-                        return False, f"[CANCEL] verify present=true orderId={order_id}"
+                        return False, f"[CANCEL] verify present=true orderId={order_id}", "failed"
                 self._pilot_pending_cancel_ids.add(order_id)
                 self._closed_order_ids.add(order_id)
                 self._discard_registry_for_order_id(order_id)
@@ -8516,8 +8606,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._bot_order_ids.discard(order_id)
                 self._owned_order_ids.discard(order_id)
                 self._legacy_order_ids.discard(order_id)
-                return True, None
-            return False, self._format_cancel_exception(exc, order_id)
+                return True, None, "missing"
+            return False, self._format_cancel_exception(exc, order_id), "failed"
         self._pilot_pending_cancel_ids.add(order_id)
         self._closed_order_ids.add(order_id)
         self._discard_registry_for_order_id(order_id)
@@ -8526,7 +8616,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._bot_order_ids.discard(order_id)
         self._owned_order_ids.discard(order_id)
         self._legacy_order_ids.discard(order_id)
-        return True, None
+        return True, None, "canceled"
 
     def find_matching_order(
         self,
@@ -9064,6 +9154,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_order_cell(row, 3, order.qty, align=Qt.AlignRight)
             self._set_order_cell(row, 4, order.filled, align=Qt.AlignRight)
             self._set_order_cell(row, 5, order.age, align=Qt.AlignRight)
+            info = self._order_info_map.get(order.order_id)
+            if info is not None:
+                self._remember_order_created_ts(order.order_id, info.created_ts)
+            elif order.order_id and order.order_id not in self._order_age_registry:
+                self._remember_order_created_ts(order.order_id, time_fn())
             self._set_order_row_tooltip(row)
 
     def _render_sim_orders(self, planned: list[GridPlannedOrder]) -> None:
@@ -9078,6 +9173,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_order_cell(row, 3, f"{order.qty:.8f}", align=Qt.AlignRight)
             self._set_order_cell(row, 4, "SIM", align=Qt.AlignRight)
             self._set_order_cell(row, 5, age_text, align=Qt.AlignRight)
+            self._remember_order_created_ts(order_id, time_fn())
             self._set_order_row_tooltip(row)
         self._refresh_orders_metrics()
 
@@ -9279,6 +9375,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 order_id = str(entry.get("orderId", ""))
                 if order_id:
                     self._bot_order_ids.add(order_id)
+                    self._remember_order_created_ts(order_id, time_fn())
                     level_index = entry.get("level_index")
                     if isinstance(level_index, int):
                         self._order_id_to_level_index[order_id] = level_index
@@ -9340,28 +9437,61 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
 
-    def _cancel_live_orders(self, order_ids: list[str]) -> None:
+    def _cancel_live_orders(self, order_ids: list[str], *, reason: str) -> None:
+        reason_label = reason.replace("cancel_", "")
         if not self._account_client:
-            self._append_log("Cancel selected: no account client.", kind="WARN")
+            self._append_log(f"Cancel {reason_label}: no account client.", kind="WARN")
             return
         filtered_ids = [order_id for order_id in order_ids if order_id and order_id != "—"]
         if not filtered_ids:
-            self._append_log("Cancel selected: no valid order IDs.", kind="WARN")
+            self._append_log(f"Cancel {reason_label}: no valid order IDs.", kind="WARN")
             return
+        self._append_log(
+            f"[ORDERS][CANCEL] start reason={reason} planned={len(filtered_ids)}",
+            kind="INFO",
+        )
 
-        def _cancel() -> list[dict[str, Any]]:
+        def _cancel() -> dict[str, Any]:
             responses: list[dict[str, Any]] = []
+            errors: list[str] = []
+            canceled = 0
+            missing = 0
+            failed = 0
             batch_size = 4
             for idx, order_id in enumerate(filtered_ids, start=1):
-                ok, error = self._cancel_order_idempotent(order_id)
+                ok, error, outcome = self._cancel_order_idempotent(order_id)
+                if not ok and error:
+                    self._sleep_ms(120)
+                    ok_retry, error_retry, outcome_retry = self._cancel_order_idempotent(order_id)
+                    if ok_retry:
+                        ok = True
+                        outcome = outcome_retry
+                        error = None
+                    else:
+                        error = error_retry or error
+                        outcome = outcome_retry
                 if ok:
                     responses.append({"orderId": order_id})
-                elif error:
-                    self._signals.log_append.emit(error, "ERROR")
-                    self._signals.api_error.emit(error)
+                    if outcome == "missing":
+                        missing += 1
+                    else:
+                        canceled += 1
+                else:
+                    failed += 1
+                    if error:
+                        errors.append(error)
+                        self._signals.api_error.emit(error)
                 if idx % batch_size == 0:
                     self._sleep_ms(250)
-            return responses
+            return {
+                "responses": responses,
+                "errors": errors,
+                "canceled": canceled,
+                "missing": missing,
+                "failed": failed,
+                "planned": len(filtered_ids),
+                "reason": reason,
+            }
 
         worker = _Worker(_cancel, self._can_emit_worker_results)
         worker.signals.success.connect(self._handle_cancel_selected_result)
@@ -9369,18 +9499,34 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_cancel_selected_result(self, result: object, latency_ms: int) -> None:
-        if not isinstance(result, list):
+        if not isinstance(result, dict):
             self._handle_cancel_error("Unexpected cancel response")
             return
-        for entry in result:
+        responses = result.get("responses", [])
+        for entry in responses if isinstance(responses, list) else []:
             order_id = str(entry.get("orderId", "—")) if isinstance(entry, dict) else "—"
             if isinstance(entry, dict):
                 self._discard_order_key_from_order(entry)
                 self._discard_registry_for_order(entry)
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
-        self._append_log(f"Cancel selected: {len(result)}", kind="ORDERS")
+        errors = result.get("errors", [])
+        if isinstance(errors, list):
+            for message in errors:
+                if message:
+                    self._append_log(str(message), kind="WARN")
+        canceled = int(result.get("canceled", 0) or 0)
+        missing = int(result.get("missing", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
+        planned = int(result.get("planned", 0) or 0)
+        reason = str(result.get("reason", "cancel_selected"))
+        self._append_log(
+            f"[ORDERS][CANCEL] done reason={reason} planned={planned} canceled={canceled} missing={missing} failed={failed}",
+            kind="INFO",
+        )
+        self._set_cancel_buttons_enabled(True)
         self._request_orders_refresh("cancel_selected")
         self._schedule_force_open_orders_refresh("cancel_selected")
+        self._append_log("orders refreshed after cancel", kind="INFO")
 
     def _cancel_all_live_orders(self) -> None:
         self._cancel_bot_orders()
@@ -9401,6 +9547,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _handle_cancel_error(self, message: str) -> None:
         self._append_log(f"[LIVE] cancel failed: {message}", kind="WARN")
+        self._set_cancel_buttons_enabled(True)
+        self._request_orders_refresh("cancel_error")
+        self._append_log("orders refreshed after cancel", kind="INFO")
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
 
@@ -9473,6 +9622,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 removed += 1
         return removed
 
+    def _remember_order_created_ts(self, order_id: str, created_ts: float) -> None:
+        if not order_id:
+            return
+        self._order_age_registry[order_id] = created_ts
+
     def _format_age(self, time_ms: object, now_ms: int) -> str:
         if not isinstance(time_ms, (int, float)):
             return "—"
@@ -9485,6 +9639,33 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if minutes:
             return f"{minutes}m {seconds}s"
         return f"{seconds}s"
+
+    def _tick_order_ages(self) -> None:
+        if not hasattr(self, "_orders_table"):
+            return
+        if self._orders_table.rowCount() == 0:
+            if hasattr(self, "_pilot_orders_oldest_value"):
+                self._update_pilot_orders_metrics()
+            return
+        now = time_fn()
+        now_ms = int(now * 1000)
+        for row in range(self._orders_table.rowCount()):
+            order_id = self._order_id_for_row(row)
+            if not order_id or order_id == "—":
+                continue
+            info = self._order_info_map.get(order_id)
+            if info is not None:
+                created_ts = info.created_ts
+            else:
+                created_ts = self._order_age_registry.get(order_id)
+                if created_ts is None:
+                    created_ts = now
+                    self._order_age_registry[order_id] = created_ts
+            age_text = self._format_age(int(created_ts * 1000), now_ms)
+            age_item = self._orders_table.item(row, 5)
+            if age_item and age_item.text() != age_text:
+                age_item.setText(age_text)
+        self._update_pilot_orders_metrics()
 
     def _extract_order_value(self, row: int) -> float:
         price_item = self._orders_table.item(row, 2)
@@ -9519,6 +9700,44 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_pilot_orders_metrics()
         if self._orders_table.rowCount() > 0 and not self._open_orders and self._account_client:
             self._schedule_force_open_orders_refresh("ui_drift")
+
+    def _set_cancel_buttons_enabled(self, enabled: bool) -> None:
+        if hasattr(self, "_cancel_selected_button"):
+            self._cancel_selected_button.setEnabled(enabled)
+        if hasattr(self, "_cancel_all_button"):
+            self._cancel_all_button.setEnabled(enabled)
+
+    def _mark_orders_cancelling(self, order_ids: list[str] | None, *, reason: str) -> int:
+        if not hasattr(self, "_orders_table"):
+            return 0
+        ids_set = None if order_ids is None else {order_id for order_id in order_ids if order_id and order_id != "—"}
+        removed_ids: set[str] = set()
+        for row in reversed(range(self._orders_table.rowCount())):
+            row_order_id = self._order_id_for_row(row)
+            if ids_set is None or row_order_id in ids_set:
+                removed_ids.add(row_order_id)
+                self._orders_table.removeRow(row)
+        if not removed_ids and ids_set:
+            return 0
+        if ids_set is None:
+            self._open_orders = []
+            self._open_orders_all = []
+            self._open_orders_map = {}
+            self._order_info_map = {}
+            self._order_age_registry = {}
+        else:
+            self._open_orders = [
+                order for order in self._open_orders if str(order.get("orderId", "")) not in removed_ids
+            ]
+            self._open_orders_all = [
+                order for order in self._open_orders_all if str(order.get("orderId", "")) not in removed_ids
+            ]
+            for order_id in removed_ids:
+                self._open_orders_map.pop(order_id, None)
+                self._order_info_map.pop(order_id, None)
+                self._order_age_registry.pop(order_id, None)
+        self._set_orders_snapshot(self._build_orders_snapshot(self._open_orders), reason=f"cancel_{reason}")
+        return len(removed_ids)
 
     def _apply_pnl_style(self, label: QLabel, value: float | None) -> None:
         if value is None:
@@ -9621,6 +9840,21 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             else:
                 values.append(f"{header_text}={item.text() if item else '—'}")
         return "; ".join(values)
+
+    def _append_log_throttled(
+        self,
+        message: str,
+        *,
+        kind: str,
+        key: str,
+        cooldown_sec: float,
+    ) -> None:
+        now = monotonic()
+        last_log = self._log_throttle_ts.get(key)
+        if last_log is not None and now - last_log < cooldown_sec:
+            return
+        self._log_throttle_ts[key] = now
+        self._append_log(message, kind=kind)
 
     def _append_log(self, message: str, kind: str = "INFO") -> None:
         entry = (kind.upper(), message)
@@ -9761,6 +9995,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_ui_timer.stop()
         if self._registry_gc_timer.isActive():
             self._registry_gc_timer.stop()
+        if self._order_age_timer.isActive():
+            self._order_age_timer.stop()
 
     def _resume_local_timers(self) -> None:
         if not self._market_kpi_timer.isActive():
@@ -9769,12 +10005,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_ui_timer.start()
         if not self._registry_gc_timer.isActive():
             self._registry_gc_timer.start()
+        if not self._order_age_timer.isActive():
+            self._order_age_timer.start()
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
         self._closing = True
         self._balances_timer.stop()
         self._orders_timer.stop()
         self._fills_timer.stop()
+        self._order_age_timer.stop()
         self._stop_local_timers()
         self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
