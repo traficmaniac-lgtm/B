@@ -17,12 +17,13 @@ from PySide6.QtWidgets import (
 
 @dataclass
 class PilotConfig:
-    min_profit_bps: float = 0.20
+    min_profit_bps: float = 0.05
     max_step_pct: float = 0.06
     max_range_pct: float = 0.40
     hold_timeout_sec: int = 30
     stale_policy: str = "CANCEL_REPLACE"
     allow_market_close: bool = True
+    allow_guard_autofix: bool = False
 
 
 class PilotSettingsDialog(QDialog):
