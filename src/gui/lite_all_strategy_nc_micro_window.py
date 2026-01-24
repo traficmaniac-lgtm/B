@@ -59,7 +59,8 @@ from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
 from src.core.micro_edge import compute_expected_edge_bps
 from src.core.nc_micro_stop import finalize_stop_state
-from src.core.nc_micro_refresh import compute_refresh_allowed
+from src.core.nc_micro_exec_dedup import CumulativeFillTracker, TradeIdDeduper, should_block_new_orders
+from src.core.nc_micro_refresh import StaleRefreshLogLimiter, compute_refresh_allowed
 from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
 from src.gui.i18n import TEXT, tr
 from src.gui.lite_grid_math import (
@@ -375,6 +376,7 @@ class TradeFill:
     time_ms: int
     order_id: str
     trade_id: str
+    is_total: bool = False
 
 
 @dataclass
@@ -895,6 +897,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_last_error: str | None = None
         self._stop_watchdog_token = 0
         self._stop_watchdog_started_ts: float | None = None
+        self._stop_finalize_waiting = False
         self._inflight_watchdog_started_ts: float | None = None
         self._inflight_watchdog_last_log_ts: float | None = None
         self._settings_save_timer: QTimer | None = None
@@ -946,6 +949,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._bot_order_keys: set[str] = set()
         self._fill_keys: set[str] = set()
         self._fill_accumulator = FillAccumulator()
+        self._fill_exec_cumulative = CumulativeFillTracker()
         self._legacy_policy = self._resolve_legacy_policy()
         self._legacy_order_ids: set[str] = set()
         self._owned_order_ids: set[str] = set()
@@ -1000,7 +1004,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._fills: list[TradeFill] = []
         self._base_lots: deque[BaseLot] = deque()
         self._fills_in_flight = False
-        self._seen_trade_ids: set[str] = set()
+        self._trade_id_deduper = TradeIdDeduper()
         self._realized_pnl = 0.0
         self._fees_total = 0.0
         self._position_fees_paid_quote = 0.0
@@ -1016,6 +1020,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stale_refresh_last_ts: dict[str, float] = {}
         self._stale_refresh_last_log_ts: float | None = None
         self._stale_refresh_last_state: tuple[str, bool] | None = None
+        self._stale_refresh_log_limiter = StaleRefreshLogLimiter(
+            min_interval_sec=STALE_REFRESH_POLL_LOG_MIN_SEC
+        )
         self._stale_refresh_hits = 0
         self._stale_refresh_calls = 0
         self._stale_refresh_skipped_rate_limit = 0
@@ -1030,6 +1037,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._registry_dirty = False
         self._fills_changed_since_refresh = False
         self._orders_snapshot_signature: tuple[tuple[str, str, str, str], ...] | None = None
+        self._orders_last_sync_ts: float | None = None
+        self._orders_last_change_ts: float | None = None
         self._balances_snapshot: tuple[float, float] | None = None
         self._sell_retry_limit = 5
         self._start_in_progress = False
@@ -4063,6 +4072,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _update_order_info_from_snapshot(self, orders: list[dict[str, Any]]) -> None:
         now = time_fn()
         self._open_orders_snapshot_ts = now
+        self._orders_last_sync_ts = now
         seen_ids: set[str] = set()
         for order in orders:
             if not isinstance(order, dict):
@@ -4103,6 +4113,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _clear_order_info(self) -> None:
         self._open_orders_snapshot_ts = None
+        self._orders_last_sync_ts = None
+        self._orders_last_change_ts = None
         self._order_info_map = {}
         self._order_age_registry = {}
         self._pilot_pending_cancel_ids.clear()
@@ -4381,12 +4393,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     self._stale_refresh_poll_suppressed[symbol] = 0
                 return
             self._stale_refresh_poll_log_ts[symbol] = now
-        state = (reason, allowed)
-        last_log = self._stale_refresh_last_log_ts
-        if self._stale_refresh_last_state != state or last_log is None or now - last_log >= LOG_DEDUP_HEARTBEAT_SEC:
-            self._append_log(message, kind="INFO")
-            self._stale_refresh_last_log_ts = now
-            self._stale_refresh_last_state = state
+        state = (allowed, why_text)
+        if not self._stale_refresh_log_limiter.should_log(reason, state, now):
+            return
+        self._append_log(message, kind="INFO")
+        self._stale_refresh_last_log_ts = now
+        self._stale_refresh_last_state = (reason, allowed)
 
     def _ensure_open_orders_snapshot_fresh(
         self,
@@ -4395,10 +4407,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         max_age_ms: int = 1500,
         cooldown_s: float = 2.0,
     ) -> bool:
-        if self._open_orders_snapshot_ts is None:
+        if self._orders_last_sync_ts is None:
             age_ms = None
         else:
-            age_ms = int(max(time_fn() - self._open_orders_snapshot_ts, 0) * 1000)
+            age_ms = int(max(time_fn() - self._orders_last_sync_ts, 0) * 1000)
         if age_ms is not None and age_ms <= max_age_ms:
             return False
         self._stale_refresh_hits += 1
@@ -5521,6 +5533,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._bot_order_keys.clear()
             self._fill_keys.clear()
             self._fill_accumulator = FillAccumulator()
+            self._fill_exec_cumulative.totals.clear()
             self._active_action_keys.clear()
             self._active_order_keys.clear()
             self._recent_order_keys.clear()
@@ -5529,7 +5542,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._open_orders_map = {}
             self._fills = []
             self._base_lots.clear()
-            self._seen_trade_ids.clear()
+            self._trade_id_deduper.clear()
+            self._fill_exec_cumulative.totals.clear()
             self._realized_pnl = 0.0
             self._fees_total = 0.0
             self._reset_position_state()
@@ -5661,7 +5675,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if finalize_stop:
                 if result.errors or remaining:
                     self._stop_done_with_errors = True
-                self._finalize_stop(keep_open_orders=bool(self._open_orders))
+                if remaining:
+                    self._stop_finalize_waiting = True
+                    self._stop_inflight = True
+                    return
+                self._finalize_stop(keep_open_orders=False)
 
         def _handle_cancel_failure(message: str) -> None:
             self._orders_in_flight = False
@@ -5751,6 +5769,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_requested = True
         self._stop_last_error = None
         self._stop_done_with_errors = False
+        self._stop_finalize_waiting = False
         if self._start_cancel_event:
             self._start_cancel_event.set()
         self._start_run_id += 1
@@ -5817,6 +5836,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._bot_order_keys.clear()
         self._fill_keys.clear()
         self._fill_accumulator = FillAccumulator()
+        self._trade_id_deduper.clear()
+        self._fill_exec_cumulative.totals.clear()
         self._active_action_keys.clear()
         self._owned_order_ids.clear()
         self._clear_local_order_registry()
@@ -5838,6 +5859,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_in_progress = False
         self._stop_inflight = False
         self._stop_requested = False
+        self._stop_finalize_waiting = False
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
         should_resume = not self._close_pending
@@ -5857,7 +5879,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             set_state=self._change_state,
             set_start_enabled=self._start_button.setEnabled,
             log_fn=self._append_log,
-            state="IDLE",
+            state="STOPPED",
         )
         self._stop_done_with_errors = False
         self._set_cancel_buttons_enabled(True)
@@ -6067,7 +6089,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_fills_timer()
         if new_state in {"RUNNING", "PAUSED", "WAITING_FILLS"} and self._current_action == "start":
             self._current_action = None
-        if new_state == "IDLE" and not self._start_in_progress:
+        if new_state in {"IDLE", "STOPPED"} and not self._start_in_progress:
             self._start_in_progress_logged = False
             self._start_button.setEnabled(True)
 
@@ -6860,28 +6882,29 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
 
     def _handle_fill_poll(self, result: object, latency_ms: int) -> None:
-        self._fills_in_flight = False
-        if not isinstance(result, list):
-            self._handle_fill_poll_error("Unexpected trades response")
+        try:
+            self._fills_in_flight = False
+            if not isinstance(result, list):
+                self._handle_fill_poll_error("Unexpected trades response")
+                return
+            for trade in result:
+                if not isinstance(trade, dict):
+                    continue
+                order_id = str(trade.get("orderId", ""))
+                if not order_id:
+                    continue
+                if order_id and order_id not in self._bot_order_ids:
+                    continue
+                is_buyer = trade.get("isBuyer")
+                side = "BUY" if is_buyer else "SELL"
+                order_stub = {"side": side, "orderId": order_id}
+                fill = self._build_trade_fill(order_stub, trade)
+                if fill:
+                    self._process_fill(fill)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _handle_fill_poll")
+            self._notify_crash("_handle_fill_poll")
             return
-        for trade in result:
-            if not isinstance(trade, dict):
-                continue
-            trade_id = str(trade.get("id", ""))
-            order_id = str(trade.get("orderId", ""))
-            if not trade_id or trade_id in self._seen_trade_ids:
-                continue
-            if not order_id:
-                continue
-            if order_id and order_id not in self._bot_order_ids:
-                continue
-            self._seen_trade_ids.add(trade_id)
-            is_buyer = trade.get("isBuyer")
-            side = "BUY" if is_buyer else "SELL"
-            order_stub = {"side": side, "orderId": order_id}
-            fill = self._build_trade_fill(order_stub, trade)
-            if fill:
-                self._process_fill(fill)
 
     def _handle_fill_poll_error(self, message: str) -> None:
         self._fills_in_flight = False
@@ -7025,6 +7048,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._orders_snapshot_hash_stable_cycles += 1
         self._orders_snapshot_hash_value = new_hash
         orders_changed = self._orders_snapshot_signature != previous_signature
+        if orders_changed:
+            self._orders_last_change_ts = time_fn()
         inflight_actions = bool(self._active_action_keys or self._pilot_action_in_progress)
         if orders_changed or inflight_actions or self._start_in_progress or self._stop_in_progress:
             self._reset_orders_poll_backoff()
@@ -7043,28 +7068,36 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._signals.open_orders_refresh.emit(True)
 
     def _handle_open_orders(self, result: object, latency_ms: int) -> None:
-        self._orders_in_flight = False
-        self._snapshot_refresh_inflight = False
-        if not isinstance(result, list):
-            self._handle_open_orders_error("Unexpected open orders response")
-            return
-        reason = self._orders_refresh_reason
-        self._apply_open_orders_snapshot(result, reason=reason)
-        if reason == "after_cancel_backoff":
-            if not self._open_orders:
-                self._cancel_reconcile_pending = 0
-                self._cancel_inflight = False
-                self._update_orders_timer_interval()
-            else:
-                if self._cancel_reconcile_pending > 0:
-                    self._cancel_reconcile_pending -= 1
-                if self._cancel_reconcile_pending <= 0:
-                    self._append_log(
-                        f"[ORDERS][DESYNC] still_nonzero after_cancel rows={len(self._open_orders)}",
-                        kind="WARN",
-                    )
+        try:
+            self._orders_in_flight = False
+            self._snapshot_refresh_inflight = False
+            if not isinstance(result, list):
+                self._handle_open_orders_error("Unexpected open orders response")
+                return
+            reason = self._orders_refresh_reason
+            self._apply_open_orders_snapshot(result, reason=reason)
+            if reason == "after_cancel_backoff":
+                if not self._open_orders:
+                    self._cancel_reconcile_pending = 0
                     self._cancel_inflight = False
                     self._update_orders_timer_interval()
+                else:
+                    if self._cancel_reconcile_pending > 0:
+                        self._cancel_reconcile_pending -= 1
+                    if self._cancel_reconcile_pending <= 0:
+                        self._append_log(
+                            f"[ORDERS][DESYNC] still_nonzero after_cancel rows={len(self._open_orders)}",
+                            kind="WARN",
+                        )
+                        self._cancel_inflight = False
+                        self._update_orders_timer_interval()
+            if self._stop_in_progress and self._stop_finalize_waiting and not self._open_orders:
+                self._stop_finalize_waiting = False
+                self._finalize_stop(keep_open_orders=False)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _handle_open_orders")
+            self._notify_crash("_handle_open_orders")
+            return
 
     def _handle_open_orders_error(self, message: str) -> None:
         self._orders_in_flight = False
@@ -7160,6 +7193,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if str(order.get("clientOrderId", "")) == client_id:
                 return True
         return False
+
+    def _find_open_order_by_client_id(self, client_id: str) -> dict[str, Any] | None:
+        if not client_id:
+            return None
+        for order in self._open_orders_all:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("clientOrderId", "")) == client_id:
+                return order
+        return None
 
     def _has_open_order_type(self, order_type: str) -> bool:
         prefix = f"{self._bot_order_prefix()}{order_type}"
@@ -7404,59 +7447,64 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_reconcile_missing_orders(self, result: object, latency_ms: int) -> None:
-        if not isinstance(result, dict):
-            self._handle_reconcile_error("Unexpected reconcile response")
-            return
-        results = result.get("results", [])
-        if not isinstance(results, list):
-            return
-        for entry in results:
-            if not isinstance(entry, dict):
-                continue
-            status = str(entry.get("status", "")).upper()
-            order = entry.get("order")
-            trade = entry.get("trade")
-            if not isinstance(order, dict):
-                continue
-            order_id = str(order.get("orderId", ""))
-            if status == "FILLED":
-                fill = self._build_trade_fill(order, trade)
-                if fill:
-                    self._process_fill(fill)
-                client_order_id = str(order.get("clientOrderId", ""))
-                if client_order_id:
-                    self._active_tp_ids.discard(client_order_id)
-                    self._active_restore_ids.discard(client_order_id)
-                    self._pending_tp_ids.discard(client_order_id)
-                    self._pending_restore_ids.discard(client_order_id)
+        try:
+            if not isinstance(result, dict):
+                self._handle_reconcile_error("Unexpected reconcile response")
+                return
+            results = result.get("results", [])
+            if not isinstance(results, list):
+                return
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                status = str(entry.get("status", "")).upper()
+                order = entry.get("order")
+                trade = entry.get("trade")
+                if not isinstance(order, dict):
+                    continue
+                order_id = str(order.get("orderId", ""))
+                if status == "FILLED":
+                    fill = self._build_trade_fill(order, trade)
+                    if fill:
+                        self._process_fill(fill)
+                    client_order_id = str(order.get("clientOrderId", ""))
+                    if client_order_id:
+                        self._active_tp_ids.discard(client_order_id)
+                        self._active_restore_ids.discard(client_order_id)
+                        self._pending_tp_ids.discard(client_order_id)
+                        self._pending_restore_ids.discard(client_order_id)
+                    if order_id:
+                        self._closed_order_ids.add(order_id)
+                        self._discard_registry_for_order_id(order_id)
+                    continue
+                if status in {"CANCELED", "EXPIRED", "REJECTED"}:
+                    client_order_id = str(order.get("clientOrderId", ""))
+                    if client_order_id:
+                        self._active_tp_ids.discard(client_order_id)
+                        self._active_restore_ids.discard(client_order_id)
+                        self._pending_tp_ids.discard(client_order_id)
+                        self._pending_restore_ids.discard(client_order_id)
+                    self._discard_registry_for_order(order)
+                    if order_id:
+                        status_key = (order_id, status)
+                        if status_key in self._closed_order_statuses:
+                            continue
+                        self._closed_order_statuses.add(status_key)
+                        self._closed_order_ids.add(order_id)
+                    self._append_log(
+                        f"[LIVE] order closed orderId={order_id} status={status}",
+                        kind="ORDERS",
+                    )
+                    continue
                 if order_id:
-                    self._closed_order_ids.add(order_id)
-                    self._discard_registry_for_order_id(order_id)
-                continue
-            if status in {"CANCELED", "EXPIRED", "REJECTED"}:
-                client_order_id = str(order.get("clientOrderId", ""))
-                if client_order_id:
-                    self._active_tp_ids.discard(client_order_id)
-                    self._active_restore_ids.discard(client_order_id)
-                    self._pending_tp_ids.discard(client_order_id)
-                    self._pending_restore_ids.discard(client_order_id)
-                self._discard_registry_for_order(order)
-                if order_id:
-                    status_key = (order_id, status)
-                    if status_key in self._closed_order_statuses:
-                        continue
-                    self._closed_order_statuses.add(status_key)
-                    self._closed_order_ids.add(order_id)
-                self._append_log(
-                    f"[LIVE] order closed orderId={order_id} status={status}",
-                    kind="ORDERS",
-                )
-                continue
-            if order_id:
-                self._append_log(
-                    f"[LIVE] order disappeared orderId={order_id} status={status}",
-                    kind="WARN",
-                )
+                    self._append_log(
+                        f"[LIVE] order disappeared orderId={order_id} status={status}",
+                        kind="WARN",
+                    )
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _handle_reconcile_missing_orders")
+            self._notify_crash("_handle_reconcile_missing_orders")
+            return
 
     def _handle_reconcile_error(self, message: str) -> None:
         self._append_log(f"Reconcile failed: {message}", kind="WARN")
@@ -7466,6 +7514,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         order: dict[str, Any],
         trade: dict[str, Any] | None,
     ) -> TradeFill | None:
+        is_total = False
         if trade:
             price = self._coerce_float(str(trade.get("price", ""))) or 0.0
             qty = self._coerce_float(str(trade.get("qty", ""))) or 0.0
@@ -7482,6 +7531,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             commission_asset = ""
             time_ms = int(order.get("updateTime", 0) or order.get("time", 0) or 0)
             trade_id = ""
+            is_total = True
         if price <= 0 or qty <= 0:
             return None
         side = str(order.get("side", "")).upper()
@@ -7495,70 +7545,156 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             time_ms=time_ms,
             order_id=str(order.get("orderId", "")),
             trade_id=trade_id,
+            is_total=is_total,
         )
 
-    def _process_fill(self, fill: TradeFill) -> None:
-        fill_key = self._fill_key(fill)
-        if fill_key in self._fill_keys:
-            return
-        self._fill_keys.add(fill_key)
-        self._fills_changed_since_refresh = True
-        client_order_id = ""
-        if fill.order_id:
-            existing_order = self._open_orders_map.get(fill.order_id, {})
-            client_order_id = str(existing_order.get("clientOrderId", ""))
-            if client_order_id:
-                self._active_tp_ids.discard(client_order_id)
-                self._active_restore_ids.discard(client_order_id)
-                self._pending_tp_ids.discard(client_order_id)
-                self._pending_restore_ids.discard(client_order_id)
-        if fill.order_id:
-            self._discard_registry_for_order_id(fill.order_id)
-        else:
-            self._discard_registry_for_values(
-                fill.side,
-                self.as_decimal(fill.price),
-                self.as_decimal(fill.qty),
-            )
-        if fill.trade_id:
-            self._seen_trade_ids.add(fill.trade_id)
-        total_filled = self.as_decimal(fill.qty)
-        delta = total_filled
-        if fill.order_id:
-            total_filled, delta = self._fill_accumulator.record(
-                fill.order_id,
-                self.as_decimal(fill.qty),
-                is_total=False,
-            )
-        if delta <= 0:
-            return
-        self._record_fill(fill)
-        self._apply_local_balance_fill(fill)
-        self._bot_order_keys.discard(
-            self._order_key(fill.side, self.as_decimal(fill.price), self.as_decimal(fill.qty))
-        )
-        step = self._rule_decimal(self._exchange_rules.get("step"))
+    def _log_exec_new(
+        self,
+        *,
+        order_id: str,
+        trade_id: str,
+        qty_delta: Decimal,
+        cum_qty: Decimal,
+        price: Decimal,
+        side: str,
+    ) -> None:
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        trade_token = trade_id or "—"
         self._append_log(
             (
-                f"[LIVE] FILLED orderId={fill.order_id} side={fill.side}"
-                f" total={self.fmt_qty(total_filled, step)} delta={self.fmt_qty(delta, step)}"
-            ),
-            kind="ORDERS",
-        )
-        self._append_log(
-            (
-                f"[FILL] side={fill.side} orderId={fill.order_id} "
-                f"price={self.fmt_price(self.as_decimal(fill.price), tick)} "
-                f"qty={self.fmt_qty(self.as_decimal(fill.qty), step)}"
+                "[EXEC] exec_new "
+                f"orderId={order_id or '—'} tradeId={trade_token} "
+                f"qty_delta={self.fmt_qty(qty_delta, step)} "
+                f"cum_qty={self.fmt_qty(cum_qty, step)} "
+                f"price={self.fmt_price(price, tick)} side={side}"
             ),
             kind="INFO",
         )
-        self._place_replacement_order(fill, delta_qty=delta, fill_client_order_id=client_order_id)
-        if fill.order_id:
-            self._fill_accumulator.mark_handled(fill.order_id, total_filled)
-        self._maybe_enable_bootstrap_sell_side(fill)
-        self._request_orders_refresh("fill")
+
+    def _log_exec_dup(
+        self,
+        *,
+        order_id: str,
+        trade_id: str,
+        cum_qty: Decimal,
+        reason: str,
+    ) -> None:
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        trade_token = trade_id or "—"
+        self._append_log(
+            (
+                "[EXEC] exec_dup "
+                f"orderId={order_id or '—'} tradeId={trade_token} "
+                f"cum_qty={self.fmt_qty(cum_qty, step)} reason={reason}"
+            ),
+            kind="INFO",
+        )
+
+    def _process_fill(self, fill: TradeFill) -> None:
+        try:
+            trade_id = fill.trade_id or ""
+            if trade_id and self._trade_id_deduper.seen(trade_id, monotonic()):
+                self._log_exec_dup(
+                    order_id=fill.order_id,
+                    trade_id=trade_id,
+                    cum_qty=self.as_decimal(fill.qty),
+                    reason="seen",
+                )
+                return
+            total_filled = self.as_decimal(fill.qty)
+            delta = total_filled
+            if fill.order_id:
+                total_filled, delta = self._fill_accumulator.record(
+                    fill.order_id,
+                    self.as_decimal(fill.qty),
+                    is_total=fill.is_total,
+                )
+            elif fill.is_total:
+                delta = self._fill_exec_cumulative.update("", total_filled)
+            if delta <= 0:
+                self._log_exec_dup(
+                    order_id=fill.order_id,
+                    trade_id=trade_id,
+                    cum_qty=total_filled,
+                    reason="seen",
+                )
+                return
+            self._fills_changed_since_refresh = True
+            fill_key = self._fill_key(fill)
+            if fill.trade_id == "" and fill.order_id == "":
+                if fill_key in self._fill_keys:
+                    self._log_exec_dup(
+                        order_id=fill.order_id,
+                        trade_id=trade_id,
+                        cum_qty=total_filled,
+                        reason="seen",
+                    )
+                    return
+            self._fill_keys.add(fill_key)
+            self._log_exec_new(
+                order_id=fill.order_id,
+                trade_id=trade_id,
+                qty_delta=delta,
+                cum_qty=total_filled,
+                price=self.as_decimal(fill.price),
+                side=fill.side,
+            )
+            client_order_id = ""
+            if fill.order_id:
+                existing_order = self._open_orders_map.get(fill.order_id, {})
+                client_order_id = str(existing_order.get("clientOrderId", ""))
+                if client_order_id:
+                    self._active_tp_ids.discard(client_order_id)
+                    self._active_restore_ids.discard(client_order_id)
+                    self._pending_tp_ids.discard(client_order_id)
+                    self._pending_restore_ids.discard(client_order_id)
+            if fill.order_id:
+                self._discard_registry_for_order_id(fill.order_id)
+            else:
+                self._discard_registry_for_values(
+                    fill.side,
+                    self.as_decimal(fill.price),
+                    self.as_decimal(fill.qty),
+                )
+            self._record_fill(fill)
+            self._apply_local_balance_fill(fill)
+            self._bot_order_keys.discard(
+                self._order_key(fill.side, self.as_decimal(fill.price), self.as_decimal(fill.qty))
+            )
+            step = self._rule_decimal(self._exchange_rules.get("step"))
+            tick = self._rule_decimal(self._exchange_rules.get("tick"))
+            self._append_log(
+                (
+                    f"[LIVE] FILLED orderId={fill.order_id} side={fill.side}"
+                    f" total={self.fmt_qty(total_filled, step)} delta={self.fmt_qty(delta, step)}"
+                ),
+                kind="ORDERS",
+            )
+            self._append_log(
+                (
+                    f"[FILL] side={fill.side} orderId={fill.order_id} "
+                    f"price={self.fmt_price(self.as_decimal(fill.price), tick)} "
+                    f"qty={self.fmt_qty(self.as_decimal(fill.qty), step)}"
+                ),
+                kind="INFO",
+            )
+            self._place_replacement_order(
+                fill,
+                delta_qty=delta,
+                total_qty=total_filled,
+                fill_client_order_id=client_order_id,
+            )
+            if fill.order_id:
+                self._fill_accumulator.mark_handled(fill.order_id, total_filled)
+                if fill.is_total:
+                    self._fill_exec_cumulative.totals[fill.order_id] = total_filled
+            self._maybe_enable_bootstrap_sell_side(fill)
+            self._request_orders_refresh("fill")
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _process_fill")
+            self._notify_crash("_process_fill")
+            return
 
     def _fill_key(self, fill: TradeFill) -> str:
         if fill.trade_id:
@@ -8141,9 +8277,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         fill: TradeFill,
         *,
         delta_qty: Decimal,
+        total_qty: Decimal | None = None,
         fill_client_order_id: str | None = None,
     ) -> None:
         if not self._account_client or not self._bot_session_id:
+            return
+        if should_block_new_orders(self._state):
+            self._append_log("[TP] blocked: stopping", kind="WARN")
             return
         if self._state not in {"RUNNING", "WAITING_FILLS"}:
             return
@@ -8169,6 +8309,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         step = self._rule_decimal(self._exchange_rules.get("step"))
         fill_price = self.as_decimal(fill.price)
         fill_qty = delta_qty
+        tp_target_qty = total_qty if (fill.side == "BUY" and total_qty is not None) else fill_qty
         balances_snapshot = self._balance_snapshot()
         base_free = self.as_decimal(balances_snapshot.get("base_free", Decimal("0")))
         quote_free = self.as_decimal(balances_snapshot.get("quote_free", Decimal("0")))
@@ -8183,7 +8324,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             allow_tp = False
         tp_min_profit_detail = ""
         tp_qty_cap = Decimal("0")
-        tp_required_qty = fill_qty
+        tp_required_qty = tp_target_qty
         tp_required_quote = Decimal("0")
         if is_micro:
             if tick is None or tick <= 0:
@@ -8202,20 +8343,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             else:
                 tp_price = self.q_price(fill_price * (Decimal("1") - tp_dec), tick)
         if tp_side == "SELL":
-            tp_required_qty = fill_qty
+            tp_required_qty = tp_target_qty
             if tp_required_qty > base_free:
                 tp_reason = "skip_insufficient_base"
                 allow_tp = False
             else:
-                tp_qty_cap = min(fill_qty, base_free)
+                tp_qty_cap = min(tp_target_qty, base_free)
         else:
-            tp_required_quote = tp_price * fill_qty
+            tp_required_quote = tp_price * tp_target_qty
             if tp_required_quote > quote_free:
                 tp_reason = "skip_insufficient_quote"
                 allow_tp = False
             else:
                 quote_cap = quote_free / tp_price if tp_price > 0 else Decimal("0")
-                tp_qty_cap = min(fill_qty, quote_cap)
+                tp_qty_cap = min(tp_target_qty, quote_cap)
         fill_order_key = fill.order_id or fill.trade_id or self._fill_key(fill)
         tp_client_order_id = self._limit_client_order_id(
             f"BBOT_LAS_v1_{self._symbol}_TP_{fill.side}_{fill_order_key}"
@@ -8243,15 +8384,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             allow_tp = False
         intended_tp_price = tp_price
         intended_tp_qty = tp_qty_cap
-        if allow_tp and (
-            self._has_open_order_client_id(tp_client_order_id)
-            or tp_client_order_id in self._active_tp_ids
-        ):
-            tp_reason = "skip_duplicate_local"
-            allow_tp = False
+        tp_replace_order_id = ""
         if allow_tp and tp_client_order_id in self._pending_tp_ids:
-            tp_reason = "skip_duplicate_local"
+            tp_reason = "skip_pending_tp"
             allow_tp = False
+        if allow_tp:
+            existing_tp = self._find_open_order_by_client_id(tp_client_order_id)
+            tp_replace_order_id = str(existing_tp.get("orderId", "")) if existing_tp else ""
+            if tp_replace_order_id:
+                tp_reason = "replace"
         if allow_tp:
             desired_tp_notional = tp_price * tp_qty_cap
             if min_notional is not None and desired_tp_notional < min_notional:
@@ -8474,7 +8615,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             tp_client_order_id = ""
         def _place() -> dict[str, Any]:
             results: dict[str, Any] = {"tp": None, "restore": None, "errors": []}
-            if allow_tp and tp_client_order_id and tp_qty > 0:
+            allow_tp_local = allow_tp
+            if allow_tp_local and tp_replace_order_id:
+                ok, error, _outcome = self._cancel_order_idempotent(tp_replace_order_id)
+                if not ok:
+                    allow_tp_local = False
+                    if error:
+                        results["errors"].append(error)
+            if allow_tp_local and tp_client_order_id and tp_qty > 0:
                 self._pending_tp_ids.add(tp_client_order_id)
                 tp_response, tp_error, tp_status = self._place_limit(
                     tp_side,
@@ -8484,6 +8632,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     reason="tp",
                     skip_open_order_duplicate=True,
                     skip_registry=False,
+                    allow_existing_client_id=bool(tp_replace_order_id),
                 )
                 if tp_response:
                     self._pending_tp_ids.discard(tp_client_order_id)
@@ -8624,9 +8773,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         ignore_keys: set[str] | None = None,
         skip_open_order_duplicate: bool = False,
         skip_registry: bool = False,
+        allow_existing_client_id: bool = False,
     ) -> tuple[dict[str, Any] | None, str | None, str]:
         if not self._account_client:
             return None, "[LIVE] place skipped: no account client", "skip_no_account"
+        if should_block_new_orders(self._state):
+            return None, "[LIVE] place skipped: stopping", "skip_stopping"
         blocked, reason = self._should_block_order_actions()
         if blocked:
             return None, f"[LIVE] place skipped: {reason}", "skip_bidask_stale"
@@ -8675,7 +8827,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 "WARN",
             )
             return None, None, "skip_invalid"
-        if client_id and self._has_open_order_client_id(client_id):
+        if client_id and self._has_open_order_client_id(client_id) and not allow_existing_client_id:
             self._signals.log_append.emit(
                 (
                     "[LIVE] skipped: duplicate reason=exchange "
@@ -9612,6 +9764,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._account_client:
             self._append_log("Live order placement skipped: no account client.", kind="WARN")
             return
+        if should_block_new_orders(self._state):
+            self._append_log("[LIVE] placement skipped: stopping", kind="WARN")
+            return
         blocked, _reason = self._should_block_order_actions()
         if blocked:
             return
@@ -10199,6 +10354,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             "WAITING FOR EDGE": "#d97706",
             "PAUSED": "#d97706",
             "STOPPING": "#f97316",
+            "STOPPED": "#6b7280",
             "ERROR": "#dc2626",
         }
         color = color_map.get(state, "#6b7280")
@@ -10348,6 +10504,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             "WAIT_EDGE": "WAITING FOR EDGE",
             "PAUSED": "PAUSED",
             "STOPPING": "STOPPING",
+            "STOPPED": "STOPPED",
             "PLACING_GRID": "PLACING_GRID",
             "ERROR": "ERROR",
         }

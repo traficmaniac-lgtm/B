@@ -1,5 +1,14 @@
 ## Technical Report
 
+### NC_MICRO v1.0.18 — Fix partial fills + TP aggregation + Stop/Cancel hardening + stale spam suppression
+- Added tradeId-based execution dedup with TTL/LRU and cumulative-fill fallback; exec logs now distinguish new vs duplicate events.
+- Switched TP to ONE-TP cancel/replace with stable clientOrderId and cumulative BUY sizing, keeping TP volume aligned with partial fills.
+- Hardened Stop flow to hold STOPPING until open orders clear (or watchdog timeout) and blocked new orders during STOPPING/STOPPED.
+- Reduced stale refresh log spam with per-reason rate limiting and updated snapshot sync/change timestamps.
+
+Why crash happened:
+- Partial fills were treated as final FILLED events, and TP dedup keys locked on the first fill; subsequent cumulative executions retriggered paths that hit inconsistent registry/GUI calls.
+
 ### NC MICRO v1.0.22
 - Fixed min profit bps conversions and TP gate logging in spread-capture mode.
 - Ensured tick-based spread-capture plans align BUY/SELL quantities and clamp sell sizing to inventory.
