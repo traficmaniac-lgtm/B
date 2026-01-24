@@ -1191,7 +1191,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.21 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.22 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -1453,7 +1453,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             take_profit_pct=tp_default,
             range_low_pct=range_pct,
             range_high_pct=range_pct,
-            grid_count=10,
+            grid_count=2,
             grid_step_mode="MANUAL",
             range_mode="Manual",
             order_size_mode="Equal",
@@ -1901,9 +1901,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._grid_step_mode_combo = QComboBox()
         self._grid_step_mode_combo.addItem("AUTO ATR", "AUTO_ATR")
         self._grid_step_mode_combo.addItem("MANUAL", "MANUAL")
-        self._grid_step_mode_combo.setCurrentIndex(
-            self._grid_step_mode_combo.findData(self._settings_state.grid_step_mode)
-        )
+        step_mode_index = self._grid_step_mode_combo.findData(self._settings_state.grid_step_mode)
+        if step_mode_index < 0:
+            step_mode_index = self._grid_step_mode_combo.findData("MANUAL")
+        self._grid_step_mode_combo.setCurrentIndex(step_mode_index)
         self._grid_step_mode_combo.currentIndexChanged.connect(
             lambda _: self._handle_grid_step_mode_change(self._grid_step_mode_combo.currentData())
         )
@@ -2562,7 +2563,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         plan, _settings, guard_hold = self._pilot_build_grid_plan(anchor_price, action_label="recenter")
         if guard_hold:
-            self._pilot_block_action(PilotAction.RECENTER, "profit guard HOLD")
+            reason = self._pilot_hold_reason or "profit guard HOLD"
+            self._pilot_block_action(PilotAction.RECENTER, reason)
             return
         if plan is None or _settings is None:
             self._pilot_block_action(PilotAction.RECENTER, "grid plan failed")
@@ -3079,6 +3081,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         snapshot = self._collect_strategy_snapshot()
         settings = self._resolve_start_settings(snapshot)
         self._apply_grid_clamps(settings, anchor_price)
+        if self._is_micro_profile():
+            plan, guard_hold, guard_reason = self._build_spread_capture_plan(settings, action_label=action_label)
+            if guard_hold:
+                self._pilot_hold_reason = guard_reason
+                self._pilot_hold_until = monotonic() + max(self.pilot_config.hold_timeout_sec, 0)
+                return None, settings, True
         guard_decision = self._apply_profit_guard(
             settings,
             anchor_price,
@@ -3088,7 +3096,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if guard_decision == "HOLD":
             return None, settings, True
         try:
-            planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
+            if self._is_micro_profile():
+                planned = plan or []
+            else:
+                planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
         except ValueError as exc:
             self._append_log(f"[NC MICRO] recenter plan failed: {exc}", kind="WARN")
             return None, None, False
@@ -3128,6 +3139,99 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if violations:
                 return False, f"buy_above_be be={be_price:.8f} n={len(violations)}"
         return True, ""
+
+    def _build_spread_capture_plan(
+        self,
+        settings: GridSettingsState,
+        *,
+        action_label: str,
+    ) -> tuple[list[GridPlannedOrder] | None, bool, str]:
+        guard_ok, guard_reason, context = self._micro_spread_capture_guard()
+        if not guard_ok:
+            return None, True, guard_reason
+        bid = context.get("bid")
+        ask = context.get("ask")
+        tick = context.get("tick")
+        mid = context.get("mid")
+        if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)) or bid <= 0 or ask <= 0:
+            return None, True, "invalid_bidask"
+        if not isinstance(tick, (int, float)) or tick <= 0:
+            return None, True, "invalid_tick"
+        if not isinstance(mid, (int, float)) or mid <= 0:
+            mid = (bid + ask) / 2
+        step_pct = self._micro_step_pct_from_tick(mid) or settings.grid_step_pct
+        settings.grid_step_mode = "TICK_BASED"
+        settings.grid_step_pct = step_pct
+        settings.grid_count = 2
+        settings.max_active_orders = min(settings.max_active_orders, 2)
+        spread_ticks = context.get("spread_ticks")
+        tp_ticks = self._micro_tp_ticks(spread_ticks if isinstance(spread_ticks, int) else None)
+        settings.take_profit_pct = self._abs_to_pct(tp_ticks * tick, mid)
+        settings.range_low_pct = max(settings.range_low_pct, step_pct)
+        settings.range_high_pct = max(settings.range_high_pct, step_pct)
+        self._grid_engine._plan_stats = GridPlanStats()
+        per_order_quote = max(float(settings.budget) / 2, 0.0)
+        buy_order = self._build_spread_capture_order(
+            side="BUY",
+            price=bid,
+            per_order_quote=per_order_quote,
+            tick=tick,
+            step=self._exchange_rules.get("step"),
+            min_notional=self._exchange_rules.get("min_notional"),
+            min_qty=self._exchange_rules.get("min_qty"),
+            max_qty=self._exchange_rules.get("max_qty"),
+        )
+        sell_order = self._build_spread_capture_order(
+            side="SELL",
+            price=ask,
+            per_order_quote=per_order_quote,
+            tick=tick,
+            step=self._exchange_rules.get("step"),
+            min_notional=self._exchange_rules.get("min_notional"),
+            min_qty=self._exchange_rules.get("min_qty"),
+            max_qty=self._exchange_rules.get("max_qty"),
+        )
+        plan = [order for order in (buy_order, sell_order) if order is not None]
+        if not plan:
+            self._append_log(
+                f"[PLAN] spread-capture empty action={action_label}",
+                kind="WARN",
+            )
+        return plan, False, "ok"
+
+    def _build_spread_capture_order(
+        self,
+        *,
+        side: str,
+        price: float,
+        per_order_quote: float,
+        tick: float | None,
+        step: float | None,
+        min_notional: float | None,
+        min_qty: float | None,
+        max_qty: float | None,
+    ) -> GridPlannedOrder | None:
+        side = side.upper()
+        if price <= 0 or per_order_quote <= 0:
+            return None
+        round_mode = "down" if side == "BUY" else "up"
+        price_rounded = self._grid_engine.round_price_to_tick(price, tick, mode=round_mode)
+        if price_rounded <= 0:
+            return None
+        qty = per_order_quote / price_rounded if price_rounded > 0 else 0.0
+        qty = self._grid_engine.quantize_qty(qty, step, mode="down")
+        qty = self._grid_engine._adjust_qty_for_filters(
+            side=side,
+            price=price_rounded,
+            qty=qty,
+            step=step,
+            min_notional=min_notional,
+            min_qty=min_qty,
+            max_qty=max_qty,
+        )
+        if qty <= 0:
+            return None
+        return GridPlannedOrder(side=side, price=price_rounded, qty=qty, level_index=1)
 
     def _pilot_cancel_orders_then_place(self, plan: list[GridPlannedOrder]) -> None:
         planned_cancel = len(self._open_orders)
@@ -3613,6 +3717,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _stale_tp_profitability(self, settings: GridSettingsState | None) -> dict[str, float | bool] | None:
         if settings is None:
+            return None
+        if self._is_micro_profile():
             return None
         tp_pct = settings.take_profit_pct or settings.grid_step_pct
         if tp_pct <= 0:
@@ -5235,33 +5341,34 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     self._append_log("[START] guard override: profit guard ignored", kind="INFO")
                 if override_guard:
                     self._profit_guard_override_pending = False
-                if settings.take_profit_pct <= 0:
-                    raise ValueError("Invalid take_profit_pct")
-                profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
-                if not profitability.get("is_profitable", True):
-                    min_tp = profitability.get("min_tp_pct")
-                    break_even = profitability.get("break_even_tp_pct")
-                    fix_target = None
-                    if isinstance(min_tp, float):
-                        fix_target = min_tp + 0.02
-                    if self._auto_fix_tp_enabled and isinstance(fix_target, float):
-                        self._apply_tp_fix(fix_target, min_tp, auto_fix=True)
-                        settings.take_profit_pct = fix_target
-                    else:
-                        should_fix = False
-                        if isinstance(fix_target, float):
-                            should_fix = self._confirm_tp_fix(fix_target, min_tp)
-                        if should_fix and isinstance(fix_target, float):
-                            self._apply_tp_fix(fix_target, min_tp, auto_fix=False)
+                if not self._is_micro_profile():
+                    if settings.take_profit_pct <= 0:
+                        raise ValueError("Invalid take_profit_pct")
+                    profitability = self._evaluate_tp_profitability(settings.take_profit_pct)
+                    if not profitability.get("is_profitable", True):
+                        min_tp = profitability.get("min_tp_pct")
+                        break_even = profitability.get("break_even_tp_pct")
+                        fix_target = None
+                        if isinstance(min_tp, float):
+                            fix_target = min_tp + 0.02
+                        if self._auto_fix_tp_enabled and isinstance(fix_target, float):
+                            self._apply_tp_fix(fix_target, min_tp, auto_fix=True)
                             settings.take_profit_pct = fix_target
                         else:
-                            self._append_log("[START] blocked: fix required (TP)", kind="WARN")
-                            if isinstance(min_tp, float) and isinstance(break_even, float):
-                                self._show_tp_break_even_helper(min_tp, break_even)
-                            self._lock_start_for_tp()
-                            self._change_state("IDLE")
-                            return
-                self._clear_tp_break_even_helper()
+                            should_fix = False
+                            if isinstance(fix_target, float):
+                                should_fix = self._confirm_tp_fix(fix_target, min_tp)
+                            if should_fix and isinstance(fix_target, float):
+                                self._apply_tp_fix(fix_target, min_tp, auto_fix=False)
+                                settings.take_profit_pct = fix_target
+                            else:
+                                self._append_log("[START] blocked: fix required (TP)", kind="WARN")
+                                if isinstance(min_tp, float) and isinstance(break_even, float):
+                                    self._show_tp_break_even_helper(min_tp, break_even)
+                                self._lock_start_for_tp()
+                                self._change_state("IDLE")
+                                return
+                    self._clear_tp_break_even_helper()
                 if not dry_run and self._first_live_session:
                     settings.grid_count = min(settings.grid_count, 4)
                     settings.max_active_orders = min(settings.max_active_orders, 4)
@@ -5279,7 +5386,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._last_price_label.setText(tr("last_price", price=f"{anchor_price:.8f}"))
                 self._market_price.setText(f"{tr('price')}: {anchor_price:.8f}")
                 self._set_market_label_state(self._market_price, active=True)
-                planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
+                if self._is_micro_profile():
+                    planned, guard_hold, guard_reason = self._build_spread_capture_plan(
+                        settings,
+                        action_label="start",
+                    )
+                    if guard_hold:
+                        self._append_log(
+                            f"[START] blocked: micro guard reason={guard_reason}",
+                            kind="WARN",
+                        )
+                        self._change_state("WAIT_EDGE")
+                        return
+                else:
+                    planned = self._grid_engine.start(settings, anchor_price, self._exchange_rules)
             except ValueError as exc:
                 self._append_log(f"Start failed: {exc}", kind="WARN")
                 self._change_state("IDLE")
@@ -6189,7 +6309,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _apply_micro_grid_clamps(self, settings: GridSettingsState, anchor_price: float) -> None:
         if not self._is_micro_profile():
             return
-        settings.grid_count = int(self._clamp(settings.grid_count, 6, 10))
+        settings.grid_count = 2
+        tick_step_pct = self._micro_step_pct_from_tick(anchor_price)
+        if tick_step_pct is not None:
+            settings.grid_step_mode = "TICK_BASED"
+            settings.grid_step_pct = tick_step_pct
         settings.grid_step_pct = self._clamp(
             settings.grid_step_pct,
             MICRO_STABLECOIN_STEP_PCT_MIN,
@@ -6197,16 +6321,18 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
         settings.range_low_pct = self._clamp(
             settings.range_low_pct,
-            0.0,
+            settings.grid_step_pct,
             MICRO_STABLECOIN_RANGE_PCT_MAX,
         )
         settings.range_high_pct = self._clamp(
             settings.range_high_pct,
-            0.0,
+            settings.grid_step_pct,
             MICRO_STABLECOIN_RANGE_PCT_MAX,
         )
-        tp_default = settings.grid_step_pct * 2
-        settings.take_profit_pct = max(settings.take_profit_pct, tp_default)
+        spread_ticks = self._micro_spread_capture_context().get("spread_ticks")
+        tp_ticks = self._micro_tp_ticks(spread_ticks if isinstance(spread_ticks, int) else None)
+        if tick_step_pct is not None:
+            settings.take_profit_pct = max(tick_step_pct * tp_ticks, tick_step_pct)
         settings.take_profit_pct = min(settings.take_profit_pct, MICRO_STABLECOIN_TP_PCT_MAX)
         settings.order_size_mode = "Equal"
         settings.max_active_orders = min(settings.max_active_orders, settings.grid_count)
@@ -7342,6 +7468,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         self._fill_keys.add(fill_key)
         self._fills_changed_since_refresh = True
+        client_order_id = ""
         if fill.order_id:
             existing_order = self._open_orders_map.get(fill.order_id, {})
             client_order_id = str(existing_order.get("clientOrderId", ""))
@@ -7392,7 +7519,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             ),
             kind="INFO",
         )
-        self._place_replacement_order(fill, delta_qty=delta)
+        self._place_replacement_order(fill, delta_qty=delta, fill_client_order_id=client_order_id)
         if fill.order_id:
             self._fill_accumulator.mark_handled(fill.order_id, total_filled)
         self._maybe_enable_bootstrap_sell_side(fill)
@@ -7546,6 +7673,50 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not tick or anchor_price <= 0:
             return 0.0
         return tick / anchor_price * 100
+
+    def _micro_step_pct_from_tick(self, anchor_price: float) -> float | None:
+        tick = self._exchange_rules.get("tick")
+        if not tick or anchor_price <= 0:
+            return None
+        return tick / anchor_price * 100
+
+    def _micro_spread_capture_context(self) -> dict[str, float | int | bool | None]:
+        bid, ask, _source = self._resolve_book_bid_ask()
+        tick = self._exchange_rules.get("tick")
+        age_ms = self._http_book_age_ms()
+        has_bidask = bid is not None and ask is not None and bid > 0 and ask > 0
+        is_live = bool(has_bidask and age_ms is not None and age_ms < BIDASK_FAIL_SOFT_MS)
+        mid = (bid + ask) / 2 if has_bidask else None
+        spread_ticks = None
+        if has_bidask and tick and tick > 0:
+            spread_ticks = int(round((ask - bid) / tick))
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "tick": tick,
+            "spread_ticks": spread_ticks,
+            "is_live": is_live,
+            "has_bidask": has_bidask,
+        }
+
+    def _micro_tp_ticks(self, spread_ticks: int | None) -> int:
+        if spread_ticks is None:
+            return 1
+        if spread_ticks >= 2:
+            return 1
+        if spread_ticks == 1:
+            return 2
+        return 1
+
+    def _micro_spread_capture_guard(self) -> tuple[bool, str, dict[str, float | int | bool | None]]:
+        context = self._micro_spread_capture_context()
+        if not context["has_bidask"] or not context["is_live"]:
+            return False, "no_live_bidask", context
+        spread_ticks = context.get("spread_ticks")
+        if not isinstance(spread_ticks, int) or spread_ticks < 1:
+            return False, "spread_lt_1_tick", context
+        return True, "ok", context
 
     def _profit_guard_should_hold(
         self,
@@ -7982,19 +8153,37 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
         )
 
-    def _place_replacement_order(self, fill: TradeFill, *, delta_qty: Decimal) -> None:
+    def _place_replacement_order(
+        self,
+        fill: TradeFill,
+        *,
+        delta_qty: Decimal,
+        fill_client_order_id: str | None = None,
+    ) -> None:
         if not self._account_client or not self._bot_session_id:
             return
         if self._state not in {"RUNNING", "WAITING_FILLS"}:
             return
         settings = self._live_settings or self._settings_state
-        tp_pct = settings.take_profit_pct or settings.grid_step_pct
-        if tp_pct <= 0:
+        is_micro = self._is_micro_profile()
+        order_type = self._order_registry_type_from_client_id(fill_client_order_id or "")
+        if is_micro and order_type == "TP":
+            plan, guard_hold, guard_reason = self._build_spread_capture_plan(settings, action_label="tp_reentry")
+            if guard_hold:
+                self._append_log(f"[TP] reentry hold reason={guard_reason}", kind="INFO")
+                return
+            if not plan:
+                self._append_log("[TP] reentry skipped: empty plan", kind="WARN")
+                return
+            self._place_live_orders(plan)
             return
+        if not is_micro:
+            tp_pct = settings.take_profit_pct or settings.grid_step_pct
+            if tp_pct <= 0:
+                return
         self._rebuild_registry_from_open_orders(self._open_orders)
         tick = self._rule_decimal(self._exchange_rules.get("tick"))
         step = self._rule_decimal(self._exchange_rules.get("step"))
-        tp_dec = self.as_decimal(tp_pct) / Decimal("100")
         fill_price = self.as_decimal(fill.price)
         fill_qty = delta_qty
         balances_snapshot = self._balance_snapshot()
@@ -8013,8 +8202,23 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         tp_qty_cap = Decimal("0")
         tp_required_qty = fill_qty
         tp_required_quote = Decimal("0")
+        if is_micro:
+            if tick is None or tick <= 0:
+                return
+            spread_ticks = self._micro_spread_capture_context().get("spread_ticks")
+            tp_ticks = self._micro_tp_ticks(spread_ticks if isinstance(spread_ticks, int) else None)
+            tick_move = tick * Decimal(tp_ticks)
+            if tp_side == "SELL":
+                tp_price = self.q_price(fill_price + tick_move, tick)
+            else:
+                tp_price = self.q_price(fill_price - tick_move, tick)
+        else:
+            tp_dec = self.as_decimal(settings.take_profit_pct or settings.grid_step_pct) / Decimal("100")
+            if tp_side == "SELL":
+                tp_price = self.q_price(fill_price * (Decimal("1") + tp_dec), tick)
+            else:
+                tp_price = self.q_price(fill_price * (Decimal("1") - tp_dec), tick)
         if tp_side == "SELL":
-            tp_price = self.q_price(fill_price * (Decimal("1") + tp_dec), tick)
             tp_required_qty = fill_qty
             if tp_required_qty > base_free:
                 tp_reason = "skip_insufficient_base"
@@ -8022,7 +8226,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             else:
                 tp_qty_cap = min(fill_qty, base_free)
         else:
-            tp_price = self.q_price(fill_price * (Decimal("1") - tp_dec), tick)
             tp_required_quote = tp_price * fill_qty
             if tp_required_quote > quote_free:
                 tp_reason = "skip_insufficient_quote"
@@ -8143,6 +8346,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     kind="WARN",
                 )
 
+        allow_restore = not is_micro
         step_pct = settings.grid_step_pct or 0.0
         reference_price = self._last_price or fill.price
         step_abs = self.q_price(
@@ -8192,7 +8396,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if restore_decision == "ok":
             restore_notional = restore_price * restore_qty
             intended_restore_qty = restore_qty
-        allow_restore = restore_decision == "ok" and restore_qty > 0
+        allow_restore = allow_restore and restore_decision == "ok" and restore_qty > 0
         filled_order_id = fill.order_id or fill.trade_id or self._fill_key(fill)
         level_index = None
         if fill.order_id:
@@ -8250,7 +8454,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 ),
                 kind="INFO",
             )
-        else:
+        elif not is_micro:
             if restore_side == "SELL":
                 restore_detail = (
                     f"required_qty={self._format_balance_decimal(restore_debug['required_qty'])} "
