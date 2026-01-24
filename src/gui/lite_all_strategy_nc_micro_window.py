@@ -929,6 +929,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._auto_fix_tp_enabled = True
         self.enable_guard_autofix = True
         self._stop_in_progress = False
+        self._stop_requested = False
         self._pilot_state = PilotState.OFF
         self._pilot_auto_actions_enabled = True
         self._pilot_confirm_dry_run = False
@@ -4329,6 +4330,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_dry_run_toggle(self, checked: bool) -> None:
         if self._suppress_dry_run_event:
             return
+        if self._start_in_progress or self._stop_in_progress or self._current_action in {"start", "stop"}:
+            self._suppress_dry_run_event = True
+            self._dry_run_toggle.setChecked(not checked)
+            self._suppress_dry_run_event = False
+            self._append_log("[TRADE] toggle rejected: reason=stop/start flow", kind="WARN")
+            return
         if not checked and not self._can_trade():
             self._suppress_dry_run_event = True
             self._dry_run_toggle.setChecked(True)
@@ -4487,10 +4494,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if not dry_run and self._trade_gate != TradeGate.TRADE_OK:
                 reason = self._trade_gate_reason()
                 self._append_log(f"Start blocked: TRADE DISABLED (reason={reason}).", kind="WARN")
-                dry_run = True
-                self._suppress_dry_run_event = True
-                self._dry_run_toggle.setChecked(True)
-                self._suppress_dry_run_event = False
+                self._mark_preflight_blocked()
+                self._change_state("IDLE")
+                return
             self._grid_engine.set_mode("DRY_RUN" if dry_run else "LIVE")
             if not dry_run and (not self._rules_loaded or (not self._fees_last_fetch_ts and not self._fee_unverified)):
                 self._append_log("Start blocked: rules/fees not loaded.", kind="WARN")
@@ -4728,14 +4734,18 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._change_state("PAUSED")
 
     def _handle_stop(self) -> None:
+        self._append_log("[STOP] requested", kind="INFO")
+        if self._stop_in_progress:
+            self._stop_requested = True
+            return
         self._stop_in_progress = True
+        self._stop_requested = True
         self._closing = True
         if self._start_cancel_event:
             self._start_cancel_event.set()
         self._start_run_id += 1
         self._stop_local_timers()
         self._append_log("Stop pressed.", kind="ORDERS")
-        self._append_log("[STOP] requested", kind="INFO")
         self._grid_engine.stop(cancel_all=True)
         self._change_state("STOPPING")
         self._orders_in_flight = True
@@ -4783,6 +4793,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids.clear()
         self._pending_restore_ids.clear()
         self._stop_in_progress = False
+        self._stop_requested = False
         self._closing = False
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
@@ -4802,7 +4813,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             open_orders_after: list[dict[str, Any]] = []
             verify_ok = False
             for attempt in range(1, 4):
-                events.append(("INFO", f"[STOP] cancel_all symbol={symbol} attempt={attempt}"))
+                events.append(("INFO", f"[STOP] cancel_all attempt={attempt}"))
                 ok = True
                 err_text: str | None = None
                 try:
@@ -4811,8 +4822,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     ok = False
                     err_text = str(exc)
                     errors.append(self._format_cancel_exception(exc, "cancel_all"))
-                err_log = err_text if err_text is not None else "None"
-                events.append(("INFO", f"[STOP] cancel_all result ok={ok} err={err_log}"))
                 self._sleep_ms(random.randint(300, 500))
                 try:
                     open_orders_after = self._account_client.get_open_orders(symbol)
@@ -4826,7 +4835,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     open_orders_after = []
                     errors.append(f"[STOP] verify open_orders failed: {exc}")
                 verify_count = len(open_orders_after) if verify_ok else -1
-                events.append(("INFO", f"[STOP] verify open_orders n={verify_count}"))
+                events.append(("INFO", f"[STOP] verify exchange open_orders n={verify_count}"))
                 if verify_ok and not open_orders_after:
                     break
                 if attempt < 3:
@@ -4852,7 +4861,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._force_refresh_open_orders_and_wait(timeout_ms=2_000)
             self._force_refresh_balances_and_wait(timeout_ms=2_000)
             self._finalize_stop()
-            self._append_log("[STOP] gui orders cleared", kind="INFO")
+            self._append_log("[STOP] gui orders cleared (n=0)", kind="INFO")
             self._append_log("[STOP] done", kind="INFO")
             return
         events = result.get("events", [])
@@ -4891,7 +4900,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         keep_open_orders = (not verify_ok) or bool(self._open_orders)
         self._finalize_stop(keep_open_orders=keep_open_orders)
         if not keep_open_orders:
-            self._append_log("[STOP] gui orders cleared", kind="INFO")
+            self._append_log("[STOP] gui orders cleared (n=0)", kind="INFO")
         self._append_log("[STOP] done", kind="INFO")
 
     def _handle_stop_cancel_error(self, message: str) -> None:
@@ -7435,10 +7444,40 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             _status, code, _message, _response = self._parse_binance_exception(exc)
             if code == -2011:
+                self._signals.log_append.emit("[CANCEL] unknown -> verifying on exchange", "INFO")
+                present = False
+                try:
+                    open_orders = self._account_client.get_open_orders(self._symbol)
+                    if isinstance(open_orders, list):
+                        present = any(
+                            str(order.get("orderId", "")) == order_id
+                            for order in open_orders
+                            if isinstance(order, dict)
+                        )
+                except Exception as verify_exc:  # noqa: BLE001
+                    return False, f"[CANCEL] verify failed: {verify_exc}"
                 self._signals.log_append.emit(
-                    f"[INFO] cancel unknown -> treated as done orderId={order_id}",
+                    f"[CANCEL] verify present={str(present).lower()}",
                     "INFO",
                 )
+                if present:
+                    try:
+                        self._account_client.cancel_open_orders(self._symbol)
+                    except Exception as cancel_exc:  # noqa: BLE001
+                        return False, self._format_cancel_exception(cancel_exc, order_id)
+                    try:
+                        open_orders_after = self._account_client.get_open_orders(self._symbol)
+                        present_after = False
+                        if isinstance(open_orders_after, list):
+                            present_after = any(
+                                str(order.get("orderId", "")) == order_id
+                                for order in open_orders_after
+                                if isinstance(order, dict)
+                            )
+                    except Exception as verify_exc:  # noqa: BLE001
+                        return False, f"[CANCEL] verify failed: {verify_exc}"
+                    if present_after:
+                        return False, f"[CANCEL] verify present=true orderId={order_id}"
                 self._pilot_pending_cancel_ids.add(order_id)
                 self._closed_order_ids.add(order_id)
                 self._discard_registry_for_order_id(order_id)
