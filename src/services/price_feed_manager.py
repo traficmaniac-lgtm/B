@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Coroutine, Iterable, Literal
 
 import websockets
 
@@ -95,19 +95,31 @@ class SafeLoopCaller:
             return False
         return True
 
-    def run_coroutine_threadsafe(self, coro: asyncio.Future, *, timeout_s: float | None = None) -> bool:
+    def run_coroutine_threadsafe(self, coro: Coroutine[Any, Any, Any], *, timeout_s: float | None = None) -> bool:
         if self._is_closing_fn():
             self._log_skip("[WS] skip coroutine: closing/loop closed")
+            if hasattr(coro, "close"):
+                coro.close()
             return False
         loop = self._loop_fn()
         if not loop or loop.is_closed():
             self._log_skip("[WS] skip coroutine: closing/loop closed")
+            if hasattr(coro, "close"):
+                coro.close()
             return False
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
-            if timeout_s is not None:
-                future.result(timeout=timeout_s)
-        except (asyncio.TimeoutError, RuntimeError):
+        except RuntimeError:
+            self._log_skip("[WS] skip coroutine: runtime error")
+            if hasattr(coro, "close"):
+                coro.close()
+            return False
+        try:
+            future.result(timeout=timeout_s)
+        except asyncio.TimeoutError:
+            self._log_skip("[WS] skip coroutine: runtime error")
+            return False
+        except RuntimeError:
             self._log_skip("[WS] skip coroutine: runtime error")
             return False
         except Exception:  # noqa: BLE001
@@ -430,19 +442,27 @@ class _BinanceBookTickerWsThread:
     def stop(self) -> None:
         if self._stopping:
             return
+        self._logger.info("[FEED] stop requested")
         self._stopping = True
         self._closing = True
         self._set_state(WS_STATE_STOPPING, "stopping")
         self._stop_event.set()
-        if self._loop and self._loop.is_running() and not self._loop.is_closed():
+        loop = self._loop
+        if not loop or loop.is_closed():
+            self._logger.info("[FEED] stop skipped: loop closed")
+        elif loop.is_running():
             try:
                 if self._connect_task:
                     self._safe_call(self._connect_task.cancel)
-                self._loop_caller.run_coroutine_threadsafe(self._shutdown(), timeout_s=5.0)
+                self._logger.info("[FEED] shutdown start")
+                if self._loop_caller.run_coroutine_threadsafe(self._shutdown(), timeout_s=5.0):
+                    self._logger.info("[FEED] shutdown done")
             except TimeoutError:
-                self._logger.warning("WS shutdown timeout; continuing stop.")
+                self._logger.warning("[FEED] ws shutdown failed: timeout")
+            except RuntimeError:
+                self._logger.info("[FEED] stop skipped: loop closed")
             except Exception:  # noqa: BLE001
-                self._logger.warning("WS shutdown error", exc_info=True)
+                self._logger.warning("[FEED] ws shutdown failed", exc_info=True)
             finally:
                 self._safe_call(self._loop.stop)
         if self._thread.is_alive():
@@ -834,6 +854,7 @@ class PriceFeedManager:
     def stop(self) -> None:
         if self._stopping:
             return
+        self._logger.info("[FEED] stop requested")
         self._stopping = True
         self._stop_event.set()
         with self._symbols_update_lock:
@@ -1022,6 +1043,9 @@ class PriceFeedManager:
                     return latest_tick
 
     def shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._logger.info("[FEED] stop requested")
         self._stopping = True
         self._shutting_down = True
         self._stop_event.set()
@@ -1034,6 +1058,7 @@ class PriceFeedManager:
                 timer.cancel()
         self._transport_test_timers.clear()
         self._ws_thread.stop()
+        self._ws_thread = None
         if self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=5.0)
         self._registry.clear()
