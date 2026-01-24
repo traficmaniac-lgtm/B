@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -10,6 +10,25 @@ class RefreshDecision:
     dt_since_last_ms: int | None
     blocked_by_interval: bool
     blocked_by_hash_stable: bool
+
+
+@dataclass
+class StaleRefreshLogLimiter:
+    min_interval_sec: float = 10.0
+    last_log_ts: dict[str, float] = field(default_factory=dict)
+    last_state: dict[str, tuple[object, ...]] = field(default_factory=dict)
+
+    def should_log(self, reason: str, state: tuple[object, ...], now: float) -> bool:
+        last_state = self.last_state.get(reason)
+        last_log = self.last_log_ts.get(reason)
+        if last_state != state:
+            self.last_state[reason] = state
+            self.last_log_ts[reason] = now
+            return True
+        if last_log is None or now - last_log >= self.min_interval_sec:
+            self.last_log_ts[reason] = now
+            return True
+        return False
 
 
 def compute_refresh_allowed(
