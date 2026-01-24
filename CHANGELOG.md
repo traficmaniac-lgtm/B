@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.21
+- Safe WS shutdown (skip enqueue on closing/loop closed).
+- Time sync fix for signed requests with -1021 retry + recvWindow bump.
+- Micro TP gate calibration for low spreads.
+
 ## v1.0.20
 - Add STOP watchdog timeout to force finalize and re-enable Start after cancellation hangs.
 - Deduplicate noisy PILOT/KPI/ORDERS stale logs with heartbeat logging.
