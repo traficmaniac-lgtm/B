@@ -247,6 +247,11 @@ STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 AUTO_EXEC_ACTION_COOLDOWN_SEC = 30
 SNAPSHOT_REFRESH_COOLDOWN_MS = 1500
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
+ORDERS_POLL_IDLE_MS = 2500
+ORDERS_POLL_RUNNING_MS = 1200
+ORDERS_POLL_MAX_MS = 5000
+ORDERS_EVENT_DEDUP_SEC = 0.5
+UI_SOURCE_DEBOUNCE_MS = 300
 STALE_COOLDOWN_SEC = 120
 STALE_ACTION_COOLDOWN_SEC = 120
 STALE_AUTO_ACTION_PAUSE_SEC = 300
@@ -774,6 +779,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._symbol = symbol.strip().upper()
         self._price_feed_manager = price_feed_manager
         self.trade_source = "HTTP_ONLY"
+        self._pending_trade_source: str | None = None
+        self._last_trade_source_change_ms = 0
         self._signals = _LiteGridSignals()
         self._signals.price_update.connect(self._apply_price_update)
         self._signals.status_update.connect(self._apply_status_update)
@@ -913,6 +920,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._balances_tick_count = 0
         self._orders_tick_count = 0
         self._orders_last_count: int | None = None
+        self._orders_poll_last_ts: int | None = None
+        self._orders_poll_backoff_ms = 0
+        self._orders_event_refresh_ts: dict[str, float] = {}
+        self._orders_snapshot_signature: tuple[tuple[str, str, str, str], ...] | None = None
         self._balances_snapshot: tuple[float, float] | None = None
         self._sell_retry_limit = 5
         self._start_in_progress = False
@@ -1012,6 +1023,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._orders_timer = QTimer(self)
         self._orders_timer.setInterval(3_000)
         self._orders_timer.timeout.connect(self._refresh_open_orders)
+        self._trade_source_timer = QTimer(self)
+        self._trade_source_timer.setSingleShot(True)
+        self._trade_source_timer.timeout.connect(self._apply_pending_trade_source)
         self._fills_timer = QTimer(self)
         self._fills_timer.setInterval(2_500)
         self._fills_timer.timeout.connect(self._refresh_fills)
@@ -1057,7 +1071,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.10 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version=NC MICRO v1.0.11 symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -2890,7 +2904,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             kind="INFO",
         )
         self._activate_stale_warmup()
-        self._refresh_open_orders(force=True)
+        self._request_orders_refresh("pilot_cancel_replace")
         self._set_pilot_action_in_progress(False)
 
     def _handle_pilot_break_even_result(self, result: object, latency_ms: int) -> None:
@@ -2917,7 +2931,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 ),
                 kind="INFO",
             )
-        self._refresh_open_orders(force=True)
+        self._request_orders_refresh("pilot_break_even")
         self._set_pilot_action_in_progress(False)
         self._current_action = None
         self._pilot_pending_action = None
@@ -3740,8 +3754,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return False
         self._last_snapshot_refresh_ts = now
         self._snapshot_refresh_inflight = True
-        self._append_log(f"[ORDERS] stale -> refresh reason={reason}", kind="INFO")
-        self._refresh_open_orders(force=True)
+        self._orders_poll_last_ts = int(now * 1000)
+        self._refresh_open_orders(force=True, reason=reason)
         return True
 
     def _maybe_log_open_orders_snapshot_stale(self, snapshot_age_sec: int, *, skip_actions: bool = False) -> None:
@@ -3821,9 +3835,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             price = update.last_price if isinstance(update.last_price, (int, float)) else None
             if price is not None and price > 0:
                 self._ws_last_price = price
+            self._queue_trade_source(update.source)
         except Exception as exc:
             self._logger.error("SAFE_SKIP _apply_price_update: %s", exc)
             return
+
+    def _queue_trade_source(self, source: str | None) -> None:
+        if not hasattr(self, "_trade_source_timer"):
+            return
+        new_source = source or "HTTP"
+        if new_source == self.trade_source:
+            return
+        self._pending_trade_source = new_source
+        if not self._trade_source_timer.isActive():
+            self._trade_source_timer.start(UI_SOURCE_DEBOUNCE_MS)
+
+    def _apply_pending_trade_source(self) -> None:
+        if self._pending_trade_source is None:
+            return
+        self.trade_source = self._pending_trade_source
+        self._pending_trade_source = None
+        self._last_trade_source_change_ms = int(monotonic() * 1000)
 
     def _update_http_book_snapshot(self, payload: dict[str, Any]) -> tuple[float | None, float | None]:
         bid = self._coerce_float(payload.get("bidPrice"))
@@ -4960,7 +4992,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_refresh(self) -> None:
         self._append_log("Manual refresh requested.", kind="INFO")
         self._refresh_balances(force=True)
-        self._refresh_open_orders(force=True)
+        self._request_orders_refresh("manual_refresh")
         self._refresh_exchange_rules(force=True)
         self._refresh_trade_fees(force=True)
 
@@ -5513,7 +5545,23 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_runtime_balances()
         self._signals.balances_refresh.emit(False)
 
-    def _refresh_open_orders(self, force: bool = False, *, force_refresh: bool = False) -> None:
+    def _request_orders_refresh(self, event: str) -> None:
+        now = monotonic()
+        last_ts = self._orders_event_refresh_ts.get(event)
+        if last_ts is not None and now - last_ts < ORDERS_EVENT_DEDUP_SEC:
+            return
+        self._orders_event_refresh_ts[event] = now
+        self._reset_orders_poll_backoff()
+        self._refresh_open_orders(force=True, event_key=event)
+
+    def _refresh_open_orders(
+        self,
+        force: bool = False,
+        *,
+        force_refresh: bool = False,
+        reason: str | None = None,
+        event_key: str | None = None,
+    ) -> None:
         try:
             if force_refresh:
                 force = True
@@ -5544,6 +5592,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._apply_trade_gate()
                 return
             if not force:
+                now_ms = int(monotonic() * 1000)
+                interval_ms = self._current_orders_poll_interval_ms()
+                if self._orders_poll_last_ts is not None and now_ms - self._orders_poll_last_ts < interval_ms:
+                    return
+            if not force:
                 if self._ensure_open_orders_snapshot_fresh("poll"):
                     return
                 snapshot_age_sec = self._snapshot_age_sec()
@@ -5552,11 +5605,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if self._orders_in_flight:
                 if not force and not self._stop_in_progress:
                     return
+            if not force:
+                self._orders_poll_last_ts = int(monotonic() * 1000)
             self._orders_in_flight = True
             worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
             worker.signals.success.connect(self._handle_open_orders)
             worker.signals.error.connect(self._handle_open_orders_error)
             self._thread_pool.start(worker)
+            if reason and not force_refresh:
+                self._append_log(f"[ORDERS] stale -> refresh reason={reason}", kind="INFO")
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_open_orders")
             self._notify_crash("_refresh_open_orders")
@@ -5648,11 +5705,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._auto_pause_on_api_error(message)
         self._auto_pause_on_exception(message)
 
+    def _current_orders_poll_interval_ms(self) -> int:
+        base_interval = ORDERS_POLL_RUNNING_MS if self._state == "RUNNING" else ORDERS_POLL_IDLE_MS
+        interval = base_interval + self._orders_poll_backoff_ms
+        return int(min(interval, ORDERS_POLL_MAX_MS))
+
+    def _reset_orders_poll_backoff(self) -> None:
+        if self._orders_poll_backoff_ms != 0:
+            self._orders_poll_backoff_ms = 0
+            self._update_orders_timer_interval()
+
     def _update_orders_timer_interval(self) -> None:
         if not hasattr(self, "_orders_timer"):
             return
-        slow_poll = not self._open_orders
-        interval = 10_000 if slow_poll else 3_000
+        interval = self._current_orders_poll_interval_ms()
         if self._orders_timer.interval() != interval:
             self._orders_timer.setInterval(interval)
 
@@ -5669,6 +5735,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not should_run and self._fills_timer.isActive():
             self._fills_timer.stop()
 
+    @staticmethod
+    def _orders_signature(orders: list[dict[str, Any]]) -> tuple[tuple[str, str, str, str], ...]:
+        signature: list[tuple[str, str, str, str]] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            order_id = str(order.get("orderId", ""))
+            status = str(order.get("status", ""))
+            price = str(order.get("price", ""))
+            qty = str(order.get("origQty", ""))
+            if order_id:
+                signature.append((order_id, status, price, qty))
+        return tuple(sorted(signature))
+
     def _handle_open_orders(self, result: object, latency_ms: int) -> None:
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
@@ -5677,6 +5757,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         self._purge_recent_order_keys()
         previous_map = dict(self._open_orders_map)
+        previous_signature = self._orders_snapshot_signature
         self._open_orders_all = [item for item in result if isinstance(item, dict)]
         self._open_orders_loaded = True
         self._bootstrap_legacy_orders(self._open_orders_all)
@@ -5728,6 +5809,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if missing and self._account_client and self._state in {"RUNNING", "WAITING_FILLS"}:
             self._queue_reconcile_missing_orders(missing[:3])
         count = len(self._open_orders)
+        self._orders_snapshot_signature = self._orders_signature(self._open_orders_all)
+        orders_changed = self._orders_snapshot_signature != previous_signature
+        inflight_actions = bool(self._active_action_keys or self._pilot_action_in_progress)
+        if orders_changed or inflight_actions or self._start_in_progress or self._stop_in_progress:
+            self._reset_orders_poll_backoff()
+        else:
+            base_interval = ORDERS_POLL_RUNNING_MS if self._state == "RUNNING" else ORDERS_POLL_IDLE_MS
+            max_backoff = max(ORDERS_POLL_MAX_MS - base_interval, 0)
+            if self._orders_poll_backoff_ms < max_backoff:
+                self._orders_poll_backoff_ms = min(self._orders_poll_backoff_ms + 500, max_backoff)
         if self._orders_last_count is None or count != self._orders_last_count:
             self._append_log(
                 f"open orders updated (n={count}).",
@@ -6213,6 +6304,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if fill.order_id:
             self._fill_accumulator.mark_handled(fill.order_id, total_filled)
         self._maybe_enable_bootstrap_sell_side(fill)
+        self._request_orders_refresh("fill")
 
     def _fill_key(self, fill: TradeFill) -> str:
         if fill.trade_id:
@@ -7092,7 +7184,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 elif label == "RESTORE":
                     self._active_restore_ids.add(client_order_id)
                     self._pending_restore_ids.discard(client_order_id)
-        self._refresh_open_orders(force=True)
+        self._request_orders_refresh("place_tp_restore")
 
     def _place_limit(
         self,
@@ -7236,7 +7328,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                         ),
                         "WARN",
                     )
-                    QTimer.singleShot(0, self, lambda: self._refresh_open_orders(force=True))
+                    QTimer.singleShot(0, self, lambda: self._request_orders_refresh("place_duplicate"))
                     return None, "skip_duplicate_exchange", "skip_duplicate_exchange"
                 if reason_tag == "INSUFFICIENT_BALANCE":
                     if registry_key:
@@ -8249,7 +8341,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._handle_open_orders(open_orders, latency_ms)
             self._append_log(f"[LIVE] OPEN_ORDERS n={len(self._open_orders)}", kind="ORDERS")
         else:
-            self._refresh_open_orders(force=True)
+            self._request_orders_refresh("place_orders")
         self._activate_stale_warmup()
         self._change_state("RUNNING")
         if self._pilot_pending_action == PilotAction.RECENTER:
@@ -8314,7 +8406,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._discard_registry_for_order(entry)
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel selected: {len(result)}", kind="ORDERS")
-        self._refresh_open_orders(force=True)
+        self._request_orders_refresh("cancel_selected")
 
     def _cancel_all_live_orders(self) -> None:
         self._cancel_bot_orders()
@@ -8330,7 +8422,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._discard_registry_for_order(entry)
             self._append_log(f"[LIVE] cancel orderId={order_id}", kind="ORDERS")
         self._append_log(f"Cancel all: {len(result)}", kind="ORDERS")
-        self._refresh_open_orders(force=True)
+        self._request_orders_refresh("cancel_all")
 
     def _handle_cancel_error(self, message: str) -> None:
         self._append_log(f"[LIVE] cancel failed: {message}", kind="WARN")
