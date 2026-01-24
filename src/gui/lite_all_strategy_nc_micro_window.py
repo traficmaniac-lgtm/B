@@ -178,6 +178,17 @@ class GridSettingsState:
     order_size_mode: str = "Equal"
 
 
+@dataclass(frozen=True)
+class MarketHealth:
+    has_bidask: bool
+    spread_bps: float | None
+    vol_bps: float | None
+    age_ms: int | None
+    src: str | None
+    edge_raw_bps: float | None
+    expected_profit_bps: float | None
+
+
 class _LiteGridSignals(QObject):
     price_update = Signal(object)
     status_update = Signal(str, str)
@@ -246,6 +257,10 @@ STALE_LOG_DEDUP_SEC = 600
 STALE_AUTO_ACTION_COOLDOWN_SEC = 300
 AUTO_EXEC_ACTION_COOLDOWN_SEC = 30
 SNAPSHOT_REFRESH_COOLDOWN_MS = 1500
+STALE_REFRESH_MIN_MS = 2000
+STALE_REFRESH_POLL_AGE_MS = 2000
+STALE_REFRESH_POLL_HARD_MAX_SEC = 10
+STALE_REFRESH_LOG_DEDUP_SEC = 5
 STALE_SNAPSHOT_MAX_AGE_SEC = 5
 ORDERS_POLL_IDLE_MS = 2500
 ORDERS_POLL_RUNNING_MS = 1200
@@ -267,6 +282,8 @@ PROFIT_GUARD_THIN_SPREAD_FACTOR = 0.25
 PROFIT_GUARD_LOW_VOL_FACTOR = 0.5
 PROFIT_GUARD_LOW_VOL_FLOOR_PCT = 0.05
 PROFIT_GUARD_MIN_VOL_PCT = 0.05
+MARKET_HEALTH_RISK_BUFFER_MULT = 0.5
+MARKET_HEALTH_LOG_COOLDOWN_SEC = 5
 VOL_CONFIRM_TICKS = 3
 VOL_CONFIRM_TIME_MS = 1000
 KPI_BOOK_REQUEST_INTERVAL_MS = 1000
@@ -923,6 +940,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._orders_poll_last_ts: int | None = None
         self._orders_poll_backoff_ms = 0
         self._orders_event_refresh_ts: dict[str, float] = {}
+        self._stale_refresh_last_ts: dict[str, float] = {}
+        self._stale_refresh_last_log_ts: float | None = None
+        self._stale_refresh_hits = 0
+        self._stale_refresh_calls = 0
+        self._stale_refresh_skipped_rate_limit = 0
+        self._stale_refresh_skipped_no_change = 0
+        self._registry_dirty = False
+        self._fills_changed_since_refresh = False
         self._orders_snapshot_signature: tuple[tuple[str, str, str, str], ...] | None = None
         self._balances_snapshot: tuple[float, float] | None = None
         self._sell_retry_limit = 5
@@ -1005,6 +1030,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._kpi_last_state_ts: float | None = None
         self._kpi_last_reason: str | None = None
         self._kpi_last_good: dict[str, Any] | None = None
+        self._market_health: MarketHealth | None = None
+        self._market_health_last_reason: str | None = None
+        self._market_health_last_log_ts: float | None = None
         self._open_orders_snapshot_ts: float | None = None
         self._order_info_map: dict[str, OrderInfo] = {}
         self._registry_key_last_seen_ts: dict[str, float] = {}
@@ -3728,6 +3756,43 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             self._snapshot_refresh_suppressed_log_ts = now
 
+    def _should_allow_stale_refresh(self, reason: str, age_ms: int | None) -> bool:
+        now = monotonic()
+        last_refresh = self._stale_refresh_last_ts.get(reason)
+        if last_refresh is not None and (now - last_refresh) * 1000 < STALE_REFRESH_MIN_MS:
+            self._stale_refresh_skipped_rate_limit += 1
+            return False
+        if reason == "poll":
+            should_refresh = False
+            if age_ms is not None and age_ms >= STALE_REFRESH_POLL_AGE_MS:
+                should_refresh = True
+            if self._registry_dirty or self._fills_changed_since_refresh:
+                should_refresh = True
+            if last_refresh is not None and now - last_refresh >= STALE_REFRESH_POLL_HARD_MAX_SEC:
+                should_refresh = True
+            if not should_refresh:
+                self._stale_refresh_skipped_no_change += 1
+                return False
+        self._stale_refresh_last_ts[reason] = now
+        self._stale_refresh_calls += 1
+        return True
+
+    def _maybe_log_stale_refresh(self, reason: str) -> None:
+        now = monotonic()
+        last_log = self._stale_refresh_last_log_ts
+        if last_log is not None and now - last_log < STALE_REFRESH_LOG_DEDUP_SEC:
+            return
+        self._append_log(
+            (
+                "[ORDERS] stale -> refresh "
+                f"reason={reason} hits={self._stale_refresh_hits} calls={self._stale_refresh_calls} "
+                f"skip_rate={self._stale_refresh_skipped_rate_limit} "
+                f"skip_no_change={self._stale_refresh_skipped_no_change}"
+            ),
+            kind="INFO",
+        )
+        self._stale_refresh_last_log_ts = now
+
     def _ensure_open_orders_snapshot_fresh(
         self,
         reason: str,
@@ -3741,12 +3806,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             age_ms = int(max(time_fn() - self._open_orders_snapshot_ts, 0) * 1000)
         if age_ms is not None and age_ms <= max_age_ms:
             return False
+        self._stale_refresh_hits += 1
         now = monotonic()
         if self._orders_in_flight:
             self._maybe_log_snapshot_refresh_suppressed("inflight")
             return False
         if self._snapshot_refresh_inflight:
             self._maybe_log_snapshot_refresh_suppressed("inflight")
+            return False
+        if not self._should_allow_stale_refresh(reason, age_ms):
             return False
         if now - self._last_snapshot_refresh_ts < cooldown_s:
             remaining_ms = max(int((cooldown_s - (now - self._last_snapshot_refresh_ts)) * 1000), 0)
@@ -4080,6 +4148,47 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 )
                 self._feed_last_ok = feed_ok
                 self._feed_last_source = book_source
+
+            spread_bps = spread_pct * 100 if spread_pct is not None else None
+            vol_bps = volatility_pct * 100 if volatility_pct is not None else None
+            maker_pct, taker_pct, _fee_defaulted = self._profit_guard_fee_inputs()
+            fill_mode = self._runtime_profit_inputs().get("expected_fill_mode") or "MAKER"
+            fee_pct = taker_pct if fill_mode == "TAKER" else maker_pct
+            fees_bps = fee_pct * 100
+            slippage_bps = PROFIT_GUARD_SLIPPAGE_BPS
+            edge_raw_bps = None
+            expected_profit_bps = None
+            risk_buffer_bps = None
+            if spread_bps is not None:
+                edge_raw_bps = spread_bps - (fees_bps * 2) - slippage_bps
+                risk_buffer_bps = (vol_bps or 0.0) * MARKET_HEALTH_RISK_BUFFER_MULT
+                expected_profit_bps = edge_raw_bps - risk_buffer_bps
+            self._market_health = MarketHealth(
+                has_bidask=best_bid is not None and best_ask is not None,
+                spread_bps=spread_bps,
+                vol_bps=vol_bps,
+                age_ms=bidask_age_ms,
+                src=book_source,
+                edge_raw_bps=edge_raw_bps,
+                expected_profit_bps=expected_profit_bps,
+            )
+            if expected_profit_bps is not None:
+                edge_reason = "thin_edge" if expected_profit_bps <= 0 else "ok"
+                if (
+                    self._market_health_last_reason != edge_reason
+                    or self._market_health_last_log_ts is None
+                    or now_ts - self._market_health_last_log_ts >= MARKET_HEALTH_LOG_COOLDOWN_SEC
+                ):
+                    self._append_log(
+                        (
+                            "[KPI] edge_raw_bps="
+                            f"{edge_raw_bps:.2f} expected_profit_bps={expected_profit_bps:.2f} "
+                            f"risk_buffer_bps={risk_buffer_bps:.2f} reason={edge_reason}"
+                        ),
+                        kind="INFO",
+                    )
+                    self._market_health_last_reason = edge_reason
+                    self._market_health_last_log_ts = now_ts
 
             is_spread_zero = spread_pct is not None and spread_pct == 0
             spread_zero_ok = is_spread_zero and self._symbol in SPREAD_ZERO_OK_SYMBOLS
@@ -5613,7 +5722,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             worker.signals.error.connect(self._handle_open_orders_error)
             self._thread_pool.start(worker)
             if reason and not force_refresh:
-                self._append_log(f"[ORDERS] stale -> refresh reason={reason}", kind="INFO")
+                self._maybe_log_stale_refresh(reason)
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_open_orders")
             self._notify_crash("_refresh_open_orders")
@@ -5651,6 +5760,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._bot_client_ids.add(client_order_id)
         self._sync_active_ids_from_open_orders()
         self._sync_registry_from_open_orders(self._open_orders)
+        self._registry_dirty = False
 
     def _refresh_fills(self) -> None:
         try:
@@ -5799,6 +5909,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         for order_id in closed_order_ids:
             self._closed_order_ids.add(order_id)
             self._discard_registry_for_order_id(order_id)
+        self._registry_dirty = False
+        self._fills_changed_since_refresh = False
         self._render_open_orders()
         self._grid_engine.sync_open_orders(self._open_orders)
         missing = [
@@ -5880,6 +5992,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._recent_order_keys.clear()
         self._order_id_to_registry_key.clear()
         self._registry_key_last_seen_ts.clear()
+        self._registry_dirty = True
 
     def _rebuild_registry_from_open_orders(self, orders: list[dict[str, Any]]) -> None:
         self._clear_local_order_registry()
@@ -5907,7 +6020,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             qty_key = self._format_decimal(self.q_qty(self.as_decimal(qty), step), step)
             registry_key = self._order_registry_key(side, price_key, qty_key, order_type)
             if registry_key not in self._active_order_keys:
-                self._register_order_key(registry_key)
+                self._register_order_key(registry_key, mark_dirty=False)
             self._registry_key_last_seen_ts[registry_key] = now
             if order_id:
                 self._order_id_to_registry_key[order_id] = registry_key
@@ -5989,16 +6102,29 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _mark_recent_order_key(self, key: str, ttl_s: float) -> None:
         self._recent_order_keys[key] = monotonic() + ttl_s
 
-    def _register_order_key(self, key: str, ttl_s: float | None = None) -> None:
+    def _mark_registry_dirty(self) -> None:
+        self._registry_dirty = True
+
+    def _register_order_key(self, key: str, ttl_s: float | None = None, *, mark_dirty: bool = True) -> None:
         self._active_order_keys.add(key)
         self._registry_key_last_seen_ts[key] = time_fn()
         self._mark_recent_order_key(key, ttl_s or self._recent_key_ttl_s)
+        if mark_dirty:
+            self._mark_registry_dirty()
 
-    def _discard_order_registry_key(self, key: str, *, drop_recent: bool = False) -> None:
+    def _discard_order_registry_key(
+        self,
+        key: str,
+        *,
+        drop_recent: bool = False,
+        mark_dirty: bool = True,
+    ) -> None:
         self._active_order_keys.discard(key)
         self._registry_key_last_seen_ts.pop(key, None)
         if drop_recent:
             self._recent_order_keys.pop(key, None)
+        if mark_dirty:
+            self._mark_registry_dirty()
 
     def _discard_registry_for_order_id(self, order_id: str) -> None:
         key = self._order_id_to_registry_key.pop(order_id, None)
@@ -6250,6 +6376,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if fill_key in self._fill_keys:
             return
         self._fill_keys.add(fill_key)
+        self._fills_changed_since_refresh = True
         if fill.order_id:
             existing_order = self._open_orders_map.get(fill.order_id, {})
             client_order_id = str(existing_order.get("clientOrderId", ""))
@@ -7004,6 +7131,18 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 restore_reason = "skip_duplicate_local"
                 allow_restore = False
         if allow_restore:
+            price_str = self.fmt_price(restore_price, tick)
+            qty_str = self.fmt_qty(restore_qty, step)
+            registry_key = self._order_registry_key(
+                restore_side,
+                price_str,
+                qty_str,
+                self._order_registry_type("restore"),
+            )
+            if registry_key in self._active_order_keys or registry_key in self._recent_order_keys:
+                restore_reason = "skip_duplicate_restore"
+                allow_restore = False
+        if allow_restore:
             restore_action_key = build_action_key("RESTORE", fill.order_id, restore_price, restore_qty, step)
             if restore_action_key in self._active_action_keys:
                 restore_reason = "skip_duplicate_local"
@@ -7035,6 +7174,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 restore_key_detail = (
                     f"clientId={restore_client_order_id} "
                     f"local_key={build_action_key('RESTORE', fill.order_id, intended_restore_price, intended_restore_qty, step)} "
+                )
+            elif restore_reason == "skip_duplicate_restore":
+                restore_key_detail = (
+                    f"registry_key={self._order_registry_key(restore_side, self.fmt_price(restore_price, tick), self.fmt_qty(restore_qty, step), self._order_registry_type('restore'))} "
                 )
             self._append_log(
                 (

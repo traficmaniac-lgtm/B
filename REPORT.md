@@ -1,5 +1,21 @@
 ## Technical Report
 
+### NC MICRO v1.6.6
+- Added stale refresh limiter with per-reason rate limits, poll change detection, and deduped logging counters.
+- Introduced per-symbol router hysteresis with deterministic source selection and compact router status fields for UI.
+- Guarded WS shutdown paths to skip closed-loop enqueues with rate-limited logs.
+- Hardened NC MICRO order registry to skip duplicate RESTORE placements via active registry keys.
+- Added MarketHealth KPI with edge/expected-profit calculations and thin-edge logging.
+
+Manual check (EURIUSDT, ~10 min):
+1. Open NC MICRO for EURIUSDT and leave WS in flapping state (toggle network or simulate degraded WS).
+2. Observe router status: `src` stays stable (usually HTTP) and does not switch every second.
+3. Let the app run for a few minutes with no order changes; confirm `[ORDERS] stale -> refresh` logs appear
+   no more than once every ~5s and refreshes are spaced out.
+4. Trigger a fill (or simulate) and verify RESTORE is not duplicated; logs show `skip_duplicate_restore` if
+   a duplicate is attempted.
+5. Stop the window/app; confirm no `RuntimeError: Event loop is closed` and shutdown logs are orderly.
+
 ### NC MICRO v1.0.5
 - Hardened NC_MICRO HTTP book success handlers with bound callbacks, self guards, and payload safety to prevent runtime crashes.
 
