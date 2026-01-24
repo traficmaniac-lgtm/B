@@ -56,6 +56,7 @@ from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
 from src.core.micro_edge import compute_expected_edge_bps
 from src.core.nc_micro_refresh import compute_refresh_allowed
+from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
 from src.gui.i18n import TEXT, tr
 from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
 from src.gui.models.app_state import AppState
@@ -225,7 +226,6 @@ class PilotState(Enum):
 
 
 class PilotAction(Enum):
-    TOGGLE = "TOGGLE"
     RECENTER = "RECENTER"
     RECOVERY = "RECOVERY"
     FLATTEN_BE = "FLATTEN_BE"
@@ -988,9 +988,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._stop_in_progress = False
         self._stop_requested = False
         self._pilot_state = PilotState.OFF
-        self._pilot_auto_actions_enabled = True
+        self.pilot_enabled = False
+        self.pilot_config = PilotConfig()
         self._pilot_confirm_dry_run = False
-        self._pilot_allow_market = False
+        self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_action_in_progress = False
         self._current_action: str | None = None
         self._pilot_pending_action: PilotAction | None = None
@@ -1010,7 +1011,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._last_snapshot_refresh_ts = 0.0
         self._snapshot_refresh_inflight = False
         self._snapshot_refresh_suppressed_log_ts: float | None = None
-        self._pilot_stale_policy = StalePolicy.NONE
+        self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         self._pilot_pending_cancel_ids: set[str] = set()
         self._pilot_stale_seen_ids: dict[str, float] = {}
         self._pilot_stale_handled: dict[str, float] = {}
@@ -1375,14 +1376,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._settings_state = self._micro_grid_defaults()
 
     def _profit_guard_slippage_pct(self) -> float:
-        if self._is_micro_profile():
-            return MICRO_STABLECOIN_SLIPPAGE_PCT
-        return PROFIT_GUARD_SLIPPAGE_BPS * 0.01
+        return max(self.pilot_config.slippage_bps, 0.0) * 0.01
 
     def _profit_guard_pad_pct(self) -> float:
-        if self._is_micro_profile():
-            return MICRO_STABLECOIN_PAD_PCT
-        return PROFIT_GUARD_EXTRA_BUFFER_PCT
+        return max(self.pilot_config.pad_bps, 0.0) * 0.01
 
     def _profit_guard_buffer_pct(self) -> float:
         if self._is_micro_profile():
@@ -1390,9 +1387,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return PROFIT_GUARD_BUFFER_PCT
 
     def _profit_guard_min_floor_pct(self) -> float:
-        if self._is_micro_profile():
-            return MICRO_STABLECOIN_THIN_EDGE_MIN_PROFIT_PCT
-        return PROFIT_GUARD_MIN_FLOOR_PCT
+        return max(self.pilot_config.min_expected_profit_bps, 0.0) * 0.01
 
     def _build_right_panel(self) -> QSplitter:
         self._right_splitter = QSplitter(Qt.Vertical)
@@ -1562,54 +1557,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         algo_pilot_layout.addWidget(metrics_widget, stretch=0)
         algo_pilot_layout.addSpacing(6)
 
-        self._pilot_toggle_button = QPushButton("Пилот ВКЛ / ВЫКЛ")
-        self._pilot_toggle_button.clicked.connect(self._handle_pilot_toggle)
-        self._pilot_recenter_button = QPushButton("Перестроить сетку")
-        self._pilot_recenter_button.clicked.connect(self._handle_pilot_recenter)
-        self._pilot_recovery_button = QPushButton("В режим безубытка")
-        self._pilot_recovery_button.clicked.connect(self._handle_pilot_recovery)
-        self._pilot_flatten_button = QPushButton("Закрыть в безубыток")
-        self._pilot_flatten_button.clicked.connect(self._handle_pilot_flatten)
-        self._pilot_flag_stale_button = QPushButton("Пометить устаревшие")
-        self._pilot_flag_stale_button.clicked.connect(self._handle_pilot_flag_stale)
-        self._pilot_toggle_button.setToolTip(
-            "Включить/выключить автологику пилота (пока без торговли)"
-        )
-        self._pilot_recenter_button.setToolTip(
-            "Отменить текущие ордера и построить сетку заново от текущей цены"
-        )
-        self._pilot_recovery_button.setToolTip(
-            "Защитный режим: цель — выйти в 0 с учётом комиссии"
-        )
-        self._pilot_flatten_button.setToolTip(
-            "Отменить всё и закрыть позицию по цене безубытка"
-        )
-        self._pilot_flag_stale_button.setToolTip(
-            "Проверить ордера по дрейфу цены и предложить действие"
-        )
-        self._pilot_auto_actions_toggle = QCheckBox("Авто-действия пилота")
-        self._pilot_auto_actions_toggle.setChecked(True)
-        self._pilot_auto_actions_toggle.setEnabled(False)
-        self._pilot_auto_actions_toggle.setToolTip(
-            "Если включено — пилот может сам выполнять Перестроить/Recovery по триггерам (с подтверждением в LIVE)"
-        )
-        self._pilot_auto_actions_toggle.toggled.connect(self._handle_pilot_auto_actions_toggle)
-        self._pilot_stale_policy_combo = QComboBox()
-        self._pilot_stale_policy_combo.addItem("Policy: NONE", StalePolicy.NONE)
-        self._pilot_stale_policy_combo.addItem("Policy: RECENTER", StalePolicy.RECENTER)
-        self._pilot_stale_policy_combo.addItem("Policy: CANCEL_REPLACE", StalePolicy.CANCEL_REPLACE_STALE)
-        self._pilot_stale_policy_combo.setCurrentIndex(0)
-        self._pilot_stale_policy_combo.setToolTip(
-            "Политика реакции на устаревшие ордера (только при авто-действиях)"
-        )
-        self._pilot_stale_policy_combo.currentIndexChanged.connect(self._handle_pilot_stale_policy_change)
-        self._pilot_confirm_dry_run_toggle = QCheckBox("Всегда спрашивать (DRY)")
-        self._pilot_confirm_dry_run_toggle.setChecked(False)
-        self._pilot_confirm_dry_run_toggle.setEnabled(False)
-        self._pilot_confirm_dry_run_toggle.toggled.connect(self._handle_pilot_confirm_dry_run_toggle)
-        self._pilot_allow_market_toggle = QCheckBox("Разрешить MARKET (закрытие)")
-        self._pilot_allow_market_toggle.setChecked(False)
-        self._pilot_allow_market_toggle.toggled.connect(self._handle_pilot_allow_market_toggle)
+        self._pilot_status_label = QLabel(self._pilot_status_text())
+        self._pilot_status_label.setStyleSheet("color: #111827; font-weight: 600;")
+        self._pilot_enable_button = QPushButton("▶ Пилот ВКЛ")
+        self._pilot_enable_button.clicked.connect(self._handle_pilot_enable)
+        self._pilot_disable_button = QPushButton("⏹ Пилот ВЫКЛ")
+        self._pilot_disable_button.clicked.connect(self._handle_pilot_disable)
+        self._pilot_settings_button = QPushButton("⚙ Настройки пилота")
+        self._pilot_settings_button.clicked.connect(self._handle_pilot_settings)
+        self._pilot_enable_button.setToolTip("Включить пилот (авто-действия активны).")
+        self._pilot_disable_button.setToolTip("Выключить пилот (авто-действия отключены).")
+        self._pilot_settings_button.setToolTip("Открыть настройки пилота.")
         self._pilot_action_status_label = QLabel("Статус: —")
         self._pilot_action_status_label.setStyleSheet("color: #6b7280; font-size: 11px;")
 
@@ -1618,21 +1576,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         pilot_buttons_layout = QVBoxLayout(buttons_widget)
         pilot_buttons_layout.setSpacing(6)
         for button in (
-            self._pilot_toggle_button,
-            self._pilot_recenter_button,
-            self._pilot_recovery_button,
-            self._pilot_flatten_button,
-            self._pilot_flag_stale_button,
+            self._pilot_enable_button,
+            self._pilot_disable_button,
+            self._pilot_settings_button,
         ):
             button.setMinimumHeight(34)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            pilot_buttons_layout.addWidget(button)
-
-        pilot_buttons_layout.addSpacing(6)
-        pilot_buttons_layout.addWidget(self._pilot_auto_actions_toggle)
-        pilot_buttons_layout.addWidget(self._pilot_stale_policy_combo)
-        pilot_buttons_layout.addWidget(self._pilot_confirm_dry_run_toggle)
-        pilot_buttons_layout.addWidget(self._pilot_allow_market_toggle)
+        pilot_buttons_layout.addWidget(self._pilot_status_label)
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(6)
+        controls_row.addWidget(self._pilot_enable_button)
+        controls_row.addWidget(self._pilot_disable_button)
+        controls_row.addWidget(self._pilot_settings_button)
+        pilot_buttons_layout.addLayout(controls_row)
+        pilot_buttons_layout.addSpacing(4)
         pilot_buttons_layout.addWidget(self._pilot_action_status_label)
         pilot_buttons_layout.addStretch(1)
         algo_pilot_layout.addWidget(buttons_widget, stretch=0)
@@ -1991,68 +1948,81 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._apply_log_filter()
         return frame
 
-    def _handle_pilot_toggle(self) -> None:
-        self._pilot_execute(PilotAction.TOGGLE)
+    def _handle_pilot_enable(self) -> None:
+        self._set_pilot_enabled(True)
 
-    def _handle_pilot_recenter(self) -> None:
-        self._pilot_execute(PilotAction.RECENTER)
+    def _handle_pilot_disable(self) -> None:
+        self._set_pilot_enabled(False)
 
-    def _handle_pilot_recovery(self) -> None:
-        self._pilot_execute(PilotAction.RECOVERY)
+    def _handle_pilot_settings(self) -> None:
+        dialog = PilotSettingsDialog(self.pilot_config, on_save=self._apply_pilot_config, parent=self)
+        dialog.exec()
 
-    def _handle_pilot_flatten(self) -> None:
-        self._pilot_execute(PilotAction.FLATTEN_BE)
+    def _apply_pilot_config(self, config: PilotConfig) -> None:
+        self.pilot_config = config
+        self._pilot_stale_policy = self._resolve_pilot_stale_policy(config.stale_policy)
+        self._pilot_allow_market = config.allow_market_close
+        self._append_log(
+            (
+                "[PILOT] settings updated "
+                f"stale_policy={config.stale_policy} allow_market_close={str(config.allow_market_close).lower()}"
+            ),
+            kind="INFO",
+        )
 
-    def _handle_pilot_flag_stale(self) -> None:
-        self._pilot_execute(PilotAction.FLAG_STALE)
+    @staticmethod
+    def _resolve_pilot_stale_policy(value: str) -> StalePolicy:
+        mapping = {
+            "NONE": StalePolicy.NONE,
+            "RECENTER": StalePolicy.RECENTER,
+            "CANCEL_REPLACE": StalePolicy.CANCEL_REPLACE_STALE,
+            "CANCEL_REPLACE_STALE": StalePolicy.CANCEL_REPLACE_STALE,
+        }
+        return mapping.get(value.upper(), StalePolicy.CANCEL_REPLACE_STALE)
 
-    def _handle_pilot_auto_actions_toggle(self, checked: bool) -> None:
-        self._pilot_auto_actions_enabled = True
-        if hasattr(self, "_pilot_auto_actions_toggle"):
-            self._pilot_auto_actions_toggle.blockSignals(True)
-            self._pilot_auto_actions_toggle.setChecked(True)
-            self._pilot_auto_actions_toggle.blockSignals(False)
-        self._append_log("[NC MICRO] auto-actions FORCED", kind="INFO")
-
-    def _handle_pilot_confirm_dry_run_toggle(self, checked: bool) -> None:
-        self._pilot_confirm_dry_run = False
-        if hasattr(self, "_pilot_confirm_dry_run_toggle"):
-            self._pilot_confirm_dry_run_toggle.blockSignals(True)
-            self._pilot_confirm_dry_run_toggle.setChecked(False)
-            self._pilot_confirm_dry_run_toggle.blockSignals(False)
-        self._append_log("[NC MICRO] dry-run confirm IGNORED", kind="INFO")
-
-    def _handle_pilot_allow_market_toggle(self, checked: bool) -> None:
-        self._pilot_allow_market = checked
-        state = "enabled" if checked else "disabled"
-        self._append_log(f"[NC MICRO] market close {state}", kind="INFO")
-
-    def _handle_pilot_stale_policy_change(self, _: int) -> None:
-        if not hasattr(self, "_pilot_stale_policy_combo"):
+    def _set_pilot_enabled(self, enabled: bool) -> None:
+        if self.pilot_enabled == enabled:
             return
-        policy = self._pilot_stale_policy_combo.currentData()
-        if isinstance(policy, StalePolicy):
-            self._pilot_stale_policy = policy
-            self._append_log(f"[NC MICRO] stale policy={policy.value}", kind="INFO")
+        self.pilot_enabled = enabled
+        if enabled:
+            self._pilot_anchor_price = self._last_price
+            self._set_pilot_state(PilotState.NORMAL)
+            self._append_log("[PILOT] enabled", kind="INFO")
+        else:
+            self._pilot_anchor_price = None
+            self._set_pilot_state(PilotState.OFF)
+            self._log_pilot_disabled()
+        self._set_pilot_buttons_enabled(not self._pilot_action_in_progress)
+
+    def _pilot_status_text(self) -> str:
+        return "Пилот: ON (MICRO)" if self.pilot_enabled else "Пилот: OFF"
+
+    def _log_pilot_disabled(self) -> None:
+        self._append_log("[PILOT] disabled, guard=warn_only", kind="INFO")
+
+    def _log_pilot_auto_action(self, *, action: str, reason: str) -> None:
+        expected_profit = None
+        if self._market_health and self._market_health.expected_profit_bps is not None:
+            expected_profit = self._market_health.expected_profit_bps
+        expected_text = f"{expected_profit:.2f}" if isinstance(expected_profit, (int, float)) else "—"
+        self._append_log(
+            f"[PILOT] action={action} reason={reason} expected_profit_bps={expected_text}",
+            kind="INFO",
+        )
 
     def _set_pilot_buttons_enabled(self, enabled: bool) -> None:
         for name in (
-            "_pilot_toggle_button",
-            "_pilot_recenter_button",
-            "_pilot_recovery_button",
-            "_pilot_flatten_button",
-            "_pilot_flag_stale_button",
-            "_pilot_auto_actions_toggle",
-            "_pilot_stale_policy_combo",
-            "_pilot_confirm_dry_run_toggle",
-            "_pilot_allow_market_toggle",
+            "_pilot_enable_button",
+            "_pilot_disable_button",
+            "_pilot_settings_button",
         ):
             if hasattr(self, name):
-                control = getattr(self, name)
-                if name in {"_pilot_auto_actions_toggle", "_pilot_confirm_dry_run_toggle"}:
-                    control.setEnabled(False)
-                else:
-                    control.setEnabled(enabled)
+                getattr(self, name).setEnabled(enabled)
+        if enabled:
+            if hasattr(self, "_pilot_enable_button"):
+                self._pilot_enable_button.setEnabled(not self.pilot_enabled)
+            if hasattr(self, "_pilot_disable_button"):
+                self._pilot_disable_button.setEnabled(self.pilot_enabled)
 
     def _set_pilot_action_in_progress(self, enabled: bool, *, status: str | None = None) -> None:
         self._pilot_action_in_progress = enabled
@@ -2064,7 +2034,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _pilot_action_label(self, action: PilotAction) -> str:
         mapping = {
-            PilotAction.TOGGLE: "Пилот ВКЛ/ВЫКЛ",
             PilotAction.RECENTER: "Перестроить сетку",
             PilotAction.RECOVERY: "В режим безубытка",
             PilotAction.FLATTEN_BE: "Закрыть в безубыток",
@@ -2137,12 +2106,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             PilotAction.RECENTER: "recenter",
             PilotAction.RECOVERY: "recovery",
             PilotAction.FLATTEN_BE: "flatten",
-            PilotAction.TOGGLE: "toggle",
             PilotAction.FLAG_STALE: "flag_stale",
             PilotAction.CANCEL_REPLACE_STALE: "cancel_replace_stale",
         }
         requested = action_key.get(action, action.value.lower())
         if self._action_lock_blocked(requested):
+            return
+        if not self.pilot_enabled:
+            self._log_pilot_disabled()
             return
         if self._pilot_action_in_progress:
             self._pilot_block_action(action, "in_progress")
@@ -2167,14 +2138,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 f"[NC_MICRO] auto-exec action={requested} reason={exec_reason}",
                 kind="INFO",
             )
-        if action == PilotAction.TOGGLE:
-            next_state = PilotState.NORMAL if self._pilot_state == PilotState.OFF else PilotState.OFF
-            if next_state == PilotState.NORMAL:
-                self._pilot_anchor_price = self._last_price
-            else:
-                self._pilot_anchor_price = None
-            self._set_pilot_state(next_state)
-            return
+            self._log_pilot_auto_action(
+                action="shift_grid" if action == PilotAction.RECENTER else requested,
+                reason=exec_reason,
+            )
         if action == PilotAction.FLAG_STALE:
             (
                 total,
@@ -2332,6 +2299,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         auto: bool = False,
         reason: str | None = None,
     ) -> None:
+        if not self.pilot_enabled:
+            self._log_pilot_disabled()
+            return
         if not self._pilot_trade_gate_ready(PilotAction.CANCEL_REPLACE_STALE):
             return
         if not stale_orders:
@@ -2378,6 +2348,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 f"[NC_MICRO] auto-exec action=cancel_replace_stale reason={exec_reason}",
                 kind="INFO",
             )
+            self._log_pilot_auto_action(action="cancel_replace_stale", reason=exec_reason)
         if not self._pilot_confirm_action(PilotAction.CANCEL_REPLACE_STALE, summary):
             return
         self._pilot_stale_action_ts[self._symbol] = time_fn()
@@ -2799,7 +2770,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._last_price is None:
             return None
         if auto:
-            return self._last_price
+            if self.pilot_config.auto_shift_anchor:
+                return self._last_price
+            return self._pilot_anchor_price or self._last_price
         if self._pilot_anchor_price is None or self._pilot_anchor_price == self._last_price:
             return self._last_price
         return self._last_price
@@ -3127,6 +3100,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if not hasattr(self, "_pilot_state_value"):
                 return
             self._pilot_state_value.setText(self._pilot_state_label(self._pilot_state))
+            if hasattr(self, "_pilot_status_label"):
+                self._pilot_status_label.setText(self._pilot_status_text())
             regime = "Диапазон"
             if len(self._price_history) >= 10:
                 first_price = self._price_history[0]
@@ -3161,7 +3136,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     f"[NC MICRO] auto-recenter trigger distance={distance_pct:.2f}% symbol={self._symbol}",
                     kind="INFO",
                 )
-                if self._pilot_auto_actions_enabled:
+                if self.pilot_enabled:
                     self._pilot_execute(PilotAction.RECENTER, auto=True, reason="distance")
                 else:
                     self._pilot_set_warning("Рекомендуется перестроить")
@@ -3186,13 +3161,6 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._pilot_break_even_value.setToolTip("")
             else:
                 self._pilot_break_even_value.setToolTip("")
-            has_position = position_qty > 0
-            be_actions_enabled = has_position and break_even is not None and break_even > 0
-            if hasattr(self, "_pilot_recovery_button"):
-                self._pilot_recovery_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
-            if hasattr(self, "_pilot_flatten_button"):
-                self._pilot_flatten_button.setEnabled(be_actions_enabled and not self._pilot_action_in_progress)
-
             pnl_text = "—"
             if self._last_price is not None and self._base_asset:
                 base_free = self._balances.get(self._base_asset, (0.0, 0.0))[0]
@@ -3947,7 +3915,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         stale_orders = self._stale_action_candidates(stale_orders)
         if not stale_orders:
             return
-        if not self._pilot_auto_actions_enabled:
+        if not self.pilot_enabled:
             return
         if self._pilot_auto_actions_paused_until and monotonic() < self._pilot_auto_actions_paused_until:
             return
@@ -6648,6 +6616,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return 2 * maker_pct
 
     def _current_profit_guard_mode(self) -> ProfitGuardMode:
+        if not self.pilot_enabled:
+            return ProfitGuardMode.WARN_ONLY
         if self._fee_source == "OVERRIDE":
             return ProfitGuardMode.WARN_ONLY
         return ProfitGuardMode.WARN_ONLY if self._fee_unverified else self._profit_guard_mode
@@ -6806,7 +6776,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         action_label: str,
         update_ui: bool,
         min_profit_pct: float,
-    ) -> None:
+    ) -> bool:
         tp_old = settings.take_profit_pct
         step_old = settings.grid_step_pct
         range_low_old = settings.range_low_pct
@@ -6824,6 +6794,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             settings.range_low_pct = min_range_pct
         if settings.range_high_pct < min_range_pct:
             settings.range_high_pct = min_range_pct
+        changed = (
+            settings.take_profit_pct != tp_old
+            or settings.grid_step_pct != step_old
+            or settings.range_low_pct != range_low_old
+            or settings.range_high_pct != range_high_old
+        )
         if settings.take_profit_pct != tp_old:
             self._append_log(
                 (
@@ -6879,6 +6855,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 or settings.range_high_pct != range_high_old
             ):
                 self._update_grid_preview()
+        return changed
 
     def _apply_profit_guard(
         self,
@@ -6928,14 +6905,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             )
             if guard_mode == ProfitGuardMode.BLOCK:
                 return "HOLD"
-        if self.enable_guard_autofix:
-            self._profit_guard_autofix(
+        if self.enable_guard_autofix and self.pilot_enabled:
+            changed = self._profit_guard_autofix(
                 settings,
                 anchor_price,
                 action_label=action_label,
                 update_ui=update_ui,
                 min_profit_pct=min_profit_pct,
             )
+            if changed:
+                self._log_pilot_auto_action(action="guard_autofix", reason="thin_edge")
         return "OK"
 
     def _evaluate_tp_profitability(self, tp_pct: float) -> dict[str, float | bool]:
