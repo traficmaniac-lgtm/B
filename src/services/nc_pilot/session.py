@@ -71,6 +71,7 @@ class PilotAlgoState:
     last_valid: bool = False
     last_profit_bps: float | None = None
     last_suggested_action: str | None = None
+    last_symbol: str | None = None
     life_ms: int = 0
     last_ts: float | None = None
 
@@ -96,6 +97,9 @@ class PilotRuntimeState:
     indicator_states: dict[str, bool] = field(default_factory=dict)
     indicator_tooltips: dict[str, str] = field(default_factory=dict)
     algo_states: dict[str, PilotAlgoState] = field(default_factory=dict)
+    min_edge_bps: float = 0.5
+    max_age_ms: int = 1500
+    max_notional: float = 200.0
 
 
 @dataclass
