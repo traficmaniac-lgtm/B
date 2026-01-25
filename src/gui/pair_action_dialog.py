@@ -18,6 +18,7 @@ from src.gui.models.pair_mode import (
     PAIR_MODE_LITE,
     PAIR_MODE_LITE_ALL_STRATEGY,
     PAIR_MODE_NC_MICRO,
+    PAIR_MODE_NC_PILOT,
     PairMode,
 )
 
@@ -57,6 +58,12 @@ class PairActionDialog(QDialog):
             description="No-Commission Micro Grid (auto pilot)",
             button_text="Open NC MICRO",
             on_click=lambda: self._choose_mode(PAIR_MODE_NC_MICRO),
+        ))
+        layout.addWidget(self._build_option_card(
+            title="NC PILOT",
+            description="Experimental pilot based on NC MICRO (v1)",
+            button_text="Open NC PILOT",
+            on_click=lambda: self._choose_mode(PAIR_MODE_NC_PILOT),
         ))
         layout.addStretch()
         self.setLayout(layout)
