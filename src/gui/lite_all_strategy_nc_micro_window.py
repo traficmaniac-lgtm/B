@@ -5,7 +5,6 @@ import faulthandler
 import json
 import os
 import random
-import sys
 import threading
 import time
 import traceback
@@ -58,6 +57,7 @@ from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
 from src.core.micro_edge import compute_expected_edge_bps
+from src.core.crash_guard import register_crash_log_path, register_panic_hold_callback, safe_qt
 from src.core.nc_micro_safe_call import safe_call
 from src.core.nc_micro_stop import finalize_stop_state
 from src.core.nc_micro_exec_dedup import CumulativeFillTracker, TradeIdDeduper, should_block_new_orders
@@ -121,26 +121,7 @@ def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> tuple[str, obje
         except Exception:
             return
 
-    def _sys_hook(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
-        _write_traceback("SYS", exc_type, exc, tb)
-        try:
-            logger.exception("[NC_MICRO][CRASH] unhandled exception", exc_info=(exc_type, exc, tb))
-        except Exception:
-            return
-
-    def _thread_hook(args: threading.ExceptHookArgs) -> None:
-        _write_traceback(f"THREAD:{args.thread.name}", args.exc_type, args.exc_value, args.exc_traceback)
-        try:
-            logger.exception(
-                "[NC_MICRO][CRASH] unhandled thread exception",
-                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-            )
-        except Exception:
-            return
-
-    sys.excepthook = _sys_hook
-    if hasattr(threading, "excepthook"):
-        threading.excepthook = _thread_hook
+    register_crash_log_path(crash_log_path)
     return crash_log_path, crash_file
 
 
@@ -858,27 +839,43 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._last_trade_source_change_ms = 0
         self._signals = _LiteGridSignals()
         self._signals.price_update.connect(
-            lambda update: self._safe_call(
-                lambda: self._apply_price_update(update),
+            lambda update: safe_qt(
+                lambda: self._safe_call(
+                    lambda: self._apply_price_update(update),
+                    label="signal:price_update",
+                ),
                 label="signal:price_update",
+                logger=self._logger,
             )
         )
         self._signals.status_update.connect(
-            lambda status, message: self._safe_call(
-                lambda: self._apply_status_update(status, message),
+            lambda status, message: safe_qt(
+                lambda: self._safe_call(
+                    lambda: self._apply_status_update(status, message),
+                    label="signal:status_update",
+                ),
                 label="signal:status_update",
+                logger=self._logger,
             )
         )
         self._signals.log_append.connect(
-            lambda message, kind: self._safe_call(
-                lambda: self._append_log(message, kind=kind),
+            lambda message, kind: safe_qt(
+                lambda: self._safe_call(
+                    lambda: self._append_log(message, kind=kind),
+                    label="signal:log_append",
+                ),
                 label="signal:log_append",
+                logger=self._logger,
             )
         )
         self._signals.api_error.connect(
-            lambda message: self._safe_call(
-                lambda: self._handle_live_api_error(message),
+            lambda message: safe_qt(
+                lambda: self._safe_call(
+                    lambda: self._handle_live_api_error(message),
+                    label="signal:api_error",
+                ),
                 label="signal:api_error",
+                logger=self._logger,
             )
         )
         self._log_entries: list[tuple[str, str]] = []
@@ -891,6 +888,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             f"[NC_MICRO] crash catcher installed path={self._crash_log_path}",
             kind="INFO",
         )
+        register_panic_hold_callback(self.panic_hold)
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._handle_about_to_quit)
@@ -3609,6 +3607,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_hold_reason = reason
             self._pilot_hold_until = now + hold_timeout if hold_timeout else now
             self._set_pilot_state(PilotState.HOLD, reason=reason)
+        except Exception:
+            return
+
+    def panic_hold(self, reason: str) -> None:
+        if self._closing:
+            return
+        try:
+            self._logger.error("[NC_MICRO][PANIC] hold reason=%s", reason)
+            self._current_action = None
+            self._pilot_pending_action = None
+            self._pilot_pending_plan = None
+            self._set_pilot_action_in_progress(False)
+            self._pilot_force_hold(reason=f"panic:{reason}")
         except Exception:
             return
 
