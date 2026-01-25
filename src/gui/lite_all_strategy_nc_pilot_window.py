@@ -1563,7 +1563,7 @@ class NcPilotTabWidget(QWidget):
         left_stack = QSplitter(Qt.Vertical)
         left_stack.setChildrenCollapsible(False)
         left_stack.addWidget(self._build_pairs_overview_panel())
-        left_stack.addWidget(self._build_arb_indicators_panel())
+        left_stack.addWidget(self._build_market_panel())
         left_stack.setStretchFactor(0, 2)
         left_stack.setStretchFactor(1, 1)
 
