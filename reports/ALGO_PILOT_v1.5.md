@@ -252,3 +252,64 @@ Profit guard поднимает TP/step/range до минимально приб
 ---
 
 Если нужно добавить разделы (например, детальный список сигналов/слотов, протоколы ошибок или сценарии тестирования), можно расширить документ точечно.
+
+## 10. Политики управления риском (guard policies)
+
+ALGO PILOT использует несколько «слоёв» guard‑логики, которые влияют на доступные действия:
+
+- **Market Health Guard** — блокирует действия при отсутствии bid/ask, слишком широком спреде или повышенной волатильности.
+- **Profit Guard** — динамически поднимает минимальные TP/step/range, чтобы обеспечить положительный expected edge.
+- **Break‑even Guard** — ограничивает перестроение, если оно выводит сетку ниже/выше цены безубытка.
+- **Trade Gate** — управляет LIVE‑доступом (ключи, canTrade, read‑only, подтверждение).
+
+### 10.1 Границы действий
+
+| Действие | Разрешено при | Блокируется при |
+| --- | --- | --- |
+| `RECENTER` | MarketHealth=OK, TradeGate=OK | no bid/ask, thin‑edge, live‑gate fail |
+| `RECOVERY` | MarketHealth=OK | spread spike, no bid/ask |
+| `FLATTEN_BE` | TradeGate=OK | live‑gate fail |
+| `CANCEL_REPLACE_STALE` | MarketHealth=OK | stale cooldown, thin‑edge |
+
+## 11. State machine пилота (упрощённо)
+
+```
+OFF -> NORMAL
+NORMAL -> RECENTERING -> NORMAL
+NORMAL -> RECOVERY -> NORMAL
+NORMAL -> PAUSED_BY_RISK -> NORMAL
+```
+
+- В `PAUSED_BY_RISK` любые авто‑действия блокированы, UI продолжает обновляться.
+- В `RECENTERING/RECOVERY` любые новые действия ставятся в очередь или отбрасываются.
+
+## 12. Потоки данных и момент принятия решений
+
+1. **Price feed** обновляет last/bid/ask + source.
+2. **KPI вычисления** формируют MarketHealth, spread/vol.
+3. **GridEngine** пересчитывает план при изменении параметров или триггерах.
+4. **Pilot decision** определяет intent (`recenter`, `recovery`, `flag_stale`).
+5. **Order router** отправляет действия через NetWorker (dedup/priority).
+6. **Registry** обновляет локальный снимок и guard‑состояния.
+
+## 13. Типовые edge‑cases и защита
+
+- **WS flapping** → приоритет HTTP, переход в `WAITING_BOOK` до появления bid/ask.
+- **Partial fills** → cumulative tracking + единый TP‑план на суммарный объём.
+- **Stale loop** → rate‑limit refresh, cooldown по причинам.
+- **Live‑режим без подтверждения** → автоматический fallback в DRY‑RUN.
+
+## 14. Операционный чек‑лист
+
+1. Проверить MarketHealth (bid/ask, spread, vol) перед LIVE.
+2. Убедиться, что `TradeGate=OK` и ключи имеют `canTrade=true`.
+3. Проверить, что включён Profit Guard (минимальный edge > 0).
+4. При включении пилота убедиться, что stale‑политика соответствует риску.
+5. Перед выключением убедиться в отсутствии inflight‑операций.
+
+## 15. Логи и диагностика
+
+- `PILOT` — изменения состояния пилота и причины блокировок.
+- `KPI` — обновления MarketHealth (spread, vol, source).
+- `ORDERS` — cancel/replace, stale‑refresh, registry updates.
+- `CRASH` — fatal‑ошибки и дампы stacktrace.

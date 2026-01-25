@@ -186,3 +186,49 @@ NC MICRO использует фоновый worker для сетевых зад
 5. Пользователь включает режим (dry‑run или live) → `GridEngine` строит сетку.
 6. Ордеры проходят trade‑gate + profit/break‑even/thin‑edge guards.
 7. Фоны: stale‑детект, refresh‑лимиты, дедуп fills, stop‑циклы, логирование.
+
+## 17. Конфигурация и tunables
+
+Основные параметры, влияющие на поведение режима:
+
+- `prices.http_poll_interval_ms` — частота HTTP‑поллинга bid/ask.
+- `prices.ws_stale_ttl_ms` — TTL для WS, после которого включается fallback.
+- `nc_micro.refresh_min_interval_ms` — минимальный интервал refresh.
+- `nc_micro.refresh_hard_ttl_ms` — hard‑TTL, после которого refresh обязателен.
+- `nc_micro.thin_edge_min_bps` — минимальный edge для разрешения действий.
+- `nc_micro.stop_watchdog_sec` — watchdog остановки.
+
+Рекомендуется подбирать значения под конкретный рынок и тип пары (high‑cap vs low‑cap).
+
+## 18. Типовые сбои и реакция
+
+- **HTTP/WS деградация** → переход в `WAITING_BOOK`, блокировка действий пилота.
+- **Дублирующиеся fills** → `ExecKeyDeduper` подавляет повторную обработку.
+- **Hanging cancel** → `cancel_reconcile` и watchdog принудительно финализируют stop.
+- **Ошибки API** → `TradeGate` блокирует live, UI остаётся в DRY‑RUN.
+
+## 19. Диагностика и сигналы логов
+
+- `[KPI]` — переходы состояния, причины `WAITING_BOOK`.
+- `[ORDERS]` — причины refresh/reconcile, stale‑skip counters.
+- `[TRADE_GATE]` — причины запрета live‑торговли.
+- `[CRASH]` — фатальные исключения и стек.
+
+При анализе инцидента важно собирать:
+- время последнего bid/ask;
+- статус источника (WS/HTTP) и latency;
+- причины guard‑блокировок (thin‑edge/stale/breakeven).
+
+## 20. Мини‑чеклист оператора
+
+1. Убедиться, что `MarketHealth` в статусе OK и `age_ms` < TTL.
+2. Проверить `TradeGate=OK`, LIVE подтверждён.
+3. Убедиться, что `ProfitGuardMode` не заблокировал действия.
+4. Проверить отсутствие stale‑refresh spam и repeated errors.
+5. Перед остановкой убедиться, что `STOPPING` завершён и ордера сняты.
+
+## 21. Взаимодействие с тестами/валидацией
+
+- Использовать manual‑скрипты из `tests/manual/*` для проверки сценариев WS‑flapping.
+- Перед релизом проверять сценарии: start/stop, stale‑fallback, partial fills.
+- При изменении refresh‑логики обновлять текстовые отчёты в `reports/REPORT.md`.

@@ -119,3 +119,35 @@
 
 - Возможны доп. роли: `liquidity booster`, `neutralizer`.
 - Поддержка альтернативных источников данных (index price, funding).
+
+## 9. Контракты между компонентами
+
+- **Pair Scanner → Cluster Builder**: список кандидатов `{symbol, liquidity_score, corr_vector}`.
+- **Cluster Builder → Signal Engine**: `ClusterPlan` (primary/secondary, hedge_ratio_target).
+- **Signal Engine → Risk Engine**: `Intent` (действие, объём, допустимые отклонения).
+- **Risk Engine → Orchestrator**: `GuardResult` (OK/REJECT + причины).
+
+## 10. Схемы данных (минимум)
+
+- `PairSnapshot`: price, bid/ask, age_ms, source, spread_bps, vol_bps.
+- `ClusterSnapshot`: net_exposure, hedge_ratio, active_pairs, guard_flags.
+- `Intent`: action, size, priority, deadline.
+
+## 11. Наблюдаемость и логирование
+
+- Сегрегация по `cluster_id` и `pair_id`.
+- Отдельные каналы: `SIGNAL`, `GUARD`, `EXEC`, `REBAL`.
+- KPI‑лог через агрегатор (1 строка в N секунд).
+
+## 12. Масштабирование
+
+- Горизонтальное масштабирование возможно по кластерам (partition по `cluster_id`).
+- Внутрикластерные операции должны быть строго последовательными.
+- Внешние сервисы (PriceFeed/NetWorker) должны поддерживать backpressure.
+
+## 13. План внедрения
+
+1. MVP: один кластер (primary + 1 secondary), ручной запуск.
+2. Автоматический Pair Scanner + простые guard‑правила.
+3. Добавление ребаланса и автопаузы.
+4. Расширение до нескольких кластеров и динамического бюджета.
