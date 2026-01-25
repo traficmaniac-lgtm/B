@@ -132,6 +132,7 @@ class SafeLoopCaller:
 class RouterConfig:
     warmup_ms: int = WARMUP_MS
     ws_stale_ms: int = WS_STALE_MS
+    fallback_cooldown_ms: int = 5000
 
 
 def decide_price_source(
@@ -1622,14 +1623,26 @@ class PriceFeedManager:
         enabled: bool,
         reason: str | None,
     ) -> None:
+        now_ms = self._now_ms()
         with self._lock:
             state = self._symbol_state.setdefault(symbol, {})
             current_enabled = state.get("http_fallback_enabled", False)
             current_reason = state.get("http_fallback_reason")
+            last_fallback_ms = state.get("http_fallback_last_ms", 0)
+            if enabled and not current_enabled:
+                if now_ms - last_fallback_ms < self._router_config.fallback_cooldown_ms:
+                    self._log_rate_limited(
+                        symbol,
+                        "http_fallback_suppressed",
+                        "info",
+                        f"[ROUTER] fallback suppressed (cooldown) symbol={symbol}",
+                    )
+                    return
             if enabled:
                 state["http_fallback_enabled"] = True
                 state["http_fallback_reason"] = reason
                 state["http_disable_grace_until_ms"] = None
+                state["http_fallback_last_ms"] = now_ms
             else:
                 state["http_fallback_enabled"] = False
                 state["http_fallback_reason"] = None
