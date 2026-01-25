@@ -1,5 +1,18 @@
 ## Technical Report
 
+### NC_MICRO v1.0.26 — Net worker, DRY-RUN fallback, bid/ask polling, GUI cleanup
+- Routed NC_MICRO Binance HTTP calls through a dedicated net worker with a single thread-bound httpx.Client to prevent SSL/thread crashes.
+- Added account snapshot preservation with error banners + backoff (1s→3s after 3 failures) so balances never reset on transient errors.
+- Enabled DRY-RUN by default with LIVE fallback messaging; added start-mode logging and tightened bid/ask polling log noise.
+- Simplified the NC_MICRO UI to only the essential controls and refreshed the grid summary line.
+
+Manual check (NC_MICRO v1.0.26):
+1. Open NC_MICRO EURIUSDT: confirm DRY-RUN ON by default and logs show `[NC_MICRO] opened. version=NC MICRO v1.0.26`.
+2. Disconnect internet / force API error: balances remain, banner reads `ACCOUNT: ERROR (kept last)`, no crash.
+3. Toggle LIVE: if trade_gate not OK, UI stays in DRY-RUN with `LIVE unavailable` banner; Start still allowed in DRY-RUN.
+4. Verify bid/ask via HTTP book polling within ~2s; `no bid/ask` logs appear at most every 5s with reason.
+5. Close window: app remains running; feed manager stays alive when other subscribers exist.
+
 ### NC_MICRO v1.0.23 — Global crash guard + Qt handler + panic HOLD
 - Added global crash guard hooks (sys/thread/Qt) that log `[CRASH] uncaught` and append tracebacks to APP/NC_MICRO crash logs.
 - Registered NC_MICRO window panic_hold callback to force Pilot HOLD and cancel pending actions on fatal exceptions.
