@@ -202,6 +202,7 @@ class OverviewTab(QWidget):
         config: Config,
         app_state: AppState,
         on_open_pair: Callable[[str], None],
+        on_open_nc_pilot: Callable[[], None] | None = None,
         price_feed_manager: PriceFeedManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -210,6 +211,7 @@ class OverviewTab(QWidget):
         self._app_state = app_state
         self._logger = get_logger("gui.overview")
         self._on_open_pair = on_open_pair
+        self._on_open_nc_pilot = on_open_nc_pilot
         self._favorites_path = self._resolve_favorites_path()
         self._favorite_symbols = self._load_favorites()
         self._active_streams: set[str] = set()
@@ -294,7 +296,15 @@ class OverviewTab(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
-        layout.addWidget(splitter)
+        modules_panel = self._build_modules_panel()
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.addWidget(splitter)
+        main_splitter.addWidget(modules_panel)
+        main_splitter.setStretchFactor(0, 5)
+        main_splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(main_splitter)
 
         self.setLayout(layout)
         self.refresh_account_status()
@@ -376,6 +386,29 @@ class OverviewTab(QWidget):
         layout.addWidget(self._refresh_button)
         layout.addStretch()
         return layout
+
+    def _build_modules_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QLabel("Modules")
+        header.setStyleSheet("font-weight: 600; font-size: 12px;")
+        layout.addWidget(header)
+
+        nc_pilot_button = QPushButton("NC PILOT (Multi-Pair)")
+        nc_pilot_button.setFixedHeight(28)
+        nc_pilot_button.clicked.connect(self._handle_open_nc_pilot)
+        nc_pilot_button.setEnabled(self._on_open_nc_pilot is not None)
+        layout.addWidget(nc_pilot_button)
+
+        layout.addStretch()
+        return panel
+
+    def _handle_open_nc_pilot(self) -> None:
+        if self._on_open_nc_pilot:
+            self._on_open_nc_pilot()
 
     def _update_selected_pair(self) -> None:
         selected = self._table.selectionModel().selectedRows()
