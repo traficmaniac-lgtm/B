@@ -79,6 +79,7 @@ from src.gui.lite_grid_math import (
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
 from src.services.nc_pilot.pilot_controller import PilotController
+from src.services.nc_pilot.kpi_state import has_valid_bidask
 from src.services.nc_pilot.session import GridSettingsState, MultiContext, NcPilotSession
 from src.services.net import get_net_worker, shutdown_net_worker
 from src.services.net.net_worker import NetWorker
@@ -91,7 +92,7 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.19"
+NC_PILOT_VERSION = "v1.0.20"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
@@ -888,7 +889,7 @@ class NcPilotTabWidget(QWidget):
         self.session = self._session
         self._pilot_controller = PilotController(self, self._session)
         self._session.pilot.selected_symbols = set(PILOT_SYMBOLS)
-        self.trade_source = "HTTP_ONLY"
+        self.trade_source = "HTTP"
         self._pending_trade_source: str | None = None
         self._last_trade_source_change_ms = 0
         self._signals = _LiteGridSignals()
@@ -1053,6 +1054,7 @@ class NcPilotTabWidget(QWidget):
         self._book_ticker_backoff_ms: dict[str, int] = {}
         self._book_ticker_backoff_until_ts: dict[str, float] = {}
         self._book_ticker_unsupported_symbols: set[str] = set()
+        self._multi_book_snapshot_symbol: str | None = None
         self._bot_order_ids: set[str] = set()
         self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
@@ -2856,9 +2858,14 @@ class NcPilotTabWidget(QWidget):
     def _pilot_invalid_label(reason: str) -> str:
         if reason.startswith("invalid_symbol:"):
             return "INVALID"
+        if reason.startswith("warming_window"):
+            detail = reason.split(":", 1)[1] if ":" in reason else ""
+            detail_text = f" {detail}" if detail else ""
+            return f"WARMING{detail_text}"
         return {
             "no_data": "NO DATA",
             "no_bidask": "NO BID/ASK",
+            "no_book": "NO BOOK",
             "stale": "STALE",
             "pair_disabled": "DISABLED",
             "no_window": "NO WINDOW",
@@ -4699,11 +4706,32 @@ class NcPilotTabWidget(QWidget):
         self._pilot_stale_warmup_last_log_ts = None
 
     def _http_book_age_ms(self) -> int | None:
+        if self._is_multi_symbol(self._symbol):
+            _symbol, age_ms = self._resolve_multi_book_snapshot()
+            return age_ms
         snapshot = self.book_snapshot or {}
         snapshot_ts = snapshot.get("ts") if snapshot else None
         if not isinstance(snapshot_ts, (int, float)):
             return None
         return int((monotonic() - snapshot_ts) * 1000)
+
+    def _resolve_multi_book_snapshot(self) -> tuple[dict[str, float] | None, int | None]:
+        best_payload: dict[str, float] | None = None
+        best_age_ms: int | None = None
+        now_ts = time_fn()
+        for symbol in self._filter_multi_pairs():
+            cached, saved_at = self._pilot_market_cache.get(symbol, "book_ticker") or (None, None)
+            if not isinstance(cached, dict) or not isinstance(saved_at, (int, float)):
+                continue
+            bid = self._coerce_float(cached.get("bidPrice"))
+            ask = self._coerce_float(cached.get("askPrice"))
+            if not self._validate_bid_ask(bid, ask, source="HTTP_BOOK"):
+                continue
+            age_ms = int((now_ts - saved_at) * 1000)
+            if best_age_ms is None or age_ms < best_age_ms:
+                best_payload = {"bid": bid, "ask": ask}
+                best_age_ms = age_ms
+        return best_payload, best_age_ms
 
     def _stale_warmup_remaining(self) -> int | None:
         if self._pilot_stale_warmup_until is None:
@@ -5545,6 +5573,8 @@ class NcPilotTabWidget(QWidget):
 
     def _is_book_ticker_supported(self, symbol: str) -> bool:
         symbol = symbol.strip().upper()
+        if self._is_multi_symbol(symbol):
+            return False
         if symbol in self._book_ticker_unsupported_symbols:
             return False
         exchange_symbols = self._pilot_exchange_symbols()
@@ -5589,15 +5619,16 @@ class NcPilotTabWidget(QWidget):
         return
 
     def _validate_bid_ask(self, bid: float | None, ask: float | None, *, source: str) -> bool:
-        if bid is None or ask is None:
-            return False
-        if not isfinite(bid) or not isfinite(ask):
-            return False
-        if ask <= bid:
-            return False
-        return True
+        return has_valid_bidask(bid, ask)
 
     def _resolve_book_bid_ask(self) -> tuple[float | None, float | None, str]:
+        if self._is_multi_symbol(self._symbol):
+            payload, _age_ms = self._resolve_multi_book_snapshot()
+            if payload:
+                bid = payload.get("bid")
+                ask = payload.get("ask")
+                if self._validate_bid_ask(bid, ask, source="HTTP_BOOK"):
+                    return bid, ask, "HTTP"
         snapshot = self.book_snapshot or {}
         bid = self._coerce_float(snapshot.get("bid")) if snapshot else None
         ask = self._coerce_float(snapshot.get("ask")) if snapshot else None
@@ -5696,13 +5727,13 @@ class NcPilotTabWidget(QWidget):
                 cooldown_sec=2.0,
             )
             return
-        if not self._is_book_ticker_supported(self._symbol):
-            return
-        if self._book_ticker_backoff_active(self._symbol, now_ts):
-            return
         if self._is_multi_symbol(self._symbol):
             self._kpi_last_book_request_ts = now_ts
             self._request_multi_book_ticker()
+            return
+        if not self._is_book_ticker_supported(self._symbol):
+            return
+        if self._book_ticker_backoff_active(self._symbol, now_ts):
             return
         self._kpi_last_book_request_ts = now_ts
         self._queue_net_request(
@@ -5725,6 +5756,7 @@ class NcPilotTabWidget(QWidget):
                 if bid is not None and ask is not None:
                     self._set_http_cache("book_ticker", payload)
                     self._clear_book_ticker_backoff(self._symbol)
+                    self._queue_trade_source("HTTP")
         except Exception:
             self._logger.exception("[NC_PILOT][CRASH] exception in _handle_book_ticker_success")
             self._notify_crash("_handle_book_ticker_success")
@@ -5756,13 +5788,13 @@ class NcPilotTabWidget(QWidget):
                 cooldown_sec=2.0,
             )
             return
-        if not self._is_book_ticker_supported(self._symbol):
-            return
-        if self._book_ticker_backoff_active(self._symbol, now_ts):
-            return
         if self._is_multi_symbol(self._symbol):
             self._bidask_last_request_ts = now_ts
             self._request_multi_book_ticker()
+            return
+        if not self._is_book_ticker_supported(self._symbol):
+            return
+        if self._book_ticker_backoff_active(self._symbol, now_ts):
             return
         self._bidask_last_request_ts = now_ts
         self._queue_net_request(
@@ -5787,6 +5819,7 @@ class NcPilotTabWidget(QWidget):
                 return
             self._set_http_cache("book_ticker", payload)
             self._clear_book_ticker_backoff(self._symbol)
+            self._queue_trade_source("HTTP")
             if not self._bidask_ready_logged:
                 self._append_log(
                     f"[BIDASK] ready src=HTTP_BOOK bid={bid:.8f} ask={ask:.8f}",
@@ -5800,12 +5833,8 @@ class NcPilotTabWidget(QWidget):
             return
 
     def _resolve_multi_symbols(self) -> list[str]:
-        raw_symbols = self._multi_context.enabled_pairs or []
         symbols: list[str] = []
-        for item in raw_symbols:
-            symbol = str(item).strip().upper()
-            if not symbol or symbol in symbols:
-                continue
+        for symbol in self._filter_multi_pairs():
             if not self._is_book_ticker_supported(symbol):
                 continue
             symbols.append(symbol)
@@ -5871,6 +5900,15 @@ class NcPilotTabWidget(QWidget):
                 return
             self._pilot_set_cache(symbol, "book_ticker", payload)
             self._clear_book_ticker_backoff(symbol)
+            if self._is_multi_symbol(self._symbol):
+                now_ts = monotonic()
+                self.book_snapshot = {"bid": bid, "ask": ask, "ts": now_ts}
+                self._bidask_last = (bid, ask)
+                self._bidask_ts = now_ts
+                self._bidask_src = "HTTP_BOOK"
+                self._multi_book_snapshot_symbol = symbol
+                self.bidask_ready = True
+                self._queue_trade_source("HTTP")
             if symbol not in self._multi_bidask_logged:
                 self._append_log(
                     f"[BIDASK] ok symbol={symbol} age_ms=0",
@@ -5974,10 +6012,18 @@ class NcPilotTabWidget(QWidget):
             self._market_fee.setText(self._fee_display_text())
             self._set_market_label_state(self._market_fee, active=True)
 
-            if bidask_age_ms is not None:
-                source_age_text = f"{book_source} | {bidask_age_ms}ms"
-            else:
-                source_age_text = f"{book_source} | —"
+            router_symbol = self._resolve_router_display_symbol()
+            router_snapshot = (
+                self._price_feed_manager.get_snapshot(router_symbol)
+                if router_symbol and hasattr(self, "_price_feed_manager")
+                else None
+            )
+            ws_state = self._format_ws_state(router_snapshot.ws_status) if router_snapshot else "—"
+            router_source = router_snapshot.router_source if router_snapshot else book_source
+            router_reason = router_snapshot.router_reason if router_snapshot else None
+            age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
+            reason_text = f" ({router_reason})" if router_source == "HTTP" and router_reason else ""
+            source_age_text = f"{book_source} | {age_text} | WS {ws_state}{reason_text}"
             self._market_source.setText(source_age_text)
             self._set_market_label_state(self._market_source, active=source_age_text != "—")
 
@@ -7754,28 +7800,27 @@ class NcPilotTabWidget(QWidget):
         self._pilot_market_cache.set(symbol, key, payload)
 
     def _pilot_fetch_book_ticker(self, symbol: str) -> tuple[dict[str, Any] | None, int | None]:
-        if not self._is_book_ticker_supported(symbol):
+        cleaned = self._normalize_exchange_symbol(symbol)
+        if not cleaned or not self._is_book_ticker_supported(cleaned):
             return None, None
-        cached, age_ms = self._pilot_get_cached(symbol, "book_ticker")
+        cached, age_ms = self._pilot_get_cached(cleaned, "book_ticker")
         if isinstance(cached, dict):
             return cached, age_ms
-        if self._is_multi_symbol(self._symbol):
-            return None, None
-        if self._book_ticker_backoff_active(symbol, monotonic()):
+        if self._book_ticker_backoff_active(cleaned, monotonic()):
             return None, None
         try:
             payload, _latency_ms = self._net_call_sync(
                 "book_ticker",
-                {"symbol": symbol},
+                {"symbol": cleaned},
                 timeout_ms=2000,
             )
         except Exception as exc:  # noqa: BLE001
             if self._is_rate_limit_or_server_error(str(exc)):
-                self._register_book_ticker_rate_limit(symbol, str(exc))
+                self._register_book_ticker_rate_limit(cleaned, str(exc))
             return None, None
         if isinstance(payload, dict):
-            self._pilot_set_cache(symbol, "book_ticker", payload)
-            self._clear_book_ticker_backoff(symbol)
+            self._pilot_set_cache(cleaned, "book_ticker", payload)
+            self._clear_book_ticker_backoff(cleaned)
             return payload, 0
         return None, None
 
@@ -7884,13 +7929,34 @@ class NcPilotTabWidget(QWidget):
             return "MIXED"
         return "LOST"
 
+    def _resolve_router_display_symbol(self) -> str | None:
+        if not self._is_multi_symbol(self._symbol):
+            return self._symbol
+        if self._multi_book_snapshot_symbol:
+            return self._multi_book_snapshot_symbol
+        pairs = self._filter_multi_pairs()
+        return pairs[0] if pairs else None
+
+    @staticmethod
+    def _format_ws_state(status: str | None) -> str:
+        if status == WS_CONNECTED:
+            return "CONNECTED"
+        if status == WS_DEGRADED:
+            return "DEGRADED"
+        if status == WS_LOST:
+            return "LOST"
+        return "—"
+
     def _pilot_exchange_symbols(self) -> set[str] | None:
         if not hasattr(self, "_price_feed_manager") or not self._price_feed_manager:
             return None
         return self._price_feed_manager.get_exchange_symbols()
 
     def _pilot_exchange_rules(self, symbol: str) -> dict[str, float | None] | None:
-        cached = self._pilot_market_cache.get(symbol, "exchange_info")
+        cleaned = self._normalize_exchange_symbol(symbol)
+        if cleaned is None:
+            return None
+        cached = self._pilot_market_cache.get(cleaned, "exchange_info")
         if cached:
             data, saved_at = cached
             ttl = self._pilot_market_cache_ttls.get("exchange_info")
@@ -7901,7 +7967,7 @@ class NcPilotTabWidget(QWidget):
         try:
             payload, _latency_ms = self._net_call_sync(
                 "exchange_info_symbol",
-                {"symbol": symbol},
+                {"symbol": cleaned},
                 timeout_ms=5000,
             )
         except Exception as exc:  # noqa: BLE001
@@ -7928,7 +7994,7 @@ class NcPilotTabWidget(QWidget):
             "min_qty": min_qty,
             "max_qty": max_qty,
         }
-        self._pilot_market_cache.set(symbol, "exchange_info", data)
+        self._pilot_market_cache.set(cleaned, "exchange_info", data)
         return data
 
     def _pilot_alias_summary(self) -> str:
@@ -11020,7 +11086,10 @@ class NcPilotTabWidget(QWidget):
                 symbol_map[symbol_name] = entry
         any_tradeable = False
         first_rules: dict[str, float | None] | None = None
-        for symbol in self._multi_context.enabled_pairs:
+        enabled_pairs = self._filter_multi_pairs()
+        if enabled_pairs != (self._multi_context.enabled_pairs or []):
+            self._multi_context.enabled_pairs = enabled_pairs
+        for symbol in enabled_pairs:
             info = symbol_map.get(symbol)
             if not info:
                 continue
@@ -11056,7 +11125,7 @@ class NcPilotTabWidget(QWidget):
         self._update_grid_preview()
         self._update_runtime_balances()
         self._append_log(
-            f"Exchange rules loaded ({latency_ms}ms). mode=MULTI symbols={len(self._multi_context.enabled_pairs)}",
+            f"Exchange rules loaded ({latency_ms}ms). mode=MULTI symbols={len(enabled_pairs)}",
             kind="INFO",
         )
 
@@ -11072,6 +11141,8 @@ class NcPilotTabWidget(QWidget):
 
     def _refresh_trade_fees(self, force: bool = False) -> None:
         if not self._account_client or self._fees_in_flight:
+            return
+        if self._is_multi_symbol(self._symbol):
             return
         now = time_fn()
         if not force and self._fees_last_fetch_ts and now - self._fees_last_fetch_ts < 1800:
@@ -12436,6 +12507,12 @@ class NcPilotTabWidget(QWidget):
                 raise RuntimeError("HTTP client not initialized")
             return self._http_client
 
+        def _require_symbol(raw: object) -> str:
+            cleaned = self._normalize_exchange_symbol(str(raw) if raw is not None else None)
+            if not cleaned:
+                raise ValueError("invalid_symbol")
+            return cleaned
+
         def _dispatch(_client: object) -> object:
             if action == "account_info":
                 return _require_account().get_account_info()
@@ -12443,24 +12520,21 @@ class NcPilotTabWidget(QWidget):
                 symbol = str(params.get("symbol", ""))
                 return _require_account().get_open_orders(self._normalize_symbol_for_open_orders(symbol))
             if action == "trade_fees":
-                symbol = str(params.get("symbol", ""))
-                return _require_account().get_trade_fees(symbol)
+                return _require_account().get_trade_fees(_require_symbol(params.get("symbol", "")))
             if action == "my_trades":
-                symbol = str(params.get("symbol", ""))
                 limit = int(params.get("limit", 50))
-                return _require_account().get_my_trades(symbol, limit=limit)
+                return _require_account().get_my_trades(_require_symbol(params.get("symbol", "")), limit=limit)
             if action == "order":
-                symbol = str(params.get("symbol", ""))
                 order_id = params.get("order_id")
                 orig_client_order_id = params.get("orig_client_order_id")
                 return _require_account().get_order(
-                    symbol,
+                    _require_symbol(params.get("symbol", "")),
                     order_id=str(order_id) if order_id is not None else None,
                     orig_client_order_id=str(orig_client_order_id) if orig_client_order_id else None,
                 )
             if action == "place_limit_order":
                 return _require_account().place_limit_order(
-                    symbol=str(params.get("symbol", "")),
+                    symbol=_require_symbol(params.get("symbol", "")),
                     side=str(params.get("side", "")),
                     price=str(params.get("price", "")),
                     quantity=str(params.get("quantity", "")),
@@ -12469,32 +12543,29 @@ class NcPilotTabWidget(QWidget):
                 )
             if action == "cancel_order":
                 return _require_account().cancel_order(
-                    symbol=str(params.get("symbol", "")),
+                    symbol=_require_symbol(params.get("symbol", "")),
                     order_id=str(params.get("order_id")) if params.get("order_id") else None,
                     orig_client_order_id=params.get("orig_client_order_id"),
                 )
             if action == "cancel_open_orders":
-                symbol = str(params.get("symbol", ""))
-                return _require_account().cancel_open_orders(symbol)
+                return _require_account().cancel_open_orders(_require_symbol(params.get("symbol", "")))
             if action == "sync_time_offset":
                 return _require_account().sync_time_offset()
             if action == "exchange_info_symbol":
-                symbol = str(params.get("symbol", ""))
-                return _require_http().get_exchange_info_symbol(symbol)
+                symbol = params.get("symbol", "")
+                cleaned = self._normalize_exchange_symbol(str(symbol) if symbol is not None else None)
+                return _require_http().get_exchange_info_symbol(cleaned or "")
             if action == "exchange_info":
                 return _require_http().get_exchange_info()
             if action == "book_ticker":
-                symbol = str(params.get("symbol", ""))
-                return _require_http().get_book_ticker(symbol)
+                return _require_http().get_book_ticker(_require_symbol(params.get("symbol", "")))
             if action == "orderbook_depth":
-                symbol = str(params.get("symbol", ""))
                 limit = int(params.get("limit", 50))
-                return _require_http().get_orderbook_depth(symbol, limit=limit)
+                return _require_http().get_orderbook_depth(_require_symbol(params.get("symbol", "")), limit=limit)
             if action == "klines":
-                symbol = str(params.get("symbol", ""))
                 interval = str(params.get("interval", "1h"))
                 limit = int(params.get("limit", 120))
-                return _require_http().get_klines(symbol, interval=interval, limit=limit)
+                return _require_http().get_klines(_require_symbol(params.get("symbol", "")), interval=interval, limit=limit)
             raise ValueError(f"Unknown net action: {action}")
 
         return _dispatch
@@ -12541,6 +12612,27 @@ class NcPilotTabWidget(QWidget):
 
     def _is_multi_symbol(self, symbol: str | None) -> bool:
         return not symbol or symbol.strip().upper() == PILOT_WINDOW_SYMBOL
+
+    def _normalize_exchange_symbol(self, symbol: str | None) -> str | None:
+        if symbol is None:
+            return None
+        cleaned = symbol.strip().upper()
+        if not cleaned or self._is_multi_symbol(cleaned):
+            return None
+        exchange_symbols = self._pilot_exchange_symbols()
+        if exchange_symbols and cleaned not in exchange_symbols:
+            return None
+        return cleaned
+
+    def _filter_multi_pairs(self) -> list[str]:
+        raw_symbols = self._multi_context.enabled_pairs or []
+        filtered: list[str] = []
+        for item in raw_symbols:
+            cleaned = self._normalize_exchange_symbol(str(item))
+            if not cleaned or cleaned in filtered:
+                continue
+            filtered.append(cleaned)
+        return filtered
 
     def _normalize_symbol_for_open_orders(self, symbol: str | None) -> str | None:
         if self._is_multi_symbol(symbol):
@@ -12686,6 +12778,8 @@ class NcPilotTabWidget(QWidget):
             self._registry_gc_timer.stop()
         if self._order_age_timer.isActive():
             self._order_age_timer.stop()
+        if hasattr(self, "_trade_source_timer") and self._trade_source_timer.isActive():
+            self._trade_source_timer.stop()
 
     def _stop_runtime_timers(self) -> None:
         if self._balances_timer.isActive():
@@ -12809,3 +12903,11 @@ class NcPilotMainWindow(QMainWindow):
             self._panel.close()
         shutdown_net_worker()
         super().closeEvent(event)
+
+    def has_active_tabs(self) -> bool:
+        if not hasattr(self, "_panel"):
+            return False
+        panel = getattr(self, "_panel", None)
+        if panel is None:
+            return False
+        return not getattr(panel, "_disposed", False)
