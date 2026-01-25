@@ -6,12 +6,18 @@
 .
 ├── CHANGELOG.md — project changelog.
 ├── AI_PROTOCOL.md — project notes for AI usage and expectations.
-├── NC MICRO.md — detailed NC MICRO mode overview (RU).
 ├── PROJECT_STRUCTURE.md — this file: layout reference and per-file overview.
 ├── README.md — quickstart and usage instructions.
-├── REPORT.md — project report/notes.
-├── SYSTEM_OVERVIEW_RU.md — detailed system overview in Russian.
-├── ALGO_PILOT_v1.5.md — detailed description of the ALGO PILOT mode (RU, фактическая версия v1.6.5).
+├── reports
+│   ├── ALGO_PILOT_v1.5.md — detailed description of the ALGO PILOT mode (RU, фактическая версия v1.6.5).
+│   ├── NC MICRO.md — detailed NC MICRO mode overview (RU).
+│   ├── NC_PILOT_MULTI_PAIR_2LEG_REBAL_LOOP_SPREAD.md — 2-leg rebalancing loop spread playbook (RU).
+│   ├── NC_PILOT_MULTI_PAIR_ARCHITECTURE.md — architecture & components for NC Pilot multi-pair (RU).
+│   ├── NC_PILOT_MULTI_PAIR_OVERVIEW.md — strategic overview of NC Pilot multi-pair (RU).
+│   ├── NC_PILOT_MULTI_PAIR_RISK_CONTROLS.md — risk controls, guards, and kill-switches (RU).
+│   ├── NC_PILOT_MULTI_PAIR_RUNTIME.md — runtime loops, scheduling, and state handling (RU).
+│   ├── REPORT.md — project report/notes.
+│   └── SYSTEM_OVERVIEW_RU.md — detailed system overview in Russian.
 ├── _link_test.txt — link test artifact.
 ├── requirements.txt — Python dependencies.
 ├── requirements.txt.txt — duplicate dependency list (legacy).
