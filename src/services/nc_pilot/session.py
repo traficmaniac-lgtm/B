@@ -76,7 +76,7 @@ class PilotAlgoState:
     last_ts: float | None = None
 
 
-PILOT_DEFAULT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDTUSDC", "TUSDUSDT")
+PILOT_DEFAULT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
 
 
 @dataclass
