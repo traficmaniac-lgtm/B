@@ -9,7 +9,15 @@ from PySide6.QtCore import QTimer
 
 from src.gui.lite_grid_math import compute_order_qty
 from src.services.nc_pilot.arb_hub import ArbHub
-from src.services.nc_pilot.session import NcPilotSession, PilotAlgoState
+from src.services.nc_pilot.pilot_analysis import (
+    LoopFamilyScanner,
+    PilotMarketSnapshot,
+    PilotWindow,
+    RebalFamilyScanner,
+    SpreadFamilyScanner,
+    TwoLegFamilyScanner,
+)
+from src.services.nc_pilot.session import NcPilotSession
 from src.services.nc_pilot.symbol_aliases import format_alias_summary, resolve_symbol
 
 
@@ -24,17 +32,25 @@ class PilotPlan:
 
 
 class PilotController:
-    ANALYSIS_INTERVAL_MS = 400
+    SCAN_INTERVAL_MS = 1000
+    STALE_MS = 2000
+    TTL_MS = 5000
+    MIN_BPS_SPREAD = 0.5
+    MIN_BPS_REBAL = 0.5
+    MIN_BPS_2LEG = 0.8
+    MIN_BPS_LOOP = 1.0
+    BEST_DELTA_BPS = 0.3
     ORDER_COOLDOWN_SEC = 1.5
-    PILOT_SYMBOLS = ("USDTUSDC", "TUSDUSDT", "EURIUSDT", "EURIEUR")
+    PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
 
     def __init__(self, window: object, session: NcPilotSession) -> None:
         self._window = window
         self._session = session
         self._arb_hub = ArbHub()
         self._analysis_timer = QTimer(window)
-        self._analysis_timer.setInterval(self.ANALYSIS_INTERVAL_MS)
+        self._analysis_timer.setInterval(self.SCAN_INTERVAL_MS)
         self._analysis_timer.timeout.connect(self._on_analysis_tick)
+        self._last_windows: dict[str, PilotWindow] = {}
 
     def start_analysis(self) -> None:
         pilot = self._session.pilot
@@ -49,16 +65,7 @@ class PilotController:
         self._window._update_pilot_status_line()
 
     def start_trading(self) -> None:
-        pilot = self._session.pilot
-        if not pilot.analysis_on:
-            self._log_skip("analysis_off")
-            return
-        if pilot.trading_on:
-            return
-        pilot.trading_on = True
-        pilot.state = "TRADING"
-        self._window._set_pilot_controls(analysis_on=True, trading_on=True)
-        self._window._update_pilot_status_line()
+        self._window._append_pilot_log("[PILOT] trading disabled (analysis-only)")
 
     def stop(self, *, cancel_orders: bool) -> None:
         pilot = self._session.pilot
@@ -89,110 +96,69 @@ class PilotController:
             return
         effective_symbols, invalid_symbols = self._refresh_symbol_resolution()
         now = monotonic()
+        windows: list[PilotWindow] = []
         if invalid_symbols:
             reason = next(iter(invalid_symbols.values()))
-            spread_snapshot = self._arb_hub._invalid_family_snapshot(
-                family="SPREAD",
-                algo_id="SPREAD_BEST",
-                reason=reason,
-                details={"reason": reason, "invalid_symbols": invalid_symbols},
-            )
-            snapshots = [
-                spread_snapshot,
-                self._arb_hub._invalid_family_snapshot(
-                    family="REBAL",
-                    algo_id="REBAL",
-                    reason=reason,
-                    details={"reason": reason},
-                ),
-                self._arb_hub._invalid_family_snapshot(
-                    family="2LEG",
-                    algo_id="2LEG",
-                    reason=reason,
-                    details={"reason": reason},
-                ),
-                self._arb_hub._invalid_family_snapshot(
-                    family="LOOP",
-                    algo_id="LOOP",
-                    reason=reason,
-                    details={"reason": reason},
-                ),
-            ]
+            for family in ("SPREAD", "REBAL", "2LEG", "LOOP"):
+                windows.append(self._invalid_window(family=family, reason=reason, ttl_ms=self.TTL_MS))
         else:
             market_data = self._window._pilot_collect_market_data(set(effective_symbols))
-            quotes: dict[str, ArbHub.MarketQuote] = {}
-            for symbol, payload in market_data.items():
-                quotes[symbol] = ArbHub.MarketQuote(
-                    bid=payload.get("bid"),
-                    ask=payload.get("ask"),
-                    age_ms=payload.get("age_ms"),
-                    ts_ms=payload.get("ts_ms"),
-                    src=payload.get("src") or "NONE",
-                    depth=payload.get("depth"),
-                )
-            spread_snapshot = self._arb_hub.compute_spread_family_best(
-                market_by_symbol=quotes,
-                selected_symbols=effective_symbols,
-                min_edge_bps=pilot.min_edge_bps,
-                max_notional=pilot.max_notional,
-                max_age_ms=pilot.max_age_ms,
-            )
-            snapshots = [
-                spread_snapshot,
-                self._arb_hub._invalid_family_snapshot(
-                    family="REBAL",
-                    algo_id="REBAL",
-                    reason="no_data",
-                    details={"reason": "no_data"},
+            snapshot = PilotMarketSnapshot.from_market_data(market_data, stale_ms=self.STALE_MS)
+            fee_bps = self._window.get_effective_fees_pct(self._session.symbol) * 100
+            slippage_bps = self._window._profit_guard_slippage_pct() * 100
+            safety_bps = self._window._profit_guard_pad_pct() * 100
+            scanners = [
+                SpreadFamilyScanner(
+                    symbols=effective_symbols,
+                    min_bps=self.MIN_BPS_SPREAD,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    safety_bps=safety_bps,
+                    ttl_ms=self.TTL_MS,
+                    max_notional_default=pilot.max_notional,
                 ),
-                self._arb_hub._invalid_family_snapshot(
-                    family="2LEG",
-                    algo_id="2LEG",
-                    reason="no_data",
-                    details={"reason": "no_data"},
+                RebalFamilyScanner(
+                    min_bps=self.MIN_BPS_REBAL,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    safety_bps=safety_bps,
+                    ttl_ms=self.TTL_MS,
                 ),
-                self._arb_hub._invalid_family_snapshot(
-                    family="LOOP",
-                    algo_id="LOOP",
-                    reason="no_data",
-                    details={"reason": "no_data"},
+                TwoLegFamilyScanner(
+                    min_bps=self.MIN_BPS_2LEG,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    safety_bps=safety_bps,
+                    ttl_ms=self.TTL_MS,
+                ),
+                LoopFamilyScanner(
+                    min_bps=self.MIN_BPS_LOOP,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    safety_bps=safety_bps,
+                    ttl_ms=self.TTL_MS,
                 ),
             ]
+            for scanner in scanners:
+                windows.append(scanner.scan(snapshot))
         ui_snapshots: list[dict[str, object]] = []
-        for snapshot in snapshots:
-            algo_state = pilot.algo_states.setdefault(snapshot.algo_id, PilotAlgoState())
-            prev_route = algo_state.last_route_text
-            prev_valid = algo_state.last_valid
-            prev_action = algo_state.last_suggested_action
-            prev_symbol = algo_state.last_symbol
-            dt_ms = 0
-            if algo_state.last_ts is not None:
-                dt_ms = max(int((now - algo_state.last_ts) * 1000), 0)
-            if snapshot.valid and prev_symbol == snapshot.symbol:
-                algo_state.life_ms += dt_ms
-            else:
-                algo_state.life_ms = 0
-            snapshot.life_ms = algo_state.life_ms
-            algo_state.last_route_text = snapshot.route_text
-            algo_state.last_symbol = snapshot.symbol
-            algo_state.last_ts = now
-            algo_state.last_valid = snapshot.valid
-            algo_state.last_profit_bps = snapshot.profit_bps if snapshot.valid else None
-            algo_state.last_suggested_action = snapshot.suggested_action if snapshot.valid else None
-            self._log_route_state(snapshot, prev_route, prev_valid)
-            ui_snapshots.append(self._snapshot_to_dict(snapshot))
-        pilot.last_best_route = spread_snapshot.route_text if spread_snapshot.valid else None
-        pilot.last_best_edge_bps = spread_snapshot.profit_bps if spread_snapshot.valid else None
-        pilot.last_decision = spread_snapshot.suggested_action if spread_snapshot.valid else "—"
+        for window in windows:
+            prev = self._last_windows.get(window.family)
+            window = self._apply_window_lifecycle(window, prev, now)
+            self._last_windows[window.family] = window
+            self._maybe_log_best_changed(window, prev)
+            if window.valid and (not prev or not prev.valid):
+                pilot.counters.windows_found_today += 1
+            ui_snapshots.append(self._window_to_dict(window, now))
+        best_window = self._select_best_window(windows, now)
+        pilot.last_best_route = best_window.route if best_window else None
+        pilot.last_best_edge_bps = best_window.profit_bps if best_window else None
+        pilot.last_decision = "analysis_only"
+        pilot.state = "ANALYZE"
         self._window._update_pilot_routes_table(ui_snapshots)
         self._window._update_arb_signals()
         self._window._update_pilot_status_line()
         self._window._update_pilot_dashboard_counters()
-        if not pilot.trading_on:
-            pilot.state = "ANALYZE"
-            return
-        pilot.state = "TRADING"
-        self._execute_trading(now)
 
     def _execute_trading(self, now: float) -> None:
         pilot = self._session.pilot
@@ -348,57 +314,85 @@ class PilotController:
             return min(budget, base_value * Decimal("0.30"))
         return budget
 
-    def _log_route_state(
+    def _apply_window_lifecycle(
         self,
-        snapshot: ArbHub.RouteSnapshot,
-        prev_route: str | None,
-        prev_valid: bool,
-    ) -> None:
-        if snapshot.family != "SPREAD":
+        window: PilotWindow,
+        prev: PilotWindow | None,
+        now: float,
+    ) -> PilotWindow:
+        if not window.valid:
+            window.ts_start = 0.0
+        elif prev and prev.valid and prev.route == window.route:
+            window.ts_start = prev.ts_start
+        else:
+            window.ts_start = now
+        window.ts_last = now
+        return window
+
+    def _maybe_log_best_changed(self, window: PilotWindow, prev: PilotWindow | None) -> None:
+        if prev is None and not window.valid:
             return
-        if snapshot.valid and not prev_valid:
-            self._window._append_pilot_log(
-                (
-                    "[ROUTE_ON] "
-                    f"family={snapshot.family} symbol={snapshot.symbol} "
-                    f"profit={snapshot.profit_abs_usdt:+.2f} "
-                    f"bps={snapshot.profit_bps:+.2f}"
-                )
-            )
+        prev_profit = prev.profit_bps if prev else None
+        changed = False
+        if prev is None:
+            changed = True
+        elif prev.route != window.route:
+            changed = True
+        elif prev.valid != window.valid:
+            changed = True
+        elif prev_profit is not None and abs(prev_profit - window.profit_bps) > self.BEST_DELTA_BPS:
+            changed = True
+        if not changed:
             return
-        if not snapshot.valid and prev_valid:
-            reason = snapshot.reason_invalid or "no_data"
-            self._window._append_pilot_log(
-                f"[ROUTE_OFF] family={snapshot.family} reason={reason}"
+        self._window._append_pilot_log(
+            (
+                "[PILOT] BEST_CHANGED "
+                f"family={window.family} route={window.route} "
+                f"profit_bps={window.profit_bps:+.2f} valid={str(window.valid).lower()} "
+                f"reason={window.reason}"
             )
-            return
-        if snapshot.valid and prev_valid and prev_route and prev_route != snapshot.route_text:
-            self._window._append_pilot_log(
-                (
-                    "[ROUTE_SWITCH] "
-                    f"family={snapshot.family} old={prev_route} new={snapshot.route_text} "
-                    f"profit={snapshot.profit_abs_usdt:+.2f}"
-                )
-            )
+        )
 
     @staticmethod
-    def _snapshot_to_dict(snapshot: ArbHub.RouteSnapshot) -> dict[str, object]:
+    def _window_to_dict(window: PilotWindow, now: float) -> dict[str, object]:
         return {
-            "family": snapshot.family,
-            "algo_id": snapshot.algo_id,
-            "route_text": snapshot.route_text,
-            "symbol": snapshot.symbol,
-            "effective_symbol": snapshot.symbol or "—",
-            "profit_abs_usdt": snapshot.profit_abs_usdt,
-            "profit_bps": snapshot.profit_bps,
-            "life_ms": snapshot.life_ms,
-            "depth_ok": snapshot.depth_ok,
-            "age_ms": snapshot.age_ms,
-            "suggested_action": snapshot.suggested_action,
-            "details": snapshot.details,
-            "valid": snapshot.valid,
-            "reason": snapshot.reason_invalid,
+            "family": window.family,
+            "route_text": window.route,
+            "symbols": window.symbols,
+            "profit_abs_usdt": window.profit_abs,
+            "profit_bps": window.profit_bps,
+            "life_s": window.life_s(),
+            "ttl_ms": window.ttl_ms,
+            "valid": window.valid,
+            "reason": window.reason,
+            "details": window.details,
+            "is_alive": window.is_alive(now),
         }
+
+    @staticmethod
+    def _invalid_window(*, family: str, reason: str, ttl_ms: int) -> PilotWindow:
+        now = monotonic()
+        return PilotWindow(
+            family=family,
+            route="—",
+            symbols=[],
+            profit_abs=0.0,
+            profit_bps=0.0,
+            max_notional=0.0,
+            ts_start=0.0,
+            ts_last=now,
+            ttl_ms=ttl_ms,
+            valid=False,
+            reason=reason,
+            details={"reason": reason},
+        )
+
+    @staticmethod
+    def _select_best_window(windows: list[PilotWindow], now: float) -> PilotWindow | None:
+        valid = [window for window in windows if window.valid and window.is_alive(now)]
+        if not valid:
+            return None
+        return max(valid, key=lambda item: item.profit_bps)
 
     def _log_skip(self, reason: str) -> None:
         pilot = self._session.pilot

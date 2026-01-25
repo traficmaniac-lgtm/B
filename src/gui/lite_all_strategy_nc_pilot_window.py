@@ -92,10 +92,10 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.6"
+NC_PILOT_VERSION = "v1.0.9"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
-PILOT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDTUSDC", "TUSDUSDT")
+PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
 
 
 @dataclass
@@ -2397,12 +2397,11 @@ class NcPilotTabWidget(QWidget):
         self._pilot_dashboard_counters_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_dashboard_counters_label)
 
-        self._pilot_routes_table = QTableWidget(4, 8, self)
+        self._pilot_routes_table = QTableWidget(4, 7, self)
         self._pilot_routes_table.setHorizontalHeaderLabels(
             [
                 "Family",
                 "Route",
-                "EffSymbol",
                 "Profit abs",
                 "Profit bps",
                 "Life",
@@ -2412,7 +2411,7 @@ class NcPilotTabWidget(QWidget):
         )
         header = self._pilot_routes_table.horizontalHeader()
         header.setStretchLastSection(True)
-        for column in range(7):
+        for column in range(6):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self._pilot_routes_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._pilot_routes_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -2423,7 +2422,7 @@ class NcPilotTabWidget(QWidget):
         self._pilot_routes_table.setVerticalHeaderLabels(["SPREAD", "REBAL", "2LEG", "LOOP"])
         self._pilot_route_rows = {"SPREAD": 0, "REBAL": 1, "2LEG": 2, "LOOP": 3}
         for family, row in self._pilot_route_rows.items():
-            initial = [family, "—", "—", "—", "—", "—", "—", "—"]
+            initial = [family, "—", "—", "—", "—", "—", "—"]
             for column, value in enumerate(initial):
                 item = QTableWidgetItem(str(value))
                 item.setTextAlignment(Qt.AlignCenter)
@@ -2563,12 +2562,10 @@ class NcPilotTabWidget(QWidget):
     def _update_pilot_selected_symbols(self) -> None:
         if not hasattr(self, "_pilot_pair_checkboxes"):
             return
-        selected = {
-            symbol
-            for symbol, checkbox in self._pilot_pair_checkboxes.items()
-            if checkbox.isChecked()
-        }
-        self._session.pilot.selected_symbols = selected
+        fixed = set(PILOT_SYMBOLS)
+        for symbol, checkbox in self._pilot_pair_checkboxes.items():
+            checkbox.setChecked(symbol in fixed)
+        self._session.pilot.selected_symbols = fixed
         self._schedule_settings_save()
         self._update_arb_signals()
 
@@ -2616,17 +2613,17 @@ class NcPilotTabWidget(QWidget):
             row = self._pilot_route_rows[family]
             reason = snapshot.get("reason", "")
             valid = bool(snapshot.get("valid"))
+            is_alive = bool(snapshot.get("is_alive"))
             status = self._pilot_invalid_label(reason)
-            life_ms = snapshot.get("life_ms", 0)
-            life_s = life_ms / 1000 if isinstance(life_ms, (int, float)) else 0.0
+            life_s = snapshot.get("life_s", 0.0)
+            life_s = life_s if isinstance(life_s, (int, float)) else 0.0
             values = [
                 family,
                 snapshot.get("route_text", "—"),
-                snapshot.get("effective_symbol", "—"),
-                f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}" if valid else status,
-                f"{snapshot.get('profit_bps', 0.0):+.2f}" if valid else status,
+                f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}" if valid and is_alive else status,
+                f"{snapshot.get('profit_bps', 0.0):+.2f}" if valid and is_alive else status,
                 f"{life_s:.1f}s",
-                "YES" if valid else "NO",
+                "YES" if valid and is_alive else "NO",
                 reason or "—",
             ]
             for column, value in enumerate(values):
@@ -2652,39 +2649,32 @@ class NcPilotTabWidget(QWidget):
             led, label = row
             profit_abs = snapshot.get("profit_abs_usdt", 0.0)
             profit_bps = snapshot.get("profit_bps", 0.0)
-            life_ms = snapshot.get("life_ms", 0)
+            life_s = snapshot.get("life_s", 0.0)
             route_text = snapshot.get("route_text", "—")
-            depth_ok = bool(snapshot.get("depth_ok"))
-            age_ms = snapshot.get("age_ms")
             valid = bool(snapshot.get("valid"))
             reason = snapshot.get("reason", "")
             status = self._pilot_invalid_label(reason)
-            life_s = life_ms / 1000 if isinstance(life_ms, (int, float)) else 0.0
-            if family == "SPREAD":
-                if valid:
-                    label.setText(
-                        f"SPREAD: {snapshot.get('symbol', '—')} | "
-                        f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
-                        f"life {life_s:.1f}s"
-                    )
-                else:
-                    label.setText(f"SPREAD: NO WINDOW ({reason})")
-                led.set_state(valid)
-                details = snapshot.get("details", {})
-                tooltip = (
-                    "SPREAD\n"
-                    f"route={route_text}\n"
-                    f"bid={details.get('bid')} ask={details.get('ask')} mid={details.get('mid')}\n"
-                    f"edge_bps={details.get('edge_bps')} age_ms={age_ms}\n"
-                    f"min_edge_bps={details.get('min_edge_bps')} max_notional={details.get('max_notional')}"
+            is_alive = bool(snapshot.get("is_alive"))
+            life_s = life_s if isinstance(life_s, (int, float)) else 0.0
+            if valid and is_alive:
+                label.setText(
+                    f"{family}: {route_text} | "
+                    f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
+                    f"life {life_s:.1f}s"
                 )
-                label.setToolTip(tooltip)
-                led.set_tooltip(tooltip)
             else:
-                label.setText(f"{family}: NO DATA")
-                led.set_state(False)
-                label.setToolTip(f"{family}: NO DATA")
-                led.set_tooltip(f"{family}: NO DATA")
+                label.setText(f"{family}: NO WINDOW ({status})")
+            led.set_state(valid and is_alive)
+            details = snapshot.get("details", {})
+            tooltip = (
+                f"{family}\n"
+                f"route={route_text}\n"
+                f"profit={profit_abs:+.2f}USDT ({profit_bps:+.2f}bps)\n"
+                f"life={life_s:.1f}s valid={str(valid).lower()} alive={str(is_alive).lower()}\n"
+                f"reason={reason} details={details}"
+            )
+            label.setToolTip(tooltip)
+            led.set_tooltip(tooltip)
 
     @staticmethod
     def _pilot_invalid_label(reason: str) -> str:
@@ -2692,9 +2682,8 @@ class NcPilotTabWidget(QWidget):
             return "INVALID"
         return {
             "no_data": "NO DATA",
-            "depth": "DEPTH",
-            "age": "AGE",
-            "edge": "EDGE",
+            "no_bidask": "NO BID/ASK",
+            "stale": "STALE",
             "pair_disabled": "DISABLED",
             "no_window": "NO WINDOW",
         }.get(reason, "NO DATA")
