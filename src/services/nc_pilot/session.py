@@ -65,7 +65,15 @@ class PilotRuntimeCounters:
     skips: int = 0
 
 
-PILOT_DEFAULT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDCUSDT", "TUSDUSDT")
+@dataclass
+class PilotAlgoState:
+    last_route_text: str | None = None
+    last_valid: bool = False
+    life_ms: int = 0
+    last_ts: float | None = None
+
+
+PILOT_DEFAULT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDTUSDC", "TUSDUSDT")
 
 
 @dataclass
@@ -85,6 +93,7 @@ class PilotRuntimeState:
     selected_symbols: set[str] = field(default_factory=lambda: set(PILOT_DEFAULT_SYMBOLS))
     indicator_states: dict[str, bool] = field(default_factory=dict)
     indicator_tooltips: dict[str, str] = field(default_factory=dict)
+    algo_states: dict[str, PilotAlgoState] = field(default_factory=dict)
 
 
 @dataclass
