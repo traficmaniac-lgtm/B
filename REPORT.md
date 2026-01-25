@@ -1,5 +1,11 @@
 ## Technical Report
 
+### NC_MICRO v1.0.30 — Exec dup dedupe + rate limit
+- Added exec-key LRU/TTL cache for (symbol, orderId, tradeId) to skip duplicate fills.
+- Rate-limited exec_dup INFO logs to first dup + once per 10s with suppression count.
+- Reset exec dedupe/log state on start/stop to avoid stale suppression.
+- Manual check: LIVE fill shows one exec_new; exec_dup suppressed (≤1 per 10s).
+
 ### NC_MICRO v1.0.26 — Net worker, DRY-RUN fallback, bid/ask polling, GUI cleanup
 - Routed NC_MICRO Binance HTTP calls through a dedicated net worker with a single thread-bound httpx.Client to prevent SSL/thread crashes.
 - Added account snapshot preservation with error banners + backoff (1s→3s after 3 failures) so balances never reset on transient errors.

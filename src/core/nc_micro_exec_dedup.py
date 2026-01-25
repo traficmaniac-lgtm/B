@@ -39,6 +39,39 @@ class TradeIdDeduper:
 
 
 @dataclass
+class ExecKeyDeduper:
+    max_size: int = 20_000
+    ttl_sec: float = 2 * 60 * 60
+    _keys: OrderedDict[tuple[str, str, str], float] = field(default_factory=OrderedDict)
+
+    def seen(self, key: tuple[str, str, str], now: float) -> bool:
+        if not key:
+            return False
+        self._purge(now)
+        if key in self._keys:
+            self._keys.move_to_end(key)
+            return True
+        self._keys[key] = now
+        self._trim()
+        return False
+
+    def clear(self) -> None:
+        self._keys.clear()
+
+    def _purge(self, now: float) -> None:
+        if not self._keys:
+            return
+        ttl_cutoff = now - self.ttl_sec
+        expired = [key for key, ts in self._keys.items() if ts <= ttl_cutoff]
+        for key in expired:
+            self._keys.pop(key, None)
+
+    def _trim(self) -> None:
+        while len(self._keys) > self.max_size:
+            self._keys.popitem(last=False)
+
+
+@dataclass
 class CumulativeFillTracker:
     totals: dict[str, Decimal] = field(default_factory=dict)
 

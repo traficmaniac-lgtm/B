@@ -61,7 +61,12 @@ from src.core.crash_guard import register_crash_log_path, register_panic_hold_ca
 from src.core.nc_micro_safe_call import safe_call
 from src.core.nc_micro_stop import finalize_stop_state
 from src.core.version import VERSION
-from src.core.nc_micro_exec_dedup import CumulativeFillTracker, TradeIdDeduper, should_block_new_orders
+from src.core.nc_micro_exec_dedup import (
+    CumulativeFillTracker,
+    ExecKeyDeduper,
+    TradeIdDeduper,
+    should_block_new_orders,
+)
 from src.core.nc_micro_refresh import StaleRefreshLogLimiter, compute_refresh_allowed
 from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
 from src.gui.i18n import TEXT, tr
@@ -86,6 +91,13 @@ from src.services.price_feed_manager import (
 )
 
 _NC_MICRO_CRASH_HANDLES: list[object] = []
+EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
+
+
+@dataclass
+class ExecDupLogState:
+    count: int = 0
+    last_log_ts: float | None = None
 
 
 def _install_nc_micro_crash_catcher(logger: Any, symbol: str) -> tuple[str, object]:
@@ -1028,6 +1040,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._base_lots: deque[BaseLot] = deque()
         self._fills_in_flight = False
         self._trade_id_deduper = TradeIdDeduper()
+        self._exec_key_deduper = ExecKeyDeduper()
+        self._exec_dup_log_state: dict[str, ExecDupLogState] = {}
         self._realized_pnl = 0.0
         self._fees_total = 0.0
         self._position_fees_paid_quote = 0.0
@@ -5516,6 +5530,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._fills = []
             self._base_lots.clear()
             self._trade_id_deduper.clear()
+            self._exec_key_deduper.clear()
+            self._exec_dup_log_state.clear()
             self._fill_exec_cumulative.totals.clear()
             self._realized_pnl = 0.0
             self._fees_total = 0.0
@@ -5893,6 +5909,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._fill_keys.clear()
         self._fill_accumulator = FillAccumulator()
         self._trade_id_deduper.clear()
+        self._exec_key_deduper.clear()
+        self._exec_dup_log_state.clear()
         self._fill_exec_cumulative.totals.clear()
         self._active_action_keys.clear()
         self._owned_order_ids.clear()
@@ -7702,16 +7720,26 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         *,
         order_id: str,
         trade_id: str,
-        cum_qty: Decimal,
-        reason: str,
     ) -> None:
-        step = self._rule_decimal(self._exchange_rules.get("step"))
+        key = order_id or trade_id or "—"
+        state = self._exec_dup_log_state.get(key)
+        if state is None:
+            state = ExecDupLogState()
+            self._exec_dup_log_state[key] = state
+        state.count += 1
+        now = monotonic()
+        should_log = state.count == 1
+        if state.last_log_ts is not None and now - state.last_log_ts >= EXEC_DUP_LOG_COOLDOWN_SEC:
+            should_log = True
+        if not should_log:
+            return
+        state.last_log_ts = now
         trade_token = trade_id or "—"
         self._append_log(
             (
-                "[EXEC] exec_dup "
+                "[EXEC] exec_dup suppressed "
                 f"orderId={order_id or '—'} tradeId={trade_token} "
-                f"cum_qty={self.fmt_qty(cum_qty, step)} reason={reason}"
+                f"dup_count={state.count}"
             ),
             kind="INFO",
         )
@@ -7721,13 +7749,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         try:
             trade_id = fill.trade_id or ""
+            if trade_id:
+                exec_key = (self._symbol, fill.order_id or "", trade_id)
+                if self._exec_key_deduper.seen(exec_key, monotonic()):
+                    self._log_exec_dup(order_id=fill.order_id, trade_id=trade_id)
+                    return
             if trade_id and self._trade_id_deduper.seen(trade_id, monotonic()):
-                self._log_exec_dup(
-                    order_id=fill.order_id,
-                    trade_id=trade_id,
-                    cum_qty=self.as_decimal(fill.qty),
-                    reason="seen",
-                )
+                self._log_exec_dup(order_id=fill.order_id, trade_id=trade_id)
                 return
             total_filled = self.as_decimal(fill.qty)
             delta = total_filled
@@ -7740,23 +7768,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             elif fill.is_total:
                 delta = self._fill_exec_cumulative.update("", total_filled)
             if delta <= 0:
-                self._log_exec_dup(
-                    order_id=fill.order_id,
-                    trade_id=trade_id,
-                    cum_qty=total_filled,
-                    reason="seen",
-                )
+                self._log_exec_dup(order_id=fill.order_id, trade_id=trade_id)
                 return
             self._fills_changed_since_refresh = True
             fill_key = self._fill_key(fill)
             if fill.trade_id == "" and fill.order_id == "":
                 if fill_key in self._fill_keys:
-                    self._log_exec_dup(
-                        order_id=fill.order_id,
-                        trade_id=trade_id,
-                        cum_qty=total_filled,
-                        reason="seen",
-                    )
+                    self._log_exec_dup(order_id=fill.order_id, trade_id=trade_id)
                     return
             self._fill_keys.add(fill_key)
             self._log_exec_new(
