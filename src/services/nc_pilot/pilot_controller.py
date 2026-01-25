@@ -62,6 +62,7 @@ class PilotController:
     DEFAULT_MIN_WINDOW_LIFE_S = 3.0
     DEFAULT_MAX_PRICE_AGE_MS = 1500
     DEFAULT_COOLDOWN_AFTER_TRADE_S = 2.0
+    TWOLEG_BIDASK_GRACE_MS = 500
     PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
 
     TWO_LEG_ROUTE_MAP = {
@@ -83,6 +84,8 @@ class PilotController:
         self._analysis_timer.setInterval(self.SCAN_INTERVAL_MS)
         self._analysis_timer.timeout.connect(self._on_analysis_tick)
         self._last_windows: dict[str, PilotWindow] = {}
+        self._bidask_cache: dict[str, dict[str, float]] = {}
+        self._last_2leg_state: str | None = None
 
     def start_analysis(self) -> None:
         pilot = self._session.pilot
@@ -140,6 +143,7 @@ class PilotController:
         effective_symbols, invalid_symbols = self._refresh_symbol_resolution()
         now = monotonic()
         snapshot: PilotMarketSnapshot | None = None
+        snapshot_2leg: PilotMarketSnapshot | None = None
         windows: list[PilotWindow] = []
         if invalid_symbols:
             reason = next(iter(invalid_symbols.values()))
@@ -147,7 +151,9 @@ class PilotController:
                 windows.append(self._invalid_window(family=family, reason=reason, ttl_ms=self.TTL_MS))
         else:
             market_data = self._window._pilot_collect_market_data(set(effective_symbols))
+            self._update_bidask_cache(market_data, now)
             snapshot = PilotMarketSnapshot.from_market_data(market_data, stale_ms=self.STALE_MS)
+            snapshot_2leg = self._build_2leg_snapshot(market_data, now)
             fee_bps = self._window.get_effective_fees_pct(self._session.symbol) * 100
             slippage_bps = self._window._profit_guard_slippage_pct() * 100
             safety_bps = self._window._profit_guard_pad_pct() * 100
@@ -185,12 +191,15 @@ class PilotController:
                 ),
             ]
             for scanner in scanners:
-                windows.append(scanner.scan(snapshot))
+                if scanner.family == "2LEG":
+                    windows.append(scanner.scan(snapshot_2leg))
+                else:
+                    windows.append(scanner.scan(snapshot))
         ui_snapshots: list[dict[str, object]] = []
         for window in windows:
             prev = self._last_windows.get(window.family)
             if window.family == "2LEG":
-                window = self._apply_2leg_window_state(window, prev, snapshot, now)
+                window = self._apply_2leg_window_state(window, prev, snapshot_2leg, now)
             else:
                 window = self._apply_window_lifecycle(window, prev, now)
             self._last_windows[window.family] = window
@@ -213,7 +222,7 @@ class PilotController:
             if best_window and best_window.family not in execute_allowed:
                 self._log_trade_block(best_window.family, now, reason="not_allowed")
             trade_window = next((item for item in windows if item.family == "2LEG"), None)
-            self._maybe_execute_window_trade(trade_window, snapshot, now)
+            self._maybe_execute_window_trade(trade_window, snapshot_2leg, now)
 
     def _maybe_execute_window_trade(
         self,
@@ -467,7 +476,13 @@ class PilotController:
         if prev and prev.valid and prev.route == window.route:
             candidate_start = prev.ts_start
         life_s = max(now - candidate_start, 0.0)
-        ok, reason, details = self._validate_2leg_window(window, snapshot, now, life_s=life_s)
+        ok, reason, details = self._validate_2leg_window(
+            window,
+            snapshot,
+            now,
+            life_s=life_s,
+            allow_degraded=True,
+        )
         if ok:
             window.valid = True
             window.reason = "ok"
@@ -483,6 +498,7 @@ class PilotController:
                 "validation": details,
                 "validation_reason": reason,
             }
+        self._log_2leg_window_state(window, reason=reason, now=now)
         return window
 
     def _validate_2leg_window(
@@ -492,6 +508,7 @@ class PilotController:
         now: float,
         *,
         life_s: float,
+        allow_degraded: bool = False,
     ) -> tuple[bool, str, dict[str, object]]:
         if window is None:
             return False, "missing_bidask", {}
@@ -508,28 +525,49 @@ class PilotController:
         if snapshot is None:
             return False, "missing_bidask", {}
         if not window.symbols:
-            return False, "missing_bidask", {"route": window.route}
+            legs = self.TWO_LEG_ROUTE_MAP.get(window.route)
+            if legs:
+                available_symbols = snapshot.quotes.keys()
+                symbols: list[str] = []
+                for from_asset, to_asset in legs:
+                    symbol, _side, _invert = resolve_leg_market(from_asset, to_asset, available_symbols)
+                    if symbol:
+                        symbols.append(symbol)
+                if self._is_2leg_bidask_missing(symbols, now):
+                    return False, "missing_bidask", {"route": window.route}
+            return False, window.reason or "no_window", {"route": window.route}
         legs = self.TWO_LEG_ROUTE_MAP.get(window.route)
         if not legs:
-            return False, "missing_bidask", {"route": window.route}
+            if self._is_2leg_bidask_missing(window.symbols, now):
+                return False, "missing_bidask", {"route": window.route}
+            return False, window.reason or "no_window", {"route": window.route}
         available_symbols = snapshot.quotes.keys()
         resolved_legs: list[tuple[str, str, str, str]] = []
         for from_asset, to_asset in legs:
             symbol, side, _invert = resolve_leg_market(from_asset, to_asset, available_symbols)
             if not symbol:
-                return False, "missing_bidask", {"route": window.route}
+                if self._is_2leg_bidask_missing(window.symbols, now):
+                    return False, "missing_bidask", {"route": window.route}
+                return False, "no_data", {"route": window.route}
             resolved_legs.append((symbol, side, from_asset, to_asset))
+        leg_symbols = [symbol for symbol, *_rest in resolved_legs]
+        leg_ages = [self._bidask_age_ms(symbol, now) for symbol in leg_symbols]
+        if self._is_2leg_bidask_missing(leg_symbols, now):
+            return False, "missing_bidask", {"leg_ages_ms": leg_ages}
         for symbol, _side, _from_asset, _to_asset in resolved_legs:
             quote = snapshot.quote(symbol)
             if quote is None or quote.bid is None or quote.ask is None:
-                return False, "missing_bidask", {"symbol": symbol}
+                return False, "no_data", {"symbol": symbol}
             if quote.bid <= 0 or quote.ask <= 0:
-                return False, "missing_bidask", {"symbol": symbol}
-            if quote.age_ms is None or quote.age_ms > max_price_age_ms:
+                return False, "no_data", {"symbol": symbol}
+            age_ms = self._bidask_age_ms(symbol, now)
+            if age_ms is None or age_ms > max_price_age_ms:
+                if allow_degraded and age_ms is not None and age_ms <= self.TTL_MS:
+                    continue
                 return (
                     False,
                     "stale_price",
-                    {"symbol": symbol, "age_ms": quote.age_ms, "max_price_age_ms": max_price_age_ms},
+                    {"symbol": symbol, "age_ms": age_ms, "max_price_age_ms": max_price_age_ms},
                 )
         if window.profit_bps < min_profit_bps:
             return (
@@ -555,10 +593,10 @@ class PilotController:
         for symbol, side, require_asset, _output_asset in resolved_legs:
             quote = snapshot.quote(symbol)
             if quote is None or quote.bid is None or quote.ask is None:
-                return False, "missing_bidask", {"symbol": symbol}
+                return False, "no_data", {"symbol": symbol}
             price_raw = quote.bid if side == "SELL" else quote.ask
             if price_raw is None or price_raw <= 0:
-                return False, "missing_bidask", {"symbol": symbol}
+                return False, "no_data", {"symbol": symbol}
             price = Decimal(str(price_raw))
             qty = required_notional if side == "SELL" else required_notional / price
             free = self._window._pilot_balance_free(require_asset)
@@ -614,6 +652,83 @@ class PilotController:
         if open_total > 2:
             return False, "cooldown", {"block": "open_orders", "open_orders": open_total}
         return True, "ok", {}
+
+    def _update_bidask_cache(self, market_data: dict[str, dict[str, object]], now: float) -> None:
+        for symbol, payload in market_data.items():
+            bid = payload.get("bid")
+            ask = payload.get("ask")
+            if bid is None or ask is None:
+                continue
+            try:
+                bid_value = float(bid)
+                ask_value = float(ask)
+            except (TypeError, ValueError):
+                continue
+            if bid_value <= 0 or ask_value <= 0:
+                continue
+            self._bidask_cache[symbol] = {"bid": bid_value, "ask": ask_value, "ts": now}
+
+    def _build_2leg_snapshot(
+        self,
+        market_data: dict[str, dict[str, object]],
+        now: float,
+    ) -> PilotMarketSnapshot:
+        merged: dict[str, dict[str, object]] = {}
+        for symbol, payload in market_data.items():
+            merged_payload = dict(payload)
+            cache = self._bidask_cache.get(symbol)
+            if cache:
+                age_ms = int((now - cache["ts"]) * 1000)
+                if age_ms <= self.TTL_MS:
+                    merged_payload.update({"bid": cache["bid"], "ask": cache["ask"], "age_ms": age_ms})
+            merged[symbol] = merged_payload
+        return PilotMarketSnapshot.from_market_data(merged, stale_ms=self.TTL_MS)
+
+    def _bidask_age_ms(self, symbol: str, now: float) -> int | None:
+        cache = self._bidask_cache.get(symbol)
+        if not cache:
+            return None
+        return int((now - cache["ts"]) * 1000)
+
+    def _is_2leg_bidask_missing(self, symbols: list[str], now: float) -> bool:
+        if not symbols:
+            return True
+        ages = [self._bidask_age_ms(symbol, now) for symbol in symbols]
+        return all(age is None or age > self.TTL_MS for age in ages)
+
+    def _log_2leg_window_state(self, window: PilotWindow, *, reason: str, now: float) -> None:
+        state = "NO_WINDOW"
+        if window.valid:
+            state = "WINDOW"
+        if window.valid and len(window.symbols) >= 2:
+            age_a = self._bidask_age_ms(window.symbols[0], now)
+            age_b = self._bidask_age_ms(window.symbols[1], now)
+            if (
+                age_a is not None
+                and age_b is not None
+                and (age_a > self.DEFAULT_MAX_PRICE_AGE_MS or age_b > self.DEFAULT_MAX_PRICE_AGE_MS)
+                and (age_a <= self.TTL_MS and age_b <= self.TTL_MS)
+            ):
+                state = "WINDOW_DEGRADED"
+        if state == self._last_2leg_state:
+            return
+        if state == "NO_WINDOW" and reason == "missing_bidask":
+            self._window._append_pilot_log("[2LEG] ANALYZE -> NO_WINDOW reason=missing_bidask")
+        elif state == "WINDOW":
+            self._window._append_pilot_log("[2LEG] ANALYZE -> WINDOW")
+        elif state == "WINDOW_DEGRADED":
+            self._window._append_pilot_log("[2LEG] ANALYZE -> WINDOW_DEGRADED")
+        if window.valid and len(window.symbols) >= 2:
+            age_a = self._bidask_age_ms(window.symbols[0], now)
+            age_b = self._bidask_age_ms(window.symbols[1], now)
+            if (
+                age_a is not None
+                and age_b is not None
+                and age_a <= self.TWOLEG_BIDASK_GRACE_MS
+                and age_b <= self.TWOLEG_BIDASK_GRACE_MS
+            ):
+                self._window._append_pilot_log(f"[2LEG] bidask_ok legA={age_a} legB={age_b}")
+        self._last_2leg_state = state
 
     def _panic_hold(self, reason: str) -> None:
         self._window._append_pilot_log(f"[PANIC] hold reason={reason} -> cancel_all")
