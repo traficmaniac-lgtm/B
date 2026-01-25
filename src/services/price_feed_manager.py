@@ -2085,6 +2085,11 @@ class PriceFeedManager:
         thread = threading.Thread(target=self._load_exchange_info, name="price-feed-exchange-info", daemon=True)
         thread.start()
 
+    def get_exchange_symbols(self) -> set[str]:
+        self._ensure_exchange_info_loaded()
+        with self._lock:
+            return set(self._exchange_symbols)
+
     def _load_exchange_info(self) -> None:
         try:
             data = self._http_client.get_exchange_info()

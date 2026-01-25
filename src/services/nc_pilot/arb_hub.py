@@ -124,9 +124,7 @@ class ArbHub:
         max_age_ms: int,
     ) -> RouteSnapshot:
         candidates: list[ArbHub.RouteSnapshot] = []
-        for symbol in ("EURIUSDT", "EURIEUR", "USDTUSDC", "TUSDUSDT"):
-            if symbol not in selected_symbols:
-                continue
+        for symbol in sorted(selected_symbols):
             quote = market_by_symbol.get(symbol)
             snapshot = self._compute_spread_snapshot(
                 symbol=symbol,

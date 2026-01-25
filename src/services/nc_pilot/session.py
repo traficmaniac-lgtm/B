@@ -94,6 +94,8 @@ class PilotRuntimeState:
     last_exec_ts: float | None = None
     order_client_ids: set[str] = field(default_factory=set)
     selected_symbols: set[str] = field(default_factory=lambda: set(PILOT_DEFAULT_SYMBOLS))
+    symbol_aliases: dict[str, str] = field(default_factory=dict)
+    invalid_symbols: dict[str, str] = field(default_factory=dict)
     indicator_states: dict[str, bool] = field(default_factory=dict)
     indicator_tooltips: dict[str, str] = field(default_factory=dict)
     algo_states: dict[str, PilotAlgoState] = field(default_factory=dict)
