@@ -14,6 +14,7 @@ from src.services.nc_pilot.pilot_analysis import (
     PilotMarketSnapshot,
     PilotWindow,
     RebalFamilyScanner,
+    resolve_leg_market,
     SpreadFamilyScanner,
     TwoLegFamilyScanner,
 )
@@ -62,12 +63,12 @@ class PilotController:
 
     TWO_LEG_ROUTE_MAP = {
         "USDC→USDT→TUSD": [
-            ("USDCUSDT", "SELL", "USDC", "USDT", "bid"),
-            ("TUSDUSDT", "BUY", "USDT", "TUSD", "ask"),
+            ("USDC", "USDT"),
+            ("USDT", "TUSD"),
         ],
         "TUSD→USDT→USDC": [
-            ("TUSDUSDT", "SELL", "TUSD", "USDT", "bid"),
-            ("USDCUSDT", "BUY", "USDT", "USDC", "ask"),
+            ("TUSD", "USDT"),
+            ("USDT", "USDC"),
         ],
     }
 
@@ -367,25 +368,41 @@ class PilotController:
         required_notional = Decimal(str(max(window.max_notional, 0.0)))
         if required_notional <= 0:
             return None, None
-        for symbol, side, require_asset, _output_asset, _price_side in legs:
-            if side == "SELL":
-                free = self._window._pilot_balance_free(require_asset)
-                if free < required_notional:
-                    return None, (require_asset, required_notional, free)
-            else:
-                free = self._window._pilot_balance_free(require_asset)
-                if free < required_notional:
-                    return None, (require_asset, required_notional, free)
+        available_symbols = snapshot.quotes.keys()
+        resolved_legs: list[tuple[str, str, str, str, bool]] = []
+        for from_asset, to_asset in legs:
+            symbol, side, invert = resolve_leg_market(from_asset, to_asset, available_symbols)
+            if not symbol:
+                return None, None
+            resolved_legs.append((symbol, side, from_asset, to_asset, invert))
+        for _symbol, _side, require_asset, _output_asset, _invert in resolved_legs:
+            free = self._window._pilot_balance_free(require_asset)
+            if free < required_notional:
+                return None, (require_asset, required_notional, free)
         plan: list[TwoLegOrderPlan] = []
-        for symbol, side, require_asset, _output_asset, price_side in legs:
+        for idx, (symbol, side, require_asset, _output_asset, invert) in enumerate(resolved_legs, start=1):
             quote = snapshot.quote(symbol)
             if quote is None or quote.bid is None or quote.ask is None:
                 return None, None
             if snapshot.is_stale(symbol):
                 return None, None
-            price_raw = quote.bid if price_side == "bid" else quote.ask
+            price_raw = quote.bid if side == "SELL" else quote.ask
             if price_raw is None or price_raw <= 0:
                 return None, None
+            if invert:
+                eff_bid = 1 / quote.ask if quote.ask and quote.ask > 0 else None
+                eff_ask = 1 / quote.bid if quote.bid and quote.bid > 0 else None
+                self._window._append_pilot_log(
+                    "[2LEG] "
+                    f"leg{idx} symbol={symbol} invert=true "
+                    f"bid={quote.bid:.8f} ask={quote.ask:.8f} "
+                    f"eff_bid={eff_bid:.8f} eff_ask={eff_ask:.8f}"
+                )
+            else:
+                self._window._append_pilot_log(
+                    "[2LEG] "
+                    f"leg{idx} symbol={symbol} invert=false bid={quote.bid:.8f} ask={quote.ask:.8f}"
+                )
             price = Decimal(str(price_raw))
             if side == "SELL":
                 qty = required_notional
@@ -478,7 +495,14 @@ class PilotController:
         legs = self.TWO_LEG_ROUTE_MAP.get(window.route)
         if not legs:
             return False, "missing_bidask", {"route": window.route}
-        for symbol in window.symbols:
+        available_symbols = snapshot.quotes.keys()
+        resolved_legs: list[tuple[str, str, str, str]] = []
+        for from_asset, to_asset in legs:
+            symbol, side, _invert = resolve_leg_market(from_asset, to_asset, available_symbols)
+            if not symbol:
+                return False, "missing_bidask", {"route": window.route}
+            resolved_legs.append((symbol, side, from_asset, to_asset))
+        for symbol, _side, _from_asset, _to_asset in resolved_legs:
             quote = snapshot.quote(symbol)
             if quote is None or quote.bid is None or quote.ask is None:
                 return False, "missing_bidask", {"symbol": symbol}
@@ -505,11 +529,11 @@ class PilotController:
         required_notional = Decimal(str(max(window.max_notional, 0.0)))
         if required_notional <= 0:
             return False, "insufficient_balance", {"required_notional": float(required_notional)}
-        for symbol, side, require_asset, _output_asset, price_side in legs:
+        for symbol, side, require_asset, _output_asset in resolved_legs:
             quote = snapshot.quote(symbol)
             if quote is None or quote.bid is None or quote.ask is None:
                 return False, "missing_bidask", {"symbol": symbol}
-            price_raw = quote.bid if price_side == "bid" else quote.ask
+            price_raw = quote.bid if side == "SELL" else quote.ask
             if price_raw is None or price_raw <= 0:
                 return False, "missing_bidask", {"symbol": symbol}
             price = Decimal(str(price_raw))
