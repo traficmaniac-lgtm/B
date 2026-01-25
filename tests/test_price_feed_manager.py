@@ -4,6 +4,8 @@ import asyncio
 from src.services.price_feed_manager import (
     WS_CONNECTED,
     WS_LOST,
+    WS_RECOVERY_HOLD_MS,
+    PriceUpdate,
     PriceFeedManager,
     _BinanceBookTickerWsThread,
     calculate_backoff,
@@ -40,11 +42,11 @@ def test_ws_state_machine_hysteresis() -> None:
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     assert manager._symbol_state[symbol]["ws_status"] == WS_CONNECTED
 
-    now_ms = 6000
+    now_ms = manager._router_config.ws_stale_ms + 1000
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     assert manager._symbol_state[symbol]["ws_status"] == WS_LOST
 
-    now_ms = 16000
+    now_ms = manager._router_config.ws_stale_ms + 11_000
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     assert manager._symbol_state[symbol]["ws_status"] == WS_LOST
     assert manager._symbol_state[symbol]["http_fallback_enabled"] is True
@@ -52,11 +54,12 @@ def test_ws_state_machine_hysteresis() -> None:
     for tick in (16100, 16200, 16300):
         now_ms = tick
         manager._handle_ws_message({"s": symbol, "b": "1.0", "a": "1.1", "E": tick})
+    now_ms = 16300 + WS_RECOVERY_HOLD_MS + 100
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     assert manager._symbol_state[symbol]["ws_status"] == WS_CONNECTED
     assert manager._symbol_state[symbol]["http_fallback_enabled"] is False
 
-    now_ms = 16300 + 6000
+    now_ms = 16300 + manager._router_config.ws_stale_ms + 1000
     manager._heartbeat_symbol(symbol, now_ms, subscribed=True)
     assert manager._symbol_state[symbol]["http_fallback_enabled"] is True
 
@@ -117,3 +120,23 @@ def test_manager_register_ignored_after_shutdown() -> None:
     manager.shutdown()
     manager.register_symbol("BTCUSDT")
     manager.unregister_symbol("BTCUSDT")
+
+
+def test_subscribe_refcounts_registry() -> None:
+    manager = PriceFeedManager(Config())
+    seen: list[PriceUpdate] = []
+
+    def _cb(update: PriceUpdate) -> None:
+        seen.append(update)
+
+    def _cb_two(update: PriceUpdate) -> None:
+        seen.append(update)
+
+    manager.subscribe("BTCUSDT", _cb)
+    assert manager._registry.count("BTCUSDT") == 1
+    manager.subscribe("BTCUSDT", _cb_two)
+    assert manager._registry.count("BTCUSDT") == 2
+    manager.unsubscribe("BTCUSDT", _cb)
+    assert manager._registry.count("BTCUSDT") == 1
+    manager.unsubscribe("BTCUSDT", _cb_two)
+    assert manager._registry.count("BTCUSDT") == 0

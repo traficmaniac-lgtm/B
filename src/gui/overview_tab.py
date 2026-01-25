@@ -689,7 +689,6 @@ class OverviewTab(QWidget):
         if not self._allow_streaming:
             return
         if symbol not in self._active_streams:
-            self._price_manager.register_symbol(symbol)
             self._price_manager.subscribe(symbol, self._handle_price_update)
             self._active_streams.add(symbol)
         if include_status and symbol not in self._status_streams:
@@ -699,7 +698,6 @@ class OverviewTab(QWidget):
     def _unsubscribe_symbol(self, symbol: str) -> None:
         if symbol in self._active_streams:
             self._price_manager.unsubscribe(symbol, self._handle_price_update)
-            self._price_manager.unregister_symbol(symbol)
             self._active_streams.discard(symbol)
         self._latest_price_updates.pop(symbol, None)
 
@@ -709,7 +707,6 @@ class OverviewTab(QWidget):
                 self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
             for symbol in list(self._active_streams):
                 self._price_manager.unsubscribe(symbol, self._handle_price_update)
-                self._price_manager.unregister_symbol(symbol)
             self._status_streams.clear()
             self._active_streams.clear()
             self._update_price_timer()
@@ -818,7 +815,6 @@ class OverviewTab(QWidget):
             self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
         for symbol in list(self._active_streams):
             self._price_manager.unsubscribe(symbol, self._handle_price_update)
-            self._price_manager.unregister_symbol(symbol)
         self._status_streams.clear()
         self._active_streams.clear()
         self._selected_symbol = None

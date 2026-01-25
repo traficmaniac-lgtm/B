@@ -913,7 +913,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._market_kpi_timer.start()
         self._registry_gc_timer.start()
 
-        self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
         self._price_feed_manager.start()
@@ -7843,7 +7842,6 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
         self._market_kpi_timer.stop()
         self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
-        self._price_feed_manager.unregister_symbol(self._symbol)
         self._append_log("Lite Grid Terminal closed.", kind="INFO")
         super().closeEvent(event)
 

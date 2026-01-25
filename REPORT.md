@@ -237,3 +237,17 @@ Tests:
 - Logged user-driven parameter changes and kept invalidation only on real edits.
 - Cleared pending actions/confidence on snapshot refresh to return INVALID -> DATA_READY cleanly.
 - Made reset defaults idempotent to avoid duplicate "Settings reset to defaults." events.
+
+### NC_MICRO v1.0.27 — Multi-tab parallel sessions + 1m logs
+- Added per-symbol NcMicroSession container (config, runtime flags, market cache, order tracking, counters).
+- Stored NC_MICRO settings per symbol (with legacy fallback) and added Apply button + Start config snapshot.
+- Implemented per-symbol 1-minute summary heartbeat with reduced exec dup spam.
+- Switched price feed subscriptions to refcounted subscribe/unsubscribe and improved feed logging for multi-symbol mode.
+
+Acceptance checklist:
+1. ✅ Session isolation: per-symbol config + runtime + trackers stored on NcMicroSession (no shared mutable state).
+2. ✅ Settings: per-symbol persistence with Apply button; Start logs config snapshot; reset defaults affects only current session.
+3. ✅ Price feed: subscribe/unsubscribe refcounts per symbol; open tabs drive subscriptions without overview global state.
+4. ✅ Exec dedup: per-symbol caches; exec_dup logs are DEBUG + counted in 1m summary.
+5. ✅ 1-minute summary log per symbol using monotonic time (heartbeat even on no bid/ask).
+6. ✅ Log tagging: session logs prefixed with [NC_MICRO][symbol].
