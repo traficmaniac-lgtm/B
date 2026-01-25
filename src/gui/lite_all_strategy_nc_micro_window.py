@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -831,7 +832,7 @@ class GridEngine:
         return self._plan_stats
 
 
-class LiteAllStrategyNcMicroWindow(QMainWindow):
+class NcMicroTabWidget(QWidget):
     def __init__(
         self,
         symbol: str,
@@ -847,6 +848,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._logger = NcMicroLoggerAdapter(get_logger("gui.lite_all_strategy_nc_micro"), self._symbol)
         self._price_feed_manager = price_feed_manager
         self._session = NcMicroSession(symbol=self._symbol)
+        self.session = self._session
         self.trade_source = "HTTP_ONLY"
         self._pending_trade_source: str | None = None
         self._last_trade_source_change_ms = 0
@@ -1238,15 +1240,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self.setWindowTitle(f"Lite All Strategy Terminal — NC MICRO — {self._symbol}")
         self.resize(1050, 720)
 
-        central = QWidget(self)
-        outer_layout = QVBoxLayout(central)
+        outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(10, 10, 10, 10)
         outer_layout.setSpacing(8)
 
         outer_layout.addLayout(self._build_header())
         outer_layout.addWidget(self._build_body())
-
-        self.setCentralWidget(central)
         self._apply_trade_gate()
         if self._pilot_ui_timer is not None:
             self._pilot_ui_timer.start()
@@ -1271,10 +1270,97 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             f"[NC_MICRO] opened. version={VERSION} symbol={self._symbol}",
             kind="INFO",
         )
+        self.update_ui_lock_state()
+        self._log_ui_tab_created()
 
     @property
     def symbol(self) -> str:
         return self._symbol
+
+    def ui_from_config(self) -> None:
+        self._refresh_settings_ui_from_state()
+
+    def config_from_ui(self) -> GridSettingsState:
+        if not hasattr(self, "_budget_input"):
+            return self._settings_state
+        return GridSettingsState(
+            budget=float(self._budget_input.value()),
+            direction=str(self._direction_combo.currentData() or self._settings_state.direction),
+            grid_count=int(self._grid_count_input.value()),
+            grid_step_pct=float(self._grid_step_input.value()),
+            grid_step_mode=str(self._grid_step_mode_combo.currentData() or self._settings_state.grid_step_mode),
+            range_mode=str(self._range_mode_combo.currentData() or self._settings_state.range_mode),
+            range_low_pct=float(self._range_low_input.value()),
+            range_high_pct=float(self._range_high_input.value()),
+            take_profit_pct=float(self._take_profit_input.value()),
+            stop_loss_enabled=bool(self._stop_loss_toggle.isChecked()),
+            stop_loss_pct=float(self._stop_loss_input.value()),
+            max_active_orders=int(self._max_orders_input.value()),
+            order_size_mode=str(self._order_size_combo.currentData() or self._settings_state.order_size_mode),
+        )
+
+    def set_controls_enabled(self, enabled: bool, reason: str = "") -> None:
+        self._set_strategy_controls_enabled(enabled)
+        if reason:
+            self._append_log(
+                f"[NC_MICRO][UI] controls_enabled={str(enabled).lower()} reason={reason}",
+                kind="INFO",
+            )
+
+    def update_ui_lock_state(self) -> None:
+        locked = (
+            self._session.runtime.start_in_progress
+            or self._stop_in_progress
+            or self._engine_state == "STOPPING"
+        )
+        self._set_strategy_controls_enabled(not locked)
+
+    def on_start_clicked(self) -> None:
+        self._handle_start()
+
+    def on_stop_clicked(self) -> None:
+        self._handle_stop()
+
+    def on_pause_clicked(self) -> None:
+        self._handle_pause()
+
+    def on_tab_activated(self) -> None:
+        self.update_ui_lock_state()
+        self._log_ui_tab_activated()
+
+    def _ui_fields_enabled(self) -> list[bool]:
+        fields = [
+            getattr(self, "_budget_input", None),
+            getattr(self, "_grid_step_input", None),
+            getattr(self, "_range_low_input", None),
+            getattr(self, "_range_high_input", None),
+            getattr(self, "_take_profit_input", None),
+            getattr(self, "_max_orders_input", None),
+        ]
+        return [bool(field and field.isEnabled()) for field in fields]
+
+    def _log_ui_tab_created(self) -> None:
+        form_enabled = bool(getattr(self, "_grid_panel", None) and self._grid_panel.isEnabled())
+        fields_enabled = self._ui_fields_enabled()
+        self._append_log(
+            (
+                "[NC_MICRO][UI] tab_created "
+                f"symbol={self._symbol} widgets_id={hex(id(self))} "
+                f"form_enabled={str(form_enabled).lower()} "
+                f"fields_enabled={fields_enabled}"
+            ),
+            kind="INFO",
+        )
+
+    def _log_ui_tab_activated(self) -> None:
+        fields_enabled = self._ui_fields_enabled()
+        self._append_log(
+            (
+                "[NC_MICRO][UI] tab_activated "
+                f"symbol={self._symbol} enabled={fields_enabled} engine_state={self._engine_state}"
+            ),
+            kind="INFO",
+        )
 
     def _resolve_legacy_policy(self) -> LegacyPolicy:
         policy_raw = getattr(self._app_state, "nc_micro_legacy_policy", "CANCEL")
@@ -1861,6 +1947,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def _build_grid_panel(self) -> QWidget:
         group = QGroupBox(tr("grid_settings"))
+        self._grid_panel = group
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
@@ -4712,7 +4799,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
 
     def _handle_book_ticker_success(self, payload: object, _latency_ms: int) -> None:
-        assert isinstance(self, LiteAllStrategyNcMicroWindow)
+        assert isinstance(self, NcMicroTabWidget)
         try:
             if self._closing:
                 return
@@ -4753,7 +4840,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
 
     def _handle_success(self, payload: object, _latency_ms: int) -> None:
-        assert isinstance(self, LiteAllStrategyNcMicroWindow)
+        assert isinstance(self, NcMicroTabWidget)
         try:
             if self._closing:
                 return
@@ -5334,6 +5421,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._append_log("[START] ignored: in_progress", kind="WARN")
                 self._start_in_progress_logged = True
             return
+        ui_settings = self.config_from_ui()
+        self._append_log(
+            (
+                "[NC_MICRO][UI] start_clicked "
+                f"symbol={self._symbol} "
+                "cfg={"
+                f"budget={ui_settings.budget:.2f},"
+                f"step={ui_settings.grid_step_pct:.4f},"
+                f"range_dn={ui_settings.range_low_pct:.4f},"
+                f"range_up={ui_settings.range_high_pct:.4f},"
+                f"tp={ui_settings.take_profit_pct:.4f},"
+                f"max_active={ui_settings.max_active_orders}"
+                "}"
+            ),
+            kind="INFO",
+        )
         self._apply_settings_from_ui()
         snapshot = self._collect_strategy_snapshot()
         self._append_log(
@@ -6284,6 +6387,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._apply_engine_state_style(self._engine_state)
         self._update_orders_timer_interval()
         self._update_fills_timer()
+        self.update_ui_lock_state()
         if new_state in {"RUNNING", "PAUSED", "WAITING_FILLS"} and self._current_action == "start":
             self._current_action = None
         if new_state in {"IDLE", "STOPPED"} and not self._session.runtime.start_in_progress:
@@ -9351,7 +9455,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _rule_decimal(value: float | None) -> Decimal | None:
         if value is None:
             return None
-        return LiteAllStrategyNcMicroWindow.as_decimal(value)
+        return NcMicroTabWidget.as_decimal(value)
 
     @staticmethod
     def as_decimal(value: float | str | Decimal) -> Decimal:
@@ -9975,7 +10079,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if not isinstance(entry, dict):
                 continue
             if entry.get("filterType") == filter_type:
-                return LiteAllStrategyNcMicroWindow._coerce_float(str(entry.get(key, "")))
+                return NcMicroTabWidget._coerce_float(str(entry.get(key, "")))
         return None
 
     def _order_id_for_row(self, row: int) -> str:
@@ -10698,6 +10802,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._session.runtime.engine_state = state
         self._engine_state_label.setText(f"{tr('engine')}: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
+        self.update_ui_lock_state()
 
     def _update_pnl(self, unrealized: float | None, realized: float | None) -> None:
         if unrealized is None and realized is None:
@@ -11237,3 +11342,77 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
     def dump_settings(self) -> dict[str, Any]:
         return asdict(self._settings_state)
+
+
+class NcMicroMainWindow(QMainWindow):
+    def __init__(
+        self,
+        config: Config,
+        app_state: AppState,
+        price_feed_manager: PriceFeedManager,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._config = config
+        self._app_state = app_state
+        self._price_feed_manager = price_feed_manager
+        self._logger = get_logger("gui.nc_micro_main_window")
+        self._tabs_by_symbol: dict[str, NcMicroTabWidget] = {}
+        self.setWindowTitle("NC_MICRO")
+        self.resize(1150, 760)
+
+        self._tab_widget = QTabWidget(self)
+        self._tab_widget.setTabsClosable(True)
+        self._tab_widget.tabCloseRequested.connect(self._close_tab)
+        self._tab_widget.currentChanged.connect(self._handle_tab_changed)
+        self.setCentralWidget(self._tab_widget)
+
+    def add_or_activate_symbol(self, symbol: str) -> None:
+        normalized = symbol.strip().upper()
+        if not normalized:
+            return
+        existing = self._tabs_by_symbol.get(normalized)
+        if existing is not None:
+            index = self._tab_widget.indexOf(existing)
+            if index >= 0:
+                if self._tab_widget.currentIndex() != index:
+                    self._tab_widget.setCurrentIndex(index)
+                else:
+                    existing.on_tab_activated()
+            return
+        tab = NcMicroTabWidget(
+            symbol=normalized,
+            config=self._config,
+            app_state=self._app_state,
+            price_feed_manager=self._price_feed_manager,
+            parent=self,
+        )
+        self._tabs_by_symbol[normalized] = tab
+        index = self._tab_widget.addTab(tab, normalized)
+        self._tab_widget.setCurrentIndex(index)
+        self._logger.info("[NC_MICRO][UI] tab_added symbol=%s index=%s", normalized, index)
+
+    def _close_tab(self, index: int) -> None:
+        widget = self._tab_widget.widget(index)
+        if widget is None:
+            return
+        symbol = getattr(widget, "symbol", None)
+        self._tab_widget.removeTab(index)
+        if isinstance(widget, QWidget):
+            widget.close()
+            widget.deleteLater()
+        if symbol:
+            self._tabs_by_symbol.pop(symbol, None)
+        self._logger.info("[NC_MICRO][UI] tab_closed symbol=%s index=%s", symbol, index)
+
+    def _handle_tab_changed(self, index: int) -> None:
+        widget = self._tab_widget.widget(index)
+        if isinstance(widget, NcMicroTabWidget):
+            widget.on_tab_activated()
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802
+        for index in reversed(range(self._tab_widget.count())):
+            widget = self._tab_widget.widget(index)
+            if widget is not None:
+                widget.close()
+        super().closeEvent(event)
