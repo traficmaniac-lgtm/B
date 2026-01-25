@@ -91,7 +91,7 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.1"
+NC_PILOT_VERSION = "v1.0.2"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 
@@ -1565,15 +1565,24 @@ class NcPilotTabWidget(QWidget):
         return wrapper
 
     def _build_body(self) -> QSplitter:
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_market_panel())
-        splitter.addWidget(self._build_grid_panel())
-        splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 1)
-        return splitter
+        outer_splitter = QSplitter(Qt.Vertical)
+        outer_splitter.setChildrenCollapsible(False)
+
+        top_splitter = QSplitter(Qt.Horizontal)
+        top_splitter.setChildrenCollapsible(False)
+        top_splitter.addWidget(self._build_market_panel())
+        top_splitter.addWidget(self._build_grid_panel())
+        top_splitter.addWidget(self._build_right_panel())
+        top_splitter.setStretchFactor(0, 1)
+        top_splitter.setStretchFactor(1, 2)
+        top_splitter.setStretchFactor(2, 1)
+
+        outer_splitter.addWidget(top_splitter)
+        outer_splitter.addWidget(self._build_pilot_dashboard_panel())
+        outer_splitter.setStretchFactor(0, 3)
+        outer_splitter.setStretchFactor(1, 2)
+        outer_splitter.setSizes([700, 320])
+        return outer_splitter
 
     def _is_micro_profile(self) -> bool:
         return self._symbol.replace("/", "").upper() in MICRO_STABLECOIN_SYMBOLS
@@ -2128,6 +2137,7 @@ class NcPilotTabWidget(QWidget):
         self._grid_preview_label = QLabel("—")
         self._grid_preview_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._grid_preview_label)
+        layout.addWidget(self._build_pilot_control_panel())
 
         self._apply_range_mode(self._settings_state.range_mode)
         self._apply_grid_step_mode(self._settings_state.grid_step_mode)
@@ -2150,6 +2160,7 @@ class NcPilotTabWidget(QWidget):
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
+        group.setMinimumHeight(280)
         layout = QVBoxLayout(group)
         layout.setSpacing(4)
 
@@ -2234,13 +2245,12 @@ class NcPilotTabWidget(QWidget):
         self._cancel_all_on_stop_toggle = QCheckBox(tr("cancel_all_on_stop"))
         self._cancel_all_on_stop_toggle.setChecked(True)
         layout.addWidget(self._cancel_all_on_stop_toggle)
-        layout.addWidget(self._build_pilot_panel())
 
         self._apply_pnl_style(self._pnl_label, None)
         self._refresh_orders_metrics()
         return group
 
-    def _build_pilot_panel(self) -> QWidget:
+    def _build_pilot_control_panel(self) -> QWidget:
         group = QGroupBox("PILOT")
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
@@ -2251,9 +2261,9 @@ class NcPilotTabWidget(QWidget):
         layout.setSpacing(4)
 
         buttons = QHBoxLayout()
-        self._pilot_start_analysis_button = QPushButton("Start Analysis")
-        self._pilot_start_trading_button = QPushButton("Start Trading")
-        self._pilot_stop_trading_button = QPushButton("Stop Trading")
+        self._pilot_start_analysis_button = QPushButton("Старт анализ")
+        self._pilot_start_trading_button = QPushButton("Старт торговля")
+        self._pilot_stop_trading_button = QPushButton("Стоп")
         for button in (
             self._pilot_start_analysis_button,
             self._pilot_start_trading_button,
@@ -2268,7 +2278,7 @@ class NcPilotTabWidget(QWidget):
         buttons.addWidget(self._pilot_stop_trading_button)
         layout.addLayout(buttons)
 
-        self._pilot_status_line = QLabel("state=IDLE | best=— | edge=—bps | last=—")
+        self._pilot_status_line = QLabel("state=IDLE | best=— | edge=— bps | last=—")
         self._pilot_status_line.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_status_line)
 
@@ -2277,6 +2287,46 @@ class NcPilotTabWidget(QWidget):
         layout.addWidget(self._pilot_cancel_on_stop_toggle)
 
         self._set_pilot_controls(analysis_on=False, trading_on=False)
+        return group
+
+    def _build_pilot_dashboard_panel(self) -> QWidget:
+        group = QGroupBox("PILOT DASHBOARD")
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self._pilot_dashboard_counters_label = QLabel(
+            "Pilot: state=— | windows_today=0 | max_edge=— bps | active_routes=0 | last_decision=—"
+        )
+        self._pilot_dashboard_counters_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        layout.addWidget(self._pilot_dashboard_counters_label)
+
+        self._pilot_routes_table = QTableWidget(0, 7, self)
+        self._pilot_routes_table.setHorizontalHeaderLabels(
+            [
+                "Route",
+                "State",
+                "Edge bps",
+                "Profit abs",
+                "DepthOK",
+                "TTL life (ms)",
+                "Suggested action",
+            ]
+        )
+        header = self._pilot_routes_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        for column in range(6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self._pilot_routes_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._pilot_routes_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._pilot_routes_table.verticalHeader().setDefaultSectionSize(22)
+        self._pilot_routes_table.setMinimumHeight(200)
+        self._pilot_routes_table.cellClicked.connect(self._handle_pilot_route_click)
+        layout.addWidget(self._pilot_routes_table)
         return group
 
     def _build_logs(self) -> QFrame:
@@ -2364,6 +2414,13 @@ class NcPilotTabWidget(QWidget):
         )
         self._pilot_controller.stop(cancel_orders=cancel_orders)
 
+    def _handle_pilot_route_click(self, row: int, _column: int) -> None:
+        if not hasattr(self, "_pilot_routes_table"):
+            return
+        route_item = self._pilot_routes_table.item(row, 0)
+        route_text = route_item.text() if route_item else "—"
+        self._append_log(f"[PILOT] route details: {route_text}", kind="INFO")
+
     def _set_pilot_controls(self, *, analysis_on: bool, trading_on: bool) -> None:
         if hasattr(self, "_pilot_start_analysis_button"):
             self._pilot_start_analysis_button.setEnabled(not analysis_on)
@@ -2377,9 +2434,48 @@ class NcPilotTabWidget(QWidget):
             return
         runtime = self._session.pilot
         best = runtime.last_best_route or "—"
-        edge = f"{runtime.last_best_edge_bps:.3f}" if runtime.last_best_edge_bps is not None else "—"
+        edge = f"{runtime.last_best_edge_bps:.2f}" if runtime.last_best_edge_bps is not None else "—"
         last = runtime.last_decision or "—"
-        self._pilot_status_line.setText(f"state={runtime.state} | best={best} | edge={edge}bps | last={last}")
+        self._pilot_status_line.setText(f"state={runtime.state} | best={best} | edge={edge} bps | last={last}")
+        self._set_pilot_controls(analysis_on=runtime.analysis_on, trading_on=runtime.trading_on)
+
+    def _update_pilot_dashboard_counters(self) -> None:
+        if not hasattr(self, "_pilot_dashboard_counters_label"):
+            return
+        runtime = self._session.pilot
+        counters = runtime.counters
+        edge = f"{runtime.last_best_edge_bps:.2f}" if runtime.last_best_edge_bps is not None else "—"
+        last_decision = runtime.last_decision or "—"
+        self._pilot_dashboard_counters_label.setText(
+            "Pilot: state="
+            f"{runtime.state} | windows_today={counters.windows_found_today} "
+            f"| max_edge={edge} bps | active_routes=0 | last_decision={last_decision}"
+        )
+
+    def _update_pilot_routes_table(self) -> None:
+        if not hasattr(self, "_pilot_routes_table"):
+            return
+        runtime = self._session.pilot
+        route = runtime.last_best_route
+        edge = runtime.last_best_edge_bps
+        if not route:
+            if self._pilot_routes_table.rowCount() != 0:
+                self._pilot_routes_table.setRowCount(0)
+            return
+        self._pilot_routes_table.setRowCount(1)
+        values = [
+            route,
+            runtime.state,
+            "—" if edge is None else f"{edge:.2f}",
+            "—",
+            "—",
+            "—",
+            runtime.last_decision or "—",
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setTextAlignment(Qt.AlignCenter)
+            self._pilot_routes_table.setItem(0, column, item)
 
     def _pilot_client_order_id(
         self,
@@ -3880,6 +3976,9 @@ class NcPilotTabWidget(QWidget):
         if self._closing:
             return
         try:
+            self._update_pilot_status_line()
+            self._update_pilot_dashboard_counters()
+            self._update_pilot_routes_table()
             if not hasattr(self, "_pilot_state_value"):
                 return
             self._pilot_update_state_machine()
