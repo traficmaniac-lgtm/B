@@ -78,6 +78,7 @@ from src.gui.lite_grid_math import (
 )
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
+from src.services.nc_pilot.pilot_controller import PilotController
 from src.services.nc_pilot.session import GridSettingsState, NcPilotSession
 from src.services.net import get_net_worker, shutdown_net_worker
 from src.services.net.net_worker import NetWorker
@@ -90,7 +91,7 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.0"
+NC_PILOT_VERSION = "v1.0.1"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 
@@ -852,6 +853,7 @@ class NcPilotTabWidget(QWidget):
         self._price_feed_manager = price_feed_manager
         self._session = NcPilotSession(symbol=self._symbol)
         self.session = self._session
+        self._pilot_controller = PilotController(self, self._session)
         self.trade_source = "HTTP_ONLY"
         self._pending_trade_source: str | None = None
         self._last_trade_source_change_ms = 0
@@ -989,6 +991,7 @@ class NcPilotTabWidget(QWidget):
         self._open_orders = self._session.order_tracking.open_orders
         self._open_orders_all = self._session.order_tracking.open_orders_all
         self._open_orders_loaded = False
+        self._pilot_virtual_orders: list[dict[str, Any]] = []
         self._bot_order_ids: set[str] = set()
         self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
@@ -2231,9 +2234,49 @@ class NcPilotTabWidget(QWidget):
         self._cancel_all_on_stop_toggle = QCheckBox(tr("cancel_all_on_stop"))
         self._cancel_all_on_stop_toggle.setChecked(True)
         layout.addWidget(self._cancel_all_on_stop_toggle)
+        layout.addWidget(self._build_pilot_panel())
 
         self._apply_pnl_style(self._pnl_label, None)
         self._refresh_orders_metrics()
+        return group
+
+    def _build_pilot_panel(self) -> QWidget:
+        group = QGroupBox("PILOT")
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        buttons = QHBoxLayout()
+        self._pilot_start_analysis_button = QPushButton("Start Analysis")
+        self._pilot_start_trading_button = QPushButton("Start Trading")
+        self._pilot_stop_trading_button = QPushButton("Stop Trading")
+        for button in (
+            self._pilot_start_analysis_button,
+            self._pilot_start_trading_button,
+            self._pilot_stop_trading_button,
+        ):
+            button.setFixedHeight(26)
+        self._pilot_start_analysis_button.clicked.connect(self._handle_pilot_start_analysis)
+        self._pilot_start_trading_button.clicked.connect(self._handle_pilot_start_trading)
+        self._pilot_stop_trading_button.clicked.connect(self._handle_pilot_stop_trading)
+        buttons.addWidget(self._pilot_start_analysis_button)
+        buttons.addWidget(self._pilot_start_trading_button)
+        buttons.addWidget(self._pilot_stop_trading_button)
+        layout.addLayout(buttons)
+
+        self._pilot_status_line = QLabel("state=IDLE | best=— | edge=—bps | last=—")
+        self._pilot_status_line.setStyleSheet("color: #6b7280; font-size: 11px;")
+        layout.addWidget(self._pilot_status_line)
+
+        self._pilot_cancel_on_stop_toggle = QCheckBox("Cancel pilot orders on Stop")
+        self._pilot_cancel_on_stop_toggle.setChecked(True)
+        layout.addWidget(self._pilot_cancel_on_stop_toggle)
+
+        self._set_pilot_controls(analysis_on=False, trading_on=False)
         return group
 
     def _build_logs(self) -> QFrame:
@@ -2307,6 +2350,142 @@ class NcPilotTabWidget(QWidget):
     def _handle_pilot_settings(self) -> None:
         dialog = PilotSettingsDialog(self.pilot_config, on_save=self._apply_pilot_config, parent=self)
         dialog.exec()
+
+    def _handle_pilot_start_analysis(self) -> None:
+        self._pilot_controller.start_analysis()
+
+    def _handle_pilot_start_trading(self) -> None:
+        self._pilot_controller.start_trading()
+
+    def _handle_pilot_stop_trading(self) -> None:
+        cancel_orders = bool(
+            getattr(self, "_pilot_cancel_on_stop_toggle", None)
+            and self._pilot_cancel_on_stop_toggle.isChecked()
+        )
+        self._pilot_controller.stop(cancel_orders=cancel_orders)
+
+    def _set_pilot_controls(self, *, analysis_on: bool, trading_on: bool) -> None:
+        if hasattr(self, "_pilot_start_analysis_button"):
+            self._pilot_start_analysis_button.setEnabled(not analysis_on)
+        if hasattr(self, "_pilot_start_trading_button"):
+            self._pilot_start_trading_button.setEnabled(analysis_on and not trading_on)
+        if hasattr(self, "_pilot_stop_trading_button"):
+            self._pilot_stop_trading_button.setEnabled(analysis_on or trading_on)
+
+    def _update_pilot_status_line(self) -> None:
+        if not hasattr(self, "_pilot_status_line"):
+            return
+        runtime = self._session.pilot
+        best = runtime.last_best_route or "—"
+        edge = f"{runtime.last_best_edge_bps:.3f}" if runtime.last_best_edge_bps is not None else "—"
+        last = runtime.last_decision or "—"
+        self._pilot_status_line.setText(f"state={runtime.state} | best={best} | edge={edge}bps | last={last}")
+
+    def _pilot_client_order_id(
+        self,
+        *,
+        arb_id: str,
+        leg_index: int,
+        leg_type: str,
+        side: str,
+    ) -> str:
+        client_id = f"PILOT|{arb_id}|{self._symbol}|L{leg_index}|{leg_type}|{side}"
+        return self._limit_client_order_id(client_id)
+
+    def _pilot_trade_gate_ready(self) -> bool:
+        if not self._live_enabled():
+            return True
+        return self._trade_gate == TradeGate.TRADE_OK
+
+    def _send_pilot_order(
+        self,
+        *,
+        side: str,
+        price: Decimal,
+        qty: Decimal,
+        client_order_id: str,
+        arb_id: str,
+        leg_index: int,
+        leg_type: str,
+        dry_run: bool,
+    ) -> bool:
+        tick = self._rule_decimal(self._exchange_rules.get("tick"))
+        step = self._rule_decimal(self._exchange_rules.get("step"))
+        price_text = self.fmt_price(price, tick)
+        qty_text = self.fmt_qty(qty, step)
+        self._append_log(
+            (
+                f"[EXEC] arb_id={arb_id} leg={leg_index} {leg_type} "
+                f"side={side} price={price_text} qty={qty_text} dry={str(dry_run).lower()}"
+            ),
+            kind="INFO",
+        )
+        if dry_run:
+            self._append_pilot_virtual_order(
+                {
+                    "orderId": client_order_id,
+                    "clientOrderId": client_order_id,
+                    "side": f"{side} [DRY]",
+                    "price": price_text,
+                    "origQty": qty_text,
+                    "executedQty": "[DRY]",
+                    "status": "NEW",
+                    "time": int(time_fn() * 1000),
+                }
+            )
+            self._session.pilot.order_client_ids.add(client_order_id)
+            return True
+        response, error, status = self._place_limit(
+            side,
+            price,
+            qty,
+            client_order_id,
+            reason="pilot",
+            skip_open_order_duplicate=True,
+            skip_registry=False,
+            allow_existing_client_id=False,
+        )
+        if response:
+            self._session.pilot.order_client_ids.add(client_order_id)
+            return True
+        if error and status != "skip_duplicate_exchange":
+            self._append_log(str(error), kind="WARN")
+        return False
+
+    def _append_pilot_virtual_order(self, order: dict[str, Any]) -> None:
+        self._pilot_virtual_orders.append(order)
+        snapshot = self._build_orders_snapshot(self._open_orders)
+        self._set_orders_snapshot(snapshot, reason="pilot_dry_run")
+
+    def _cancel_pilot_orders(self) -> int:
+        if self._dry_run_toggle.isChecked():
+            count = len(self._pilot_virtual_orders)
+            self._pilot_virtual_orders.clear()
+            self._session.pilot.order_client_ids.clear()
+            snapshot = self._build_orders_snapshot(self._open_orders)
+            self._set_orders_snapshot(snapshot, reason="pilot_cancel_dry_run")
+            return count
+        canceled = 0
+        for order in list(self._open_orders):
+            if not isinstance(order, dict):
+                continue
+            client_id = str(order.get("clientOrderId", ""))
+            if not client_id.startswith("PILOT|"):
+                continue
+            order_id = str(order.get("orderId", ""))
+            if order_id:
+                ok, _error, _outcome = self._cancel_order_idempotent(order_id)
+                if ok:
+                    canceled += 1
+                    self._session.pilot.order_client_ids.discard(client_id)
+            else:
+                try:
+                    self._cancel_order_sync(symbol=self._symbol, orig_client_order_id=client_id)
+                    canceled += 1
+                    self._session.pilot.order_client_ids.discard(client_id)
+                except Exception:  # noqa: BLE001
+                    continue
+        return canceled
 
     def _apply_pilot_config(self, config: PilotConfig) -> None:
         if not self._pilot_feature_enabled:
@@ -10155,7 +10334,10 @@ class NcPilotTabWidget(QWidget):
         now_ms = int(time_fn() * 1000)
         rows: list[OrderRow] = []
         fingerprint_parts: list[tuple[str, str, str, str, str]] = []
-        for order in orders:
+        merged_orders = list(orders)
+        if self._pilot_virtual_orders:
+            merged_orders.extend(self._pilot_virtual_orders)
+        for order in merged_orders:
             if not isinstance(order, dict):
                 continue
             order_id = str(order.get("orderId", ""))
@@ -11388,6 +11570,8 @@ class NcPilotTabWidget(QWidget):
         if self._order_age_timer.isActive():
             self._order_age_timer.stop()
         self._stop_local_timers()
+        if hasattr(self, "_pilot_controller"):
+            self._pilot_controller.shutdown()
 
     def _resume_local_timers(self) -> None:
         if not self._market_kpi_timer.isActive():
