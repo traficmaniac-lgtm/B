@@ -87,6 +87,18 @@ class PilotController:
         pilot = self._session.pilot
         if not pilot.analysis_on:
             return
+        selected_symbols = {symbol.upper() for symbol in pilot.selected_symbols}
+        if not selected_symbols:
+            pilot.last_best_route = None
+            pilot.last_best_edge_bps = None
+            self._log_skip("no_pairs_selected")
+            return
+        current_symbol = self._window._symbol.replace("/", "").upper()
+        if current_symbol not in selected_symbols:
+            pilot.last_best_route = None
+            pilot.last_best_edge_bps = None
+            self._log_skip("pair_not_selected")
+            return
         market = self._session.market
         balances = self._window._balance_snapshot()
         base_free = self._window.as_decimal(balances.get("base_free", Decimal("0")))

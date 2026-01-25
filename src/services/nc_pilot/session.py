@@ -65,6 +65,9 @@ class PilotRuntimeCounters:
     skips: int = 0
 
 
+PILOT_DEFAULT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDCUSDT", "TUSDUSDT")
+
+
 @dataclass
 class PilotRuntimeState:
     state: Literal["IDLE", "ANALYZE", "TRADING", "ERROR"] = "IDLE"
@@ -79,6 +82,9 @@ class PilotRuntimeState:
     last_route_log_ts: float | None = None
     last_exec_ts: float | None = None
     order_client_ids: set[str] = field(default_factory=set)
+    selected_symbols: set[str] = field(default_factory=lambda: set(PILOT_DEFAULT_SYMBOLS))
+    indicator_states: dict[str, bool] = field(default_factory=dict)
+    indicator_tooltips: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
