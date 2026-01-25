@@ -4,6 +4,7 @@
 
 ```
 .
+├── CHANGELOG.md — project changelog.
 ├── AI_PROTOCOL.md — project notes for AI usage and expectations.
 ├── NC MICRO.md — detailed NC MICRO mode overview (RU).
 ├── PROJECT_STRUCTURE.md — this file: layout reference and per-file overview.
@@ -111,6 +112,12 @@
 │       ├── ai_provider.py — AI provider stub/bridge.
 │       ├── data_cache.py — in-memory data cache.
 │       ├── markets_service.py — market list loading/filtering.
+│       ├── nc_micro
+│       │   ├── __init__.py — NC MICRO service helpers package.
+│       │   └── session.py — NC MICRO runtime/session state containers.
+│       ├── net
+│       │   ├── __init__.py — NetWorker lifecycle helpers.
+│       │   └── net_worker.py — background HTTP worker with queue/dedup/rate-limit.
 │       ├── price_feed_manager.py — price feed orchestration (WS + HTTP fallback).
 │       ├── price_feed_service.py — per-symbol feed service used by the manager.
 │       ├── price_hub.py — Qt hub for price updates.
@@ -149,6 +156,7 @@ These files are created at runtime and are not tracked in the repo:
 - `config.json` — main application configuration (env, endpoints, limits). Expected by `src/app/main.py` and `core/config.py`.
 - `config.user.yaml` — user state (auto-created at first run) for GUI settings and API keys.
 - `data/exchange_info_*.json` — cached Binance exchange info payloads (MarketsService cache).
+- `logs/crash/NC_MICRO_*.log` — crash‑catcher logs for NC MICRO window sessions.
 
 ## Modules overview (expanded)
 
@@ -165,6 +173,8 @@ These files are created at runtime and are not tracked in the repo:
 - **services**: application services for prices, markets, caching, and rate limiting.
 - **services/price_feed_manager.py**: WS/HTTP price orchestration and status reporting.
 - **services/price_feed_service.py**: per‑symbol feed used by the manager.
+- **services/nc_micro/session.py**: NC MICRO session/runtime state containers (grid settings, market cache, counters).
+- **services/net/net_worker.py**: background HTTP task worker with priority/dedup/rate limiting.
 - **binance**: HTTP, websocket, and account client wrappers for Binance endpoints.
 - **ai**: AI operator schemas, datapack building, validation, and OpenAI client wrapper.
 - **runtime**: local runtime engine and virtual order simulation.
