@@ -79,7 +79,7 @@ from src.gui.lite_grid_math import (
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
 from src.services.nc_pilot.pilot_controller import PilotController
-from src.services.nc_pilot.session import GridSettingsState, NcPilotSession
+from src.services.nc_pilot.session import GridSettingsState, MultiContext, NcPilotSession
 from src.services.net import get_net_worker, shutdown_net_worker
 from src.services.net.net_worker import NetWorker
 from src.services.price_feed_manager import (
@@ -91,7 +91,7 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.13"
+NC_PILOT_VERSION = "v1.0.19"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
@@ -884,6 +884,7 @@ class NcPilotTabWidget(QWidget):
         self._logger = NcPilotLoggerAdapter(get_logger("gui.lite_all_strategy_nc_pilot"), self._symbol)
         self._price_feed_manager = price_feed_manager
         self._session = NcPilotSession(symbol=self._symbol)
+        self._multi_context: MultiContext = self._session.multi_context
         self.session = self._session
         self._pilot_controller = PilotController(self, self._session)
         self._session.pilot.selected_symbols = set(PILOT_SYMBOLS)
@@ -1003,6 +1004,7 @@ class NcPilotTabWidget(QWidget):
             "book_ticker": 2.0,
             "klines_1h": 60.0,
             "exchange_info_symbol": 3600.0,
+            "exchange_info_all": 3600.0,
         }
         self._pilot_log_window: PilotLogWindow | None = None
         self._pilot_route_snapshots: dict[str, object] = {}
@@ -6165,12 +6167,6 @@ class NcPilotTabWidget(QWidget):
             self._suppress_dry_run_event = False
             self._append_log("[TRADE] toggle rejected: reason=stop/start flow", kind="WARN")
             return
-        if not checked and not self._can_trade():
-            self._suppress_dry_run_event = True
-            self._dry_run_toggle.setChecked(True)
-            self._suppress_dry_run_event = False
-            self._append_log("LIVE unavailable: trade gate not ready (running DRY-RUN).", kind="WARN")
-            return
         if not checked:
             confirm = QMessageBox.question(
                 self,
@@ -6198,15 +6194,7 @@ class NcPilotTabWidget(QWidget):
         self._apply_trade_gate()
         if not checked and self._trade_gate != TradeGate.TRADE_OK:
             reason = self._trade_gate_reason()
-            self._append_log(f"LIVE unavailable: {reason} (running DRY-RUN).", kind="WARN")
-            self._suppress_dry_run_event = True
-            self._dry_run_toggle.setChecked(True)
-            self._suppress_dry_run_event = False
-            self._dry_run_enabled = True
-            self._live_mode_confirmed = False
-            self._grid_engine.set_mode("DRY_RUN")
-            self._apply_trade_gate()
-            return
+            self._append_log(f"LIVE unavailable: {reason} (mode=LIVE selected).", kind="WARN")
         self._update_fills_timer()
 
     def _set_strategy_controls_enabled(self, enabled: bool) -> None:
@@ -7935,21 +7923,30 @@ class NcPilotTabWidget(QWidget):
         return self._engine_ready_state
 
     def _update_engine_ready(self) -> None:
-        new_ready = (
-            self._trade_gate_state == TradeGateState.OK
-            and self._account_can_trade
-            and self._live_enabled()
-        )
+        if self._live_enabled():
+            new_ready = self._live_available()
+        else:
+            new_ready = self._can_run_dry()
         if new_ready == self._engine_ready_state:
             return
         self._engine_ready_state = new_ready
         if new_ready:
-            self._append_log("[ENGINE] ready=true (trade_gate=ok)", kind="INFO")
+            mode = "live" if self._live_enabled() else "dry"
+            self._append_log(f"[ENGINE] ready=true (mode={mode})", kind="INFO")
 
     def _live_enabled(self) -> bool:
         if not hasattr(self, "_dry_run_toggle"):
             return False
         return not self._dry_run_toggle.isChecked()
+
+    def _live_available(self) -> bool:
+        return self._trade_gate == TradeGate.TRADE_OK and self._account_can_trade and self._live_enabled()
+
+    def _can_run_dry(self) -> bool:
+        return self._http_client is not None
+
+    def _can_analyze(self) -> bool:
+        return True
 
     def _balance_age_s(self) -> float | None:
         if self._balance_ready_ts_monotonic_ms is None:
@@ -8493,7 +8490,9 @@ class NcPilotTabWidget(QWidget):
                 self._handle_open_orders_error("Unexpected open orders response")
                 return
             reason = self._orders_refresh_reason
-            self._apply_open_orders_snapshot(result, reason=reason)
+            filtered = [item for item in result if isinstance(item, dict)]
+            filtered = self._filter_open_orders_for_multi(filtered, self._symbol)
+            self._apply_open_orders_snapshot(filtered, reason=reason)
             if reason == "after_cancel_backoff":
                 if not self._open_orders:
                     self._cancel_reconcile_pending = 0
@@ -8543,6 +8542,8 @@ class NcPilotTabWidget(QWidget):
         return bool(prefix and client_order_id.startswith(prefix))
 
     def _bot_order_prefix(self) -> str:
+        if self._is_multi_symbol(self._symbol):
+            return "BBOT_LAS_v1_"
         return f"BBOT_LAS_v1_{self._symbol}_"
 
     def _sync_active_ids_from_open_orders(self) -> None:
@@ -10694,17 +10695,28 @@ class NcPilotTabWidget(QWidget):
         if self._rules_loaded and not force:
             return
         if not force:
-            cached = self._get_http_cached("exchange_info_symbol")
+            cached = self._get_http_cached("exchange_info_all" if self._is_multi_symbol(self._symbol) else "exchange_info_symbol")
             if isinstance(cached, dict):
-                self._handle_exchange_info(cached, latency_ms=0)
+                if self._is_multi_symbol(self._symbol):
+                    self._handle_exchange_info_multi(cached, latency_ms=0)
+                else:
+                    self._handle_exchange_info(cached, latency_ms=0)
                 return
         self._rules_in_flight = True
-        self._queue_net_request(
-            "exchange_info_symbol",
-            {"symbol": self._symbol},
-            on_success=self._handle_exchange_info,
-            on_error=self._handle_exchange_error,
-        )
+        if self._is_multi_symbol(self._symbol):
+            self._queue_net_request(
+                "exchange_info",
+                {},
+                on_success=self._handle_exchange_info_multi,
+                on_error=self._handle_exchange_error,
+            )
+        else:
+            self._queue_net_request(
+                "exchange_info_symbol",
+                {"symbol": self._symbol},
+                on_success=self._handle_exchange_info,
+                on_error=self._handle_exchange_error,
+            )
 
     def _sync_account_time(self) -> None:
         if not self._account_client:
@@ -10764,6 +10776,62 @@ class NcPilotTabWidget(QWidget):
         self._update_runtime_balances()
         self._append_log(
             f"Exchange rules loaded ({latency_ms}ms). base={self._base_asset}, quote={self._quote_asset}",
+            kind="INFO",
+        )
+
+    def _handle_exchange_info_multi(self, result: object, latency_ms: int) -> None:
+        self._rules_in_flight = False
+        if not isinstance(result, dict):
+            self._handle_exchange_error("Unexpected exchange info response")
+            return
+        self._set_http_cache("exchange_info_all", result)
+        symbols_data = result.get("symbols", []) if isinstance(result.get("symbols"), list) else []
+        symbol_map: dict[str, dict[str, Any]] = {}
+        for entry in symbols_data:
+            if not isinstance(entry, dict):
+                continue
+            symbol_name = str(entry.get("symbol", "")).upper()
+            if symbol_name:
+                symbol_map[symbol_name] = entry
+        any_tradeable = False
+        first_rules: dict[str, float | None] | None = None
+        for symbol in self._multi_context.enabled_pairs:
+            info = symbol_map.get(symbol)
+            if not info:
+                continue
+            filters = info.get("filters", [])
+            tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
+            step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
+            min_qty = self._extract_filter_value(filters, "LOT_SIZE", "minQty")
+            max_qty = self._extract_filter_value(filters, "LOT_SIZE", "maxQty")
+            min_notional = self._extract_filter_value(filters, "MIN_NOTIONAL", "minNotional")
+            if min_notional is None:
+                min_notional = self._extract_filter_value(filters, "NOTIONAL", "minNotional")
+            data = {
+                "tick": tick_size,
+                "step": step_size,
+                "min_notional": min_notional,
+                "min_qty": min_qty,
+                "max_qty": max_qty,
+            }
+            self._pilot_market_cache.set(symbol, "exchange_info", data)
+            if first_rules is None:
+                first_rules = data
+                self._base_asset = str(info.get("baseAsset", self._base_asset)).upper()
+                self._quote_asset = str(info.get("quoteAsset", self._quote_asset)).upper()
+            if str(info.get("status", "")).upper() == "TRADING":
+                any_tradeable = True
+        if first_rules is not None:
+            self._exchange_rules = first_rules
+            self._rules_loaded = True
+        self._symbol_tradeable = any_tradeable
+        self._balance_ready_ts_monotonic_ms = None
+        self._apply_trade_gate()
+        self._update_rules_label()
+        self._update_grid_preview()
+        self._update_runtime_balances()
+        self._append_log(
+            f"Exchange rules loaded ({latency_ms}ms). mode=MULTI symbols={len(self._multi_context.enabled_pairs)}",
             kind="INFO",
         )
 
@@ -10842,15 +10910,6 @@ class NcPilotTabWidget(QWidget):
             )
             self._trade_gate_state = state
         self._update_engine_ready()
-        if gate in {
-            TradeGate.TRADE_DISABLED_NO_KEYS,
-            TradeGate.TRADE_DISABLED_API_ERROR,
-            TradeGate.TRADE_DISABLED_CANT_TRADE,
-            TradeGate.TRADE_DISABLED_SYMBOL,
-        }:
-            self._suppress_dry_run_event = True
-            self._dry_run_toggle.setChecked(True)
-            self._suppress_dry_run_event = False
         self._dry_run_toggle.setEnabled(True)
         self._apply_trade_status_label()
         self._update_grid_preview()
@@ -12128,6 +12187,11 @@ class NcPilotTabWidget(QWidget):
         if action == "book_ticker":
             symbol = str(params.get("symbol", ""))
             dedup_key = f"{action}:{symbol}"
+        elif action == "open_orders":
+            symbol = str(params.get("symbol", ""))
+            dedup_key = f"{action}:{symbol}"
+        elif action == "account_info":
+            dedup_key = action
         self._net_worker.submit(
             action,
             fn,
@@ -12152,7 +12216,7 @@ class NcPilotTabWidget(QWidget):
                 return _require_account().get_account_info()
             if action == "open_orders":
                 symbol = str(params.get("symbol", ""))
-                return _require_account().get_open_orders(symbol)
+                return _require_account().get_open_orders(self._normalize_symbol_for_open_orders(symbol))
             if action == "trade_fees":
                 symbol = str(params.get("symbol", ""))
                 return _require_account().get_trade_fees(symbol)
@@ -12192,6 +12256,8 @@ class NcPilotTabWidget(QWidget):
             if action == "exchange_info_symbol":
                 symbol = str(params.get("symbol", ""))
                 return _require_http().get_exchange_info_symbol(symbol)
+            if action == "exchange_info":
+                return _require_http().get_exchange_info()
             if action == "book_ticker":
                 symbol = str(params.get("symbol", ""))
                 return _require_http().get_book_ticker(symbol)
@@ -12248,6 +12314,28 @@ class NcPilotTabWidget(QWidget):
             raise RuntimeError(str(result["error"]))
         return result["value"], int(result["latency"] or 0)
 
+    def _is_multi_symbol(self, symbol: str | None) -> bool:
+        return not symbol or symbol.strip().upper() == PILOT_WINDOW_SYMBOL
+
+    def _normalize_symbol_for_open_orders(self, symbol: str | None) -> str | None:
+        if self._is_multi_symbol(symbol):
+            return None
+        return symbol.strip().upper() if symbol else None
+
+    def _filter_open_orders_for_multi(self, orders: list[dict[str, Any]], symbol: str | None) -> list[dict[str, Any]]:
+        if not self._is_multi_symbol(symbol):
+            return orders
+        allowed = set(self._multi_context.enabled_pairs or [])
+        if not allowed:
+            return orders
+        filtered: list[dict[str, Any]] = []
+        for order in orders:
+            order_symbol = str(order.get("symbol", "")).upper()
+            if not order_symbol or order_symbol not in allowed:
+                continue
+            filtered.append(order)
+        return filtered
+
     def _fetch_open_orders_sync(self, symbol: str) -> list[dict[str, Any]]:
         payload, _latency_ms = self._net_call_sync(
             "open_orders",
@@ -12256,7 +12344,8 @@ class NcPilotTabWidget(QWidget):
         )
         if not isinstance(payload, list):
             raise ValueError("Unexpected open orders response")
-        return [item for item in payload if isinstance(item, dict)]
+        filtered = [item for item in payload if isinstance(item, dict)]
+        return self._filter_open_orders_for_multi(filtered, symbol)
 
     def _fetch_my_trades_sync(self, symbol: str, *, limit: int = 50) -> list[dict[str, Any]]:
         payload, _latency_ms = self._net_call_sync(

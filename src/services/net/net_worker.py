@@ -20,6 +20,7 @@ class _DedupState:
     latest_requested: bool = False
     last_submit_ms: int = 0
     last_task: "NetTask | None" = None
+    last_inflight_log_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,7 @@ class NetWorker:
                     state.last_task = task
                 return True
             if state.inflight:
+                self._log_inflight_skip(task, state, now_ms)
                 state.latest_requested = True
                 state.last_task = task
                 return True
@@ -281,6 +283,19 @@ class NetWorker:
             self._logger.info("[NET][DROP] book_ticker symbol=%s reason=rate_limit", symbol)
         else:
             self._logger.info("[NET][DROP] book_ticker reason=rate_limit")
+
+    def _log_inflight_skip(self, task: NetTask, state: _DedupState, now_ms: int) -> None:
+        if task.name not in {"open_orders", "account_info"}:
+            return
+        interval_ms = 5000
+        if now_ms - state.last_inflight_log_ms < interval_ms:
+            return
+        state.last_inflight_log_ms = now_ms
+        symbol = self._extract_symbol(task)
+        if symbol:
+            self._logger.info("[NET][SKIP] %s inflight symbol=%s", task.name, symbol)
+        else:
+            self._logger.info("[NET][SKIP] %s inflight", task.name)
 
     @staticmethod
     def _extract_symbol(task: NetTask) -> str | None:
