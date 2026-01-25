@@ -58,6 +58,7 @@ from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.logging import get_logger
 from src.core.micro_edge import compute_expected_edge_bps
+from src.core.nc_micro_safe_call import safe_call
 from src.core.nc_micro_stop import finalize_stop_state
 from src.core.nc_micro_exec_dedup import CumulativeFillTracker, TradeIdDeduper, should_block_new_orders
 from src.core.nc_micro_refresh import StaleRefreshLogLimiter, compute_refresh_allowed
@@ -856,10 +857,30 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_trade_source: str | None = None
         self._last_trade_source_change_ms = 0
         self._signals = _LiteGridSignals()
-        self._signals.price_update.connect(self._apply_price_update)
-        self._signals.status_update.connect(self._apply_status_update)
-        self._signals.log_append.connect(self._append_log)
-        self._signals.api_error.connect(self._handle_live_api_error)
+        self._signals.price_update.connect(
+            lambda update: self._safe_call(
+                lambda: self._apply_price_update(update),
+                label="signal:price_update",
+            )
+        )
+        self._signals.status_update.connect(
+            lambda status, message: self._safe_call(
+                lambda: self._apply_status_update(status, message),
+                label="signal:status_update",
+            )
+        )
+        self._signals.log_append.connect(
+            lambda message, kind: self._safe_call(
+                lambda: self._append_log(message, kind=kind),
+                label="signal:log_append",
+            )
+        )
+        self._signals.api_error.connect(
+            lambda message: self._safe_call(
+                lambda: self._handle_live_api_error(message),
+                label="signal:api_error",
+            )
+        )
         self._log_entries: list[tuple[str, str]] = []
         self._log_throttle_ts: dict[str, float] = {}
         self._crash_log_path, self._crash_file = _install_nc_micro_crash_catcher(
@@ -1154,28 +1175,47 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
         self._balances_timer = QTimer(self)
         self._balances_timer.setInterval(10_000)
-        self._balances_timer.timeout.connect(self._refresh_balances)
+        self._balances_timer.timeout.connect(
+            lambda: self._safe_call(self._refresh_balances, label="timer:balances")
+        )
         self._orders_timer = QTimer(self)
         self._orders_timer.setInterval(ORDERS_POLL_IDLE_MS)
-        self._orders_timer.timeout.connect(lambda: self._refresh_orders(reason="poll"))
+        self._orders_timer.timeout.connect(
+            lambda: self._safe_call(
+                lambda: self._refresh_orders(reason="poll"),
+                label="timer:orders",
+            )
+        )
         self._trade_source_timer = QTimer(self)
         self._trade_source_timer.setSingleShot(True)
-        self._trade_source_timer.timeout.connect(self._apply_pending_trade_source)
+        self._trade_source_timer.timeout.connect(
+            lambda: self._safe_call(self._apply_pending_trade_source, label="timer:trade_source")
+        )
         self._fills_timer = QTimer(self)
         self._fills_timer.setInterval(2_500)
-        self._fills_timer.timeout.connect(self._refresh_fills)
+        self._fills_timer.timeout.connect(
+            lambda: self._safe_call(self._refresh_fills, label="timer:fills")
+        )
         self._pilot_ui_timer = QTimer(self)
         self._pilot_ui_timer.setInterval(750)
-        self._pilot_ui_timer.timeout.connect(self._update_pilot_panel)
+        self._pilot_ui_timer.timeout.connect(
+            lambda: self._safe_call(self._update_pilot_panel, label="timer:pilot_ui")
+        )
         self._market_kpi_timer = QTimer(self)
         self._market_kpi_timer.setInterval(500)
-        self._market_kpi_timer.timeout.connect(self.update_market_kpis)
+        self._market_kpi_timer.timeout.connect(
+            lambda: self._safe_call(self.update_market_kpis, label="timer:market_kpis")
+        )
         self._registry_gc_timer = QTimer(self)
         self._registry_gc_timer.setInterval(REGISTRY_GC_INTERVAL_MS)
-        self._registry_gc_timer.timeout.connect(self._gc_registry_keys)
+        self._registry_gc_timer.timeout.connect(
+            lambda: self._safe_call(self._gc_registry_keys, label="timer:registry_gc")
+        )
         self._order_age_timer = QTimer(self)
         self._order_age_timer.setInterval(1_000)
-        self._order_age_timer.timeout.connect(self._tick_order_ages)
+        self._order_age_timer.timeout.connect(
+            lambda: self._safe_call(self._tick_order_ages, label="timer:order_ages")
+        )
 
         self.setWindowTitle(f"Lite All Strategy Terminal — NC MICRO — {self._symbol}")
         self.resize(1050, 720)
@@ -1602,6 +1642,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
 
     def _save_settings_to_disk(self) -> None:
+        if self._closing:
+            return
         if not self._is_micro_profile():
             return
         path = self._resolve_settings_path()
@@ -1648,7 +1690,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if self._settings_save_timer is None:
             self._settings_save_timer = QTimer(self)
             self._settings_save_timer.setSingleShot(True)
-            self._settings_save_timer.timeout.connect(self._save_settings_to_disk)
+            self._settings_save_timer.timeout.connect(
+                lambda: self._safe_call(self._save_settings_to_disk, label="timer:save_settings")
+            )
         self._settings_save_timer.start(500)
 
     def _profit_guard_slippage_pct(self) -> float:
@@ -3556,6 +3600,38 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return None
         return self.as_decimal(state.break_even_price)
 
+    def _pilot_force_hold(self, *, reason: str) -> None:
+        if self._closing:
+            return
+        try:
+            now = monotonic()
+            hold_timeout = max(self.pilot_config.hold_timeout_sec, 0)
+            self._pilot_hold_reason = reason
+            self._pilot_hold_until = now + hold_timeout if hold_timeout else now
+            self._set_pilot_state(PilotState.HOLD, reason=reason)
+        except Exception:
+            return
+
+    def _safe_call(
+        self,
+        fn: Callable[[], object],
+        *,
+        label: str,
+        on_error: Callable[[], object] | None = None,
+    ) -> None:
+        def _wrapped_on_error() -> None:
+            if on_error is not None:
+                on_error()
+            self._pilot_force_hold(reason=f"exception:{label}")
+
+        safe_call(
+            fn,
+            label=label,
+            on_error=_wrapped_on_error,
+            logger=self._logger,
+            crash_writer=self._write_crash_log_line if self._crash_log_path else None,
+        )
+
     def _set_pilot_state(self, state: PilotState, *, reason: str | None = None) -> None:
         if self._pilot_state == state:
             return
@@ -3583,6 +3659,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return mapping.get(state, state.value)
 
     def _update_pilot_panel(self) -> None:
+        if self._closing:
+            return
         try:
             if not hasattr(self, "_pilot_state_value"):
                 return
@@ -3657,6 +3735,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _update_pilot_panel")
             self._notify_crash("_update_pilot_panel")
+            self._pilot_force_hold(reason="exception:_update_pilot_panel")
             return
 
     def _collect_order_metrics(self) -> tuple[int, int, int, int | None, OrderInfo | None, int | None]:
@@ -4491,6 +4570,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _emit_price_update")
             self._notify_crash("_emit_price_update")
+            self._pilot_force_hold(reason="exception:_emit_price_update")
             return
 
     def _emit_status_update(self, status: str, message: str) -> None:
@@ -4499,6 +4579,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _emit_status_update")
             self._notify_crash("_emit_status_update")
+            self._pilot_force_hold(reason="exception:_emit_status_update")
             return
 
     def _kpi_allows_start(self) -> bool:
@@ -4510,6 +4591,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return price is not None and best_bid is not None and best_ask is not None
 
     def _apply_price_update(self, update: PriceUpdate) -> None:
+        if self._closing:
+            return
         try:
             self._last_price_update = update
             self._ws_last_tick_ts = monotonic()
@@ -4518,8 +4601,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if price is not None and price > 0:
                 self._ws_last_price = price
             self._queue_trade_source(update.source)
-        except Exception as exc:
-            self._logger.error("SAFE_SKIP _apply_price_update: %s", exc)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _apply_price_update")
+            self._notify_crash("_apply_price_update")
+            self._pilot_force_hold(reason="exception:_apply_price_update")
             return
 
     def _queue_trade_source(self, source: str | None) -> None:
@@ -4533,6 +4618,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._trade_source_timer.start(UI_SOURCE_DEBOUNCE_MS)
 
     def _apply_pending_trade_source(self) -> None:
+        if self._closing:
+            return
         if self._pending_trade_source is None:
             return
         self.trade_source = self._pending_trade_source
@@ -4669,18 +4756,27 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return book if isinstance(book, dict) else {}
 
         worker = _Worker(_fetch, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_book_ticker_success)
+        worker.signals.success.connect(
+            lambda payload, latency_ms: self._safe_call(
+                lambda: self._handle_book_ticker_success(payload, latency_ms),
+                label="signal:book_ticker_success",
+            )
+        )
         self._thread_pool.start(worker)
 
     def _handle_book_ticker_success(self, payload: object, _latency_ms: int) -> None:
         assert isinstance(self, LiteAllStrategyNcMicroWindow)
         try:
+            if self._closing:
+                return
             if isinstance(payload, dict) and payload:
                 bid, ask = self._update_http_book_snapshot(payload)
                 if bid is not None and ask is not None:
                     self._set_http_cache("book_ticker", payload)
-        except Exception as exc:
-            self._logger.error("SAFE_SKIP _handle_book_ticker_success: %s", exc)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _handle_book_ticker_success")
+            self._notify_crash("_handle_book_ticker_success")
+            self._pilot_force_hold(reason="exception:_handle_book_ticker_success")
             return
 
     def _fetch_bidask_http_book(self) -> None:
@@ -4696,12 +4792,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return book if isinstance(book, dict) else {}
 
         worker = _Worker(_fetch, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_success)
+        worker.signals.success.connect(
+            lambda payload, latency_ms: self._safe_call(
+                lambda: self._handle_success(payload, latency_ms),
+                label="signal:book_ticker_poll",
+            )
+        )
         self._thread_pool.start(worker)
 
     def _handle_success(self, payload: object, _latency_ms: int) -> None:
         assert isinstance(self, LiteAllStrategyNcMicroWindow)
         try:
+            if self._closing:
+                return
             if not isinstance(payload, dict) or not payload:
                 return
             bid, ask = self._update_http_book_snapshot(payload)
@@ -4714,14 +4817,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     kind="INFO",
                 )
                 self._bidask_ready_logged = True
-        except Exception as exc:
-            self._logger.error("SAFE_SKIP _handle_success: %s", exc)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _handle_success")
+            self._notify_crash("_handle_success")
+            self._pilot_force_hold(reason="exception:_handle_success")
             return
 
     def update_market_kpis(self) -> None:
+        if self._closing:
+            return
         try:
-            if self._closing:
-                return
             if not hasattr(self, "_market_price"):
                 return
             now_ts = monotonic()
@@ -4735,7 +4840,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             best_ask = None
             bidask_age_ms = None
             bidask_state = "missing"
-            book_source = self.trade_source
+            book_source = self.trade_source or "UNKNOWN"
             snapshot = self.book_snapshot or {}
             snapshot_ts = snapshot.get("ts") if snapshot else None
             bid = self._coerce_float(snapshot.get("bid")) if snapshot else None
@@ -4787,9 +4892,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._market_fee.setText(self._fee_display_text())
             self._set_market_label_state(self._market_fee, active=True)
 
-            source_age_text = "—"
             if bidask_age_ms is not None:
                 source_age_text = f"{book_source} | {bidask_age_ms}ms"
+            else:
+                source_age_text = f"{book_source} | —"
             self._market_source.setText(source_age_text)
             self._set_market_label_state(self._market_source, active=source_age_text != "—")
 
@@ -4987,8 +5093,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._grid_engine.on_price(price)
             self._update_runtime_balances()
             self._refresh_unrealized_pnl()
-        except Exception as exc:
-            self._logger.error("SAFE_SKIP update_market_kpis: %s", exc)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in update_market_kpis")
+            self._notify_crash("update_market_kpis")
+            self._pilot_force_hold(reason="exception:update_market_kpis")
             return
 
     def _compute_recent_volatility_pct(self) -> float | None:
@@ -5002,6 +5110,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return (high - low) / low * 100
 
     def _apply_status_update(self, status: str, _: str) -> None:
+        if self._closing:
+            return
         try:
             overall_status = (
                 self._price_feed_manager.get_ws_overall_status()
@@ -5016,8 +5126,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._ws_status = WS_LOST
             else:
                 self._ws_status = ""
-        except Exception as exc:
-            self._logger.error("SAFE_SKIP _apply_status_update: %s", exc)
+        except Exception:
+            self._logger.exception("[NC_MICRO][CRASH] exception in _apply_status_update")
+            self._notify_crash("_apply_status_update")
+            self._pilot_force_hold(reason="exception:_apply_status_update")
             return
 
     @staticmethod
@@ -5586,12 +5698,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._cancel_reconcile_pending = 2
 
         def _run_followup() -> None:
+            if self._closing:
+                return
             if self._cancel_reconcile_pending <= 0:
                 return
             self._refresh_orders(force=True, reason="after_cancel_backoff")
 
-        QTimer.singleShot(300, self, _run_followup)
-        QTimer.singleShot(700, self, _run_followup)
+        QTimer.singleShot(
+            300,
+            self,
+            lambda: self._safe_call(_run_followup, label="timer:cancel_followup"),
+        )
+        QTimer.singleShot(
+            700,
+            self,
+            lambda: self._safe_call(_run_followup, label="timer:cancel_followup"),
+        )
 
     def _cancel_all_and_reconcile(
         self,
@@ -5711,6 +5833,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         def _on_timeout() -> None:
             if token != self._stop_watchdog_token:
                 return
+            if self._closing:
+                return
             if not self._stop_in_progress or self._state != "STOPPING":
                 return
             pending = len(self._open_orders)
@@ -5726,13 +5850,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._snapshot_refresh_inflight = False
             self._finalize_stop(keep_open_orders=bool(self._open_orders))
 
-        QTimer.singleShot(STOP_DEADLINE_MS, self, _on_timeout)
+        QTimer.singleShot(
+            STOP_DEADLINE_MS,
+            self,
+            lambda: self._safe_call(_on_timeout, label="timer:stop_watchdog"),
+        )
 
     def _cancel_stop_watchdog(self) -> None:
         self._stop_watchdog_token += 1
         self._stop_watchdog_started_ts = None
 
     def _check_inflight_watchdog(self) -> None:
+        if self._closing:
+            self._inflight_watchdog_started_ts = None
+            return
         if self._stop_in_progress:
             self._inflight_watchdog_started_ts = None
             return
@@ -6615,9 +6746,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_grid_preview()
 
     def _refresh_balances(self, force: bool = False) -> None:
+        if self._closing and not self._stop_in_progress and not force:
+            return
         try:
-            if self._closing and not self._stop_in_progress and not force:
-                return
             self._balances_tick_count += 1
             if self._balances_tick_count % 30 == 0:
                 self._logger.debug("balances refresh tick")
@@ -6637,6 +6768,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_balances")
             self._notify_crash("_refresh_balances")
+            self._pilot_force_hold(reason="exception:_refresh_balances")
             return
 
     def _handle_account_info(self, result: object, latency_ms: int) -> None:
@@ -6736,7 +6868,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
 
         def _kick() -> None:
-            self._refresh_orders(force=True, force_refresh=True, reason=reason)
+            if self._closing:
+                return
+            self._safe_call(
+                lambda: self._refresh_orders(force=True, force_refresh=True, reason=reason),
+                label="timer:force_orders_refresh",
+            )
 
         QTimer.singleShot(400, self, _kick)
         QTimer.singleShot(800, self, _kick)
@@ -6759,10 +6896,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         force_refresh: bool = False,
         event_key: str | None = None,
     ) -> None:
+        critical_reason = self._is_critical_refresh_reason(reason)
+        if self._closing and not self._stop_in_progress and not critical_reason and not force:
+            return
         try:
-            critical_reason = self._is_critical_refresh_reason(reason)
-            if self._closing and not self._stop_in_progress and not critical_reason and not force:
-                return
             if force_refresh:
                 force = True
                 self._snapshot_refresh_inflight = False
@@ -6818,6 +6955,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_orders")
             self._notify_crash("_refresh_orders")
+            self._pilot_force_hold(reason="exception:_refresh_orders")
             self._orders_in_flight = False
             self._snapshot_refresh_inflight = False
             return
@@ -6857,9 +6995,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._registry_dirty = False
 
     def _refresh_fills(self) -> None:
+        if self._closing and not self._stop_in_progress:
+            return
         try:
-            if self._closing and not self._stop_in_progress:
-                return
             if self._dry_run_toggle.isChecked():
                 return
             if self._state != "RUNNING":
@@ -6879,10 +7017,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_fills")
             self._notify_crash("_refresh_fills")
+            self._pilot_force_hold(reason="exception:_refresh_fills")
             return
 
     def _handle_fill_poll(self, result: object, latency_ms: int) -> None:
         try:
+            if self._closing:
+                return
             self._fills_in_flight = False
             if not isinstance(result, list):
                 self._handle_fill_poll_error("Unexpected trades response")
@@ -6904,6 +7045,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _handle_fill_poll")
             self._notify_crash("_handle_fill_poll")
+            self._pilot_force_hold(reason="exception:_handle_fill_poll")
             return
 
     def _handle_fill_poll_error(self, message: str) -> None:
@@ -7068,6 +7210,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._signals.open_orders_refresh.emit(True)
 
     def _handle_open_orders(self, result: object, latency_ms: int) -> None:
+        if self._closing:
+            return
         try:
             self._orders_in_flight = False
             self._snapshot_refresh_inflight = False
@@ -7097,6 +7241,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _handle_open_orders")
             self._notify_crash("_handle_open_orders")
+            self._pilot_force_hold(reason="exception:_handle_open_orders")
             return
 
     def _handle_open_orders_error(self, message: str) -> None:
@@ -7324,6 +7469,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._discard_registry_for_values(side, self.as_decimal(price), self.as_decimal(qty))
 
     def _gc_registry_keys(self) -> None:
+        if self._closing:
+            return
         try:
             now = time_fn()
             if self._registry_gc_last_ts and now - self._registry_gc_last_ts < REGISTRY_GC_INTERVAL_MS / 1000:
@@ -7358,6 +7505,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _gc_registry_keys")
             self._notify_crash("_gc_registry_keys")
+            self._pilot_force_hold(reason="exception:_gc_registry_keys")
             return
 
     @staticmethod
@@ -7447,6 +7595,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_reconcile_missing_orders(self, result: object, latency_ms: int) -> None:
+        if self._closing:
+            return
         try:
             if not isinstance(result, dict):
                 self._handle_reconcile_error("Unexpected reconcile response")
@@ -7504,6 +7654,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _handle_reconcile_missing_orders")
             self._notify_crash("_handle_reconcile_missing_orders")
+            self._pilot_force_hold(reason="exception:_handle_reconcile_missing_orders")
             return
 
     def _handle_reconcile_error(self, message: str) -> None:
@@ -7592,6 +7743,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
 
     def _process_fill(self, fill: TradeFill) -> None:
+        if self._closing:
+            return
         try:
             trade_id = fill.trade_id or ""
             if trade_id and self._trade_id_deduper.seen(trade_id, monotonic()):
@@ -7694,6 +7847,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _process_fill")
             self._notify_crash("_process_fill")
+            self._pilot_force_hold(reason="exception:_process_fill")
             return
 
     def _fill_key(self, fill: TradeFill) -> str:
@@ -7836,7 +7990,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return max(base_min_profit, settings.take_profit_pct)
 
     def _current_spread_pct(self) -> float | None:
-        best_bid, best_ask, _source = self._resolve_book_bid_ask()
+        best_bid, best_ask, source = self._resolve_book_bid_ask()
+        if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
+            book_source = source if source and source != "—" else (self.trade_source or "UNKNOWN")
+            self._update_kpi_waiting_book(monotonic(), book_source, self._http_book_age_ms())
+            return None
         return self._compute_spread_pct_from_book(best_bid, best_ask)
 
     def _min_tick_step_pct(self, anchor_price: float) -> float:
@@ -7856,6 +8014,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         tick = self._exchange_rules.get("tick")
         age_ms = self._http_book_age_ms()
         has_bidask = bid is not None and ask is not None and bid > 0 and ask > 0
+        if not has_bidask:
+            book_source = _source if _source and _source != "—" else (self.trade_source or "UNKNOWN")
+            self._update_kpi_waiting_book(monotonic(), book_source, age_ms)
         is_live = bool(has_bidask and age_ms is not None and age_ms < BIDASK_FAIL_SOFT_MS)
         mid = (bid + ask) / 2 if has_bidask else None
         spread_ticks = None
@@ -8909,7 +9070,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                         ),
                         "WARN",
                     )
-                    QTimer.singleShot(0, self, lambda: self._request_orders_refresh("place_duplicate"))
+                    QTimer.singleShot(
+                        0,
+                        self,
+                        lambda: self._safe_call(
+                            lambda: self._request_orders_refresh("place_duplicate"),
+                            label="timer:place_duplicate_refresh",
+                        ),
+                    )
                     return None, "skip_duplicate_exchange", "skip_duplicate_exchange"
                 if reason_tag == "INSUFFICIENT_BALANCE":
                     if registry_key:
@@ -10235,6 +10403,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return f"{seconds}s"
 
     def _tick_order_ages(self) -> None:
+        if self._closing:
+            return
         self._check_inflight_watchdog()
         if not hasattr(self, "_orders_table"):
             return
@@ -10654,11 +10824,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._close_pending or self._close_finalizing:
             return
         self._close_finalizing = True
-        QTimer.singleShot(0, self, self.close)
+        QTimer.singleShot(0, self, lambda: self._safe_call(self.close, label="timer:close_window"))
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
+        self._closing = True
         if self._close_finalizing:
-            self._closing = True
             self._stop_runtime_timers()
             self._stop_price_feed(shutdown=True)
         elif not self._stop_in_progress:
