@@ -1543,6 +1543,8 @@ class NcPilotTabWidget(QWidget):
             label.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
             return label
 
+        self._last_price_label = QLabel(tr("last_price", price="—"))
+        self._last_price_label.setStyleSheet("font-weight: 600;")
         self._status_engine_label = _status_label("ENGINE: IDLE")
         self._status_mode_label = _status_label("MODE: DRY")
         self._status_http_label = _status_label("HTTP: OK")
@@ -1552,6 +1554,7 @@ class NcPilotTabWidget(QWidget):
         self._status_last_action_label = _status_label("LAST ACTION: —")
 
         for label in (
+            self._last_price_label,
             self._status_engine_label,
             self._status_mode_label,
             self._status_http_label,
