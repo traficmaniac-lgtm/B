@@ -16,10 +16,10 @@ SYMBOLS = [SYMBOL_USDCUSDT, SYMBOL_TUSDUSDT]
 @dataclass
 class SymbolFilters:
     symbol: str
-    tick_size: float
-    step_size: float
-    min_qty: float
-    min_notional: float
+    tick_size: Decimal
+    step_size: Decimal
+    min_qty: Decimal
+    min_notional: Decimal
 
 
 @dataclass
@@ -28,20 +28,18 @@ class Book:
     ask: float
 
 
-def safe_decimal(value) -> Decimal:
+def d(value) -> Decimal:
     return Decimal(str(value))
 
 
-def floor_to_step(value: float, step: float) -> float:
-    step_d = safe_decimal(step)
-    if step_d == 0:
-        return float(value)
-    value_d = safe_decimal(value)
-    floored = (value_d / step_d).to_integral_value(rounding=ROUND_FLOOR) * step_d
-    return float(floored)
+def floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    floored = (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    return floored
 
 
-def floor_to_tick(price: float, tick: float) -> float:
+def floor_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     return floor_to_step(price, tick)
 
 
@@ -54,19 +52,19 @@ def fetch_exchange_info_filters(symbols: list[str]) -> dict[str, SymbolFilters]:
     filters_map: dict[str, SymbolFilters] = {}
     for symbol_info in data.get("symbols", []):
         symbol = symbol_info.get("symbol")
-        tick_size = 0.0
-        step_size = 0.0
-        min_qty = 0.0
-        min_notional = 0.0
+        tick_size = d(0)
+        step_size = d(0)
+        min_qty = d(0)
+        min_notional = d(0)
         for filt in symbol_info.get("filters", []):
             filt_type = filt.get("filterType")
             if filt_type == "PRICE_FILTER":
-                tick_size = float(filt.get("tickSize", 0))
+                tick_size = d(filt.get("tickSize", 0))
             elif filt_type == "LOT_SIZE":
-                step_size = float(filt.get("stepSize", 0))
-                min_qty = float(filt.get("minQty", 0))
+                step_size = d(filt.get("stepSize", 0))
+                min_qty = d(filt.get("minQty", 0))
             elif filt_type in {"MIN_NOTIONAL", "NOTIONAL"}:
-                min_notional = float(filt.get("minNotional", filt.get("notional", 0)))
+                min_notional = d(filt.get("minNotional", filt.get("notional", 0)))
         filters_map[symbol] = SymbolFilters(
             symbol=symbol,
             tick_size=tick_size,
@@ -94,7 +92,17 @@ def get_two_books_strict(session: requests.Session) -> dict[str, Book]:
 
 def simulate_2leg(direction: str, amount_in: float, books: dict[str, Book],
                   filters: dict[str, SymbolFilters], fee_bps: float, slip_bps: float) -> dict:
-    fee_factor = 1 - (fee_bps + slip_bps) / 10000.0
+    amount_in_d = d(amount_in)
+    if amount_in_d <= 0:
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "zero_amount",
+            "legs": [],
+        }
+    fee_factor = d(1) - d(fee_bps + slip_bps) / d(10000)
 
     if direction == "A":
         sell_symbol = SYMBOL_USDCUSDT
@@ -104,80 +112,162 @@ def simulate_2leg(direction: str, amount_in: float, books: dict[str, Book],
         buy_symbol = SYMBOL_USDCUSDT
 
     if sell_symbol not in books or buy_symbol not in books:
-        return {"ok": False, "reason": "missing_book"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "missing_book",
+            "legs": [],
+        }
 
     sell_book = books[sell_symbol]
     buy_book = books[buy_symbol]
     sell_filters = filters[sell_symbol]
     buy_filters = filters[buy_symbol]
 
-    sell_price = floor_to_tick(sell_book.bid, sell_filters.tick_size)
+    sell_price = floor_to_tick(d(sell_book.bid), sell_filters.tick_size)
     if sell_price <= 0:
-        return {"ok": False, "reason": "sell_price_zero"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "sell_price_zero",
+            "legs": [],
+        }
 
-    qty_sell = floor_to_step(amount_in, sell_filters.step_size)
+    qty_sell = floor_to_step(amount_in_d, sell_filters.step_size)
     if qty_sell <= 0:
-        return {"ok": False, "reason": "rounding_zero_qty_leg1"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "rounding_zero_qty_leg1",
+            "legs": [],
+        }
     if qty_sell < sell_filters.min_qty:
-        return {"ok": False, "reason": "minQty_leg1"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "minQty_leg1",
+            "legs": [],
+        }
 
     notional_sell = qty_sell * sell_price
     if notional_sell < sell_filters.min_notional:
-        return {"ok": False, "reason": "minNotional_leg1"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "minNotional_leg1",
+            "legs": [],
+        }
 
     proceeds_quote = notional_sell * fee_factor
 
-    buy_price = floor_to_tick(buy_book.ask, buy_filters.tick_size)
+    buy_price = floor_to_tick(d(buy_book.ask), buy_filters.tick_size)
     if buy_price <= 0:
-        return {"ok": False, "reason": "buy_price_zero"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "buy_price_zero",
+            "legs": [],
+        }
 
     theoretical_qty = proceeds_quote / buy_price
     qty_buy = floor_to_step(theoretical_qty, buy_filters.step_size)
     if qty_buy <= 0:
-        return {"ok": False, "reason": "rounding_zero_qty_leg2"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "rounding_zero_qty_leg2",
+            "legs": [],
+        }
     if qty_buy < buy_filters.min_qty:
-        return {"ok": False, "reason": "minQty_leg2"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "minQty_leg2",
+            "legs": [],
+        }
 
     notional_buy = qty_buy * buy_price
     if notional_buy < buy_filters.min_notional:
-        return {"ok": False, "reason": "minNotional_leg2"}
+        return {
+            "ok": False,
+            "out_amount": 0.0,
+            "out_per_1": 0.0,
+            "bps": float("-inf"),
+            "reason": "minNotional_leg2",
+            "legs": [],
+        }
 
-    qty_buy_after_cost = qty_buy * fee_factor
+    leftover_quote = proceeds_quote - notional_buy
 
-    out_amount = qty_buy_after_cost
-    out_per_1 = out_amount / amount_in if amount_in else 0
+    out_amount = qty_buy
+    out_per_1 = out_amount / amount_in_d
+    bps = (out_per_1 - d(1)) * d(10000)
     return {
         "ok": True,
-        "out_amount": out_amount,
-        "out_per_1": out_per_1,
-        "leg1": {
-            "symbol": sell_symbol,
-            "qty": qty_sell,
-            "price": sell_price,
-            "notional": notional_sell,
-        },
-        "leg2": {
-            "symbol": buy_symbol,
-            "qty": qty_buy,
-            "price": buy_price,
-            "notional": notional_buy,
-        },
+        "out_amount": float(out_amount),
+        "out_per_1": float(out_per_1),
+        "bps": float(bps),
+        "reason": "",
+        "legs": [
+            {
+                "symbol": sell_symbol,
+                "side": "SELL",
+                "qty": float(qty_sell),
+                "price": float(sell_price),
+                "notional": float(notional_sell),
+                "leftover": 0.0,
+            },
+            {
+                "symbol": buy_symbol,
+                "side": "BUY",
+                "qty": float(qty_buy),
+                "price": float(buy_price),
+                "notional": float(notional_buy),
+                "leftover": float(leftover_quote),
+            },
+        ],
     }
 
 
 class BookWorker(QtCore.QObject):
     books_ready = QtCore.Signal(dict, float, float)
     data_not_ok = QtCore.Signal(str)
+    fetch_error = QtCore.Signal(str)
+    fetch_recovered = QtCore.Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.session = requests.Session()
         self.active = False
         self._busy = False
+        self._backoff = 0.5
+        self._max_backoff = 5.0
+        self._next_allowed = 0.0
+        self._last_error = None
+        self._had_error = False
 
     @QtCore.Slot()
     def request_tick(self) -> None:
+        now = time.time()
         if not self.active or self._busy:
+            return
+        if now < self._next_allowed:
             return
         self._busy = True
         start = time.time()
@@ -188,8 +278,19 @@ class BookWorker(QtCore.QObject):
             else:
                 age_ms = (time.time() - start) * 1000.0
                 self.books_ready.emit(books, age_ms, age_ms)
+                if self._had_error:
+                    self._had_error = False
+                    self._last_error = None
+                    self._backoff = 0.5
+                    self.fetch_recovered.emit()
         except Exception as exc:
-            self.data_not_ok.emit(str(exc))
+            self._had_error = True
+            reason = f"{exc} (backoff {self._backoff:.1f}s)"
+            if self._last_error != reason:
+                self._last_error = reason
+                self.fetch_error.emit(reason)
+            self._next_allowed = time.time() + self._backoff
+            self._backoff = min(self._backoff * 2, self._max_backoff)
         finally:
             self._busy = False
 
@@ -202,6 +303,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.books: dict[str, Book] = {}
         self.window_open = False
         self.last_tradable = {"A": None, "B": None}
+        self.last_data_issue = None
+        self.last_fetch_error = None
 
         self._build_ui()
         self._init_worker()
@@ -249,6 +352,18 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addStretch()
         layout.addLayout(controls)
 
+        summary_layout = QtWidgets.QHBoxLayout()
+        self.tradable_best_label = QtWidgets.QLabel("Best Tradable: NO")
+        self.best_dir_label = QtWidgets.QLabel("Best Dir: -")
+        self.sim_bps_label = QtWidgets.QLabel("Sim Bps: N/A")
+        self.reason_label = QtWidgets.QLabel("Reason: -")
+        summary_layout.addWidget(self.tradable_best_label)
+        summary_layout.addWidget(self.best_dir_label)
+        summary_layout.addWidget(self.sim_bps_label)
+        summary_layout.addWidget(self.reason_label)
+        summary_layout.addStretch()
+        layout.addLayout(summary_layout)
+
         self.table = QtWidgets.QTableWidget(2, 8)
         self.table.setHorizontalHeaderLabels([
             "Direction",
@@ -284,6 +399,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.moveToThread(self.worker_thread)
         self.worker.books_ready.connect(self._on_books_ready)
         self.worker.data_not_ok.connect(self._on_data_not_ok)
+        self.worker.fetch_error.connect(self._on_fetch_error)
+        self.worker.fetch_recovered.connect(self._on_fetch_recovered)
         self.worker_thread.start()
 
     def _log_filters(self) -> None:
@@ -315,10 +432,23 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QMetaObject.invokeMethod(self.worker, "request_tick", QtCore.Qt.QueuedConnection)
 
     def _on_data_not_ok(self, reason: str) -> None:
-        self._log(f"data_not_ok: {reason}")
+        if self.last_data_issue != reason:
+            self.last_data_issue = reason
+            self._log(f"data_not_ok: {reason}")
+
+    def _on_fetch_error(self, reason: str) -> None:
+        if self.last_fetch_error != reason:
+            self.last_fetch_error = reason
+            self._log(f"network_error: {reason}")
+
+    def _on_fetch_recovered(self) -> None:
+        if self.last_fetch_error is not None:
+            self.last_fetch_error = None
+            self._log("network_error resolved")
 
     def _on_books_ready(self, books: dict[str, Book], age_ms_usdc: float, age_ms_tusd: float) -> None:
         self.books = books
+        self.last_data_issue = None
         self._refresh_simulations()
 
     def _refresh_simulations(self) -> None:
@@ -337,7 +467,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tradable = "YES" if result.get("ok") else "NO"
             reason = result.get("reason", "")
             out_per_1 = result.get("out_per_1", 0.0)
-            bps = (out_per_1 - 1.0) * 10000 if result.get("ok") else float("-inf")
+            bps = result.get("bps", float("-inf"))
 
             if result.get("ok") and bps > best_bps:
                 best_bps = bps
@@ -352,8 +482,9 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(f"{bps:.2f}"))
 
-            leg1 = result.get("leg1")
-            leg2 = result.get("leg2")
+            legs = result.get("legs", [])
+            leg1 = legs[0] if len(legs) > 0 else None
+            leg2 = legs[1] if len(legs) > 1 else None
             leg1_text = "" if not leg1 else (
                 f"{leg1['symbol']} qty={leg1['qty']:.6f} px={leg1['price']:.6f}"
             )
@@ -370,6 +501,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 state = "tradable" if result.get("ok") else "untradable"
                 self._log(f"direction {direction} became {state}")
                 self.last_tradable[direction] = result.get("ok")
+
+        if best_dir is not None:
+            self.tradable_best_label.setText("Best Tradable: YES")
+            self.best_dir_label.setText(f"Best Dir: {best_dir}")
+            self.sim_bps_label.setText(f"Sim Bps: {best_bps:.2f}")
+            self.reason_label.setText("Reason: -")
+        else:
+            reason_a = results.get("A", {}).get("reason", "-")
+            reason_b = results.get("B", {}).get("reason", "-")
+            reason = reason_a if reason_a == reason_b else f"A:{reason_a} B:{reason_b}"
+            self.tradable_best_label.setText("Best Tradable: NO")
+            self.best_dir_label.setText("Best Dir: -")
+            self.sim_bps_label.setText("Sim Bps: N/A")
+            self.reason_label.setText(f"Reason: {reason}")
 
         should_open = best_dir is not None and best_bps >= min_bps
         if should_open and not self.window_open:
@@ -400,6 +545,13 @@ if __name__ == "__main__":
     main()
 
 # Manual test checklist
-# - Launch the app and click Start; verify GUI stays responsive while data updates.
-# - Check logs show filter load once and direction tradable state changes.
-# - Increase sim_amount until minNotional/minQty triggers and verify tradable flips to NO.
+# - Launch the app and confirm filters log once with tick/step/minQty/minNotional per symbol.
+# - Click Start and verify the GUI remains responsive while updates arrive.
+# - Confirm data_not_ok logs only once when bid/ask is missing, then clears on recovery.
+# - Validate network_error backoff logs increase on repeated failures and resolve on recovery.
+# - Adjust Sim amount upward/downward to trigger minQty and minNotional failures.
+# - Verify tradable state change logs only when a direction flips between YES/NO.
+# - Confirm Best Tradable/Best Dir/Sim Bps fields update with simulation results.
+# - Ensure window OPEN/CLOSE logs follow sim_bps threshold and ok==true only.
+# - Click Stop and confirm updates halt without thread errors.
+# - Close the window and confirm clean shutdown without event loop warnings.
