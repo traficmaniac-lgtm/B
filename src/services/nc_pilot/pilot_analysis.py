@@ -363,92 +363,88 @@ class TwoLegFamilyScanner(BaseFamilyScanner):
             tusd_out = _apply_cost(usdt / tusd.ask, self._cost_bps)
             end_usdt = tusd_out
             profit_bps = (end_usdt - start_usdt) / start_usdt * 10000
-            if profit_bps >= self._min_bps:
-                candidates.append(
-                    PilotWindow(
-                        family="2LEG",
-                        route="USDC→USDT→TUSD",
-                        symbols=["USDCUSDT", "TUSDUSDT"],
-                        profit_abs=end_usdt - start_usdt,
-                        profit_bps=profit_bps,
-                        max_notional=start_usdt,
-                        ts_start=now,
-                        ts_last=now,
-                        ttl_ms=self._ttl_ms,
-                        valid=True,
-                        reason="ok",
-                        details={"start_usdt": start_usdt, "end_usdt": end_usdt},
-                    )
+            candidates.append(
+                PilotWindow(
+                    family="2LEG",
+                    route="USDC→USDT→TUSD",
+                    symbols=["USDCUSDT", "TUSDUSDT"],
+                    profit_abs=end_usdt - start_usdt,
+                    profit_bps=profit_bps,
+                    max_notional=start_usdt,
+                    ts_start=now,
+                    ts_last=now,
+                    ttl_ms=self._ttl_ms,
+                    valid=profit_bps >= self._min_bps,
+                    reason="ok" if profit_bps >= self._min_bps else "profit_below_min",
+                    details={"start_usdt": start_usdt, "end_usdt": end_usdt},
                 )
+            )
         if usdc and tusd:
             amount_tusd = start_usdt
             usdt = _apply_cost(amount_tusd * tusd.bid, self._cost_bps)
             usdc_out = _apply_cost(usdt / usdc.ask, self._cost_bps)
             end_usdt = usdc_out
             profit_bps = (end_usdt - start_usdt) / start_usdt * 10000
-            if profit_bps >= self._min_bps:
-                candidates.append(
-                    PilotWindow(
-                        family="2LEG",
-                        route="TUSD→USDT→USDC",
-                        symbols=["TUSDUSDT", "USDCUSDT"],
-                        profit_abs=end_usdt - start_usdt,
-                        profit_bps=profit_bps,
-                        max_notional=start_usdt,
-                        ts_start=now,
-                        ts_last=now,
-                        ttl_ms=self._ttl_ms,
-                        valid=True,
-                        reason="ok",
-                        details={"start_usdt": start_usdt, "end_usdt": end_usdt},
-                    )
+            candidates.append(
+                PilotWindow(
+                    family="2LEG",
+                    route="TUSD→USDT→USDC",
+                    symbols=["TUSDUSDT", "USDCUSDT"],
+                    profit_abs=end_usdt - start_usdt,
+                    profit_bps=profit_bps,
+                    max_notional=start_usdt,
+                    ts_start=now,
+                    ts_last=now,
+                    ttl_ms=self._ttl_ms,
+                    valid=profit_bps >= self._min_bps,
+                    reason="ok" if profit_bps >= self._min_bps else "profit_below_min",
+                    details={"start_usdt": start_usdt, "end_usdt": end_usdt},
                 )
+            )
         if euri and eureuri and euri_mid:
             start_eur = 100.0
             euri_out = _apply_cost(start_eur * eureuri.bid, self._cost_bps)
             end_usdt = _apply_cost(euri_out * euri.bid, self._cost_bps)
             start_usdt_value = start_eur * euri_mid
             profit_bps = (end_usdt - start_usdt_value) / start_usdt_value * 10000
-            if profit_bps >= self._min_bps:
-                candidates.append(
-                    PilotWindow(
-                        family="2LEG",
-                        route="EUR→EURI→USDT",
-                        symbols=["EUREURI", "EURIUSDT"],
-                        profit_abs=end_usdt - start_usdt_value,
-                        profit_bps=profit_bps,
-                        max_notional=start_usdt_value,
-                        ts_start=now,
-                        ts_last=now,
-                        ttl_ms=self._ttl_ms,
-                        valid=True,
-                        reason="ok",
-                        details={"start_usdt": start_usdt_value, "end_usdt": end_usdt},
-                    )
+            candidates.append(
+                PilotWindow(
+                    family="2LEG",
+                    route="EUR→EURI→USDT",
+                    symbols=["EUREURI", "EURIUSDT"],
+                    profit_abs=end_usdt - start_usdt_value,
+                    profit_bps=profit_bps,
+                    max_notional=start_usdt_value,
+                    ts_start=now,
+                    ts_last=now,
+                    ttl_ms=self._ttl_ms,
+                    valid=profit_bps >= self._min_bps,
+                    reason="ok" if profit_bps >= self._min_bps else "profit_below_min",
+                    details={"start_usdt": start_usdt_value, "end_usdt": end_usdt},
                 )
+            )
         if euri and eureuri and euri_mid:
             start_usdt_value = start_usdt
             euri_out = _apply_cost(start_usdt_value / euri.ask, self._cost_bps)
             eur_out = _apply_cost(euri_out / eureuri.ask, self._cost_bps)
             end_usdt = eur_out * euri_mid
             profit_bps = (end_usdt - start_usdt_value) / start_usdt_value * 10000
-            if profit_bps >= self._min_bps:
-                candidates.append(
-                    PilotWindow(
-                        family="2LEG",
-                        route="USDT→EURI→EUR",
-                        symbols=["EURIUSDT", "EUREURI"],
-                        profit_abs=end_usdt - start_usdt_value,
-                        profit_bps=profit_bps,
-                        max_notional=start_usdt_value,
-                        ts_start=now,
-                        ts_last=now,
-                        ttl_ms=self._ttl_ms,
-                        valid=True,
-                        reason="ok",
-                        details={"start_usdt": start_usdt_value, "end_usdt": end_usdt},
-                    )
+            candidates.append(
+                PilotWindow(
+                    family="2LEG",
+                    route="USDT→EURI→EUR",
+                    symbols=["EURIUSDT", "EUREURI"],
+                    profit_abs=end_usdt - start_usdt_value,
+                    profit_bps=profit_bps,
+                    max_notional=start_usdt_value,
+                    ts_start=now,
+                    ts_last=now,
+                    ttl_ms=self._ttl_ms,
+                    valid=profit_bps >= self._min_bps,
+                    reason="ok" if profit_bps >= self._min_bps else "profit_below_min",
+                    details={"start_usdt": start_usdt_value, "end_usdt": end_usdt},
                 )
+            )
         if candidates:
             return max(candidates, key=lambda item: item.profit_bps)
         reason = "no_window"

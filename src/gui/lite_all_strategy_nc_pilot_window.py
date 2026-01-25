@@ -92,7 +92,7 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.11"
+NC_PILOT_VERSION = "v1.0.12"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
@@ -1789,6 +1789,26 @@ class NcPilotTabWidget(QWidget):
         )
         if trade_min_life is not None:
             self.pilot_config.trade_min_life_s = trade_min_life
+        min_profit_2leg = self._coerce_float(
+            pilot.get("min_profit_bps_2leg", getattr(self.pilot_config, "min_profit_bps_2leg", 6.0))
+        )
+        if min_profit_2leg is not None:
+            self.pilot_config.min_profit_bps_2leg = min_profit_2leg
+        max_window_life = self._coerce_float(
+            pilot.get("max_window_life_s", getattr(self.pilot_config, "max_window_life_s", 10.0))
+        )
+        if max_window_life is not None:
+            self.pilot_config.max_window_life_s = max_window_life
+        max_price_age = self._coerce_float(
+            pilot.get("max_price_age_ms", getattr(self.pilot_config, "max_price_age_ms", 1500))
+        )
+        if max_price_age is not None:
+            self.pilot_config.max_price_age_ms = int(max_price_age)
+        cooldown_after_trade = self._coerce_float(
+            pilot.get("cooldown_after_trade_s", getattr(self.pilot_config, "cooldown_after_trade_s", 2.0))
+        )
+        if cooldown_after_trade is not None:
+            self.pilot_config.cooldown_after_trade_s = cooldown_after_trade
         self._sync_pilot_trade_families(self.pilot_config.trade_allowed_families)
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
@@ -1868,6 +1888,10 @@ class NcPilotTabWidget(QWidget):
         self.pilot_config.trade_allowed_families = {"2LEG"}
         self.pilot_config.trade_min_profit_bps = 6.0
         self.pilot_config.trade_min_life_s = 2.0
+        self.pilot_config.min_profit_bps_2leg = 6.0
+        self.pilot_config.max_window_life_s = 10.0
+        self.pilot_config.max_price_age_ms = 1500
+        self.pilot_config.cooldown_after_trade_s = 2.0
         self._sync_pilot_trade_families(self.pilot_config.trade_allowed_families)
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
@@ -1908,6 +1932,10 @@ class NcPilotTabWidget(QWidget):
             "trade_allowed_families": sorted(self.pilot_config.trade_allowed_families),
             "trade_min_profit_bps": self.pilot_config.trade_min_profit_bps,
             "trade_min_life_s": self.pilot_config.trade_min_life_s,
+            "min_profit_bps_2leg": self.pilot_config.min_profit_bps_2leg,
+            "max_window_life_s": self.pilot_config.max_window_life_s,
+            "max_price_age_ms": self.pilot_config.max_price_age_ms,
+            "cooldown_after_trade_s": self.pilot_config.cooldown_after_trade_s,
             "selected_symbols": sorted(self._session.pilot.selected_symbols),
             "slippage_bps": PILOT_SLIPPAGE_BPS,
             "pad_bps": PILOT_PAD_BPS,
@@ -2750,6 +2778,13 @@ class NcPilotTabWidget(QWidget):
             "stale": "STALE",
             "pair_disabled": "DISABLED",
             "no_window": "NO WINDOW",
+            "profit_below_min": "LOW PROFIT",
+            "window_expired": "EXPIRED",
+            "stale_price": "STALE",
+            "missing_bidask": "NO BID/ASK",
+            "insufficient_balance": "NO BALANCE",
+            "family_disabled": "DISABLED",
+            "cooldown_active": "COOLDOWN",
         }.get(reason, "NO DATA")
 
     def _pilot_client_order_id(
