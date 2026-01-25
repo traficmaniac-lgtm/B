@@ -68,6 +68,7 @@ from src.core.nc_micro_exec_dedup import should_block_new_orders
 from src.core.nc_micro_refresh import StaleRefreshLogLimiter, compute_refresh_allowed
 from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
 from src.gui.i18n import TEXT, tr
+from src.gui.pilot_log_window import PilotLogWindow
 from src.gui.lite_grid_math import (
     FillAccumulator,
     align_tick_based_qty,
@@ -91,10 +92,10 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.3"
+NC_PILOT_VERSION = "v1.0.4"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
-PILOT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDCUSDT", "TUSDUSDT")
+PILOT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDTUSDC", "TUSDUSDT")
 
 
 @dataclass
@@ -993,6 +994,13 @@ class NcPilotTabWidget(QWidget):
             "book_ticker": 2.0,
             "klines_1h": 60.0,
             "exchange_info_symbol": 3600.0,
+        }
+        self._pilot_log_window: PilotLogWindow | None = None
+        self._pilot_route_snapshots: dict[str, object] = {}
+        self._pilot_market_cache = DataCache()
+        self._pilot_market_cache_ttls = {
+            "book_ticker": 1.5,
+            "orderbook_depth_50": 2.0,
         }
         if self._has_api_keys:
             self._account_client = BinanceAccountClient(
@@ -1925,15 +1933,12 @@ class NcPilotTabWidget(QWidget):
     def _build_right_panel(self) -> QSplitter:
         self._right_splitter = QSplitter(Qt.Vertical)
         self._right_splitter.addWidget(self._build_runtime_panel())
-        self._right_splitter.addWidget(self._build_logs())
         self._right_splitter.addWidget(self._build_pilot_dashboard_panel())
         self._right_splitter.setStretchFactor(0, 3)
         self._right_splitter.setStretchFactor(1, 2)
-        self._right_splitter.setStretchFactor(2, 2)
         self._right_splitter.setCollapsible(0, False)
         self._right_splitter.setCollapsible(1, True)
-        self._right_splitter.setCollapsible(2, True)
-        self._right_splitter.setSizes([520, 280, 240])
+        self._right_splitter.setSizes([600, 320])
         return self._right_splitter
 
     def _build_market_panel(self) -> QWidget:
@@ -2003,7 +2008,7 @@ class NcPilotTabWidget(QWidget):
         return group
 
     def _build_arb_indicators_panel(self) -> QWidget:
-        group = QGroupBox("ARB INDICATORS")
+        group = QGroupBox("ARB SIGNALS")
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
@@ -2011,24 +2016,23 @@ class NcPilotTabWidget(QWidget):
         layout = QGridLayout(group)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(4)
+        layout.setVerticalSpacing(6)
 
-        self._arb_indicators: dict[str, LedIndicator] = {}
-        labels = [
-            ("SPREAD_CAPTURE", "SC"),
-            ("REBALANCE_USDT_USDC", "U↔C"),
-            ("REBALANCE_USDT_TUSD", "U↔T"),
-            ("EURI_ANCHOR", "EURI"),
+        self._arb_signal_rows: dict[str, tuple[LedIndicator, QLabel]] = {}
+        rows = [
+            ("ALGO1", "ALGO1 USDT↔USDC: route=— | — | life=—"),
+            ("ALGO2", "ALGO2 USDT↔TUSD: route=— | — | life=—"),
+            ("ALGO3", "ALGO3 EURI ANCHOR: route=— | — | life=—"),
         ]
-        for idx, (key, short_label) in enumerate(labels):
+        for row, (algo_id, text) in enumerate(rows):
             led = LedIndicator(10, group)
-            label = QLabel(short_label)
-            label.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 600;")
-            row = idx // 2
-            col = (idx % 2) * 2
-            layout.addWidget(led, row, col)
-            layout.addWidget(label, row, col + 1)
-            self._arb_indicators[key] = led
+            label = QLabel(text)
+            label.setStyleSheet("color: #374151; font-size: 10px;")
+            label.setWordWrap(True)
+            layout.addWidget(led, row, 0)
+            layout.addWidget(label, row, 1)
+            self._arb_signal_rows[algo_id] = (led, label)
+        layout.setColumnStretch(1, 1)
         return group
 
     def _build_grid_panel(self) -> QWidget:
@@ -2328,18 +2332,22 @@ class NcPilotTabWidget(QWidget):
         self._pilot_start_analysis_button = QPushButton("Старт анализ")
         self._pilot_start_trading_button = QPushButton("Старт торговля")
         self._pilot_stop_trading_button = QPushButton("Стоп")
+        self._pilot_log_button = QPushButton("Лог пилота")
         for button in (
             self._pilot_start_analysis_button,
             self._pilot_start_trading_button,
             self._pilot_stop_trading_button,
+            self._pilot_log_button,
         ):
             button.setFixedHeight(26)
         self._pilot_start_analysis_button.clicked.connect(self._handle_pilot_start_analysis)
         self._pilot_start_trading_button.clicked.connect(self._handle_pilot_start_trading)
         self._pilot_stop_trading_button.clicked.connect(self._handle_pilot_stop_trading)
+        self._pilot_log_button.clicked.connect(self._show_pilot_log_window)
         buttons.addWidget(self._pilot_start_analysis_button)
         buttons.addWidget(self._pilot_start_trading_button)
         buttons.addWidget(self._pilot_stop_trading_button)
+        buttons.addWidget(self._pilot_log_button)
         layout.addLayout(buttons)
 
         self._pilot_status_line = QLabel("state=IDLE | best=— | edge=— bps | last=—")
@@ -2388,15 +2396,15 @@ class NcPilotTabWidget(QWidget):
         self._pilot_dashboard_counters_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_dashboard_counters_label)
 
-        self._pilot_routes_table = QTableWidget(0, 7, self)
+        self._pilot_routes_table = QTableWidget(3, 7, self)
         self._pilot_routes_table.setHorizontalHeaderLabels(
             [
+                "Algo",
                 "Route",
-                "State",
-                "Edge bps",
                 "Profit abs",
+                "Profit bps",
+                "Life ms",
                 "DepthOK",
-                "TTL life (ms)",
                 "Suggested action",
             ]
         )
@@ -2409,6 +2417,15 @@ class NcPilotTabWidget(QWidget):
         self._pilot_routes_table.verticalHeader().setDefaultSectionSize(22)
         self._pilot_routes_table.setMinimumHeight(200)
         self._pilot_routes_table.cellClicked.connect(self._handle_pilot_route_click)
+        self._pilot_routes_table.setRowCount(3)
+        self._pilot_routes_table.setVerticalHeaderLabels(["ALGO1", "ALGO2", "ALGO3"])
+        self._pilot_route_rows = {"ALGO1": 0, "ALGO2": 1, "ALGO3": 2}
+        for algo_id, row in self._pilot_route_rows.items():
+            initial = [algo_id, "—", "—", "—", "—", "—", "—"]
+            for column, value in enumerate(initial):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignCenter)
+                self._pilot_routes_table.setItem(row, column, item)
         layout.addWidget(self._pilot_routes_table)
         return group
 
@@ -2498,12 +2515,40 @@ class NcPilotTabWidget(QWidget):
         )
         self._pilot_controller.stop(cancel_orders=cancel_orders)
 
+    def _ensure_pilot_log_window(self) -> PilotLogWindow:
+        if self._pilot_log_window is None:
+            self._pilot_log_window = PilotLogWindow(self)
+        return self._pilot_log_window
+
+    def _show_pilot_log_window(self) -> None:
+        window = self._ensure_pilot_log_window()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _append_pilot_log(self, message: str) -> None:
+        window = self._ensure_pilot_log_window()
+        window.append_line(message)
+
     def _handle_pilot_route_click(self, row: int, _column: int) -> None:
         if not hasattr(self, "_pilot_routes_table"):
             return
-        route_item = self._pilot_routes_table.item(row, 0)
-        route_text = route_item.text() if route_item else "—"
-        self._append_log(f"[PILOT] route details: {route_text}", kind="INFO")
+        algo_item = self._pilot_routes_table.item(row, 0)
+        algo_id = algo_item.text() if algo_item else "—"
+        snapshot = self._pilot_route_snapshots.get(algo_id)
+        if snapshot and isinstance(snapshot, dict):
+            details = snapshot.get("details", {})
+            route_text = snapshot.get("route_text", "—")
+            profit_bps = snapshot.get("profit_bps", 0.0)
+            profit_abs = snapshot.get("profit_abs_usdt", 0.0)
+            message = (
+                f"[PILOT] {algo_id} route={route_text} "
+                f"profit={profit_abs:+.2f}USDT ({profit_bps:+.2f}bps) "
+                f"details={details}"
+            )
+        else:
+            message = f"[PILOT] {algo_id} route details unavailable"
+        self._append_pilot_log(message)
 
     def _set_pilot_controls(self, *, analysis_on: bool, trading_on: bool) -> None:
         if hasattr(self, "_pilot_start_analysis_button"):
@@ -2523,7 +2568,7 @@ class NcPilotTabWidget(QWidget):
         }
         self._session.pilot.selected_symbols = selected
         self._schedule_settings_save()
-        self._update_arb_indicators()
+        self._update_arb_signals()
 
     def _update_pilot_status_line(self) -> None:
         if not hasattr(self, "_pilot_status_line"):
@@ -2542,91 +2587,86 @@ class NcPilotTabWidget(QWidget):
         counters = runtime.counters
         edge = f"{runtime.last_best_edge_bps:.2f}" if runtime.last_best_edge_bps is not None else "—"
         last_decision = runtime.last_decision or "—"
+        active_routes = 0
+        if hasattr(self, "_pilot_route_snapshots"):
+            active_routes = sum(
+                1
+                for snap in self._pilot_route_snapshots.values()
+                if isinstance(snap, dict) and snap.get("valid")
+            )
         self._pilot_dashboard_counters_label.setText(
             "Pilot: state="
             f"{runtime.state} | windows_today={counters.windows_found_today} "
-            f"| max_edge={edge} bps | active_routes=0 | last_decision={last_decision}"
+            f"| max_edge={edge} bps | active_routes={active_routes} | last_decision={last_decision}"
         )
 
-    def _update_pilot_routes_table(self) -> None:
-        if not hasattr(self, "_pilot_routes_table"):
+    def _update_pilot_routes_table(self, snapshots: list[dict[str, Any]]) -> None:
+        if not hasattr(self, "_pilot_routes_table") or not hasattr(self, "_pilot_route_rows"):
             return
-        runtime = self._session.pilot
-        route = runtime.last_best_route
-        edge = runtime.last_best_edge_bps
-        if not route:
-            if self._pilot_routes_table.rowCount() != 0:
-                self._pilot_routes_table.setRowCount(0)
-            return
-        self._pilot_routes_table.setRowCount(1)
-        values = [
-            route,
-            runtime.state,
-            "—" if edge is None else f"{edge:.2f}",
-            "—",
-            "—",
-            "—",
-            runtime.last_decision or "—",
-        ]
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(str(value))
-            item.setTextAlignment(Qt.AlignCenter)
-            self._pilot_routes_table.setItem(0, column, item)
-
-    def _update_arb_indicators(self) -> None:
-        if not hasattr(self, "_arb_indicators"):
-            return
-        pilot = self._session.pilot
-        selected = {symbol.upper() for symbol in pilot.selected_symbols}
-        current_symbol = self._normalize_symbol_key(self._symbol)
-        health = self._market_health
-        age_ms = self._session.market.age_ms
-        src = self._session.market.source or "—"
-        bidask_ok = bool(
-            health
-            and health.has_bidask
-            and age_ms is not None
-            and age_ms < BIDASK_FAIL_SOFT_MS
-        )
-        spread_bps = health.spread_bps if health else None
-        min_edge_bps = max(self.pilot_config.min_profit_bps, 0.0)
-        sc_active = bool(bidask_ok and spread_bps is not None and spread_bps >= min_edge_bps)
-        if selected and current_symbol not in selected:
-            sc_active = False
-        edge_text = f"{spread_bps:.2f}bps" if spread_bps is not None else "—"
-        age_text = f"{age_ms}ms" if age_ms is not None else "—"
-        sc_tooltip = (
-            "SC: BUY @bid+1tick → SELL @ask-1tick | "
-            f"edge={edge_text} | src={src} age={age_text} | "
-            f"route={pilot.last_best_route or '—'}"
-        )
-        indicators: dict[str, tuple[bool, str]] = {
-            "SPREAD_CAPTURE": (sc_active, sc_tooltip),
-            "REBALANCE_USDT_USDC": (
-                bool(bidask_ok and "USDCUSDT" in selected and current_symbol == "USDCUSDT"),
-                f"U↔C: USDT→USDC (BUY USDC) | src={src} age={age_text}",
-            ),
-            "REBALANCE_USDT_TUSD": (
-                bool(bidask_ok and "TUSDUSDT" in selected and current_symbol == "TUSDUSDT"),
-                f"U↔T: USDT→TUSD (BUY TUSD) | src={src} age={age_text}",
-            ),
-            "EURI_ANCHOR": (
-                bool(
-                    bidask_ok
-                    and current_symbol in {"EURIUSDT", "EURIEUR"}
-                    and {"EURIUSDT", "EURIEUR"} & selected
-                ),
-                f"EURI: anchor via {current_symbol} | src={src} age={age_text}",
-            ),
-        }
-        for key, (active, tooltip) in indicators.items():
-            indicator = self._arb_indicators.get(key)
-            if indicator is None:
+        for snapshot in snapshots:
+            algo_id = snapshot.get("algo_id")
+            if not algo_id or algo_id not in self._pilot_route_rows:
                 continue
-            indicator.set_state(active)
-            indicator.set_tooltip(tooltip)
-            pilot.indicator_states[key] = active
-            pilot.indicator_tooltips[key] = tooltip
+            row = self._pilot_route_rows[algo_id]
+            values = [
+                algo_id,
+                snapshot.get("route_text", "—"),
+                f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}",
+                f"{snapshot.get('profit_bps', 0.0):+.2f}",
+                str(snapshot.get("life_ms", 0)),
+                "YES" if snapshot.get("depth_ok") else "NO",
+                snapshot.get("suggested_action", "—"),
+            ]
+            for column, value in enumerate(values):
+                item = self._pilot_routes_table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self._pilot_routes_table.setItem(row, column, item)
+                item.setText(str(value))
+        self._pilot_route_snapshots = {snap.get("algo_id", ""): snap for snap in snapshots}
+
+    def _update_arb_signals(self) -> None:
+        if not hasattr(self, "_arb_signal_rows"):
+            return
+        snapshots = [
+            snap for snap in self._pilot_route_snapshots.values() if isinstance(snap, dict)
+        ]
+        for snapshot in snapshots:
+            algo_id = snapshot.get("algo_id")
+            row = self._arb_signal_rows.get(algo_id)
+            if not row:
+                continue
+            led, label = row
+            profit_abs = snapshot.get("profit_abs_usdt", 0.0)
+            profit_bps = snapshot.get("profit_bps", 0.0)
+            life_ms = snapshot.get("life_ms", 0)
+            route_text = snapshot.get("route_text", "—")
+            depth_ok = bool(snapshot.get("depth_ok"))
+            age_ok = bool(snapshot.get("age_ok"))
+            valid = bool(snapshot.get("valid"))
+            reason = snapshot.get("reason", "")
+            life_s = life_ms / 1000 if isinstance(life_ms, (int, float)) else 0.0
+            if algo_id == "ALGO1":
+                prefix = "ALGO1 USDT↔USDC"
+            elif algo_id == "ALGO2":
+                prefix = "ALGO2 USDT↔TUSD"
+            else:
+                prefix = "ALGO3 EURI ANCHOR"
+            if reason == "pair_disabled":
+                route_text = "pair disabled"
+            label.setText(
+                f"{prefix}: route={route_text} | "
+                f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
+                f"life={life_s:.1f}s | depthOK={str(depth_ok)} ageOK={str(age_ok)}"
+            )
+            led.set_state(valid)
+            details = snapshot.get("details", {})
+            tooltip = f"{prefix}\nroute={route_text}\nprofit={profit_abs:+.2f} USDT ({profit_bps:+.2f} bps)\n"
+            tooltip += f"life={life_s:.1f}s depthOK={depth_ok} ageOK={age_ok}\n"
+            tooltip += f"details={details}"
+            label.setToolTip(tooltip)
+            led.set_tooltip(tooltip)
 
     def _pilot_client_order_id(
         self,
@@ -4129,7 +4169,12 @@ class NcPilotTabWidget(QWidget):
         try:
             self._update_pilot_status_line()
             self._update_pilot_dashboard_counters()
-            self._update_pilot_routes_table()
+            if hasattr(self, "_pilot_route_snapshots"):
+                snapshots = [
+                    snap for snap in self._pilot_route_snapshots.values() if isinstance(snap, dict)
+                ]
+                if snapshots:
+                    self._update_pilot_routes_table(snapshots)
             if not hasattr(self, "_pilot_state_value"):
                 return
             self._pilot_update_state_machine()
@@ -5204,7 +5249,7 @@ class NcPilotTabWidget(QWidget):
         self._kpi_vol_state = KPI_STATE_UNKNOWN
         self._kpi_state = KPI_STATE_WAITING_BOOK
         self._kpi_valid = False
-        self._update_arb_indicators()
+        self._update_arb_signals()
         self._maybe_emit_minute_summary(now_ts)
 
     @staticmethod
@@ -5622,7 +5667,7 @@ class NcPilotTabWidget(QWidget):
             self._grid_engine.on_price(price)
             self._update_runtime_balances()
             self._refresh_unrealized_pnl()
-            self._update_arb_indicators()
+            self._update_arb_signals()
             self._session.counters.kpi_updates += 1
             self._maybe_emit_minute_summary(now_ts)
         except Exception:
@@ -7177,6 +7222,69 @@ class NcPilotTabWidget(QWidget):
 
     def _set_http_cache(self, key: str, payload: Any) -> None:
         self._http_cache.set(self._symbol, key, payload)
+
+    def _pilot_get_cached(self, symbol: str, key: str) -> tuple[Any, int] | tuple[None, None]:
+        cached = self._pilot_market_cache.get(symbol, key)
+        if not cached:
+            return None, None
+        data, saved_at = cached
+        ttl = self._pilot_market_cache_ttls.get(key)
+        if ttl is None or not self._pilot_market_cache.is_fresh(saved_at, ttl):
+            return None, None
+        age_ms = int((time_fn() - saved_at) * 1000)
+        return data, age_ms
+
+    def _pilot_set_cache(self, symbol: str, key: str, payload: Any) -> None:
+        self._pilot_market_cache.set(symbol, key, payload)
+
+    def _pilot_fetch_book_ticker(self, symbol: str) -> tuple[dict[str, Any] | None, int | None]:
+        cached, age_ms = self._pilot_get_cached(symbol, "book_ticker")
+        if isinstance(cached, dict):
+            return cached, age_ms
+        try:
+            payload, _latency_ms = self._net_call_sync(
+                "book_ticker",
+                {"symbol": symbol},
+                timeout_ms=2000,
+            )
+        except Exception:
+            return None, None
+        if isinstance(payload, dict):
+            self._pilot_set_cache(symbol, "book_ticker", payload)
+            return payload, 0
+        return None, None
+
+    def _pilot_fetch_orderbook_depth(self, symbol: str) -> dict[str, Any] | None:
+        cached, _age_ms = self._pilot_get_cached(symbol, "orderbook_depth_50")
+        if isinstance(cached, dict):
+            return cached
+        try:
+            payload, _latency_ms = self._net_call_sync(
+                "orderbook_depth",
+                {"symbol": symbol, "limit": 50},
+                timeout_ms=2500,
+            )
+        except Exception:
+            return None
+        if isinstance(payload, dict):
+            self._pilot_set_cache(symbol, "orderbook_depth_50", payload)
+            return payload
+        return None
+
+    def _pilot_collect_market_data(self, symbols: set[str]) -> dict[str, dict[str, Any]]:
+        results: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            book, age_ms = self._pilot_fetch_book_ticker(symbol)
+            bid = self._coerce_float(book.get("bidPrice")) if isinstance(book, dict) else None
+            ask = self._coerce_float(book.get("askPrice")) if isinstance(book, dict) else None
+            depth = self._pilot_fetch_orderbook_depth(symbol)
+            results[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                "age_ms": age_ms,
+                "depth": depth,
+            }
+        return results
 
     def _apply_auto_clamps(self, settings: GridSettingsState, anchor_price: float) -> None:
         if settings.grid_step_mode != "AUTO_ATR":
@@ -11638,6 +11746,10 @@ class NcPilotTabWidget(QWidget):
             if action == "book_ticker":
                 symbol = str(params.get("symbol", ""))
                 return _require_http().get_book_ticker(symbol)
+            if action == "orderbook_depth":
+                symbol = str(params.get("symbol", ""))
+                limit = int(params.get("limit", 50))
+                return _require_http().get_orderbook_depth(symbol, limit=limit)
             if action == "klines":
                 symbol = str(params.get("symbol", ""))
                 interval = str(params.get("interval", "1h"))
