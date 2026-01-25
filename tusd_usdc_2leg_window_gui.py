@@ -90,36 +90,40 @@ def get_two_books_strict(session: requests.Session) -> dict[str, Book]:
     return books
 
 
+def _empty_sim(reason: str) -> dict:
+    return {
+        "ok": False,
+        "out_amount": 0.0,
+        "out_per_1": 0.0,
+        "raw_bps": float("-inf"),
+        "value_in_usdt": 0.0,
+        "value_out_usdt": 0.0,
+        "leftover_usdt": 0.0,
+        "profit_usdt": 0.0,
+        "profit_bps": float("-inf"),
+        "reason": reason,
+        "legs": [],
+    }
+
+
 def simulate_2leg(direction: str, amount_in: float, books: dict[str, Book],
                   filters: dict[str, SymbolFilters], fee_bps: float, slip_bps: float) -> dict:
     amount_in_d = d(amount_in)
     if amount_in_d <= 0:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "zero_amount",
-            "legs": [],
-        }
+        return _empty_sim("zero_amount")
     fee_factor = d(1) - d(fee_bps + slip_bps) / d(10000)
 
     if direction == "A":
         sell_symbol = SYMBOL_USDCUSDT
         buy_symbol = SYMBOL_TUSDUSDT
+        output_symbol = SYMBOL_TUSDUSDT
     else:
         sell_symbol = SYMBOL_TUSDUSDT
         buy_symbol = SYMBOL_USDCUSDT
+        output_symbol = SYMBOL_USDCUSDT
 
     if sell_symbol not in books or buy_symbol not in books:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "missing_book",
-            "legs": [],
-        }
+        return _empty_sim("missing_book")
 
     sell_book = books[sell_symbol]
     buy_book = books[buy_symbol]
@@ -128,101 +132,61 @@ def simulate_2leg(direction: str, amount_in: float, books: dict[str, Book],
 
     sell_price = floor_to_tick(d(sell_book.bid), sell_filters.tick_size)
     if sell_price <= 0:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "sell_price_zero",
-            "legs": [],
-        }
+        return _empty_sim("sell_price_zero")
 
     qty_sell = floor_to_step(amount_in_d, sell_filters.step_size)
     if qty_sell <= 0:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "rounding_zero_qty_leg1",
-            "legs": [],
-        }
+        return _empty_sim("rounding_zero_qty_leg1")
     if qty_sell < sell_filters.min_qty:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "minQty_leg1",
-            "legs": [],
-        }
+        return _empty_sim("minQty_leg1")
 
     notional_sell = qty_sell * sell_price
     if notional_sell < sell_filters.min_notional:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "minNotional_leg1",
-            "legs": [],
-        }
+        return _empty_sim("minNotional_leg1")
 
     proceeds_quote = notional_sell * fee_factor
 
     buy_price = floor_to_tick(d(buy_book.ask), buy_filters.tick_size)
     if buy_price <= 0:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "buy_price_zero",
-            "legs": [],
-        }
+        return _empty_sim("buy_price_zero")
 
     theoretical_qty = proceeds_quote / buy_price
     qty_buy = floor_to_step(theoretical_qty, buy_filters.step_size)
     if qty_buy <= 0:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "rounding_zero_qty_leg2",
-            "legs": [],
-        }
+        return _empty_sim("rounding_zero_qty_leg2")
     if qty_buy < buy_filters.min_qty:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "minQty_leg2",
-            "legs": [],
-        }
+        return _empty_sim("minQty_leg2")
 
     notional_buy = qty_buy * buy_price
     if notional_buy < buy_filters.min_notional:
-        return {
-            "ok": False,
-            "out_amount": 0.0,
-            "out_per_1": 0.0,
-            "bps": float("-inf"),
-            "reason": "minNotional_leg2",
-            "legs": [],
-        }
+        return _empty_sim("minNotional_leg2")
 
     leftover_quote = proceeds_quote - notional_buy
 
     out_amount = qty_buy
     out_per_1 = out_amount / amount_in_d
-    bps = (out_per_1 - d(1)) * d(10000)
+    raw_bps = (out_per_1 - d(1)) * d(10000)
+
+    output_filters = filters[output_symbol]
+    output_bid = floor_to_tick(d(books[output_symbol].bid), output_filters.tick_size)
+    if output_bid <= 0:
+        return _empty_sim("output_bid_zero")
+
+    value_in_usdt = amount_in_d * sell_price
+    value_out_usdt = out_amount * output_bid + leftover_quote
+    profit_usdt = value_out_usdt - value_in_usdt
+    profit_bps = (profit_usdt / value_in_usdt * d(10000)) if value_in_usdt > 0 else d(0)
+
     return {
         "ok": True,
         "out_amount": float(out_amount),
         "out_per_1": float(out_per_1),
-        "bps": float(bps),
+        "raw_bps": float(raw_bps),
+        "value_in_usdt": float(value_in_usdt),
+        "value_out_usdt": float(value_out_usdt),
+        "leftover_usdt": float(leftover_quote),
+        "profit_usdt": float(profit_usdt),
+        "profit_bps": float(profit_bps),
         "reason": "",
         "legs": [
             {
@@ -285,10 +249,10 @@ class BookWorker(QtCore.QObject):
                     self.fetch_recovered.emit()
         except Exception as exc:
             self._had_error = True
-            reason = f"{exc} (backoff {self._backoff:.1f}s)"
-            if self._last_error != reason:
-                self._last_error = reason
-                self.fetch_error.emit(reason)
+            error_text = str(exc)
+            if self._last_error != error_text:
+                self._last_error = error_text
+                self.fetch_error.emit(f"{error_text} (backoff {self._backoff:.1f}s)")
             self._next_allowed = time.time() + self._backoff
             self._backoff = min(self._backoff * 2, self._max_backoff)
         finally:
@@ -349,29 +313,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sim_amount.setSuffix(" sim amount")
         controls.addWidget(self.sim_amount)
 
+        self.show_raw = QtWidgets.QCheckBox("Show raw vs realizable")
+        self.show_raw.setChecked(False)
+        controls.addWidget(self.show_raw)
+
         controls.addStretch()
         layout.addLayout(controls)
 
         summary_layout = QtWidgets.QHBoxLayout()
         self.tradable_best_label = QtWidgets.QLabel("Best Tradable: NO")
         self.best_dir_label = QtWidgets.QLabel("Best Dir: -")
-        self.sim_bps_label = QtWidgets.QLabel("Sim Bps: N/A")
+        self.best_profit_bps_label = QtWidgets.QLabel("Best Profit Bps: N/A")
+        self.best_profit_usdt_label = QtWidgets.QLabel("Best Profit USDT: N/A")
         self.reason_label = QtWidgets.QLabel("Reason: -")
         summary_layout.addWidget(self.tradable_best_label)
         summary_layout.addWidget(self.best_dir_label)
-        summary_layout.addWidget(self.sim_bps_label)
+        summary_layout.addWidget(self.best_profit_bps_label)
+        summary_layout.addWidget(self.best_profit_usdt_label)
         summary_layout.addWidget(self.reason_label)
         summary_layout.addStretch()
         layout.addLayout(summary_layout)
 
-        self.table = QtWidgets.QTableWidget(2, 8)
+        self.table = QtWidgets.QTableWidget(2, 12)
         self.table.setHorizontalHeaderLabels([
             "Direction",
             "Tradable",
             "Reason",
-            "Sim Amount",
-            "Out per 1",
-            "Bps",
+            "Value In USDT",
+            "Value Out USDT",
+            "Leftover USDT",
+            "Profit USDT",
+            "Profit Bps",
+            "Raw Out/1",
+            "Raw Bps",
             "Leg1",
             "Leg2",
         ])
@@ -392,6 +366,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self._stop)
         self.timer.timeout.connect(self._request_tick)
+        self.show_raw.toggled.connect(self._toggle_raw_columns)
+        self._toggle_raw_columns(self.show_raw.isChecked())
+
+    def _toggle_raw_columns(self, show: bool) -> None:
+        self.table.setColumnHidden(8, not show)
+        self.table.setColumnHidden(9, not show)
 
     def _init_worker(self) -> None:
         self.worker_thread = QtCore.QThread(self)
@@ -460,27 +440,42 @@ class MainWindow(QtWidgets.QMainWindow):
         results = {}
         best_bps = float("-inf")
         best_dir = None
+        best_profit_usdt = 0.0
 
         for row, direction in enumerate(["A", "B"]):
             result = simulate_2leg(direction, sim_amount, self.books, self.filters, fee_bps, slip_bps)
             results[direction] = result
             tradable = "YES" if result.get("ok") else "NO"
             reason = result.get("reason", "")
-            out_per_1 = result.get("out_per_1", 0.0)
-            bps = result.get("bps", float("-inf"))
+            value_in = result.get("value_in_usdt", 0.0)
+            value_out = result.get("value_out_usdt", 0.0)
+            leftover = result.get("leftover_usdt", 0.0)
+            profit_usdt = result.get("profit_usdt", 0.0)
+            profit_bps = result.get("profit_bps", float("-inf"))
+            raw_out_per_1 = result.get("out_per_1", 0.0)
+            raw_bps = result.get("raw_bps", float("-inf"))
 
-            if result.get("ok") and bps > best_bps:
-                best_bps = bps
+            if result.get("ok") and profit_bps > best_bps:
+                best_bps = profit_bps
                 best_dir = direction
+                best_profit_usdt = profit_usdt
 
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(tradable))
             self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(reason))
-            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{sim_amount:.4f}"))
-            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{out_per_1:.8f}"))
-            if bps == float("-inf"):
-                self.table.setItem(row, 5, QtWidgets.QTableWidgetItem("N/A"))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{value_in:.6f}"))
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{value_out:.6f}"))
+            self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(f"{leftover:.6f}"))
+            self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(f"{profit_usdt:.6f}"))
+            if profit_bps == float("-inf"):
+                self.table.setItem(row, 7, QtWidgets.QTableWidgetItem("N/A"))
             else:
-                self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(f"{bps:.2f}"))
+                self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(f"{profit_bps:.2f}"))
+
+            self.table.setItem(row, 8, QtWidgets.QTableWidgetItem(f"{raw_out_per_1:.8f}"))
+            if raw_bps == float("-inf"):
+                self.table.setItem(row, 9, QtWidgets.QTableWidgetItem("N/A"))
+            else:
+                self.table.setItem(row, 9, QtWidgets.QTableWidgetItem(f"{raw_bps:.2f}"))
 
             legs = result.get("legs", [])
             leg1 = legs[0] if len(legs) > 0 else None
@@ -491,8 +486,8 @@ class MainWindow(QtWidgets.QMainWindow):
             leg2_text = "" if not leg2 else (
                 f"{leg2['symbol']} qty={leg2['qty']:.6f} px={leg2['price']:.6f}"
             )
-            self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(leg1_text))
-            self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(leg2_text))
+            self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(leg1_text))
+            self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(leg2_text))
 
             prev = self.last_tradable.get(direction)
             if prev is None:
@@ -505,7 +500,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if best_dir is not None:
             self.tradable_best_label.setText("Best Tradable: YES")
             self.best_dir_label.setText(f"Best Dir: {best_dir}")
-            self.sim_bps_label.setText(f"Sim Bps: {best_bps:.2f}")
+            self.best_profit_bps_label.setText(f"Best Profit Bps: {best_bps:.2f}")
+            self.best_profit_usdt_label.setText(f"Best Profit USDT: {best_profit_usdt:.6f}")
             self.reason_label.setText("Reason: -")
         else:
             reason_a = results.get("A", {}).get("reason", "-")
@@ -513,7 +509,8 @@ class MainWindow(QtWidgets.QMainWindow):
             reason = reason_a if reason_a == reason_b else f"A:{reason_a} B:{reason_b}"
             self.tradable_best_label.setText("Best Tradable: NO")
             self.best_dir_label.setText("Best Dir: -")
-            self.sim_bps_label.setText("Sim Bps: N/A")
+            self.best_profit_bps_label.setText("Best Profit Bps: N/A")
+            self.best_profit_usdt_label.setText("Best Profit USDT: N/A")
             self.reason_label.setText(f"Reason: {reason}")
 
         should_open = best_dir is not None and best_bps >= min_bps
@@ -533,12 +530,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> None:
-    filters = fetch_exchange_info_filters(SYMBOLS)
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow(filters)
-    window.resize(1100, 600)
-    window.show()
-    sys.exit(app.exec())
+    try:
+        filters = fetch_exchange_info_filters(SYMBOLS)
+        app = QtWidgets.QApplication(sys.argv)
+        window = MainWindow(filters)
+        window.resize(1300, 600)
+        window.show()
+        print("BOOT OK: USDC/TUSD Window Scanner started")
+        sys.exit(app.exec())
+    except Exception as exc:
+        print(f"BOOT FAIL: {exc}")
+        raise
 
 
 if __name__ == "__main__":
@@ -546,12 +548,14 @@ if __name__ == "__main__":
 
 # Manual test checklist
 # - Launch the app and confirm filters log once with tick/step/minQty/minNotional per symbol.
+# - Confirm BOOT OK prints after the window shows.
 # - Click Start and verify the GUI remains responsive while updates arrive.
 # - Confirm data_not_ok logs only once when bid/ask is missing, then clears on recovery.
-# - Validate network_error backoff logs increase on repeated failures and resolve on recovery.
+# - Validate network_error backoff logs only on error changes and resolve on recovery.
 # - Adjust Sim amount upward/downward to trigger minQty and minNotional failures.
 # - Verify tradable state change logs only when a direction flips between YES/NO.
-# - Confirm Best Tradable/Best Dir/Sim Bps fields update with simulation results.
-# - Ensure window OPEN/CLOSE logs follow sim_bps threshold and ok==true only.
+# - Confirm Value In/Out, Leftover, Profit USDT, Profit Bps update with realizable results.
+# - Toggle "Show raw vs realizable" to compare raw vs realizable bps.
+# - Ensure window OPEN/CLOSE logs follow Profit Bps threshold and ok==true only.
 # - Click Stop and confirm updates halt without thread errors.
 # - Close the window and confirm clean shutdown without event loop warnings.
