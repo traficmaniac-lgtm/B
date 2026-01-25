@@ -23,7 +23,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, QEventLoop, QRunnable, Qt, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -91,9 +91,10 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.2"
+NC_PILOT_VERSION = "v1.0.3"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
+PILOT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDCUSDT", "TUSDUSDT")
 
 
 @dataclass
@@ -201,6 +202,34 @@ class MarketHealth:
     src: str | None
     edge_raw_bps: float | None
     expected_profit_bps: float | None
+
+
+class LedIndicator(QWidget):
+    def __init__(self, diameter: int = 10, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._active = False
+        self._diameter = diameter
+        self.setFixedSize(diameter, diameter)
+
+    def set_state(self, active: bool) -> None:
+        if self._active == active:
+            return
+        self._active = active
+        self.update()
+
+    def set_tooltip(self, text: str) -> None:
+        self.setToolTip(text or "")
+
+    def paintEvent(self, _event: Any) -> None:
+        color = QColor("#16a34a" if self._active else "#dc2626")
+        border = QColor("#111827")
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        radius = self._diameter - 2
+        painter.setBrush(color)
+        painter.setPen(border)
+        painter.drawEllipse(1, 1, radius, radius)
+        painter.end()
 
 
 class _LiteGridSignals(QObject):
@@ -1565,9 +1594,6 @@ class NcPilotTabWidget(QWidget):
         return wrapper
 
     def _build_body(self) -> QSplitter:
-        outer_splitter = QSplitter(Qt.Vertical)
-        outer_splitter.setChildrenCollapsible(False)
-
         top_splitter = QSplitter(Qt.Horizontal)
         top_splitter.setChildrenCollapsible(False)
         top_splitter.addWidget(self._build_market_panel())
@@ -1576,13 +1602,7 @@ class NcPilotTabWidget(QWidget):
         top_splitter.setStretchFactor(0, 1)
         top_splitter.setStretchFactor(1, 2)
         top_splitter.setStretchFactor(2, 1)
-
-        outer_splitter.addWidget(top_splitter)
-        outer_splitter.addWidget(self._build_pilot_dashboard_panel())
-        outer_splitter.setStretchFactor(0, 3)
-        outer_splitter.setStretchFactor(1, 2)
-        outer_splitter.setSizes([700, 320])
-        return outer_splitter
+        return top_splitter
 
     def _is_micro_profile(self) -> bool:
         return self._symbol.replace("/", "").upper() in MICRO_STABLECOIN_SYMBOLS
@@ -1631,6 +1651,10 @@ class NcPilotTabWidget(QWidget):
 
     def _settings_symbol_key(self) -> str:
         return self._symbol.replace("/", "").upper()
+
+    @staticmethod
+    def _normalize_symbol_key(symbol: str) -> str:
+        return symbol.replace("/", "").upper()
 
     def _set_settings_state(self, settings: GridSettingsState) -> None:
         self._session.config = settings
@@ -1741,6 +1765,11 @@ class NcPilotTabWidget(QWidget):
             )
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
+        selected_symbols = pilot.get("selected_symbols")
+        if isinstance(selected_symbols, list) and selected_symbols:
+            normalized = {self._normalize_symbol_key(symbol) for symbol in selected_symbols if symbol}
+            if normalized:
+                self._session.pilot.selected_symbols = normalized
 
     def _apply_micro_defaults(self, *, reason: str) -> None:
         self._set_settings_state(self._micro_grid_defaults())
@@ -1845,6 +1874,7 @@ class NcPilotTabWidget(QWidget):
             "stale_policy": self.pilot_config.stale_policy,
             "allow_market_close": self.pilot_config.allow_market_close,
             "allow_guard_autofix": getattr(self.pilot_config, "allow_guard_autofix", False),
+            "selected_symbols": sorted(self._session.pilot.selected_symbols),
             "slippage_bps": PILOT_SLIPPAGE_BPS,
             "pad_bps": PILOT_PAD_BPS,
             "thin_edge_action": "HOLD",
@@ -1896,11 +1926,14 @@ class NcPilotTabWidget(QWidget):
         self._right_splitter = QSplitter(Qt.Vertical)
         self._right_splitter.addWidget(self._build_runtime_panel())
         self._right_splitter.addWidget(self._build_logs())
+        self._right_splitter.addWidget(self._build_pilot_dashboard_panel())
         self._right_splitter.setStretchFactor(0, 3)
-        self._right_splitter.setStretchFactor(1, 1)
+        self._right_splitter.setStretchFactor(1, 2)
+        self._right_splitter.setStretchFactor(2, 2)
         self._right_splitter.setCollapsible(0, False)
         self._right_splitter.setCollapsible(1, True)
-        self._right_splitter.setSizes([720, 240])
+        self._right_splitter.setCollapsible(2, True)
+        self._right_splitter.setSizes([520, 280, 240])
         return self._right_splitter
 
     def _build_market_panel(self) -> QWidget:
@@ -1965,7 +1998,37 @@ class NcPilotTabWidget(QWidget):
         summary_layout.setColumnStretch(1, 1)
         layout.addWidget(summary_frame)
         layout.addWidget(self._rules_label)
+        layout.addWidget(self._build_arb_indicators_panel())
         layout.addStretch(1)
+        return group
+
+    def _build_arb_indicators_panel(self) -> QWidget:
+        group = QGroupBox("ARB INDICATORS")
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
+        layout = QGridLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
+
+        self._arb_indicators: dict[str, LedIndicator] = {}
+        labels = [
+            ("SPREAD_CAPTURE", "SC"),
+            ("REBALANCE_USDT_USDC", "U↔C"),
+            ("REBALANCE_USDT_TUSD", "U↔T"),
+            ("EURI_ANCHOR", "EURI"),
+        ]
+        for idx, (key, short_label) in enumerate(labels):
+            led = LedIndicator(10, group)
+            label = QLabel(short_label)
+            label.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 600;")
+            row = idx // 2
+            col = (idx % 2) * 2
+            layout.addWidget(led, row, col)
+            layout.addWidget(label, row, col + 1)
+            self._arb_indicators[key] = led
         return group
 
     def _build_grid_panel(self) -> QWidget:
@@ -2160,6 +2223,7 @@ class NcPilotTabWidget(QWidget):
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
+        group.setMinimumHeight(260)
         group.setMinimumHeight(280)
         layout = QVBoxLayout(group)
         layout.setSpacing(4)
@@ -2282,6 +2346,24 @@ class NcPilotTabWidget(QWidget):
         self._pilot_status_line.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_status_line)
 
+        pairs_title = QLabel("Пары пилота")
+        pairs_title.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
+        layout.addWidget(pairs_title)
+        pairs_layout = QGridLayout()
+        pairs_layout.setHorizontalSpacing(6)
+        pairs_layout.setVerticalSpacing(2)
+        self._pilot_pair_checkboxes: dict[str, QCheckBox] = {}
+        selected_symbols = {symbol.upper() for symbol in self._session.pilot.selected_symbols}
+        for idx, symbol in enumerate(PILOT_SYMBOLS):
+            checkbox = QCheckBox(symbol)
+            checkbox.setChecked(symbol in selected_symbols)
+            checkbox.stateChanged.connect(self._update_pilot_selected_symbols)
+            self._pilot_pair_checkboxes[symbol] = checkbox
+            row = idx // 2
+            col = idx % 2
+            pairs_layout.addWidget(checkbox, row, col)
+        layout.addLayout(pairs_layout)
+
         self._pilot_cancel_on_stop_toggle = QCheckBox("Cancel pilot orders on Stop")
         self._pilot_cancel_on_stop_toggle.setChecked(True)
         layout.addWidget(self._pilot_cancel_on_stop_toggle)
@@ -2295,6 +2377,7 @@ class NcPilotTabWidget(QWidget):
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
+        group.setMinimumHeight(200)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
@@ -2332,6 +2415,7 @@ class NcPilotTabWidget(QWidget):
     def _build_logs(self) -> QFrame:
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
+        frame.setMinimumHeight(200)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
@@ -2429,6 +2513,18 @@ class NcPilotTabWidget(QWidget):
         if hasattr(self, "_pilot_stop_trading_button"):
             self._pilot_stop_trading_button.setEnabled(analysis_on or trading_on)
 
+    def _update_pilot_selected_symbols(self) -> None:
+        if not hasattr(self, "_pilot_pair_checkboxes"):
+            return
+        selected = {
+            symbol
+            for symbol, checkbox in self._pilot_pair_checkboxes.items()
+            if checkbox.isChecked()
+        }
+        self._session.pilot.selected_symbols = selected
+        self._schedule_settings_save()
+        self._update_arb_indicators()
+
     def _update_pilot_status_line(self) -> None:
         if not hasattr(self, "_pilot_status_line"):
             return
@@ -2476,6 +2572,61 @@ class NcPilotTabWidget(QWidget):
             item = QTableWidgetItem(str(value))
             item.setTextAlignment(Qt.AlignCenter)
             self._pilot_routes_table.setItem(0, column, item)
+
+    def _update_arb_indicators(self) -> None:
+        if not hasattr(self, "_arb_indicators"):
+            return
+        pilot = self._session.pilot
+        selected = {symbol.upper() for symbol in pilot.selected_symbols}
+        current_symbol = self._normalize_symbol_key(self._symbol)
+        health = self._market_health
+        age_ms = self._session.market.age_ms
+        src = self._session.market.source or "—"
+        bidask_ok = bool(
+            health
+            and health.has_bidask
+            and age_ms is not None
+            and age_ms < BIDASK_FAIL_SOFT_MS
+        )
+        spread_bps = health.spread_bps if health else None
+        min_edge_bps = max(self.pilot_config.min_profit_bps, 0.0)
+        sc_active = bool(bidask_ok and spread_bps is not None and spread_bps >= min_edge_bps)
+        if selected and current_symbol not in selected:
+            sc_active = False
+        edge_text = f"{spread_bps:.2f}bps" if spread_bps is not None else "—"
+        age_text = f"{age_ms}ms" if age_ms is not None else "—"
+        sc_tooltip = (
+            "SC: BUY @bid+1tick → SELL @ask-1tick | "
+            f"edge={edge_text} | src={src} age={age_text} | "
+            f"route={pilot.last_best_route or '—'}"
+        )
+        indicators: dict[str, tuple[bool, str]] = {
+            "SPREAD_CAPTURE": (sc_active, sc_tooltip),
+            "REBALANCE_USDT_USDC": (
+                bool(bidask_ok and "USDCUSDT" in selected and current_symbol == "USDCUSDT"),
+                f"U↔C: USDT→USDC (BUY USDC) | src={src} age={age_text}",
+            ),
+            "REBALANCE_USDT_TUSD": (
+                bool(bidask_ok and "TUSDUSDT" in selected and current_symbol == "TUSDUSDT"),
+                f"U↔T: USDT→TUSD (BUY TUSD) | src={src} age={age_text}",
+            ),
+            "EURI_ANCHOR": (
+                bool(
+                    bidask_ok
+                    and current_symbol in {"EURIUSDT", "EURIEUR"}
+                    and {"EURIUSDT", "EURIEUR"} & selected
+                ),
+                f"EURI: anchor via {current_symbol} | src={src} age={age_text}",
+            ),
+        }
+        for key, (active, tooltip) in indicators.items():
+            indicator = self._arb_indicators.get(key)
+            if indicator is None:
+                continue
+            indicator.set_state(active)
+            indicator.set_tooltip(tooltip)
+            pilot.indicator_states[key] = active
+            pilot.indicator_tooltips[key] = tooltip
 
     def _pilot_client_order_id(
         self,
@@ -5053,6 +5204,7 @@ class NcPilotTabWidget(QWidget):
         self._kpi_vol_state = KPI_STATE_UNKNOWN
         self._kpi_state = KPI_STATE_WAITING_BOOK
         self._kpi_valid = False
+        self._update_arb_indicators()
         self._maybe_emit_minute_summary(now_ts)
 
     @staticmethod
@@ -5470,6 +5622,7 @@ class NcPilotTabWidget(QWidget):
             self._grid_engine.on_price(price)
             self._update_runtime_balances()
             self._refresh_unrealized_pnl()
+            self._update_arb_indicators()
             self._session.counters.kpi_updates += 1
             self._maybe_emit_minute_summary(now_ts)
         except Exception:
@@ -10392,16 +10545,16 @@ class NcPilotTabWidget(QWidget):
         if not hasattr(self, "_right_splitter"):
             return
         sizes = self._right_splitter.sizes()
-        if len(sizes) < 2:
+        if len(sizes) < 3:
             return
         if sizes[1] == 0:
             restored = getattr(self, "_logs_splitter_sizes", None)
-            if not restored or len(restored) < 2:
-                restored = [720, 240]
+            if not restored or len(restored) < 3:
+                restored = [520, 280, 240]
             self._right_splitter.setSizes(restored)
         else:
             self._logs_splitter_sizes = sizes
-            self._right_splitter.setSizes([max(1, sizes[0] + sizes[1]), 0])
+            self._right_splitter.setSizes([max(1, sizes[0] + sizes[1]), 0, sizes[2]])
 
     @staticmethod
     def _extract_filter_value(filters: object, filter_type: str, key: str) -> float | None:
