@@ -256,3 +256,19 @@ Acceptance checklist:
 - Moved NC_PILOT to Desktop Terminal launcher (multi-pair controller) and removed pair-dialog entry.
 - Rebuilt NC_PILOT UI with multi-pair status, family budgets, filtered balances, and pilot-centric panels.
 - Enforced 2LEG-only execution with deterministic HOLD/TRADE_BLOCK reasons and 2LEG budget sizing.
+
+---
+
+## Reporting conventions
+
+- Каждый пункт обновления должен включать: **контекст**, **изменения**, **эффект**, **проверку**.
+- Для критических фиксов добавляется блок **Risk/Regression** и **Rollback plan**.
+- Логи ключевых проверок указывать в секции Manual check.
+
+## Release checklist (сокращённый)
+
+1. Проверить запуск GUI и загрузку конфигурации.
+2. Открыть минимум одно окно NC MICRO и ALGO PILOT.
+3. Проверить обработку ошибок API (live‑gate).
+4. Убедиться, что crash‑guard создаёт crash‑лог.
+5. Обновить заметки о версии и дату в данном отчёте.

@@ -123,3 +123,28 @@ for each cluster:
 - Не превышен ли `max_pairs_active`?
 - Все ли пары имеют `last_tick_ts` в пределах TTL?
 - Есть ли «зависшие» pending actions?
+
+## 11. Метрики производительности
+
+- `loop_latency_ms` (p50/p95) по каждому циклу.
+- `queue_depth` и `queue_wait_ms` в NetWorker.
+- `orders_per_minute` и `cancel_rate`.
+
+## 12. Ограничения SLA
+
+- Max latency для tick loop: 500–800 ms.
+- Max latency для maintenance loop: 3–5 s.
+- Max задержка между legs при ребалансе: 2–4 s.
+
+## 13. Тестовые сценарии
+
+1. 2 пары, стабильный рынок → проверка ребаланса без rollback.
+2. Всплеск волатильности → guard блокирует новые intents.
+3. Потеря WS → fallback в HTTP, затем восстановление.
+4. Частичное исполнение leg → rollback и cooldown.
+
+## 14. План восстановления (recovery)
+
+- При рестарте загружать `State Store` и reconcile с биржей.
+- Если невозможно подтвердить open orders → `SAFE_PAUSE` и отмена.
+- Для повторного запуска требуется чистый `guard_status=OK`.

@@ -232,3 +232,46 @@ src/
 - **NC_PILOT_MULTI_PAIR_RUNTIME.md** — планировщик, петли исполнения, шаблоны восстановления.
 - **NC_PILOT_MULTI_PAIR_RISK_CONTROLS.md** — гейт‑логика, лимиты, аварийные выходы.
 - **NC_PILOT_MULTI_PAIR_2LEG_REBAL_LOOP_SPREAD.md** — подробная схема 2‑leg rebalancing loop spread.
+
+## 6. Сервисы рынков и цен
+
+### `src/services/markets_service.py`
+
+- Загружает `exchangeInfo` и хранит кэш символов.
+- Формирует список торговых пар для Overview.
+- Управляет частотой обновления и логирует время ответа.
+
+### `src/services/price_feed_manager.py`
+
+- Подписки на цены и статусы WS.
+- Управляет fallback HTTP при деградации WS.
+- Хранит возраст данных и источник (`WS/HTTP`).
+
+## 7. GUI‑модули и ключевые окна
+
+- `MainWindow` — основной контейнер UI.
+- `PairActionDialog` — выбор режима для пары.
+- `LiteAllStrategy*` окна — Lite Grid / ALGO PILOT / NC MICRO.
+- `TradeReadyWindow` / `TradingRuntimeWindow` — режимы AI/Runtime.
+
+## 8. Логи и артефакты
+
+- `logs/app.log` — общий лог приложения.
+- `logs/crash/*` — crash‑дампы окон.
+- `data/exchange_info_*.json` — кэш биржевой информации.
+
+## 9. Поток данных (концептуально)
+
+```
+UI -> PairModeManager -> (Window) -> PriceFeedManager -> NetWorker -> Binance API
+```
+
+- UI инициирует действия через окно режима.
+- NetWorker обеспечивает последовательность и dedup запросов.
+- Ответы обновляют локальные модели и UI‑панели.
+
+## 10. Практические подсказки
+
+- При нестабильном WS включать fallback‑поллинг (HTTP) и следить за `age_ms`.
+- При отсутствии bid/ask необходимо проверять корректность символа и доступность book‑ticker.
+- Любые изменения в guard‑логике фиксировать в `reports/REPORT.md`.

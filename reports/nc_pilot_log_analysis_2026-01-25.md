@@ -25,3 +25,27 @@
 - **Investigate WS connectivity**: Check WS connection stability (network, firewall, rate limits). If stable WS is required for bid/ask, add reconnect/backoff and surface warnings in UI when in HTTP-only mode.
 - **Handle missing bid/ask data**: If HTTP fallback is used, ensure it populates bid/ask or adjust KPI logic to avoid reporting `WAITING_BOOK` indefinitely.
 - **Fix close handler**: Add or guard `has_active_tabs` in `NcPilotMainWindow` to avoid `AttributeError` during shutdown.
+
+## Evidence summary
+
+- Multiple `WS_DEGRADED`/`WS_LOST` transitions for the same symbols within short intervals.
+- `symbol_stale` messages followed by `src=HTTP_ONLY` updates.
+- Explicit logs showing `invalid symbol dropped: MULTI`.
+
+## Proposed fix plan
+
+1. **Sanitize symbol list** before feeding `PriceFeedManager` (drop non‑exchange tokens such as `MULTI`).
+2. **Add UI guard** to prevent user‑created pseudo‑symbols from entering the feed.
+3. **Improve fallback path** so HTTP mode still populates bid/ask for KPI.
+4. **Fix close handler** to avoid `has_active_tabs` attribute errors.
+
+## Validation plan
+
+- Reproduce with the same symbols and ensure no `invalid symbol` errors.
+- Force WS disconnect for 10–20 seconds and confirm fallback maintains bid/ask.
+- Close NC Pilot window and verify clean shutdown (no exceptions).
+
+## Open questions
+
+- Is `MULTI` a legacy mode flag or a UI alias? If so, where is it injected?
+- Do any other pseudo‑symbols exist in saved user settings?

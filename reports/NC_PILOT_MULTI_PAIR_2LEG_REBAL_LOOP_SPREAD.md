@@ -99,3 +99,40 @@ k = hedge_ratio_target
 - spread >= entry threshold?
 - Есть ли доступная ликвидность?
 - Не активированы ли guard‑флаги?
+
+## 12. Контроль рисков и охранные условия
+
+- Проверка **stale** по обеим legs до старта.
+- Запрет ребаланса при `thin_edge` и `spread_guard`.
+- Ограничение на max‑slippage и max‑latency в окне ребаланса.
+- Kill‑switch при превышении `max_rebalance_steps`.
+
+## 13. Типы ордеров и тактика исполнения
+
+- По умолчанию используются **LIMIT** с минимальным отступом от mid.
+- Допускается MARKET только для аварийного закрытия (если разрешено политикой).
+- Ордера вторичной leg отправляются только после подтверждения основной.
+
+## 14. Обработка частичных исполнений
+
+- Частичный fill primary → допустимо продолжать, если ожидаемая дельта сохраняется.
+- Частичный fill secondary → если окно истекло, выполнить rollback.
+- Учёт cumulative fills обязателен для корректной оценки hedge ratio.
+
+## 15. Метрики и лог‑сигналы
+
+- `rebalance_attempts`, `rebalance_success`, `rebalance_partial`.
+- `rebalance_latency_ms` — время от сигнала до подтверждения обеих legs.
+- `spread_entry_bps` / `spread_exit_bps` — фактические уровни входа/выхода.
+- Причины блокировки: `guard_reason`, `stale_reason`, `liquidity_drop`.
+
+## 16. Пример лога
+
+```
+[REB] start cluster=A/B spread=7.2bps target_ratio=0.8
+[REB] legA placed order_id=12345
+[REB] legA filled qty=1.2
+[REB] legB placed order_id=54321
+[REB] legB timeout -> rollback
+[REB] rollback done cooldown=120s
+```
