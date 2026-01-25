@@ -42,7 +42,9 @@ src/
   app/        — запуск GUI
   core/       — конфигурация, модели, логирование, стратегии, cancel/reconcile, NC MICRO helpers
   binance/    — HTTP/WS/Account клиенты
-  services/   — рынки, цены, кэши, rate‑limiter
+  services/   — рынки, цены, кэши, rate‑limiter, nc_micro session, net worker
+    nc_micro/ — контейнеры состояния NC MICRO (session)
+    net/      — фоновый NetWorker для HTTP‑задач
   gui/        — окна/вкладки/диалоги/модели UI (Lite, Lite All Strategy, ALGO PILOT, NC MICRO)
   ai/         — AI‑схемы и OpenAI‑клиент
   runtime/    — локальный runtime и виртуальные ордера
@@ -117,6 +119,13 @@ src/
 ### `src/services/rate_limiter.py`
 - Rate‑limit по ключам.
 
+### `src/services/nc_micro/session.py`
+- Контейнеры состояния NC MICRO: сеточные настройки, cache market‑данных, runtime‑метки, dedup‑состояние.
+
+### `src/services/net/net_worker.py`
+- Фоновый HTTP‑worker: очередь задач, приоритеты, dedup по ключу, rate‑limit и блокировки.
+- Варианты вызовов: `submit()` (async) и `call()` (sync с таймаутом).
+
 ## 8. GUI: основные окна и режимы
 
 ### MainWindow и Overview
@@ -154,6 +163,8 @@ src/
 - Trade‑gate, profit/break‑even/edge‑guards блокируют опасные действия.
 - Stale‑refresh основан на hash‑контроле, hard‑TTL и подавлении спама логов.
 - Дедупликация fills/trade_id защищает от повторной обработки.
+- Сессионное состояние хранится в `NcMicroSession` (grid‑настройки, кэш market‑данных, runtime‑счётчики и dedup‑контейнеры).
+- HTTP‑задачи отправляются через `NetWorker` (очередь и дедуп вызовов).
 
 ### AI modes
 
@@ -191,6 +202,7 @@ src/
    - берёт цены из `PriceFeedManager`, HTTP book‑ticker и кэширует их через `DataCache`,
    - контролирует thin‑edge/volatility, блокирует действия при рисках,
    - управляет stale‑refresh через `nc_micro_refresh` и dedup для fills.
+   - асинхронные HTTP‑задачи идут через `NetWorker` с приоритетами и dedup‑ключами.
 7. **AI режимы**: Pair Workspace/AI Operator собирает datapack → `OpenAIClient` → JSON → UI.
 
 ## 12. Тесты
