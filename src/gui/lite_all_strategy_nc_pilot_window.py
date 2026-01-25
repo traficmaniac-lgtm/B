@@ -1050,6 +1050,9 @@ class NcPilotTabWidget(QWidget):
         self._multi_book_index = 0
         self._multi_book_last_request_ts: float | None = None
         self._multi_bidask_logged: set[str] = set()
+        self._book_ticker_backoff_ms: dict[str, int] = {}
+        self._book_ticker_backoff_until_ts: dict[str, float] = {}
+        self._book_ticker_unsupported_symbols: set[str] = set()
         self._bot_order_ids: set[str] = set()
         self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
@@ -1240,6 +1243,7 @@ class NcPilotTabWidget(QWidget):
         self.bidask_ready = False
         self._bidask_last_request_ts: float | None = None
         self._bidask_ready_logged = False
+        self._bidask_status: str | None = None
         self._kpi_vol_samples: deque[tuple[float, float]] = deque(maxlen=KPI_VOL_SAMPLE_MAXLEN)
         self._kpi_last_good_vol: float | None = None
         self._kpi_last_good_ts: float | None = None
@@ -5509,22 +5513,83 @@ class NcPilotTabWidget(QWidget):
             return False
         return True
 
-    def _maybe_log_no_bidask(self, reason: str) -> None:
-        now = monotonic()
-        if not self._no_bidask_warned:
-            self._append_log(f"[SKIP] no bid/ask reason={reason}", kind="WARN")
-            self._no_bidask_warned = True
-            self._no_bidask_last_log_ts = now
+    def _book_ticker_ttl_ms(self) -> int:
+        ttl_sec = self._pilot_market_cache_ttls.get("book_ticker", 5.0)
+        return int(ttl_sec * 1000)
+
+    def _book_ticker_backoff_active(self, symbol: str, now_ts: float) -> bool:
+        until_ts = self._book_ticker_backoff_until_ts.get(symbol)
+        return until_ts is not None and now_ts < until_ts
+
+    def _register_book_ticker_rate_limit(self, symbol: str, message: str) -> None:
+        now_ts = monotonic()
+        prev = self._book_ticker_backoff_ms.get(symbol, 0)
+        next_backoff = prev * 2 if prev else BIDASK_POLL_MS * 2
+        next_backoff = max(next_backoff, BIDASK_POLL_MS * 2)
+        next_backoff = min(next_backoff, 15_000)
+        self._book_ticker_backoff_ms[symbol] = next_backoff
+        self._book_ticker_backoff_until_ts[symbol] = now_ts + next_backoff / 1000
+        if next_backoff != prev:
+            self._append_log_throttled(
+                f"[BIDASK] rate_limit backoff symbol={symbol} next={next_backoff}ms err={message}",
+                kind="WARN",
+                key=f"book_ticker_backoff_{symbol}",
+                cooldown_sec=5.0,
+            )
+
+    def _clear_book_ticker_backoff(self, symbol: str) -> None:
+        if symbol in self._book_ticker_backoff_ms:
+            self._book_ticker_backoff_ms.pop(symbol, None)
+        if symbol in self._book_ticker_backoff_until_ts:
+            self._book_ticker_backoff_until_ts.pop(symbol, None)
+
+    def _is_book_ticker_supported(self, symbol: str) -> bool:
+        symbol = symbol.strip().upper()
+        if symbol in self._book_ticker_unsupported_symbols:
+            return False
+        exchange_symbols = self._pilot_exchange_symbols()
+        if exchange_symbols and symbol not in exchange_symbols:
+            self._book_ticker_unsupported_symbols.add(symbol)
+            self._append_log(
+                f"[BIDASK] unsupported bookTicker symbol={symbol} -> skip",
+                kind="WARN",
+            )
+            return False
+        return True
+
+    def _log_bidask_status(
+        self,
+        *,
+        bidask_age_ms: int | None,
+        best_bid: float | None,
+        best_ask: float | None,
+    ) -> None:
+        ttl_ms = BIDASK_STALE_MS
+        if (
+            bidask_age_ms is None
+            or bidask_age_ms > ttl_ms
+            or best_bid is None
+            or best_ask is None
+        ):
+            status = "BIDASK_MISSING"
+        elif bidask_age_ms > BIDASK_FAIL_SOFT_MS:
+            status = "BIDASK_DEGRADED"
+        else:
+            status = "BIDASK_OK"
+        if status == self._bidask_status:
             return
-        last_log = self._no_bidask_last_log_ts
-        if last_log is None or now - last_log >= NO_BIDASK_LOG_INTERVAL_SEC:
-            self._append_log(f"[SKIP] no bid/ask reason={reason}", kind="INFO")
-            self._no_bidask_last_log_ts = now
+        age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
+        self._append_log(
+            f"[BIDASK] state={status} age={age_text}",
+            kind="INFO",
+        )
+        self._bidask_status = status
+
+    def _maybe_log_no_bidask(self, reason: str) -> None:
+        return
 
     def _validate_bid_ask(self, bid: float | None, ask: float | None, *, source: str) -> bool:
         if bid is None or ask is None:
-            if not self.bidask_ready:
-                self._maybe_log_no_bidask(self._bidask_state or "missing")
             return False
         if not isfinite(bid) or not isfinite(ask):
             return False
@@ -5631,6 +5696,10 @@ class NcPilotTabWidget(QWidget):
                 cooldown_sec=2.0,
             )
             return
+        if not self._is_book_ticker_supported(self._symbol):
+            return
+        if self._book_ticker_backoff_active(self._symbol, now_ts):
+            return
         if self._is_multi_symbol(self._symbol):
             self._kpi_last_book_request_ts = now_ts
             self._request_multi_book_ticker()
@@ -5655,6 +5724,7 @@ class NcPilotTabWidget(QWidget):
                 bid, ask = self._update_http_book_snapshot(payload)
                 if bid is not None and ask is not None:
                     self._set_http_cache("book_ticker", payload)
+                    self._clear_book_ticker_backoff(self._symbol)
         except Exception:
             self._logger.exception("[NC_PILOT][CRASH] exception in _handle_book_ticker_success")
             self._notify_crash("_handle_book_ticker_success")
@@ -5663,6 +5733,8 @@ class NcPilotTabWidget(QWidget):
 
     def _handle_book_ticker_error(self, error: object) -> None:
         message = self._format_account_error(error)
+        if self._is_rate_limit_or_server_error(message):
+            self._register_book_ticker_rate_limit(self._symbol, message)
         self._append_log_throttled(
             f"[BIDASK] book ticker error={message}",
             kind="WARN",
@@ -5683,6 +5755,10 @@ class NcPilotTabWidget(QWidget):
                 key="skip_http_book",
                 cooldown_sec=2.0,
             )
+            return
+        if not self._is_book_ticker_supported(self._symbol):
+            return
+        if self._book_ticker_backoff_active(self._symbol, now_ts):
             return
         if self._is_multi_symbol(self._symbol):
             self._bidask_last_request_ts = now_ts
@@ -5710,6 +5786,7 @@ class NcPilotTabWidget(QWidget):
             if bid is None or ask is None:
                 return
             self._set_http_cache("book_ticker", payload)
+            self._clear_book_ticker_backoff(self._symbol)
             if not self._bidask_ready_logged:
                 self._append_log(
                     f"[BIDASK] ready src=HTTP_BOOK bid={bid:.8f} ask={ask:.8f}",
@@ -5729,6 +5806,8 @@ class NcPilotTabWidget(QWidget):
             symbol = str(item).strip().upper()
             if not symbol or symbol in symbols:
                 continue
+            if not self._is_book_ticker_supported(symbol):
+                continue
             symbols.append(symbol)
         return symbols
 
@@ -5739,9 +5818,15 @@ class NcPilotTabWidget(QWidget):
         if symbols != self._multi_book_symbols:
             self._multi_book_symbols = symbols
             self._multi_book_index = 0
-        symbol = self._multi_book_symbols[self._multi_book_index % len(self._multi_book_symbols)]
-        self._multi_book_index = (self._multi_book_index + 1) % len(self._multi_book_symbols)
-        return symbol
+        ttl_ms = self._book_ticker_ttl_ms()
+        for _ in range(len(self._multi_book_symbols)):
+            symbol = self._multi_book_symbols[self._multi_book_index % len(self._multi_book_symbols)]
+            self._multi_book_index = (self._multi_book_index + 1) % len(self._multi_book_symbols)
+            cached, age_ms = self._pilot_peek_cache(symbol, "book_ticker")
+            if isinstance(cached, dict) and age_ms is not None and age_ms < ttl_ms:
+                continue
+            return symbol
+        return None
 
     def _request_multi_book_ticker(self) -> None:
         now_ts = monotonic()
@@ -5750,7 +5835,16 @@ class NcPilotTabWidget(QWidget):
             (now_ts - self._multi_book_last_request_ts) * 1000 < min_interval_ms
         ):
             return
-        symbol = self._next_multi_book_symbol()
+        symbol = None
+        symbols = self._multi_book_symbols or self._resolve_multi_symbols()
+        for _ in range(len(symbols)):
+            candidate = self._next_multi_book_symbol()
+            if not candidate:
+                break
+            if self._book_ticker_backoff_active(candidate, now_ts):
+                continue
+            symbol = candidate
+            break
         if not symbol:
             return
         self._multi_book_last_request_ts = now_ts
@@ -5776,6 +5870,7 @@ class NcPilotTabWidget(QWidget):
             if bid is None or ask is None or not isfinite(bid) or not isfinite(ask) or ask <= bid or bid <= 0:
                 return
             self._pilot_set_cache(symbol, "book_ticker", payload)
+            self._clear_book_ticker_backoff(symbol)
             if symbol not in self._multi_bidask_logged:
                 self._append_log(
                     f"[BIDASK] ok symbol={symbol} age_ms=0",
@@ -5790,6 +5885,8 @@ class NcPilotTabWidget(QWidget):
 
     def _handle_multi_book_ticker_error(self, symbol: str, error: object) -> None:
         message = self._format_account_error(error)
+        if self._is_rate_limit_or_server_error(message):
+            self._register_book_ticker_rate_limit(symbol, message)
         self._append_log_throttled(
             f"[BIDASK] err symbol={symbol} status={message}",
             kind="WARN",
@@ -5824,10 +5921,15 @@ class NcPilotTabWidget(QWidget):
                 bidask_age_ms = age_ms
                 if age_ms <= BIDASK_STALE_MS:
                     best_bid, best_ask = bid, ask
-                    bidask_state = "stale_cache" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
+                    bidask_state = "degraded" if age_ms > BIDASK_FAIL_SOFT_MS else "fresh"
                 else:
-                    bidask_state = "stale"
+                    bidask_state = "missing"
             self._bidask_state = bidask_state
+            self._log_bidask_status(
+                bidask_age_ms=bidask_age_ms,
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
             if not self._validate_bid_ask(best_bid, best_ask, source="HTTP_BOOK"):
                 self._update_kpi_waiting_book(now_ts, book_source, bidask_age_ms)
                 return
@@ -5879,7 +5981,7 @@ class NcPilotTabWidget(QWidget):
             self._market_source.setText(source_age_text)
             self._set_market_label_state(self._market_source, active=source_age_text != "—")
 
-            feed_ok = bool(bidask_age_ms is not None and bidask_age_ms < BIDASK_FAIL_SOFT_MS)
+            feed_ok = bool(bidask_age_ms is not None and bidask_age_ms <= BIDASK_STALE_MS)
             self._feed_ok = feed_ok
             feed_age_text = f"{bidask_age_ms}ms" if bidask_age_ms is not None else "—"
             if (
@@ -5989,7 +6091,7 @@ class NcPilotTabWidget(QWidget):
             elif bidask_missing:
                 kpi_state = KPI_STATE_UNKNOWN
                 kpi_reason = "no_bidask_yet"
-            elif bidask_state == "stale_cache":
+            elif bidask_state == "degraded":
                 kpi_state = KPI_STATE_OK
                 kpi_reason = "bidask_stale_cache"
             elif vol_state == KPI_STATE_UNKNOWN:
@@ -7640,14 +7742,26 @@ class NcPilotTabWidget(QWidget):
         age_ms = int((time_fn() - saved_at) * 1000)
         return data, age_ms
 
+    def _pilot_peek_cache(self, symbol: str, key: str) -> tuple[Any, int] | tuple[None, None]:
+        cached = self._pilot_market_cache.get(symbol, key)
+        if not cached:
+            return None, None
+        data, saved_at = cached
+        age_ms = int((time_fn() - saved_at) * 1000)
+        return data, age_ms
+
     def _pilot_set_cache(self, symbol: str, key: str, payload: Any) -> None:
         self._pilot_market_cache.set(symbol, key, payload)
 
     def _pilot_fetch_book_ticker(self, symbol: str) -> tuple[dict[str, Any] | None, int | None]:
+        if not self._is_book_ticker_supported(symbol):
+            return None, None
         cached, age_ms = self._pilot_get_cached(symbol, "book_ticker")
         if isinstance(cached, dict):
             return cached, age_ms
         if self._is_multi_symbol(self._symbol):
+            return None, None
+        if self._book_ticker_backoff_active(symbol, monotonic()):
             return None, None
         try:
             payload, _latency_ms = self._net_call_sync(
@@ -7655,10 +7769,13 @@ class NcPilotTabWidget(QWidget):
                 {"symbol": symbol},
                 timeout_ms=2000,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            if self._is_rate_limit_or_server_error(str(exc)):
+                self._register_book_ticker_rate_limit(symbol, str(exc))
             return None, None
         if isinstance(payload, dict):
             self._pilot_set_cache(symbol, "book_ticker", payload)
+            self._clear_book_ticker_backoff(symbol)
             return payload, 0
         return None, None
 
@@ -7701,6 +7818,12 @@ class NcPilotTabWidget(QWidget):
                     src = snapshot.source or "HTTP"
                     age_ms = snapshot.router_age_ms or snapshot.price_age_ms
                     ts_ms = now_ms - age_ms if age_ms is not None else now_ms
+                    if bid > 0 and ask > bid:
+                        self._pilot_set_cache(
+                            symbol,
+                            "book_ticker",
+                            {"bidPrice": bid, "askPrice": ask},
+                        )
 
             if bid is None or ask is None:
                 book, age_ms = self._pilot_fetch_book_ticker(symbol)
