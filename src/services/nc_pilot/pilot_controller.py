@@ -27,6 +27,7 @@ class PilotController:
     ORDER_COOLDOWN_SEC = 1.5
     SKIP_LOG_COOLDOWN_SEC = 5.0
     MIN_EDGE_BPS = 0.4
+    HYSTERESIS_BPS = 0.2
     MAX_AGE_MS = 2500
     MAX_NOTIONAL = 200.0
     PILOT_SYMBOLS = ("USDTUSDC", "TUSDUSDT", "EURIUSDT", "EURIEUR")
@@ -99,6 +100,8 @@ class PilotController:
                 bid=payload.get("bid"),
                 ask=payload.get("ask"),
                 age_ms=payload.get("age_ms"),
+                ts_ms=payload.get("ts_ms"),
+                src=payload.get("src") or "NONE",
                 depth=payload.get("depth"),
             )
         snapshots = self._arb_hub.compute_snapshots(
@@ -113,6 +116,23 @@ class PilotController:
             algo_state = pilot.algo_states.setdefault(snapshot.algo_id, PilotAlgoState())
             prev_route = algo_state.last_route_text
             prev_valid = algo_state.last_valid
+            prev_profit_bps = algo_state.last_profit_bps
+            prev_action = algo_state.last_suggested_action
+            if (
+                snapshot.valid
+                and prev_valid
+                and prev_route
+                and prev_profit_bps is not None
+                and snapshot.route_text != prev_route
+                and snapshot.profit_bps <= prev_profit_bps + self.HYSTERESIS_BPS
+            ):
+                snapshot.route_text = prev_route
+                snapshot.profit_bps = prev_profit_bps
+                snapshot.profit_abs_usdt = self.MAX_NOTIONAL * prev_profit_bps / 10000
+                if prev_action:
+                    snapshot.suggested_action = prev_action
+            if not snapshot.valid:
+                snapshot.route_text = "—"
             dt_ms = 0
             if algo_state.last_ts is not None:
                 dt_ms = max(int((now - algo_state.last_ts) * 1000), 0)
@@ -124,6 +144,8 @@ class PilotController:
             algo_state.last_route_text = snapshot.route_text
             algo_state.last_ts = now
             algo_state.last_valid = snapshot.valid
+            algo_state.last_profit_bps = snapshot.profit_bps if snapshot.valid else None
+            algo_state.last_suggested_action = snapshot.suggested_action if snapshot.valid else None
             self._log_route_state(snapshot, prev_route, prev_valid)
             ui_snapshots.append(self._snapshot_to_dict(snapshot))
         best_snapshot = self._select_best_snapshot(snapshots)
@@ -300,26 +322,33 @@ class PilotController:
         prev_route: str | None,
         prev_valid: bool,
     ) -> None:
+        if not snapshot.valid:
+            snapshot.route_text = "—"
         if snapshot.valid and not prev_valid:
+            life_s = snapshot.life_ms / 1000 if snapshot.life_ms else 0.0
             self._window._append_pilot_log(
                 (
                     "[ROUTE_ON] "
-                    f"algo={snapshot.algo_id} id={snapshot.route_text} "
+                    f"algo={snapshot.algo_id} route={snapshot.route_text} "
                     f"profit={snapshot.profit_abs_usdt:+.2f} "
-                    f"bps={snapshot.profit_bps:+.2f}"
+                    f"bps={snapshot.profit_bps:+.2f} "
+                    f"life={life_s:.1f}s"
                 )
             )
             return
         if not snapshot.valid and prev_valid:
+            reason = snapshot.reason
+            if reason in {"no_bidask", "no_mid"}:
+                reason = "no_data"
             self._window._append_pilot_log(
-                f"[ROUTE_OFF] algo={snapshot.algo_id} reason={snapshot.reason}"
+                f"[ROUTE_OFF] algo={snapshot.algo_id} reason={reason}"
             )
             return
         if snapshot.valid and prev_valid and prev_route and prev_route != snapshot.route_text:
             self._window._append_pilot_log(
                 (
                     "[ROUTE_SWITCH] "
-                    f"algo={snapshot.algo_id} from={prev_route} to={snapshot.route_text} "
+                    f"algo={snapshot.algo_id} old={prev_route} new={snapshot.route_text} "
                     f"profit={snapshot.profit_abs_usdt:+.2f} "
                     f"bps={snapshot.profit_bps:+.2f}"
                 )

@@ -69,6 +69,8 @@ class PilotRuntimeCounters:
 class PilotAlgoState:
     last_route_text: str | None = None
     last_valid: bool = False
+    last_profit_bps: float | None = None
+    last_suggested_action: str | None = None
     life_ms: int = 0
     last_ts: float | None = None
 

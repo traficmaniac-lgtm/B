@@ -94,6 +94,8 @@ class ArbHub:
         bid: float | None
         ask: float | None
         age_ms: int | None
+        ts_ms: int | None
+        src: str
         depth: dict[str, Any] | None
 
     @dataclass
@@ -166,11 +168,16 @@ class ArbHub:
             effective_bid,
             effective_ask,
             max_notional=max_notional,
+            price_age_ms=quote.age_ms if quote else None,
+            src=quote.src if quote else "NONE",
         )
-        if effective_bid is None and effective_ask is None:
-            return self._empty_snapshot("ALGO1", "USDT↔USDC", "no_depth", details, age_ok)
-        profit_buy = (effective_bid - 1.0) * 10000 if effective_bid is not None else -float("inf")
-        profit_sell = (1.0 - effective_ask) * 10000 if effective_ask is not None else -float("inf")
+        if bid is None or ask is None:
+            details["reason"] = "no_bidask"
+            return self._invalid_snapshot("ALGO1", "USDT↔USDC", "no_bidask", details)
+        price_bid = effective_bid if effective_bid is not None else bid
+        price_ask = effective_ask if effective_ask is not None else ask
+        profit_buy = (price_bid - 1.0) * 10000
+        profit_sell = (1.0 - price_ask) * 10000
         if profit_buy >= profit_sell:
             route_text = "USDT→USDC"
             profit_bps = profit_buy if profit_buy != -float("inf") else 0.0
@@ -181,6 +188,8 @@ class ArbHub:
             profit_bps = profit_sell if profit_sell != -float("inf") else 0.0
             depth_ok = effective_ask is not None
             suggested_action = "BUY USDTUSDC"
+        if effective_bid is None and effective_ask is None:
+            details["reason"] = "depth"
         return self._finalize_snapshot(
             "ALGO1",
             route_text,
@@ -216,11 +225,16 @@ class ArbHub:
             effective_bid,
             effective_ask,
             max_notional=max_notional,
+            price_age_ms=quote.age_ms if quote else None,
+            src=quote.src if quote else "NONE",
         )
-        if effective_bid is None and effective_ask is None:
-            return self._empty_snapshot("ALGO2", "USDT↔TUSD", "no_depth", details, age_ok)
-        profit_buy = (1.0 - effective_ask) * 10000 if effective_ask is not None else -float("inf")
-        profit_sell = (effective_bid - 1.0) * 10000 if effective_bid is not None else -float("inf")
+        if bid is None or ask is None:
+            details["reason"] = "no_bidask"
+            return self._invalid_snapshot("ALGO2", "USDT↔TUSD", "no_bidask", details)
+        price_bid = effective_bid if effective_bid is not None else bid
+        price_ask = effective_ask if effective_ask is not None else ask
+        profit_buy = (1.0 - price_ask) * 10000
+        profit_sell = (price_bid - 1.0) * 10000
         if profit_sell >= profit_buy:
             route_text = "TUSD→USDT"
             profit_bps = profit_sell if profit_sell != -float("inf") else 0.0
@@ -231,6 +245,8 @@ class ArbHub:
             profit_bps = profit_buy if profit_buy != -float("inf") else 0.0
             depth_ok = effective_ask is not None
             suggested_action = "BUY TUSDUSDT"
+        if effective_bid is None and effective_ask is None:
+            details["reason"] = "depth"
         return self._finalize_snapshot(
             "ALGO2",
             route_text,
@@ -264,40 +280,76 @@ class ArbHub:
         effective_ask_usdt = self._effective_price(quote_usdt, side="BUY", max_notional=max_notional)
         effective_bid_eur = self._effective_price(quote_eur, side="SELL", max_notional=max_notional)
         effective_ask_eur = self._effective_price(quote_eur, side="BUY", max_notional=max_notional)
+        if bid_usdt is None or ask_usdt is None or bid_eur is None or ask_eur is None:
+            details = {
+                "legs": [
+                    self._build_leg_details(
+                        symbol_usdt,
+                        bid_usdt,
+                        ask_usdt,
+                        effective_bid_usdt,
+                        effective_ask_usdt,
+                        price_age_ms=quote_usdt.age_ms if quote_usdt else None,
+                        src=quote_usdt.src if quote_usdt else "NONE",
+                    ),
+                    self._build_leg_details(
+                        symbol_eur,
+                        bid_eur,
+                        ask_eur,
+                        effective_bid_eur,
+                        effective_ask_eur,
+                        price_age_ms=quote_eur.age_ms if quote_eur else None,
+                        src=quote_eur.src if quote_eur else "NONE",
+                    ),
+                ],
+                "max_notional": max_notional,
+                "reason": "no_bidask",
+            }
+            return self._invalid_snapshot("ALGO3", "EURI ANCHOR", "no_bidask", details)
         details = {
             "legs": [
-                {
-                    "symbol": symbol_usdt,
-                    "bid": bid_usdt,
-                    "ask": ask_usdt,
-                    "effective_bid": effective_bid_usdt,
-                    "effective_ask": effective_ask_usdt,
-                },
-                {
-                    "symbol": symbol_eur,
-                    "bid": bid_eur,
-                    "ask": ask_eur,
-                    "effective_bid": effective_bid_eur,
-                    "effective_ask": effective_ask_eur,
-                },
+                self._build_leg_details(
+                    symbol_usdt,
+                    bid_usdt,
+                    ask_usdt,
+                    effective_bid_usdt,
+                    effective_ask_usdt,
+                    price_age_ms=quote_usdt.age_ms if quote_usdt else None,
+                    src=quote_usdt.src if quote_usdt else "NONE",
+                ),
+                self._build_leg_details(
+                    symbol_eur,
+                    bid_eur,
+                    ask_eur,
+                    effective_bid_eur,
+                    effective_ask_eur,
+                    price_age_ms=quote_eur.age_ms if quote_eur else None,
+                    src=quote_eur.src if quote_eur else "NONE",
+                ),
             ],
             "max_notional": max_notional,
         }
+        depth_ok = True
+        bid_usdt_calc = effective_bid_usdt if effective_bid_usdt is not None else bid_usdt
+        ask_usdt_calc = effective_ask_usdt if effective_ask_usdt is not None else ask_usdt
+        bid_eur_calc = effective_bid_eur if effective_bid_eur is not None else bid_eur
+        ask_eur_calc = effective_ask_eur if effective_ask_eur is not None else ask_eur
         if (
             effective_bid_usdt is None
             or effective_ask_usdt is None
             or effective_bid_eur is None
             or effective_ask_eur is None
         ):
-            age_ok = bool(age_ok_usdt and age_ok_eur)
-            return self._empty_snapshot("ALGO3", "EURI ANCHOR", "no_depth", details, age_ok)
-        mid_usdt = self._mid(bid_usdt, ask_usdt, effective_bid_usdt, effective_ask_usdt)
+            depth_ok = False
+            details["reason"] = "depth"
+        mid_usdt = self._mid(bid_usdt, ask_usdt, bid_usdt_calc, ask_usdt_calc)
         if mid_usdt <= 0:
-            return self._empty_snapshot("ALGO3", "EURI ANCHOR", "no_mid", details, False)
-        eur_per_usdt = (1.0 / effective_ask_usdt) * effective_bid_eur
+            details["reason"] = "no_mid"
+            return self._invalid_snapshot("ALGO3", "EURI ANCHOR", "no_mid", details)
+        eur_per_usdt = (1.0 / ask_usdt_calc) * bid_eur_calc
         usdt_equiv = eur_per_usdt * mid_usdt
         profit_route_1 = (usdt_equiv - 1.0) * 10000
-        usdt_per_eur = (1.0 / effective_ask_eur) * effective_bid_usdt
+        usdt_per_eur = (1.0 / ask_eur_calc) * bid_usdt_calc
         eur_equiv = usdt_per_eur / mid_usdt
         profit_route_2 = (eur_equiv - 1.0) * 10000
         if profit_route_1 >= profit_route_2:
@@ -309,7 +361,6 @@ class ArbHub:
             profit_bps = profit_route_2
             suggested_action = "BUY EURIEUR + SELL EURIUSDT"
         age_ok = bool(age_ok_usdt and age_ok_eur)
-        depth_ok = True
         return self._finalize_snapshot(
             "ALGO3",
             route_text,
@@ -326,7 +377,7 @@ class ArbHub:
     def _disabled_snapshot(algo_id: str, label: str, reason: str) -> RouteSnapshot:
         return ArbHub.RouteSnapshot(
             algo_id=algo_id,
-            route_text=label,
+            route_text="—",
             profit_abs_usdt=0.0,
             profit_bps=0.0,
             life_ms=0,
@@ -348,12 +399,33 @@ class ArbHub:
     ) -> RouteSnapshot:
         return ArbHub.RouteSnapshot(
             algo_id=algo_id,
-            route_text=label,
+            route_text="—",
             profit_abs_usdt=0.0,
             profit_bps=0.0,
             life_ms=0,
             depth_ok=False,
             age_ok=age_ok,
+            suggested_action="—",
+            details=details,
+            valid=False,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _invalid_snapshot(
+        algo_id: str,
+        label: str,
+        reason: str,
+        details: dict[str, Any],
+    ) -> RouteSnapshot:
+        return ArbHub.RouteSnapshot(
+            algo_id=algo_id,
+            route_text="—",
+            profit_abs_usdt=0.0,
+            profit_bps=0.0,
+            life_ms=0,
+            depth_ok=False,
+            age_ok=False,
             suggested_action="—",
             details=details,
             valid=False,
@@ -383,6 +455,8 @@ class ArbHub:
             reason = "age"
         else:
             reason = "edge"
+        if not valid:
+            details["reason"] = reason
         return ArbHub.RouteSnapshot(
             algo_id=algo_id,
             route_text=route_text,
@@ -427,7 +501,12 @@ class ArbHub:
         side: str,
         max_notional: float,
     ) -> float | None:
-        if not quote or not isinstance(quote.depth, dict):
+        if (
+            not quote
+            or quote.bid is None
+            or quote.ask is None
+            or not isinstance(quote.depth, dict)
+        ):
             return None
         levels = quote.depth.get("asks" if side == "BUY" else "bids") or []
         total_quote = 0.0
@@ -468,6 +547,8 @@ class ArbHub:
         effective_ask: float | None,
         *,
         max_notional: float,
+        price_age_ms: int | None,
+        src: str,
     ) -> dict[str, Any]:
         return {
             "symbol": symbol,
@@ -476,4 +557,27 @@ class ArbHub:
             "effective_bid": effective_bid,
             "effective_ask": effective_ask,
             "max_notional": max_notional,
+            "price_age_ms": price_age_ms,
+            "src": src,
+        }
+
+    @staticmethod
+    def _build_leg_details(
+        symbol: str,
+        bid: float | None,
+        ask: float | None,
+        effective_bid: float | None,
+        effective_ask: float | None,
+        *,
+        price_age_ms: int | None,
+        src: str,
+    ) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "effective_bid": effective_bid,
+            "effective_ask": effective_ask,
+            "price_age_ms": price_age_ms,
+            "src": src,
         }

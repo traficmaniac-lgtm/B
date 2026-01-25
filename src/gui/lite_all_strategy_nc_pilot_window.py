@@ -2608,14 +2608,17 @@ class NcPilotTabWidget(QWidget):
             if not algo_id or algo_id not in self._pilot_route_rows:
                 continue
             row = self._pilot_route_rows[algo_id]
+            reason = snapshot.get("reason", "")
+            valid = bool(snapshot.get("valid"))
+            status = self._pilot_invalid_label(reason)
             values = [
                 algo_id,
                 snapshot.get("route_text", "—"),
-                f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}",
-                f"{snapshot.get('profit_bps', 0.0):+.2f}",
+                f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}" if valid else status,
+                f"{snapshot.get('profit_bps', 0.0):+.2f}" if valid else status,
                 str(snapshot.get("life_ms", 0)),
                 "YES" if snapshot.get("depth_ok") else "NO",
-                snapshot.get("suggested_action", "—"),
+                snapshot.get("suggested_action", "—") if valid else "—",
             ]
             for column, value in enumerate(values):
                 item = self._pilot_routes_table.item(row, column)
@@ -2646,6 +2649,7 @@ class NcPilotTabWidget(QWidget):
             age_ok = bool(snapshot.get("age_ok"))
             valid = bool(snapshot.get("valid"))
             reason = snapshot.get("reason", "")
+            status = self._pilot_invalid_label(reason)
             life_s = life_ms / 1000 if isinstance(life_ms, (int, float)) else 0.0
             if algo_id == "ALGO1":
                 prefix = "ALGO1 USDT↔USDC"
@@ -2655,18 +2659,39 @@ class NcPilotTabWidget(QWidget):
                 prefix = "ALGO3 EURI ANCHOR"
             if reason == "pair_disabled":
                 route_text = "pair disabled"
-            label.setText(
-                f"{prefix}: route={route_text} | "
-                f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
-                f"life={life_s:.1f}s | depthOK={str(depth_ok)} ageOK={str(age_ok)}"
-            )
+            if valid:
+                label.setText(
+                    f"{prefix}: route={route_text} | "
+                    f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
+                    f"life={life_s:.1f}s | depthOK={str(depth_ok)} ageOK={str(age_ok)}"
+                )
+            else:
+                label.setText(
+                    f"{prefix}: route={route_text} | {status} | "
+                    f"life={life_s:.1f}s | depthOK={str(depth_ok)} ageOK={str(age_ok)}"
+                )
             led.set_state(valid)
             details = snapshot.get("details", {})
-            tooltip = f"{prefix}\nroute={route_text}\nprofit={profit_abs:+.2f} USDT ({profit_bps:+.2f} bps)\n"
+            tooltip = f"{prefix}\nroute={route_text}\n"
+            if valid:
+                tooltip += f"profit={profit_abs:+.2f} USDT ({profit_bps:+.2f} bps)\n"
+            else:
+                tooltip += f"status={status} reason={reason}\n"
             tooltip += f"life={life_s:.1f}s depthOK={depth_ok} ageOK={age_ok}\n"
             tooltip += f"details={details}"
             label.setToolTip(tooltip)
             led.set_tooltip(tooltip)
+
+    @staticmethod
+    def _pilot_invalid_label(reason: str) -> str:
+        return {
+            "no_bidask": "NO DATA",
+            "no_mid": "NO DATA",
+            "depth": "DEPTH",
+            "age": "AGE",
+            "edge": "EDGE",
+            "pair_disabled": "DISABLED",
+        }.get(reason, "NO DATA")
 
     def _pilot_client_order_id(
         self,
@@ -7277,11 +7302,19 @@ class NcPilotTabWidget(QWidget):
             book, age_ms = self._pilot_fetch_book_ticker(symbol)
             bid = self._coerce_float(book.get("bidPrice")) if isinstance(book, dict) else None
             ask = self._coerce_float(book.get("askPrice")) if isinstance(book, dict) else None
+            src = "HTTP" if isinstance(book, dict) else "NONE"
+            ts_ms = None
+            if age_ms is not None:
+                ts_ms = int(time_fn() * 1000) - age_ms
+            elif isinstance(book, dict):
+                ts_ms = int(time_fn() * 1000)
             depth = self._pilot_fetch_orderbook_depth(symbol)
             results[symbol] = {
                 "bid": bid,
                 "ask": ask,
                 "age_ms": age_ms,
+                "ts_ms": ts_ms,
+                "src": src,
                 "depth": depth,
             }
         return results
