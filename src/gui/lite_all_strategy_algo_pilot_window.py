@@ -44,6 +44,7 @@ from src.binance.account_client import AccountStatus, BinanceAccountClient
 from src.binance.http_client import BinanceHttpClient
 from src.core.config import Config
 from src.core.logging import get_logger
+from src.core.version import VERSION
 from src.gui.i18n import TEXT, tr
 from src.gui.lite_grid_math import FillAccumulator, build_action_key, compute_order_qty
 from src.gui.models.app_state import AppState
@@ -927,7 +928,7 @@ class LiteAllStrategyAlgoPilotWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[ALGO_PILOT] opened. version=ALGO PILOT v1.6.5 symbol={self._symbol}",
+            f"[ALGO_PILOT] opened. version={VERSION} symbol={self._symbol}",
             kind="INFO",
         )
 

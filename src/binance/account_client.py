@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 import httpx
 
 from src.core.logging import get_logger
+from src.core.httpx_singleton import get_shared_client
 
 
 @dataclass
@@ -193,8 +194,8 @@ class BinanceAccountClient:
         return [item for item in payload if isinstance(item, dict)]
 
     def get_server_time(self) -> dict[str, Any]:
-        with httpx.Client(base_url=self._base_url, timeout=self._timeout_s) as client:
-            response = client.get("/api/v3/time")
+        client = get_shared_client()
+        response = client.get(f"{self._base_url}/api/v3/time", timeout=self._timeout_s)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
@@ -270,8 +271,13 @@ class BinanceAccountClient:
                 signed_query = f"{query}&signature={signature}"
                 url = f"{path}?{signed_query}"
                 headers = {"X-MBX-APIKEY": self._api_key}
-                with httpx.Client(base_url=self._base_url, timeout=self._timeout_s) as client:
-                    response = client.request(method, url, headers=headers)
+                client = get_shared_client()
+                response = client.request(
+                    method,
+                    f"{self._base_url}{url}",
+                    headers=headers,
+                    timeout=self._timeout_s,
+                )
                 if response.status_code == 429 or response.status_code >= 500:
                     raise httpx.HTTPStatusError(
                         f"Retryable status {response.status_code}",

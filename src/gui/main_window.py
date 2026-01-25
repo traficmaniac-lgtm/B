@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config import Config
+from src.core.httpx_singleton import close_shared_client
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
 from src.gui.lite_grid_window import LiteGridWindow
@@ -135,5 +136,6 @@ class MainWindow(QMainWindow):
             window.close()
         self._logger.info("main window closing: stopping price feed manager")
         self._price_feed_manager.shutdown()
+        close_shared_client()
         self._logger.info("main window closed: shutdown complete")
         super().closeEvent(event)
