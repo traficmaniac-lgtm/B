@@ -1,5 +1,15 @@
 ## Technical Report
 
+### NC_MICRO v1.0.23 — Global crash guard + Qt handler + panic HOLD
+- Added global crash guard hooks (sys/thread/Qt) that log `[CRASH] uncaught` and append tracebacks to APP/NC_MICRO crash logs.
+- Registered NC_MICRO window panic_hold callback to force Pilot HOLD and cancel pending actions on fatal exceptions.
+- Added SafeQt wrapper for Qt signal handlers and hooked NC_MICRO crash log paths into the global guard.
+
+Manual check (NC_MICRO):
+1. Launch the app and open an NC_MICRO window; ensure startup logs show `[CRASH_GUARD] ... installed`.
+2. Wait until the window reaches WAITING_BOOK; if an exception occurs in background/Qt, verify the app stays alive.
+3. Confirm crash logs include `[CRASH] uncaught` and NC_MICRO switches to HOLD without trading actions.
+
 ### NC_MICRO v1.0.23 — Safe-call wrappers + bid/ask guards + closing watchdog safety
 - Added NC_MICRO-safe call wrapper that logs exceptions with stack traces, mirrors to crash log, and forces Pilot HOLD on handler failures.
 - Wrapped NC_MICRO QTimer timeouts and key Qt signal handlers with safe_call; added closing guards to timers/slots and watchdog paths.
