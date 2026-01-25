@@ -1251,6 +1251,12 @@ class PriceFeedManager:
         if worker:
             worker.stop()
 
+    def has_active_subscribers(self) -> bool:
+        with self._lock:
+            has_ticks = any(self._tick_subscribers.values())
+            has_status = any(self._status_subscribers.values())
+        return has_ticks or has_status
+
     def get_snapshot(self, symbol: str) -> MicrostructureSnapshot | None:
         cleaned = self._sanitize_symbol(symbol)
         if cleaned is None:

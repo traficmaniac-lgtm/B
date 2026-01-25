@@ -32,6 +32,7 @@ class BinanceAccountClient:
         retries: int = 2,
         backoff_base_s: float = 0.5,
         backoff_max_s: float = 5.0,
+        client: httpx.Client | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
@@ -41,6 +42,7 @@ class BinanceAccountClient:
         self._retries = max(0, retries)
         self._backoff_base_s = backoff_base_s
         self._backoff_max_s = backoff_max_s
+        self._client = client
         self._logger = get_logger("binance.account")
         self._time_offset_ms = 0
         self._time_lock = threading.Lock()
@@ -194,7 +196,7 @@ class BinanceAccountClient:
         return [item for item in payload if isinstance(item, dict)]
 
     def get_server_time(self) -> dict[str, Any]:
-        client = get_shared_client()
+        client = self._client or get_shared_client()
         response = client.get(f"{self._base_url}/api/v3/time", timeout=self._timeout_s)
         response.raise_for_status()
         payload = response.json()
@@ -271,7 +273,7 @@ class BinanceAccountClient:
                 signed_query = f"{query}&signature={signature}"
                 url = f"{path}?{signed_query}"
                 headers = {"X-MBX-APIKEY": self._api_key}
-                client = get_shared_client()
+                client = self._client or get_shared_client()
                 response = client.request(
                     method,
                     f"{self._base_url}{url}",

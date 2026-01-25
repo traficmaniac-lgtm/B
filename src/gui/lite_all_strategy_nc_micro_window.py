@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import httpx
 import faulthandler
 import json
 import os
@@ -19,7 +20,7 @@ from time import monotonic, perf_counter, sleep, time as time_fn
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, QEventLoop, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QEventLoop, QRunnable, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -51,8 +52,7 @@ from PySide6.QtWidgets import (
 from src.ai.operator_math import compute_break_even_tp_pct, compute_fee_total_pct, evaluate_tp_profitability
 from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
-from src.binance.http_client import BinanceHttpClient
-from src.core.cancel_reconcile import CancelResult, cancel_all_open_orders
+from src.core.cancel_reconcile import CancelResult
 from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
 from src.core.httpx_singleton import close_shared_client
@@ -76,6 +76,7 @@ from src.gui.lite_grid_math import (
 )
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
+from src.services.net_worker import BinanceNetWorker, NetRequest
 from src.services.price_feed_manager import (
     PriceFeedManager,
     PriceUpdate,
@@ -928,20 +929,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._apply_profile_defaults_if_pristine()
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
         self._manual_grid_step_pct = self._settings_state.grid_step_pct
-        self._thread_pool = QThreadPool.globalInstance()
+        self._net_thread = QThread(self)
+        self._net_worker: BinanceNetWorker | None = None
+        self._net_pending: dict[str, tuple[Callable[[object, int], None] | None, Callable[[object], None] | None]] = {}
+        self._net_request_counter = 0
         self._account_client: BinanceAccountClient | None = None
         api_key, api_secret = self._app_state.get_binance_keys()
         self._has_api_keys = bool(api_key and api_secret)
         self._can_read_account = False
         self._last_account_status = ""
         self._last_account_trade_snapshot: tuple[bool, tuple[str, ...]] | None = None
-        self._http_client = BinanceHttpClient(
-            base_url=self._config.binance.base_url,
-            timeout_s=self._config.http.timeout_s,
-            retries=self._config.http.retries,
-            backoff_base_s=self._config.http.backoff_base_s,
-            backoff_max_s=self._config.http.backoff_max_s,
-        )
         self._http_cache = DataCache()
         self._http_cache_ttls = {
             "book_ticker": 2.0,
@@ -959,6 +956,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 backoff_base_s=self._config.http.backoff_base_s,
                 backoff_max_s=self._config.http.backoff_max_s,
             )
+        self._setup_net_worker(api_key, api_secret)
+        if self._has_api_keys:
             self._sync_account_time()
         self._logger.info("binance keys present: %s", self._has_api_keys)
         self._balances: dict[str, tuple[float, float]] = {}
@@ -1008,6 +1007,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._base_asset = ""
         self._balances_in_flight = False
         self._balances_loaded = False
+        self._balances_error_streak = 0
+        self._balances_poll_ms = 1000
+        self._last_account_snapshot: dict[str, Any] | None = None
         self._balance_ready_ts_monotonic_ms: int | None = None
         self._last_good_balances: dict[str, tuple[float, float, float]] = {}
         self._last_good_ts: float | None = None
@@ -1174,7 +1176,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
 
         self._balances_timer = QTimer(self)
-        self._balances_timer.setInterval(10_000)
+        self._balances_timer.setInterval(self._balances_poll_ms)
         self._balances_timer.timeout.connect(
             lambda: self._safe_call(self._refresh_balances, label="timer:balances")
         )
@@ -1241,7 +1243,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._price_feed_manager.start()
         self._refresh_exchange_rules()
         if self._account_client:
-            self._balances_timer.start(10_000)
+            self._balances_timer.start(self._balances_poll_ms)
             self._orders_timer.start()
             self._refresh_balances()
             self._refresh_orders(reason="bootstrap")
@@ -1304,11 +1306,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._account_client or not self._legacy_order_ids:
             return True
         self._legacy_cancel_in_progress = True
-        loop = QEventLoop()
-        result: dict[str, Any] = {"done": False, "ok": False}
         legacy_ids = sorted(self._legacy_order_ids)
-
-        def _cancel() -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        try:
             errors: list[str] = []
             canceled = 0
             failed_ids: list[str] = []
@@ -1316,7 +1316,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if not order_id:
                     continue
                 try:
-                    self._account_client.cancel_order(self._symbol, order_id)
+                    self._cancel_order_sync(symbol=self._symbol, order_id=order_id)
                     canceled += 1
                 except Exception as exc:  # noqa: BLE001
                     failed_ids.append(order_id)
@@ -1325,7 +1325,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             deadline = monotonic() + 4.0
             while remaining_ids and monotonic() < deadline:
                 try:
-                    open_orders = self._account_client.get_open_orders(self._symbol)
+                    open_orders = self._fetch_open_orders_sync(self._symbol)
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"[LEGACY] openOrders refresh failed: {exc}")
                     break
@@ -1337,41 +1337,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 remaining_ids = remaining_ids.intersection(open_ids)
                 if remaining_ids:
                     sleep(0.25)
-            return {
+            result = {
                 "planned": len(legacy_ids),
                 "canceled": canceled,
                 "failed_ids": failed_ids,
                 "remaining_ids": list(remaining_ids),
                 "errors": errors,
+                "ok": True,
             }
-
-        def _on_success(payload: object, _latency_ms: int) -> None:
-            if result["done"]:
-                return
-            result["done"] = True
-            if isinstance(payload, dict):
-                result.update(payload)
-            result["ok"] = True
-            loop.quit()
-
-        def _on_error(message: str) -> None:
-            if result["done"]:
-                return
-            result["done"] = True
-            result["ok"] = False
-            result["error"] = message
-            loop.quit()
-
-        worker = _Worker(_cancel, self._can_emit_worker_results)
-        worker.signals.success.connect(_on_success)
-        worker.signals.error.connect(_on_error)
-        self._thread_pool.start(worker)
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(loop.quit)
-        timer.start(timeout_ms)
-        loop.exec()
-        timer.stop()
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
         self._legacy_cancel_in_progress = False
         remaining_ids = set(result.get("remaining_ids", []) if isinstance(result, dict) else [])
         self._legacy_order_ids = remaining_ids
@@ -1885,6 +1860,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pilot_disable_button.clicked.connect(self._handle_pilot_disable)
         self._pilot_settings_button = QPushButton("⚙ Настройки пилота")
         self._pilot_settings_button.clicked.connect(self._handle_pilot_settings)
+        self._pilot_settings_button.setVisible(False)
         self._pilot_enable_button.setToolTip("Включить пилот (авто-действия активны).")
         self._pilot_disable_button.setToolTip("Выключить пилот (авто-действия отключены).")
         self._pilot_settings_button.setToolTip("Открыть настройки пилота.")
@@ -1939,8 +1915,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
         layout = QVBoxLayout(group)
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight)
-        form.setVerticalSpacing(4)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setVerticalSpacing(6)
+        form.setHorizontalSpacing(10)
+
+        def _form_label(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setFixedWidth(140)
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            return label
 
         self._budget_input = QDoubleSpinBox()
         self._budget_input.setRange(10.0, 1_000_000.0)
@@ -1955,11 +1938,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._direction_combo.currentIndexChanged.connect(
             lambda _: self._update_setting("direction", self._direction_combo.currentData())
         )
+        self._direction_combo.setVisible(False)
 
         self._grid_count_input = QSpinBox()
         self._grid_count_input.setRange(2, 200)
         self._grid_count_input.setValue(self._settings_state.grid_count)
         self._grid_count_input.valueChanged.connect(lambda value: self._update_setting("grid_count", value))
+        self._grid_count_input.setVisible(False)
 
         self._grid_step_mode_combo = QComboBox()
         self._grid_step_mode_combo.addItem("AUTO ATR", "AUTO_ATR")
@@ -1971,6 +1956,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._grid_step_mode_combo.currentIndexChanged.connect(
             lambda _: self._handle_grid_step_mode_change(self._grid_step_mode_combo.currentData())
         )
+        self._grid_step_mode_combo.setVisible(False)
 
         self._grid_step_input = QDoubleSpinBox()
         self._grid_step_input.setRange(0.000001, 10.0)
@@ -1985,7 +1971,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._manual_override_button.clicked.connect(self._handle_manual_override)
         grid_step_row = QHBoxLayout()
         grid_step_row.addWidget(self._grid_step_input)
-        grid_step_row.addWidget(self._manual_override_button)
+        self._manual_override_button.setVisible(False)
 
         self._range_mode_combo = QComboBox()
         self._range_mode_combo.addItem("Авто", "Auto")
@@ -1993,6 +1979,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._range_mode_combo.currentIndexChanged.connect(
             lambda _: self._handle_range_mode_change(self._range_mode_combo.currentData())
         )
+        self._range_mode_combo.setVisible(False)
 
         self._range_low_input = QDoubleSpinBox()
         self._range_low_input.setRange(0.000001, 10.0)
@@ -2029,9 +2016,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._tp_helper_label.setVisible(False)
         tp_row = QHBoxLayout()
         tp_row.addWidget(self._take_profit_input)
-        tp_row.addWidget(self._tp_fix_button)
+        self._tp_fix_button.setVisible(False)
         self._auto_values_label = QLabel(tr("auto_values_line", values="—"))
         self._auto_values_label.setStyleSheet("color: #6b7280; font-size: 10px;")
+        self._auto_values_label.setVisible(False)
 
         stop_loss_row = QHBoxLayout()
         self._stop_loss_toggle = QCheckBox(tr("enable"))
@@ -2046,6 +2034,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
         stop_loss_row.addWidget(self._stop_loss_toggle)
         stop_loss_row.addWidget(self._stop_loss_input)
+        self._stop_loss_toggle.setVisible(False)
+        self._stop_loss_input.setVisible(False)
 
         self._max_orders_input = QSpinBox()
         self._max_orders_input.setRange(1, 200)
@@ -2059,21 +2049,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._order_size_combo.currentIndexChanged.connect(
             lambda _: self._update_setting("order_size_mode", self._order_size_combo.currentData())
         )
+        self._order_size_combo.setVisible(False)
 
-        form.addRow(tr("budget"), self._budget_input)
-        form.addRow(tr("direction"), self._direction_combo)
-        form.addRow(tr("grid_count"), self._grid_count_input)
-        form.addRow(tr("grid_step_mode"), self._grid_step_mode_combo)
-        form.addRow(tr("grid_step"), grid_step_row)
-        form.addRow(tr("range_mode"), self._range_mode_combo)
-        form.addRow(tr("range_low"), self._range_low_input)
-        form.addRow(tr("range_high"), self._range_high_input)
-        form.addRow(tr("take_profit"), tp_row)
-        form.addRow("", self._tp_helper_label)
-        form.addRow("", self._auto_values_label)
-        form.addRow(tr("stop_loss"), stop_loss_row)
-        form.addRow(tr("max_active_orders"), self._max_orders_input)
-        form.addRow(tr("order_size_mode"), self._order_size_combo)
+        form.addRow(_form_label(tr("budget")), self._budget_input)
+        form.addRow(_form_label(tr("grid_step")), grid_step_row)
+        form.addRow(_form_label(tr("range_low")), self._range_low_input)
+        form.addRow(_form_label(tr("range_high")), self._range_high_input)
+        form.addRow(_form_label(tr("take_profit")), tp_row)
+        form.addRow(_form_label(tr("max_active_orders")), self._max_orders_input)
 
         layout.addLayout(form)
 
@@ -2081,6 +2064,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         actions.addStretch()
         self._reset_button = QPushButton(tr("reset_defaults"))
         self._reset_button.clicked.connect(self._reset_defaults)
+        self._reset_button.setVisible(False)
         actions.addWidget(self._reset_button)
         layout.addLayout(actions)
 
@@ -2093,21 +2077,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_grid_preview()
         self._strategy_controls = [
             self._budget_input,
-            self._direction_combo,
-            self._grid_count_input,
-            self._grid_step_mode_combo,
             self._grid_step_input,
-            self._manual_override_button,
-            self._range_mode_combo,
             self._range_low_input,
             self._range_high_input,
             self._take_profit_input,
-            self._tp_fix_button,
-            self._stop_loss_toggle,
-            self._stop_loss_input,
             self._max_orders_input,
-            self._order_size_combo,
-            self._reset_button,
             self._dry_run_toggle,
         ]
         return group
@@ -2194,8 +2168,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._cancel_all_button.clicked.connect(self._handle_cancel_all)
         self._refresh_button.clicked.connect(self._handle_refresh)
 
-        buttons.addWidget(self._cancel_selected_button)
-        buttons.addWidget(self._cancel_all_button)
+        self._cancel_selected_button.setVisible(False)
+        self._cancel_all_button.setVisible(False)
         buttons.addWidget(self._refresh_button)
         layout.addLayout(buttons)
 
@@ -2802,10 +2776,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     )
 
             if self._account_client:
-                open_orders_before = self._account_client.get_open_orders(self._symbol)
-                bot_orders_before = self._filter_bot_orders(
-                    [order for order in open_orders_before if isinstance(order, dict)]
-                )
+                open_orders_before = self._fetch_open_orders_sync(self._symbol)
+                bot_orders_before = self._filter_bot_orders(open_orders_before)
                 self._update_order_info_from_snapshot(bot_orders_before)
                 valid_orders_snapshot = self._collect_stale_orders_from_snapshot(
                     bot_orders_before,
@@ -2893,10 +2865,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if error:
                     errors.append(error)
             if self._account_client:
-                open_orders_after = self._account_client.get_open_orders(self._symbol)
-                bot_orders_after = self._filter_bot_orders(
-                    [order for order in open_orders_after if isinstance(order, dict)]
-                )
+                open_orders_after = self._fetch_open_orders_sync(self._symbol)
+                bot_orders_after = self._filter_bot_orders(open_orders_after)
                 stale_ids = {candidate.info.order_id for candidate in cancel_candidates}
                 still_open = [
                     order
@@ -2913,10 +2883,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                         self._pilot_stale_handled[order_id] = time_fn()
                     if error:
                         errors.append(error)
-                open_orders_retry = self._account_client.get_open_orders(self._symbol)
-                bot_orders_retry = self._filter_bot_orders(
-                    [order for order in open_orders_retry if isinstance(order, dict)]
-                )
+                open_orders_retry = self._fetch_open_orders_sync(self._symbol)
+                bot_orders_retry = self._filter_bot_orders(open_orders_retry)
                 stuck_ids = [
                     str(order.get("orderId", ""))
                     for order in bot_orders_retry
@@ -2989,10 +2957,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 "skip_reason": skip_reason,
             }
 
-        worker = _Worker(_cancel_and_replace, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_pilot_cancel_replace_stale)
-        worker.signals.error.connect(self._handle_pilot_action_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _cancel_and_replace()
+            self._handle_pilot_cancel_replace_stale(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_pilot_action_error(str(exc))
 
     def _pilot_execute_recovery(self) -> None:
         position_qty = self._pilot_position_qty()
@@ -3108,10 +3077,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                         continue
                     if error:
                         errors.append(error)
-                open_orders_after = self._account_client.get_open_orders(self._symbol)
-                bot_orders = self._filter_bot_orders(
-                    [order for order in open_orders_after if isinstance(order, dict)]
-                )
+                open_orders_after = self._fetch_open_orders_sync(self._symbol)
+                bot_orders = self._filter_bot_orders(open_orders_after)
                 self._rebuild_registry_from_open_orders(bot_orders)
             response = None
             error = None
@@ -3130,10 +3097,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 errors.append(error)
             return {"response": response, "errors": errors, "cancel_n": cancel_count}
 
-        worker = _Worker(_cancel_and_place, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_pilot_break_even_result)
-        worker.signals.error.connect(self._handle_pilot_action_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _cancel_and_place()
+            self._handle_pilot_break_even_result(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_pilot_action_error(str(exc))
 
     def _pilot_build_grid_plan(
         self,
@@ -3341,10 +3309,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if self._account_client:
                 deadline = monotonic() + 5.0
                 while monotonic() < deadline:
-                    open_orders_after = self._account_client.get_open_orders(self._symbol)
-                    bot_orders = self._filter_bot_orders(
-                        [order for order in open_orders_after if isinstance(order, dict)]
-                    )
+                    open_orders_after = self._fetch_open_orders_sync(self._symbol)
+                    bot_orders = self._filter_bot_orders(open_orders_after)
                     if not bot_orders:
                         break
                     self._sleep_ms(500)
@@ -3355,11 +3321,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 "open_orders_after": open_orders_after,
                 "expected_min": expected_min,
             }
-
-        worker = _Worker(_cancel, self._can_emit_worker_results)
-        worker.signals.success.connect(lambda result, latency: self._handle_pilot_recenter_cancel(result, latency, plan))
-        worker.signals.error.connect(self._handle_pilot_action_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _cancel()
+            self._handle_pilot_recenter_cancel(result, 0, plan)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_pilot_action_error(str(exc))
 
     def _handle_pilot_recenter_cancel(self, result: object, latency_ms: int, plan: list[GridPlannedOrder]) -> None:
         _ = latency_ms
@@ -3412,20 +3378,18 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             open_orders: list[dict[str, Any]] = []
             met = False
             while monotonic() < deadline:
-                open_orders = self._account_client.get_open_orders(self._symbol)
-                bot_orders = self._filter_bot_orders(
-                    [order for order in open_orders if isinstance(order, dict)]
-                )
+                open_orders = self._fetch_open_orders_sync(self._symbol)
+                bot_orders = self._filter_bot_orders(open_orders)
                 if len(bot_orders) >= expected_min:
                     met = True
                     break
                 self._sleep_ms(500)
             return {"open_orders": open_orders, "met": met, "expected_min": expected_min}
-
-        worker = _Worker(_poll, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_pilot_recenter_open_orders)
-        worker.signals.error.connect(self._handle_pilot_action_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _poll()
+            self._handle_pilot_recenter_open_orders(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_pilot_action_error(str(exc))
 
     def _handle_pilot_recenter_open_orders(self, result: object, latency_ms: int) -> None:
         _ = latency_ms
@@ -4652,22 +4616,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self.bidask_ready = True
         return bid, ask
 
-    def _maybe_log_no_bidask(self) -> None:
+    def _maybe_log_no_bidask(self, reason: str) -> None:
         now = monotonic()
         if not self._no_bidask_warned:
-            self._append_log("[SKIP] no bid/ask", kind="WARN")
+            self._append_log(f"[SKIP] no bid/ask reason={reason}", kind="WARN")
             self._no_bidask_warned = True
             self._no_bidask_last_log_ts = now
             return
         last_log = self._no_bidask_last_log_ts
         if last_log is None or now - last_log >= NO_BIDASK_LOG_INTERVAL_SEC:
-            self._append_log("[SKIP] no bid/ask", kind="INFO")
+            self._append_log(f"[SKIP] no bid/ask reason={reason}", kind="INFO")
             self._no_bidask_last_log_ts = now
 
     def _validate_bid_ask(self, bid: float | None, ask: float | None, *, source: str) -> bool:
         if bid is None or ask is None:
             if not self.bidask_ready:
-                self._maybe_log_no_bidask()
+                self._maybe_log_no_bidask(self._bidask_state or "missing")
             return False
         if not isfinite(bid) or not isfinite(ask):
             return False
@@ -4763,19 +4727,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         ):
             return
         self._kpi_last_book_request_ts = now_ts
-
-        def _fetch() -> dict[str, Any]:
-            book = self._http_client.get_book_ticker(self._symbol)
-            return book if isinstance(book, dict) else {}
-
-        worker = _Worker(_fetch, self._can_emit_worker_results)
-        worker.signals.success.connect(
-            lambda payload, latency_ms: self._safe_call(
+        self._queue_net_request(
+            "book_ticker",
+            {"symbol": self._symbol},
+            on_success=lambda payload, latency_ms: self._safe_call(
                 lambda: self._handle_book_ticker_success(payload, latency_ms),
                 label="signal:book_ticker_success",
-            )
+            ),
+            on_error=self._handle_book_ticker_error,
         )
-        self._thread_pool.start(worker)
 
     def _handle_book_ticker_success(self, payload: object, _latency_ms: int) -> None:
         assert isinstance(self, LiteAllStrategyNcMicroWindow)
@@ -4792,6 +4752,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_force_hold(reason="exception:_handle_book_ticker_success")
             return
 
+    def _handle_book_ticker_error(self, error: object) -> None:
+        message = self._format_account_error(error)
+        self._append_log_throttled(
+            f"[BIDASK] book ticker error={message}",
+            kind="WARN",
+            key="book_ticker_error",
+            cooldown_sec=5.0,
+        )
+
     def _fetch_bidask_http_book(self) -> None:
         now_ts = monotonic()
         if self._bidask_last_request_ts and (
@@ -4799,19 +4768,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         ):
             return
         self._bidask_last_request_ts = now_ts
-
-        def _fetch() -> dict[str, Any]:
-            book = self._http_client.get_book_ticker(self._symbol)
-            return book if isinstance(book, dict) else {}
-
-        worker = _Worker(_fetch, self._can_emit_worker_results)
-        worker.signals.success.connect(
-            lambda payload, latency_ms: self._safe_call(
+        self._queue_net_request(
+            "book_ticker",
+            {"symbol": self._symbol},
+            on_success=lambda payload, latency_ms: self._safe_call(
                 lambda: self._handle_success(payload, latency_ms),
                 label="signal:book_ticker_poll",
-            )
+            ),
+            on_error=self._handle_book_ticker_error,
         )
-        self._thread_pool.start(worker)
 
     def _handle_success(self, payload: object, _latency_ms: int) -> None:
         assert isinstance(self, LiteAllStrategyNcMicroWindow)
@@ -5282,6 +5247,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._suppress_dry_run_event = True
             self._dry_run_toggle.setChecked(True)
             self._suppress_dry_run_event = False
+            self._append_log("LIVE unavailable: trade gate not ready (running DRY-RUN).", kind="WARN")
             return
         if not checked:
             confirm = QMessageBox.question(
@@ -5308,6 +5274,17 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._live_mode_confirmed = False
         self._grid_engine.set_mode("DRY_RUN" if checked else "LIVE")
         self._apply_trade_gate()
+        if not checked and self._trade_gate != TradeGate.TRADE_OK:
+            reason = self._trade_gate_reason()
+            self._append_log(f"LIVE unavailable: {reason} (running DRY-RUN).", kind="WARN")
+            self._suppress_dry_run_event = True
+            self._dry_run_toggle.setChecked(True)
+            self._suppress_dry_run_event = False
+            self._dry_run_enabled = True
+            self._live_mode_confirmed = False
+            self._grid_engine.set_mode("DRY_RUN")
+            self._apply_trade_gate()
+            return
         self._update_fills_timer()
 
     def _set_strategy_controls_enabled(self, enabled: bool) -> None:
@@ -5342,9 +5319,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._append_log(f"[START] blocked reason={reason}", kind="WARN")
             return
         self._start_price_feed_if_needed()
+        self._append_log(
+            (
+                f"[START] mode={'DRY-RUN' if self._dry_run_toggle.isChecked() else 'LIVE'} "
+                f"trade_gate={self._trade_gate.value} state={self._trade_gate_state.value}"
+            ),
+            kind="INFO",
+        )
         if self._account_client:
             if not self._balances_timer.isActive():
-                self._balances_timer.start(10_000)
+                self._balances_timer.start(self._balances_poll_ms)
             if not self._orders_timer.isActive():
                 self._orders_timer.start()
             if not self._fills_timer.isActive():
@@ -5758,15 +5742,77 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
 
         def _cancel() -> CancelResult:
-            return cancel_all_open_orders(
-                account_client=self._account_client,
-                symbol=self._symbol,
-                reason=reason,
-                timeout_s=8.0,
-                poll_interval_s=0.25,
-            )
+            start_ts = monotonic()
+            cancelled_ids: set[str] = set()
+            remaining_ids: list[str] = []
+            open_orders: list[dict[str, Any]] = []
+            errors: list[str] = []
+            log_entries: list[str] = []
 
-        worker = _Worker(_cancel, self._can_emit_worker_results)
+            def _log(message: str) -> None:
+                log_entries.append(message)
+
+            def _fetch_open_orders() -> list[dict[str, Any]]:
+                try:
+                    return self._fetch_open_orders_sync(self._symbol)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"[CANCEL] list open_orders failed: {exc}")
+                    return []
+
+            open_orders = _fetch_open_orders()
+            remaining_ids = [
+                str(order.get("orderId", ""))
+                for order in open_orders
+                if str(order.get("orderId", ""))
+            ]
+            _log(f"[CANCEL] open_orders fetched n={len(remaining_ids)} reason={reason}")
+            if not remaining_ids:
+                _log("[CANCEL] done canceled=0 remaining=0 errors=0")
+                return CancelResult(
+                    cancelled_ids=[],
+                    remaining_ids=[],
+                    errors=errors,
+                    open_orders=open_orders,
+                    passes=0,
+                    log_entries=log_entries,
+                )
+            for order_id in remaining_ids:
+                _log(f"[CANCEL] cancel send order_id={order_id}")
+                try:
+                    self._cancel_order_sync(symbol=self._symbol, order_id=order_id)
+                    cancelled_ids.add(order_id)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"[CANCEL] cancel failed order_id={order_id} error={exc}")
+            passes = 0
+            while monotonic() - start_ts < 8.0:
+                remaining = 8.0 - (monotonic() - start_ts)
+                if remaining <= 0:
+                    break
+                sleep(min(0.25, remaining))
+                passes += 1
+                open_orders = _fetch_open_orders()
+                remaining_ids = [
+                    str(order.get("orderId", ""))
+                    for order in open_orders
+                    if str(order.get("orderId", ""))
+                ]
+                _log(f"[CANCEL] poll pass={passes} remaining={len(remaining_ids)}")
+                if not remaining_ids:
+                    break
+            if remaining_ids:
+                _log(f"[CANCEL] timeout remaining_ids={remaining_ids}")
+            _log(
+                f"[CANCEL] done canceled={len(cancelled_ids)} "
+                f"remaining={len(remaining_ids)} errors={len(errors)}"
+            )
+            return CancelResult(
+                cancelled_ids=sorted(cancelled_ids),
+                remaining_ids=remaining_ids,
+                errors=errors,
+                open_orders=open_orders,
+                passes=passes,
+                log_entries=log_entries,
+            )
 
         def _handle_cancel_result(result: object, latency_ms: int) -> None:
             self._orders_in_flight = False
@@ -5833,9 +5879,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._stop_done_with_errors = True
                 self._finalize_stop(keep_open_orders=True)
 
-        worker.signals.success.connect(_handle_cancel_result)
-        worker.signals.error.connect(_handle_cancel_failure)
-        self._thread_pool.start(worker)
+        try:
+            result = _cancel()
+            _handle_cancel_result(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            _handle_cancel_failure(str(exc))
         return True
 
     def _start_stop_watchdog(self) -> None:
@@ -6047,19 +6095,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 ok = True
                 err_text: str | None = None
                 try:
-                    self._account_client.cancel_open_orders(symbol)
+                    self._cancel_open_orders_sync(symbol)
                 except Exception as exc:  # noqa: BLE001
                     ok = False
                     err_text = str(exc)
                     errors.append(self._format_cancel_exception(exc, "cancel_all"))
                 self._sleep_ms(random.randint(300, 500))
                 try:
-                    open_orders_after = self._account_client.get_open_orders(symbol)
-                    if not isinstance(open_orders_after, list):
-                        verify_ok = False
-                        open_orders_after = []
-                    else:
-                        verify_ok = True
+                    open_orders_after = self._fetch_open_orders_sync(symbol)
+                    verify_ok = True
                 except Exception as exc:  # noqa: BLE001
                     verify_ok = False
                     open_orders_after = []
@@ -6076,11 +6120,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 "verify_ok": verify_ok,
                 "errors": errors,
             }
-
-        worker = _Worker(_cancel, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_stop_cancel_result)
-        worker.signals.error.connect(self._handle_stop_cancel_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _cancel()
+            self._handle_stop_cancel_result(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_stop_cancel_error(str(exc))
 
     def _handle_stop_cancel_result(self, result: object, latency_ms: int) -> None:
         self._orders_in_flight = False
@@ -6331,7 +6375,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         try:
             cached = self._get_http_cached("klines_1h")
             if cached is None:
-                klines = self._http_client.get_klines(self._symbol, interval="1h", limit=120)
+                klines, _latency_ms = self._net_call_sync(
+                    "klines",
+                    {"symbol": self._symbol, "interval": "1h", "limit": 120},
+                    timeout_ms=5000,
+                )
                 self._set_http_cache("klines_1h", klines)
             else:
                 klines = cached
@@ -6466,7 +6514,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._append_log("PRICE: HTTP_BOOK age=cached", kind="INFO")
                 return (bid + ask) / 2
         try:
-            book = self._http_client.get_book_ticker(symbol)
+            book, _latency_ms = self._net_call_sync(
+                "book_ticker",
+                {"symbol": symbol},
+                timeout_ms=3000,
+            )
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"PRICE: HTTP_BOOK failed ({exc})", kind="WARN")
             return None
@@ -6721,6 +6773,26 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         age_ms = int(monotonic() * 1000) - self._balance_ready_ts_monotonic_ms
         return max(age_ms / 1000.0, 0.0)
 
+    def _set_balances_poll_interval(self, interval_ms: int) -> None:
+        interval_ms = max(500, int(interval_ms))
+        if self._balances_poll_ms == interval_ms:
+            return
+        self._balances_poll_ms = interval_ms
+        self._balances_timer.setInterval(self._balances_poll_ms)
+        if self._balances_timer.isActive():
+            self._balances_timer.start(self._balances_poll_ms)
+
+    @staticmethod
+    def _format_account_error(error: object) -> str:
+        if isinstance(error, httpx.HTTPStatusError):
+            status = error.response.status_code if error.response else "n/a"
+            return f"HTTP {status}"
+        if isinstance(error, httpx.RequestError):
+            return error.__class__.__name__
+        if isinstance(error, Exception):
+            return error.__class__.__name__
+        return str(error)
+
     def _reset_defaults(self) -> None:
         if self._is_micro_profile():
             defaults = self._micro_grid_defaults()
@@ -6774,10 +6846,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if self._balances_in_flight and not force:
                 return
             self._balances_in_flight = True
-            worker = _Worker(self._account_client.get_account_info, self._can_emit_worker_results)
-            worker.signals.success.connect(self._handle_account_info)
-            worker.signals.error.connect(self._handle_account_error)
-            self._thread_pool.start(worker)
+            self._queue_net_request(
+                "account_info",
+                {},
+                on_success=self._handle_account_info,
+                on_error=self._handle_account_error,
+            )
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_balances")
             self._notify_crash("_refresh_balances")
@@ -6787,7 +6861,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _handle_account_info(self, result: object, latency_ms: int) -> None:
         self._balances_in_flight = False
         if not isinstance(result, dict):
-            self._handle_account_error("Unexpected account response")
+            self._handle_account_error(ValueError("Unexpected account response"))
             return
         balances_raw = result.get("balances", [])
         balances: dict[str, tuple[float, float]] = {}
@@ -6808,8 +6882,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if self._rules_loaded:
                 self._balance_ready_ts_monotonic_ms = int(monotonic() * 1000)
             self._record_last_good_balances(balances)
-        self._set_account_status("ready")
-        self._account_api_error = False
+            self._balances_error_streak = 0
+            self._set_balances_poll_interval(1000)
+            self._set_account_status("ready")
+        else:
+            self._balances_error_streak += 1
+            if self._balances_error_streak >= 3:
+                self._set_balances_poll_interval(3000)
+            self._set_account_status("error_kept", detail=reason, kept_last=True)
+        self._account_api_error = not valid_snapshot
         status = self._account_client.get_account_status(result) if self._account_client else AccountStatus(False, [], None)
         self._account_can_trade = status.can_trade
         self._account_permissions = status.permissions
@@ -6838,6 +6919,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._balances_snapshot = snapshot
             self._refresh_trade_fees()
             self._signals.balances_refresh.emit(True)
+            self._last_account_snapshot = {
+                "balances": balances,
+                "timestamp": monotonic(),
+                "latency_ms": latency_ms,
+            }
         else:
             age_text = "n/a"
             if self._last_good_ts is not None:
@@ -6853,16 +6939,20 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._last_preflight_blocked = False
             self._last_preflight_hash = None
 
-    def _handle_account_error(self, message: str) -> None:
+    def _handle_account_error(self, message: object) -> None:
         self._balances_in_flight = False
+        self._balances_error_streak += 1
+        if self._balances_error_streak >= 3:
+            self._set_balances_poll_interval(3000)
         self._account_can_trade = False
         self._account_api_error = True
         self._account_permissions = []
         self._last_account_trade_snapshot = None
-        self._set_account_status(self._infer_account_status(message))
-        self._append_log(f"balances fetch failed: {message}", kind="WARN")
-        self._auto_pause_on_api_error(message)
-        self._auto_pause_on_exception(message)
+        reason = self._format_account_error(message)
+        self._set_account_status("error", detail=reason, kept_last=True)
+        self._append_log(f"balances fetch failed: {reason}", kind="WARN")
+        self._auto_pause_on_api_error(reason)
+        self._auto_pause_on_exception(reason)
         self._apply_trade_gate()
         self._update_runtime_balances()
         self._signals.balances_refresh.emit(False)
@@ -6961,10 +7051,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._orders_poll_last_ts = int(monotonic() * 1000)
             self._orders_in_flight = True
             self._orders_refresh_reason = reason
-            worker = _Worker(lambda: self._account_client.get_open_orders(self._symbol), self._can_emit_worker_results)
-            worker.signals.success.connect(self._handle_open_orders)
-            worker.signals.error.connect(self._handle_open_orders_error)
-            self._thread_pool.start(worker)
+            self._queue_net_request(
+                "open_orders",
+                {"symbol": self._symbol},
+                on_success=self._handle_open_orders,
+                on_error=self._handle_open_orders_error,
+            )
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_orders")
             self._notify_crash("_refresh_orders")
@@ -6977,7 +7069,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not self._account_client:
             return
         try:
-            open_orders = self._account_client.get_open_orders(self._symbol)
+            open_orders, _latency_ms = self._net_call_sync(
+                "open_orders",
+                {"symbol": self._symbol},
+                timeout_ms=5000,
+            )
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"[START] openOrders preload failed: {exc}", kind="WARN")
             return
@@ -7020,13 +7116,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             if self._fills_in_flight:
                 return
             self._fills_in_flight = True
-            worker = _Worker(
-                lambda: self._account_client.get_my_trades(self._symbol, limit=50),
-                self._can_emit_worker_results,
+            self._queue_net_request(
+                "my_trades",
+                {"symbol": self._symbol, "limit": 50},
+                on_success=self._handle_fill_poll,
+                on_error=self._handle_fill_poll_error,
             )
-            worker.signals.success.connect(self._handle_fill_poll)
-            worker.signals.error.connect(self._handle_fill_poll_error)
-            self._thread_pool.start(worker)
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception in _refresh_fills")
             self._notify_crash("_refresh_fills")
@@ -7061,11 +7156,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_force_hold(reason="exception:_handle_fill_poll")
             return
 
-    def _handle_fill_poll_error(self, message: str) -> None:
+    def _handle_fill_poll_error(self, message: object) -> None:
         self._fills_in_flight = False
-        self._append_log(f"fills poll failed: {message}", kind="WARN")
-        self._auto_pause_on_api_error(message)
-        self._auto_pause_on_exception(message)
+        reason = self._format_account_error(message)
+        self._append_log(f"fills poll failed: {reason}", kind="WARN")
+        self._auto_pause_on_api_error(reason)
+        self._auto_pause_on_exception(reason)
 
     def _current_orders_poll_interval_ms(self) -> int:
         if self._state == "STOPPING" and self._cancel_inflight:
@@ -7257,15 +7353,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._pilot_force_hold(reason="exception:_handle_open_orders")
             return
 
-    def _handle_open_orders_error(self, message: str) -> None:
+    def _handle_open_orders_error(self, message: object) -> None:
         self._orders_in_flight = False
         self._snapshot_refresh_inflight = False
         self._signals.open_orders_refresh.emit(False)
-        if self._is_auth_error(message):
+        reason = self._format_account_error(message)
+        if self._is_auth_error(reason):
             self._account_api_error = True
-        self._append_log(f"openOrders fetch failed: {message}", kind="WARN")
-        self._auto_pause_on_api_error(message)
-        self._auto_pause_on_exception(message)
+        self._append_log(f"openOrders fetch failed: {reason}", kind="WARN")
+        self._auto_pause_on_api_error(reason)
+        self._auto_pause_on_exception(reason)
         self._apply_trade_gate()
 
     def _filter_bot_orders(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -7570,15 +7667,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
 
         def _reconcile() -> dict[str, Any]:
-            trades = self._account_client.get_my_trades(self._symbol, limit=50)
+            trades = self._fetch_my_trades_sync(self._symbol, limit=50)
             trades_by_order: dict[str, dict[str, Any]] = {}
-            if isinstance(trades, list):
-                for trade in trades:
-                    if not isinstance(trade, dict):
-                        continue
-                    order_id = str(trade.get("orderId", ""))
-                    if order_id:
-                        trades_by_order[order_id] = trade
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+                order_id = str(trade.get("orderId", ""))
+                if order_id:
+                    trades_by_order[order_id] = trade
             results: list[dict[str, Any]] = []
             for order in missing:
                 order_id = str(order.get("orderId", ""))
@@ -7592,20 +7688,21 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     results.append({"status": "FILLED", "order": order, "trade": trade})
                     continue
                 if client_order_id:
-                    order_info = self._account_client.get_order(
+                    order_info = self._fetch_order_sync(
                         self._symbol,
                         orig_client_order_id=client_order_id,
                     )
                 else:
-                    order_info = self._account_client.get_order(self._symbol, order_id or None)
+                    order_info = self._fetch_order_sync(self._symbol, order_id=order_id or None)
                 status = str(order_info.get("status", "")).upper() if isinstance(order_info, dict) else "UNKNOWN"
                 results.append({"status": status, "order": order, "trade": None})
             return {"results": results}
 
-        worker = _Worker(_reconcile, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_reconcile_missing_orders)
-        worker.signals.error.connect(self._handle_reconcile_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _reconcile()
+            self._handle_reconcile_missing_orders(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_reconcile_error(str(exc))
 
     def _handle_reconcile_missing_orders(self, result: object, latency_ms: int) -> None:
         if self._closing:
@@ -8850,10 +8947,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                     results["errors"].append(restore_error)
             return results
 
-        worker = _Worker(_place, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_replacement_order)
-        worker.signals.error.connect(self._handle_live_order_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _place()
+            self._handle_replacement_order(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_live_order_error(str(exc))
 
     def _maybe_enable_bootstrap_sell_side(self, fill: TradeFill) -> None:
         if fill.side != "BUY":
@@ -9057,7 +9155,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         )
         self._signals.log_append.emit(log_message, "ORDERS")
         try:
-            response = self._account_client.place_limit_order(
+            response = self._place_limit_order_sync(
                 symbol=self._symbol,
                 side=side,
                 price=self.fmt_price(price, tick),
@@ -9301,20 +9399,19 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if order_id in self._closed_order_ids:
             return False, None, "skipped"
         try:
-            self._account_client.cancel_order(self._symbol, order_id)
+            self._cancel_order_sync(symbol=self._symbol, order_id=order_id)
         except Exception as exc:  # noqa: BLE001
             _status, code, _message, _response = self._parse_binance_exception(exc)
             if code == -2011:
                 self._signals.log_append.emit("[CANCEL] unknown -> verifying on exchange", "INFO")
                 present = False
                 try:
-                    open_orders = self._account_client.get_open_orders(self._symbol)
-                    if isinstance(open_orders, list):
-                        present = any(
-                            str(order.get("orderId", "")) == order_id
-                            for order in open_orders
-                            if isinstance(order, dict)
-                        )
+                    open_orders = self._fetch_open_orders_sync(self._symbol)
+                    present = any(
+                        str(order.get("orderId", "")) == order_id
+                        for order in open_orders
+                        if isinstance(order, dict)
+                    )
                 except Exception as verify_exc:  # noqa: BLE001
                     return False, f"[CANCEL] verify failed: {verify_exc}", "failed"
                 self._signals.log_append.emit(
@@ -9323,18 +9420,16 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 )
                 if present:
                     try:
-                        self._account_client.cancel_open_orders(self._symbol)
+                        self._cancel_open_orders_sync(self._symbol)
                     except Exception as cancel_exc:  # noqa: BLE001
                         return False, self._format_cancel_exception(cancel_exc, order_id), "failed"
                     try:
-                        open_orders_after = self._account_client.get_open_orders(self._symbol)
-                        present_after = False
-                        if isinstance(open_orders_after, list):
-                            present_after = any(
-                                str(order.get("orderId", "")) == order_id
-                                for order in open_orders_after
-                                if isinstance(order, dict)
-                            )
+                        open_orders_after = self._fetch_open_orders_sync(self._symbol)
+                        present_after = any(
+                            str(order.get("orderId", "")) == order_id
+                            for order in open_orders_after
+                            if isinstance(order, dict)
+                        )
                     except Exception as verify_exc:  # noqa: BLE001
                         return False, f"[CANCEL] verify failed: {verify_exc}", "failed"
                     if present_after:
@@ -9437,18 +9532,22 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 self._handle_exchange_info(cached, latency_ms=0)
                 return
         self._rules_in_flight = True
-        worker = _Worker(lambda: self._http_client.get_exchange_info_symbol(self._symbol), self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_exchange_info)
-        worker.signals.error.connect(self._handle_exchange_error)
-        self._thread_pool.start(worker)
+        self._queue_net_request(
+            "exchange_info_symbol",
+            {"symbol": self._symbol},
+            on_success=self._handle_exchange_info,
+            on_error=self._handle_exchange_error,
+        )
 
     def _sync_account_time(self) -> None:
         if not self._account_client:
             return
-        worker = _Worker(self._account_client.sync_time_offset, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_time_sync)
-        worker.signals.error.connect(self._handle_time_sync_error)
-        self._thread_pool.start(worker)
+        self._queue_net_request(
+            "sync_time_offset",
+            {},
+            on_success=self._handle_time_sync,
+            on_error=self._handle_time_sync_error,
+        )
 
     def _handle_time_sync(self, result: object, latency_ms: int) -> None:
         if not isinstance(result, dict):
@@ -9457,8 +9556,9 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if isinstance(offset, int):
             self._append_log(f"[LIVE] time sync offset={offset}ms ({latency_ms}ms)", kind="INFO")
 
-    def _handle_time_sync_error(self, message: str) -> None:
-        self._append_log(f"[LIVE] time sync failed: {message}", kind="WARN")
+    def _handle_time_sync_error(self, message: object) -> None:
+        reason = self._format_account_error(message)
+        self._append_log(f"[LIVE] time sync failed: {reason}", kind="WARN")
 
     def _handle_exchange_info(self, result: object, latency_ms: int) -> None:
         self._rules_in_flight = False
@@ -9500,12 +9600,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             kind="INFO",
         )
 
-    def _handle_exchange_error(self, message: str) -> None:
+    def _handle_exchange_error(self, message: object) -> None:
         self._rules_in_flight = False
         self._symbol_tradeable = False
-        self._append_log(f"Exchange rules error: {message}", kind="ERROR")
-        self._auto_pause_on_api_error(message)
-        self._auto_pause_on_exception(message)
+        reason = self._format_account_error(message)
+        self._append_log(f"Exchange rules error: {reason}", kind="ERROR")
+        self._auto_pause_on_api_error(reason)
+        self._auto_pause_on_exception(reason)
         self._apply_trade_gate()
         self._update_rules_label()
 
@@ -9516,10 +9617,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         if not force and self._fees_last_fetch_ts and now - self._fees_last_fetch_ts < 1800:
             return
         self._fees_in_flight = True
-        worker = _Worker(lambda: self._account_client.get_trade_fees(self._symbol), self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_trade_fees)
-        worker.signals.error.connect(self._handle_trade_fees_error)
-        self._thread_pool.start(worker)
+        self._queue_net_request(
+            "trade_fees",
+            {"symbol": self._symbol},
+            on_success=self._handle_trade_fees,
+            on_error=self._handle_trade_fees_error,
+        )
 
     def _handle_trade_fees(self, result: object, latency_ms: int) -> None:
         self._fees_in_flight = False
@@ -9538,11 +9641,12 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._update_rules_label()
         self._append_log(f"Trade fees loaded ({latency_ms}ms).", kind="INFO")
 
-    def _handle_trade_fees_error(self, message: str) -> None:
+    def _handle_trade_fees_error(self, message: object) -> None:
         self._fees_in_flight = False
-        self._append_log(f"Trade fees error: {message}", kind="ERROR")
-        self._auto_pause_on_api_error(message)
-        self._auto_pause_on_exception(message)
+        reason = self._format_account_error(message)
+        self._append_log(f"Trade fees error: {reason}", kind="ERROR")
+        self._auto_pause_on_api_error(reason)
+        self._auto_pause_on_exception(reason)
         self._update_rules_label()
 
     def _apply_trade_fees_from_account(self, account: dict[str, Any]) -> None:
@@ -9580,9 +9684,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._suppress_dry_run_event = True
             self._dry_run_toggle.setChecked(True)
             self._suppress_dry_run_event = False
-            self._dry_run_toggle.setEnabled(False)
-        else:
-            self._dry_run_toggle.setEnabled(True)
+        self._dry_run_toggle.setEnabled(True)
         self._apply_trade_status_label()
         self._update_grid_preview()
         self._update_fills_timer()
@@ -9590,11 +9692,18 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _apply_trade_status_label(self) -> None:
         if self._trade_gate != TradeGate.TRADE_OK:
             reason = self._trade_gate_reason()
-            self._trade_status_label.setText(f"{tr('trade_status_disabled')} ({reason})")
-            self._trade_status_label.setStyleSheet(
-                "color: #dc2626; font-size: 11px; font-weight: 600;"
-            )
-            self._trade_status_label.setToolTip(tr("trade_disabled_tooltip", reason=reason))
+            if self._dry_run_toggle.isChecked():
+                self._trade_status_label.setText(f"LIVE unavailable: {reason} (running DRY-RUN)")
+                self._trade_status_label.setStyleSheet(
+                    "color: #f97316; font-size: 11px; font-weight: 600;"
+                )
+                self._trade_status_label.setToolTip(f"LIVE unavailable: {reason} (running DRY-RUN)")
+            else:
+                self._trade_status_label.setText(f"{tr('trade_status_disabled')} ({reason})")
+                self._trade_status_label.setStyleSheet(
+                    "color: #dc2626; font-size: 11px; font-weight: 600;"
+                )
+                self._trade_status_label.setToolTip(tr("trade_disabled_tooltip", reason=reason))
             self._set_cancel_buttons_enabled(self._dry_run_toggle.isChecked())
         else:
             self._trade_status_label.setText(tr("trade_status_enabled"))
@@ -9719,7 +9828,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         text = message.lower()
         return "-1021" in text or "timestamp" in text or "recvwindow" in text
 
-    def _set_account_status(self, status: str) -> None:
+    def _set_account_status(self, status: str, *, detail: str | None = None, kept_last: bool = False) -> None:
         if status == "ready":
             self._can_read_account = True
             text = tr("account_status_ready")
@@ -9734,7 +9843,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             style = "color: #dc2626; font-size: 11px; font-weight: 600;"
         else:
             self._can_read_account = False
-            text = tr("account_status_error")
+            if kept_last:
+                detail_text = f": {detail}" if detail else ""
+                text = f"ACCOUNT: ERROR (kept last){detail_text}"
+            else:
+                text = tr("account_status_error")
             style = "color: #f97316; font-size: 11px; font-weight: 600;"
 
         self._account_status_label.setText(text)
@@ -10122,15 +10235,15 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 if idx % batch_size == 0:
                     self._sleep_ms(200)
                     try:
-                        last_open_orders = self._account_client.get_open_orders(self._symbol)
+                        last_open_orders = self._fetch_open_orders_sync(self._symbol)
                     except Exception:
                         last_open_orders = None
             return {"results": results, "errors": errors, "open_orders": last_open_orders}
-
-        worker = _Worker(_place, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_live_order_placement)
-        worker.signals.error.connect(self._handle_live_order_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _place()
+            self._handle_live_order_placement(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_live_order_error(str(exc))
 
     def _handle_live_order_placement(self, result: object, latency_ms: int) -> None:
         if not isinstance(result, dict):
@@ -10262,11 +10375,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 "planned": len(filtered_ids),
                 "reason": reason,
             }
-
-        worker = _Worker(_cancel, self._can_emit_worker_results)
-        worker.signals.success.connect(self._handle_cancel_selected_result)
-        worker.signals.error.connect(self._handle_cancel_error)
-        self._thread_pool.start(worker)
+        try:
+            result = _cancel()
+            self._handle_cancel_selected_result(result, 0)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_cancel_error(str(exc))
 
     def _handle_cancel_selected_result(self, result: object, latency_ms: int) -> None:
         if not isinstance(result, dict):
@@ -10752,18 +10865,212 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         budget = float(self._budget_input.value())
         min_order = budget / levels if levels > 0 else 0.0
         quote_ccy = self._quote_asset or "—"
+        tp_pct = float(self._take_profit_input.value())
+        max_active = int(self._max_orders_input.value())
         self._grid_preview_label.setText(
-            tr(
-                "grid_preview",
-                levels=str(levels),
-                step=f"{step:.2f}",
-                range=f"{range_pct:.2f}",
-                orders=str(levels),
-                min_order=f"{min_order:.2f}",
-                quote_ccy=quote_ccy,
+            (
+                f"Grid: budget {budget:.2f} {quote_ccy} | step {step:.2f}% | "
+                f"range {range_low:.2f}-{range_high:.2f}% | TP {tp_pct:.2f}% | "
+                f"max active {max_active} | est min/order {min_order:.2f} {quote_ccy}"
             )
         )
         self._update_auto_values_label(self._settings_state.grid_step_mode == "AUTO_ATR")
+
+    def _setup_net_worker(self, api_key: str | None, api_secret: str | None) -> None:
+        self._net_worker = BinanceNetWorker(
+            base_url=self._config.binance.base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=self._config.binance.recv_window,
+            timeout_s=self._config.http.timeout_s,
+            retries=self._config.http.retries,
+            backoff_base_s=self._config.http.backoff_base_s,
+            backoff_max_s=self._config.http.backoff_max_s,
+        )
+        self._net_worker.moveToThread(self._net_thread)
+        self._net_thread.started.connect(self._net_worker.initialize)
+        self._net_worker.request_finished.connect(self._handle_net_success)
+        self._net_worker.request_failed.connect(self._handle_net_error)
+        self._net_thread.start()
+
+    def _shutdown_net_worker(self) -> None:
+        if not self._net_worker:
+            return
+        QTimer.singleShot(0, self._net_worker, self._net_worker.shutdown)
+        self._net_thread.quit()
+        self._net_thread.wait(1500)
+
+    def _next_net_request_id(self, action: str) -> str:
+        self._net_request_counter += 1
+        return f"{action}:{self._net_request_counter}:{uuid4().hex}"
+
+    def _queue_net_request(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        on_success: Callable[[object, int], None] | None,
+        on_error: Callable[[object], None] | None,
+    ) -> None:
+        if not self._net_worker:
+            if on_error:
+                on_error(RuntimeError("net worker not initialized"))
+            return
+        request_id = self._next_net_request_id(action)
+        self._net_pending[request_id] = (on_success, on_error)
+        self._net_worker.request.emit(NetRequest(request_id=request_id, action=action, params=params))
+
+    def _net_call_sync(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int = 5000,
+    ) -> tuple[object, int]:
+        loop = QEventLoop()
+        result: dict[str, Any] = {"done": False, "value": None, "error": None, "latency": 0}
+
+        def _on_success(payload: object, latency_ms: int) -> None:
+            if result["done"]:
+                return
+            result["done"] = True
+            result["value"] = payload
+            result["latency"] = latency_ms
+            loop.quit()
+
+        def _on_error(message: object) -> None:
+            if result["done"]:
+                return
+            result["done"] = True
+            result["error"] = message
+            loop.quit()
+
+        self._queue_net_request(action, params, on_success=_on_success, on_error=_on_error)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(timeout_ms)
+        loop.exec()
+        timer.stop()
+        if not result["done"]:
+            raise TimeoutError(f"net request timeout action={action}")
+        if result["error"] is not None:
+            if isinstance(result["error"], Exception):
+                raise result["error"]
+            raise RuntimeError(str(result["error"]))
+        return result["value"], int(result["latency"] or 0)
+
+    def _fetch_open_orders_sync(self, symbol: str) -> list[dict[str, Any]]:
+        payload, _latency_ms = self._net_call_sync(
+            "open_orders",
+            {"symbol": symbol},
+            timeout_ms=5000,
+        )
+        if not isinstance(payload, list):
+            raise ValueError("Unexpected open orders response")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def _fetch_my_trades_sync(self, symbol: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        payload, _latency_ms = self._net_call_sync(
+            "my_trades",
+            {"symbol": symbol, "limit": limit},
+            timeout_ms=5000,
+        )
+        if not isinstance(payload, list):
+            raise ValueError("Unexpected trades response")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def _fetch_order_sync(
+        self,
+        symbol: str,
+        *,
+        order_id: str | None = None,
+        orig_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload, _latency_ms = self._net_call_sync(
+            "order",
+            {"symbol": symbol, "order_id": order_id, "orig_client_order_id": orig_client_order_id},
+            timeout_ms=5000,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected order response")
+        return payload
+
+    def _place_limit_order_sync(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        price: str,
+        quantity: str,
+        time_in_force: str = "GTC",
+        new_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload, _latency_ms = self._net_call_sync(
+            "place_limit_order",
+            {
+                "symbol": symbol,
+                "side": side,
+                "price": price,
+                "quantity": quantity,
+                "time_in_force": time_in_force,
+                "new_client_order_id": new_client_order_id,
+            },
+            timeout_ms=5000,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected order response format")
+        return payload
+
+    def _cancel_order_sync(
+        self,
+        *,
+        symbol: str,
+        order_id: str | None = None,
+        orig_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload, _latency_ms = self._net_call_sync(
+            "cancel_order",
+            {
+                "symbol": symbol,
+                "order_id": order_id,
+                "orig_client_order_id": orig_client_order_id,
+            },
+            timeout_ms=5000,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected cancel order response")
+        return payload
+
+    def _cancel_open_orders_sync(self, symbol: str) -> list[dict[str, Any]]:
+        payload, _latency_ms = self._net_call_sync(
+            "cancel_open_orders",
+            {"symbol": symbol},
+            timeout_ms=5000,
+        )
+        if not isinstance(payload, list):
+            raise ValueError("Unexpected cancel open orders response")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def _handle_net_success(self, request_id: str, _action: str, payload: object, latency_ms: int) -> None:
+        if not self._can_emit_worker_results():
+            return
+        handlers = self._net_pending.pop(request_id, None)
+        if not handlers:
+            return
+        on_success, _on_error = handlers
+        if on_success:
+            on_success(payload, latency_ms)
+
+    def _handle_net_error(self, request_id: str, _action: str, error: object) -> None:
+        if not self._can_emit_worker_results():
+            return
+        handlers = self._net_pending.pop(request_id, None)
+        if not handlers:
+            return
+        _on_success, on_error = handlers
+        if on_error:
+            on_error(error)
 
     def _can_emit_worker_results(self) -> bool:
         return not self._closing or self._stop_in_progress
@@ -10807,9 +11114,10 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
             self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
             self._price_feed_manager.unregister_symbol(self._symbol)
-            if shutdown and not self._price_feed_manager.is_shutting_down:
+            should_stop = not self._price_feed_manager.has_active_subscribers()
+            if should_stop and shutdown and not self._price_feed_manager.is_shutting_down:
                 self._price_feed_manager.shutdown()
-            elif not shutdown and not self._price_feed_manager.is_shutting_down:
+            elif should_stop and not shutdown and not self._price_feed_manager.is_shutting_down:
                 self._price_feed_manager.stop()
         except Exception:
             self._logger.exception("[NC_MICRO][CRASH] exception stopping price feed")
@@ -10859,6 +11167,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             except Exception:
                 return
         self._append_log("Lite Grid Terminal closed.", kind="INFO")
+        self._shutdown_net_worker()
         close_shared_client()
         super().closeEvent(event)
 
