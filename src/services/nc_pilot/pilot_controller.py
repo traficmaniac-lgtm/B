@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import inspect
 from decimal import Decimal
 from time import monotonic
 from uuid import uuid4
@@ -581,7 +583,7 @@ class PilotController:
                     "remaining_s": max(cooldown_after_trade_s - elapsed, 0.0),
                 },
             )
-        if not self._window._pilot_trade_gate_ready():
+        if not self._trade_gate_ready():
             return False, "cooldown_active", {"block": "trade_gate"}
         open_orders = getattr(self._window, "_open_orders", [])
         virtual_orders = getattr(self._window, "_pilot_virtual_orders", [])
@@ -620,7 +622,7 @@ class PilotController:
         if pilot.arb_id_active and pilot.last_exec_ts and now - pilot.last_exec_ts < self.ORDER_COOLDOWN_SEC:
             self._log_skip("cooldown")
             return
-        if not self._window._pilot_trade_gate_ready():
+        if not self._trade_gate_ready():
             self._log_skip("trade_gate")
             return
         plan = self._build_plan(best.side, base_free=base_free, quote_free=quote_free)
@@ -734,6 +736,40 @@ class PilotController:
             qty=self._window.q_qty(qty, step),
             reason="main",
         )
+
+    def _trade_gate_ready(self) -> bool:
+        method = getattr(self._window, "_pilot_trade_gate_ready", None)
+        if method is None:
+            return True
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return method()
+        if len(signature.parameters) == 0:
+            return method()
+        action = self._resolve_trade_gate_action()
+        if action is None:
+            return method()
+        return method(action)
+
+    def _resolve_trade_gate_action(self) -> object | None:
+        module_name = getattr(self._window.__class__, "__module__", "")
+        if not module_name:
+            return None
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            return None
+        action_enum = getattr(module, "PilotAction", None)
+        if action_enum is None:
+            return None
+        for preferred in ("RECOVERY", "RECENTER", "TOGGLE"):
+            if hasattr(action_enum, preferred):
+                return getattr(action_enum, preferred)
+        try:
+            return next(iter(action_enum))
+        except Exception:
+            return None
 
     @staticmethod
     def _desired_notional(
