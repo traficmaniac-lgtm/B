@@ -2397,11 +2397,12 @@ class NcPilotTabWidget(QWidget):
         self._pilot_dashboard_counters_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_dashboard_counters_label)
 
-        self._pilot_routes_table = QTableWidget(4, 7, self)
+        self._pilot_routes_table = QTableWidget(4, 8, self)
         self._pilot_routes_table.setHorizontalHeaderLabels(
             [
                 "Family",
                 "Route",
+                "EffSymbol",
                 "Profit abs",
                 "Profit bps",
                 "Life",
@@ -2411,7 +2412,7 @@ class NcPilotTabWidget(QWidget):
         )
         header = self._pilot_routes_table.horizontalHeader()
         header.setStretchLastSection(True)
-        for column in range(6):
+        for column in range(7):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self._pilot_routes_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._pilot_routes_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -2422,7 +2423,7 @@ class NcPilotTabWidget(QWidget):
         self._pilot_routes_table.setVerticalHeaderLabels(["SPREAD", "REBAL", "2LEG", "LOOP"])
         self._pilot_route_rows = {"SPREAD": 0, "REBAL": 1, "2LEG": 2, "LOOP": 3}
         for family, row in self._pilot_route_rows.items():
-            initial = [family, "—", "—", "—", "—", "—", "—"]
+            initial = [family, "—", "—", "—", "—", "—", "—", "—"]
             for column, value in enumerate(initial):
                 item = QTableWidgetItem(str(value))
                 item.setTextAlignment(Qt.AlignCenter)
@@ -2578,7 +2579,11 @@ class NcPilotTabWidget(QWidget):
         best = runtime.last_best_route or "—"
         edge = f"{runtime.last_best_edge_bps:.2f}" if runtime.last_best_edge_bps is not None else "—"
         last = runtime.last_decision or "—"
-        self._pilot_status_line.setText(f"state={runtime.state} | best={best} | edge={edge} bps | last={last}")
+        alias_summary = self._pilot_alias_summary()
+        suffix = f" | alias={alias_summary}" if alias_summary else ""
+        self._pilot_status_line.setText(
+            f"state={runtime.state} | best={best} | edge={edge} bps | last={last}{suffix}"
+        )
         self._set_pilot_controls(analysis_on=runtime.analysis_on, trading_on=runtime.trading_on)
 
     def _update_pilot_dashboard_counters(self) -> None:
@@ -2617,6 +2622,7 @@ class NcPilotTabWidget(QWidget):
             values = [
                 family,
                 snapshot.get("route_text", "—"),
+                snapshot.get("effective_symbol", "—"),
                 f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}" if valid else status,
                 f"{snapshot.get('profit_bps', 0.0):+.2f}" if valid else status,
                 f"{life_s:.1f}s",
@@ -2682,6 +2688,8 @@ class NcPilotTabWidget(QWidget):
 
     @staticmethod
     def _pilot_invalid_label(reason: str) -> str:
+        if reason.startswith("invalid_symbol:"):
+            return "INVALID"
         return {
             "no_data": "NO DATA",
             "depth": "DEPTH",
@@ -7316,6 +7324,20 @@ class NcPilotTabWidget(QWidget):
                 "depth": depth,
             }
         return results
+
+    def _pilot_exchange_symbols(self) -> set[str] | None:
+        if not hasattr(self, "_price_feed_manager") or not self._price_feed_manager:
+            return None
+        return self._price_feed_manager.get_exchange_symbols()
+
+    def _pilot_alias_summary(self) -> str:
+        runtime = self._session.pilot
+        aliases = runtime.symbol_aliases
+        return ", ".join(
+            f"{symbol}→{aliases[symbol]}"
+            for symbol in sorted(aliases)
+            if aliases[symbol] != symbol
+        )
 
     def _apply_auto_clamps(self, settings: GridSettingsState, anchor_price: float) -> None:
         if settings.grid_step_mode != "AUTO_ATR":

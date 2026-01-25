@@ -10,6 +10,7 @@ from PySide6.QtCore import QTimer
 from src.gui.lite_grid_math import compute_order_qty
 from src.services.nc_pilot.arb_hub import ArbHub
 from src.services.nc_pilot.session import NcPilotSession, PilotAlgoState
+from src.services.nc_pilot.symbol_aliases import format_alias_summary, resolve_symbol
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class PilotController:
         pilot.state = "ANALYZE"
         self._analysis_timer.start()
         self._window._append_pilot_log("[PILOT] ANALYSIS_START")
+        self._refresh_symbol_resolution(log_aliases=True)
         self._window._set_pilot_controls(analysis_on=True, trading_on=pilot.trading_on)
         self._window._update_pilot_status_line()
 
@@ -85,47 +87,77 @@ class PilotController:
         pilot = self._session.pilot
         if not pilot.analysis_on:
             return
-        selected_symbols = {symbol.upper() for symbol in pilot.selected_symbols}
+        effective_symbols, invalid_symbols = self._refresh_symbol_resolution()
         now = monotonic()
-        market_data = self._window._pilot_collect_market_data(set(self.PILOT_SYMBOLS))
-        quotes: dict[str, ArbHub.MarketQuote] = {}
-        for symbol, payload in market_data.items():
-            quotes[symbol] = ArbHub.MarketQuote(
-                bid=payload.get("bid"),
-                ask=payload.get("ask"),
-                age_ms=payload.get("age_ms"),
-                ts_ms=payload.get("ts_ms"),
-                src=payload.get("src") or "NONE",
-                depth=payload.get("depth"),
+        if invalid_symbols:
+            reason = next(iter(invalid_symbols.values()))
+            spread_snapshot = self._arb_hub._invalid_family_snapshot(
+                family="SPREAD",
+                algo_id="SPREAD_BEST",
+                reason=reason,
+                details={"reason": reason, "invalid_symbols": invalid_symbols},
             )
-        spread_snapshot = self._arb_hub.compute_spread_family_best(
-            market_by_symbol=quotes,
-            selected_symbols=selected_symbols,
-            min_edge_bps=pilot.min_edge_bps,
-            max_notional=pilot.max_notional,
-            max_age_ms=pilot.max_age_ms,
-        )
-        snapshots = [
-            spread_snapshot,
-            self._arb_hub._invalid_family_snapshot(
-                family="REBAL",
-                algo_id="REBAL",
-                reason="no_data",
-                details={"reason": "no_data"},
-            ),
-            self._arb_hub._invalid_family_snapshot(
-                family="2LEG",
-                algo_id="2LEG",
-                reason="no_data",
-                details={"reason": "no_data"},
-            ),
-            self._arb_hub._invalid_family_snapshot(
-                family="LOOP",
-                algo_id="LOOP",
-                reason="no_data",
-                details={"reason": "no_data"},
-            ),
-        ]
+            snapshots = [
+                spread_snapshot,
+                self._arb_hub._invalid_family_snapshot(
+                    family="REBAL",
+                    algo_id="REBAL",
+                    reason=reason,
+                    details={"reason": reason},
+                ),
+                self._arb_hub._invalid_family_snapshot(
+                    family="2LEG",
+                    algo_id="2LEG",
+                    reason=reason,
+                    details={"reason": reason},
+                ),
+                self._arb_hub._invalid_family_snapshot(
+                    family="LOOP",
+                    algo_id="LOOP",
+                    reason=reason,
+                    details={"reason": reason},
+                ),
+            ]
+        else:
+            market_data = self._window._pilot_collect_market_data(set(effective_symbols))
+            quotes: dict[str, ArbHub.MarketQuote] = {}
+            for symbol, payload in market_data.items():
+                quotes[symbol] = ArbHub.MarketQuote(
+                    bid=payload.get("bid"),
+                    ask=payload.get("ask"),
+                    age_ms=payload.get("age_ms"),
+                    ts_ms=payload.get("ts_ms"),
+                    src=payload.get("src") or "NONE",
+                    depth=payload.get("depth"),
+                )
+            spread_snapshot = self._arb_hub.compute_spread_family_best(
+                market_by_symbol=quotes,
+                selected_symbols=effective_symbols,
+                min_edge_bps=pilot.min_edge_bps,
+                max_notional=pilot.max_notional,
+                max_age_ms=pilot.max_age_ms,
+            )
+            snapshots = [
+                spread_snapshot,
+                self._arb_hub._invalid_family_snapshot(
+                    family="REBAL",
+                    algo_id="REBAL",
+                    reason="no_data",
+                    details={"reason": "no_data"},
+                ),
+                self._arb_hub._invalid_family_snapshot(
+                    family="2LEG",
+                    algo_id="2LEG",
+                    reason="no_data",
+                    details={"reason": "no_data"},
+                ),
+                self._arb_hub._invalid_family_snapshot(
+                    family="LOOP",
+                    algo_id="LOOP",
+                    reason="no_data",
+                    details={"reason": "no_data"},
+                ),
+            ]
         ui_snapshots: list[dict[str, object]] = []
         for snapshot in snapshots:
             algo_state = pilot.algo_states.setdefault(snapshot.algo_id, PilotAlgoState())
@@ -356,6 +388,7 @@ class PilotController:
             "algo_id": snapshot.algo_id,
             "route_text": snapshot.route_text,
             "symbol": snapshot.symbol,
+            "effective_symbol": snapshot.symbol or "—",
             "profit_abs_usdt": snapshot.profit_abs_usdt,
             "profit_bps": snapshot.profit_bps,
             "life_ms": snapshot.life_ms,
@@ -371,3 +404,28 @@ class PilotController:
         pilot = self._session.pilot
         pilot.last_decision = reason
         pilot.counters.skips += 1
+
+    def _refresh_symbol_resolution(self, *, log_aliases: bool = False) -> tuple[set[str], dict[str, str]]:
+        pilot = self._session.pilot
+        selected_symbols = {symbol.upper() for symbol in pilot.selected_symbols}
+        exchange_symbols = self._window._pilot_exchange_symbols()
+        aliases: dict[str, str] = {}
+        invalid_symbols: dict[str, str] = {}
+        effective_symbols: set[str] = set()
+        for symbol in sorted(selected_symbols):
+            effective, reason = resolve_symbol(symbol, exchange_symbols)
+            if effective is None:
+                invalid_symbols[symbol] = reason
+                continue
+            aliases[symbol] = effective
+            effective_symbols.add(effective)
+        pilot.symbol_aliases = aliases
+        pilot.invalid_symbols = invalid_symbols
+        if log_aliases:
+            summary = format_alias_summary(sorted(selected_symbols), aliases)
+            if summary:
+                for entry in summary.split(", "):
+                    self._window._append_pilot_log(f"[PILOT] symbol alias: {entry}")
+            for symbol, reason in invalid_symbols.items():
+                self._window._append_pilot_log(f"[PILOT] symbol invalid: {symbol} ({reason})")
+        return effective_symbols, invalid_symbols
