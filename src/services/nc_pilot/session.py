@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from src.core.nc_micro_exec_dedup import CumulativeFillTracker, ExecKeyDeduper, TradeIdDeduper
 
@@ -58,6 +58,30 @@ class NcPilotRuntimeState:
 
 
 @dataclass
+class PilotRuntimeCounters:
+    windows_found_today: int = 0
+    orders_sent: int = 0
+    cancels: int = 0
+    skips: int = 0
+
+
+@dataclass
+class PilotRuntimeState:
+    state: Literal["IDLE", "ANALYZE", "TRADING", "ERROR"] = "IDLE"
+    analysis_on: bool = False
+    trading_on: bool = False
+    arb_id_active: str | None = None
+    last_best_route: str | None = None
+    last_best_edge_bps: float | None = None
+    last_decision: str = "—"
+    counters: PilotRuntimeCounters = field(default_factory=PilotRuntimeCounters)
+    last_skip_log_ts: float | None = None
+    last_route_log_ts: float | None = None
+    last_exec_ts: float | None = None
+    order_client_ids: set[str] = field(default_factory=set)
+
+
+@dataclass
 class OrderTrackingState:
     open_orders: list[dict[str, Any]] = field(default_factory=list)
     open_orders_all: list[dict[str, Any]] = field(default_factory=list)
@@ -76,6 +100,7 @@ class NcPilotSession:
     market: MarketDataCache = field(default_factory=MarketDataCache)
     order_tracking: OrderTrackingState = field(default_factory=OrderTrackingState)
     counters: NcPilotMinuteCounters = field(default_factory=NcPilotMinuteCounters)
+    pilot: PilotRuntimeState = field(default_factory=PilotRuntimeState)
 
     def should_emit_minute_summary(self, now: float, interval_s: float = 60.0) -> bool:
         if self.runtime.next_summary_ts is None:
