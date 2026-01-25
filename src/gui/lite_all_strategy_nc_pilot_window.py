@@ -12054,6 +12054,18 @@ class NcPilotTabWidget(QWidget):
         self._handle_start()
 
     def _update_grid_preview(self) -> None:
+        required_fields = (
+            "_grid_count_input",
+            "_grid_step_input",
+            "_range_low_input",
+            "_range_high_input",
+            "_budget_input",
+            "_take_profit_input",
+            "_max_orders_input",
+            "_grid_preview_label",
+        )
+        if not all(hasattr(self, field) for field in required_fields):
+            return
         levels = int(self._grid_count_input.value())
         step = float(self._grid_step_input.value())
         range_low = float(self._range_low_input.value())
