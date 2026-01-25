@@ -1,5 +1,15 @@
 ## Technical Report
 
+### NC_MICRO v1.0.23 — Safe-call wrappers + bid/ask guards + closing watchdog safety
+- Added NC_MICRO-safe call wrapper that logs exceptions with stack traces, mirrors to crash log, and forces Pilot HOLD on handler failures.
+- Wrapped NC_MICRO QTimer timeouts and key Qt signal handlers with safe_call; added closing guards to timers/slots and watchdog paths.
+- Hardened bid/ask math paths to gate spread/edge calculations and push KPI into WAITING_BOOK when bid/ask is invalid.
+
+Manual check (NC_MICRO):
+1. Open NC_MICRO for a symbol without immediate bid/ask (or disconnect feed temporarily).
+2. Wait for `[KPI] state=WAITING_BOOK reason=no_bidask_yet` logs to appear.
+3. Confirm the window remains running (no crash) and Pilot transitions to HOLD on any injected handler exception.
+
 ### NC_MICRO v1.0.18 — Fix partial fills + TP aggregation + Stop/Cancel hardening + stale spam suppression
 - Added tradeId-based execution dedup with TTL/LRU and cumulative-fill fallback; exec logs now distinguish new vs duplicate events.
 - Switched TP to ONE-TP cancel/replace with stable clientOrderId and cumulative BUY sizing, keeping TP volume aligned with partial fills.
