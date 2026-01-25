@@ -27,6 +27,10 @@ class PilotConfig:
     trade_allowed_families: set[str] = field(default_factory=lambda: {"2LEG"})
     trade_min_profit_bps: float = 6.0
     trade_min_life_s: float = 2.0
+    min_profit_bps_2leg: float = 6.0
+    max_window_life_s: float = 10.0
+    max_price_age_ms: int = 1500
+    cooldown_after_trade_s: float = 2.0
 
 
 class PilotSettingsDialog(QDialog):
