@@ -25,8 +25,8 @@ class PilotConfig:
     allow_market_close: bool = True
     allow_guard_autofix: bool = False
     trade_allowed_families: set[str] = field(default_factory=lambda: {"2LEG"})
-    trade_min_profit_bps: float = 8.0
-    trade_min_life_s: float = 3.0
+    trade_min_profit_bps: float = 6.0
+    trade_min_life_s: float = 2.0
 
 
 class PilotSettingsDialog(QDialog):
