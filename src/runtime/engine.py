@@ -71,7 +71,6 @@ class RuntimeEngine:
             self._state = RuntimeState.RUNNING
             self._log_transition(previous, self._state, reason="start")
             self._emit_state()
-            self._price_feed_manager.register_symbol(self._symbol)
             self._price_feed_manager.subscribe(self._symbol, self._on_price_tick)
             self._price_feed_manager.subscribe_status(self._symbol, self._on_ws_status)
             self._price_feed_manager.start()
@@ -97,7 +96,6 @@ class RuntimeEngine:
             self._emit_state()
             self._price_feed_manager.unsubscribe(self._symbol, self._on_price_tick)
             self._price_feed_manager.unsubscribe_status(self._symbol, self._on_ws_status)
-            self._price_feed_manager.unregister_symbol(self._symbol)
             if cancel_orders:
                 self._order_book.cancel_all()
             previous = self._state

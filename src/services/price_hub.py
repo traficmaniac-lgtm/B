@@ -42,7 +42,6 @@ class PriceHub(QObject):
         if cleaned in self._symbols:
             return
         self._symbols.add(cleaned)
-        self._price_manager.register_symbol(cleaned)
         self._price_manager.subscribe(cleaned, self._handle_price_update)
         if not self._timer.isActive():
             self._price_manager.start()
@@ -53,7 +52,6 @@ class PriceHub(QObject):
         if cleaned in self._symbols:
             self._symbols.remove(cleaned)
             self._price_manager.unsubscribe(cleaned, self._handle_price_update)
-            self._price_manager.unregister_symbol(cleaned)
         if not self._symbols:
             self._timer.stop()
 
@@ -61,7 +59,6 @@ class PriceHub(QObject):
         self._timer.stop()
         for symbol in list(self._symbols):
             self._price_manager.unsubscribe(symbol, self._handle_price_update)
-            self._price_manager.unregister_symbol(symbol)
         self._symbols.clear()
 
     def _emit_snapshot(self) -> None:

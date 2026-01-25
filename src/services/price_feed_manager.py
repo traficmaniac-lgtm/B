@@ -1078,8 +1078,24 @@ class PriceFeedManager:
         if cleaned is None:
             return
         is_new = self._registry.add(cleaned)
+        active_count = len(self._registry.active_symbols())
+        multi = active_count > 1
         if is_new:
-            self._logger.info("subscribe %s", cleaned)
+            self._logger.info(
+                "[FEED] subscribe symbol=%s refcount=%s active=%s multi=%s",
+                cleaned,
+                self._registry.count(cleaned),
+                active_count,
+                multi,
+            )
+        else:
+            self._logger.debug(
+                "[FEED] subscribe symbol=%s refcount=%s active=%s multi=%s",
+                cleaned,
+                self._registry.count(cleaned),
+                active_count,
+                multi,
+            )
             now_ms = self._now_ms()
             initial_status = WS_CONNECTED if self._get_ws_state() == WS_STATE_CONNECTED else WS_LOST
             with self._lock:
@@ -1132,10 +1148,26 @@ class PriceFeedManager:
         if cleaned is None:
             return
         removed = self._registry.remove(cleaned)
+        active_count = len(self._registry.active_symbols())
+        multi = active_count > 1
         if removed:
-            self._logger.info("unsubscribe %s", cleaned)
+            self._logger.info(
+                "[FEED] unsubscribe symbol=%s refcount=%s active=%s multi=%s",
+                cleaned,
+                self._registry.count(cleaned),
+                active_count,
+                multi,
+            )
             with self._lock:
                 self._recent_unsubscribe_ms[cleaned] = self._now_ms()
+        else:
+            self._logger.debug(
+                "[FEED] unsubscribe symbol=%s refcount=%s active=%s multi=%s",
+                cleaned,
+                self._registry.count(cleaned),
+                active_count,
+                multi,
+            )
         self._schedule_symbol_update()
 
     def get_ws_overall_status(self) -> str:
@@ -1205,12 +1237,16 @@ class PriceFeedManager:
         cleaned = self._sanitize_symbol(symbol)
         if cleaned is None:
             return
+        should_register = False
         with self._lock:
             symbol_workers = self._tick_subscribers.setdefault(cleaned, {})
             if callback in symbol_workers:
                 return
+            should_register = True
             worker = _SubscriberWorker(callback, name=f"tick-{cleaned}-{id(callback)}")
             symbol_workers[callback] = worker
+        if should_register:
+            self.register_symbol(cleaned)
             worker.start()
 
     def unsubscribe(self, symbol: str, callback: Callable[[PriceUpdate], None]) -> None:
@@ -1224,15 +1260,18 @@ class PriceFeedManager:
                 self._tick_subscribers.pop(cleaned, None)
         if worker:
             worker.stop()
+            self.unregister_symbol(cleaned)
 
     def subscribe_status(self, symbol: str, callback: Callable[[str, str], None]) -> None:
         cleaned = self._sanitize_symbol(symbol)
         if cleaned is None:
             return
+        should_register = False
         with self._lock:
             symbol_workers = self._status_subscribers.setdefault(cleaned, {})
             if callback in symbol_workers:
                 return
+            should_register = True
 
             def _wrapped(item: tuple[str, str]) -> None:
                 status, details = item
@@ -1240,6 +1279,8 @@ class PriceFeedManager:
 
             worker = _SubscriberWorker(_wrapped, name=f"status-{cleaned}-{id(callback)}")
             symbol_workers[callback] = worker
+        if should_register:
+            self.register_symbol(cleaned)
             worker.start()
 
     def unsubscribe_status(self, symbol: str, callback: Callable[[str, str], None]) -> None:
@@ -1253,6 +1294,7 @@ class PriceFeedManager:
                 self._status_subscribers.pop(cleaned, None)
         if worker:
             worker.stop()
+            self.unregister_symbol(cleaned)
 
     def has_active_subscribers(self) -> bool:
         with self._lock:

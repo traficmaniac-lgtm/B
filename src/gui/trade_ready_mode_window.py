@@ -140,7 +140,6 @@ class TradeReadyModeWindow(QMainWindow):
     def _start_price_feed(self) -> None:
         if not self._price_feed_manager:
             return
-        self._price_feed_manager.register_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_tick)
         self._price_feed_manager.subscribe_status(self._symbol, self._emit_ws_status)
         self._price_feed_manager.start()
@@ -710,5 +709,4 @@ class TradeReadyModeWindow(QMainWindow):
         if self._price_feed_manager is not None:
             self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_tick)
             self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_ws_status)
-            self._price_feed_manager.unregister_symbol(self._symbol)
         super().closeEvent(event)
