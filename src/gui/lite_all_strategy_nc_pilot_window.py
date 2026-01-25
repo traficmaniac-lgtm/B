@@ -92,7 +92,7 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.4"
+NC_PILOT_VERSION = "v1.0.6"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 PILOT_SYMBOLS = ("EURIUSDT", "EURIEUR", "USDTUSDC", "TUSDUSDT")
@@ -2020,9 +2020,10 @@ class NcPilotTabWidget(QWidget):
 
         self._arb_signal_rows: dict[str, tuple[LedIndicator, QLabel]] = {}
         rows = [
-            ("ALGO1", "ALGO1 USDT↔USDC: route=— | — | life=—"),
-            ("ALGO2", "ALGO2 USDT↔TUSD: route=— | — | life=—"),
-            ("ALGO3", "ALGO3 EURI ANCHOR: route=— | — | life=—"),
+            ("SPREAD", "SPREAD: NO WINDOW"),
+            ("REBAL", "REBAL: NO DATA"),
+            ("2LEG", "2LEG: NO DATA"),
+            ("LOOP", "LOOP: NO DATA"),
         ]
         for row, (algo_id, text) in enumerate(rows):
             led = LedIndicator(10, group)
@@ -2396,16 +2397,16 @@ class NcPilotTabWidget(QWidget):
         self._pilot_dashboard_counters_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_dashboard_counters_label)
 
-        self._pilot_routes_table = QTableWidget(3, 7, self)
+        self._pilot_routes_table = QTableWidget(4, 7, self)
         self._pilot_routes_table.setHorizontalHeaderLabels(
             [
-                "Algo",
+                "Family",
                 "Route",
                 "Profit abs",
                 "Profit bps",
-                "Life ms",
-                "DepthOK",
-                "Suggested action",
+                "Life",
+                "Valid",
+                "Reason",
             ]
         )
         header = self._pilot_routes_table.horizontalHeader()
@@ -2417,11 +2418,11 @@ class NcPilotTabWidget(QWidget):
         self._pilot_routes_table.verticalHeader().setDefaultSectionSize(22)
         self._pilot_routes_table.setMinimumHeight(200)
         self._pilot_routes_table.cellClicked.connect(self._handle_pilot_route_click)
-        self._pilot_routes_table.setRowCount(3)
-        self._pilot_routes_table.setVerticalHeaderLabels(["ALGO1", "ALGO2", "ALGO3"])
-        self._pilot_route_rows = {"ALGO1": 0, "ALGO2": 1, "ALGO3": 2}
-        for algo_id, row in self._pilot_route_rows.items():
-            initial = [algo_id, "—", "—", "—", "—", "—", "—"]
+        self._pilot_routes_table.setRowCount(4)
+        self._pilot_routes_table.setVerticalHeaderLabels(["SPREAD", "REBAL", "2LEG", "LOOP"])
+        self._pilot_route_rows = {"SPREAD": 0, "REBAL": 1, "2LEG": 2, "LOOP": 3}
+        for family, row in self._pilot_route_rows.items():
+            initial = [family, "—", "—", "—", "—", "—", "—"]
             for column, value in enumerate(initial):
                 item = QTableWidgetItem(str(value))
                 item.setTextAlignment(Qt.AlignCenter)
@@ -2604,21 +2605,23 @@ class NcPilotTabWidget(QWidget):
         if not hasattr(self, "_pilot_routes_table") or not hasattr(self, "_pilot_route_rows"):
             return
         for snapshot in snapshots:
-            algo_id = snapshot.get("algo_id")
-            if not algo_id or algo_id not in self._pilot_route_rows:
+            family = snapshot.get("family")
+            if not family or family not in self._pilot_route_rows:
                 continue
-            row = self._pilot_route_rows[algo_id]
+            row = self._pilot_route_rows[family]
             reason = snapshot.get("reason", "")
             valid = bool(snapshot.get("valid"))
             status = self._pilot_invalid_label(reason)
+            life_ms = snapshot.get("life_ms", 0)
+            life_s = life_ms / 1000 if isinstance(life_ms, (int, float)) else 0.0
             values = [
-                algo_id,
+                family,
                 snapshot.get("route_text", "—"),
                 f"{snapshot.get('profit_abs_usdt', 0.0):+.2f}" if valid else status,
                 f"{snapshot.get('profit_bps', 0.0):+.2f}" if valid else status,
-                str(snapshot.get("life_ms", 0)),
-                "YES" if snapshot.get("depth_ok") else "NO",
-                snapshot.get("suggested_action", "—") if valid else "—",
+                f"{life_s:.1f}s",
+                "YES" if valid else "NO",
+                reason or "—",
             ]
             for column, value in enumerate(values):
                 item = self._pilot_routes_table.item(row, column)
@@ -2627,7 +2630,7 @@ class NcPilotTabWidget(QWidget):
                     item.setTextAlignment(Qt.AlignCenter)
                     self._pilot_routes_table.setItem(row, column, item)
                 item.setText(str(value))
-        self._pilot_route_snapshots = {snap.get("algo_id", ""): snap for snap in snapshots}
+        self._pilot_route_snapshots = {snap.get("family", ""): snap for snap in snapshots}
 
     def _update_arb_signals(self) -> None:
         if not hasattr(self, "_arb_signal_rows"):
@@ -2636,8 +2639,8 @@ class NcPilotTabWidget(QWidget):
             snap for snap in self._pilot_route_snapshots.values() if isinstance(snap, dict)
         ]
         for snapshot in snapshots:
-            algo_id = snapshot.get("algo_id")
-            row = self._arb_signal_rows.get(algo_id)
+            family = snapshot.get("family")
+            row = self._arb_signal_rows.get(family)
             if not row:
                 continue
             led, label = row
@@ -2646,51 +2649,46 @@ class NcPilotTabWidget(QWidget):
             life_ms = snapshot.get("life_ms", 0)
             route_text = snapshot.get("route_text", "—")
             depth_ok = bool(snapshot.get("depth_ok"))
-            age_ok = bool(snapshot.get("age_ok"))
+            age_ms = snapshot.get("age_ms")
             valid = bool(snapshot.get("valid"))
             reason = snapshot.get("reason", "")
             status = self._pilot_invalid_label(reason)
             life_s = life_ms / 1000 if isinstance(life_ms, (int, float)) else 0.0
-            if algo_id == "ALGO1":
-                prefix = "ALGO1 USDT↔USDC"
-            elif algo_id == "ALGO2":
-                prefix = "ALGO2 USDT↔TUSD"
-            else:
-                prefix = "ALGO3 EURI ANCHOR"
-            if reason == "pair_disabled":
-                route_text = "pair disabled"
-            if valid:
-                label.setText(
-                    f"{prefix}: route={route_text} | "
-                    f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
-                    f"life={life_s:.1f}s | depthOK={str(depth_ok)} ageOK={str(age_ok)}"
+            if family == "SPREAD":
+                if valid:
+                    label.setText(
+                        f"SPREAD: {snapshot.get('symbol', '—')} | "
+                        f"{profit_abs:+.2f} USDT ({profit_bps:+.2f} bps) | "
+                        f"life {life_s:.1f}s"
+                    )
+                else:
+                    label.setText(f"SPREAD: NO WINDOW ({reason})")
+                led.set_state(valid)
+                details = snapshot.get("details", {})
+                tooltip = (
+                    "SPREAD\n"
+                    f"route={route_text}\n"
+                    f"bid={details.get('bid')} ask={details.get('ask')} mid={details.get('mid')}\n"
+                    f"edge_bps={details.get('edge_bps')} age_ms={age_ms}\n"
+                    f"min_edge_bps={details.get('min_edge_bps')} max_notional={details.get('max_notional')}"
                 )
+                label.setToolTip(tooltip)
+                led.set_tooltip(tooltip)
             else:
-                label.setText(
-                    f"{prefix}: route={route_text} | {status} | "
-                    f"life={life_s:.1f}s | depthOK={str(depth_ok)} ageOK={str(age_ok)}"
-                )
-            led.set_state(valid)
-            details = snapshot.get("details", {})
-            tooltip = f"{prefix}\nroute={route_text}\n"
-            if valid:
-                tooltip += f"profit={profit_abs:+.2f} USDT ({profit_bps:+.2f} bps)\n"
-            else:
-                tooltip += f"status={status} reason={reason}\n"
-            tooltip += f"life={life_s:.1f}s depthOK={depth_ok} ageOK={age_ok}\n"
-            tooltip += f"details={details}"
-            label.setToolTip(tooltip)
-            led.set_tooltip(tooltip)
+                label.setText(f"{family}: NO DATA")
+                led.set_state(False)
+                label.setToolTip(f"{family}: NO DATA")
+                led.set_tooltip(f"{family}: NO DATA")
 
     @staticmethod
     def _pilot_invalid_label(reason: str) -> str:
         return {
-            "no_bidask": "NO DATA",
-            "no_mid": "NO DATA",
+            "no_data": "NO DATA",
             "depth": "DEPTH",
             "age": "AGE",
             "edge": "EDGE",
             "pair_disabled": "DISABLED",
+            "no_window": "NO WINDOW",
         }.get(reason, "NO DATA")
 
     def _pilot_client_order_id(
