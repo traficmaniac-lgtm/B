@@ -39,7 +39,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
-    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -911,6 +910,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._pending_tp_ids: set[str] = set()
         self._pending_restore_ids: set[str] = set()
         self._settings_state = GridSettingsState()
+        self._pilot_feature_enabled = False
         self.pilot_config = PilotConfig()
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
@@ -1198,11 +1198,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         self._fills_timer.timeout.connect(
             lambda: self._safe_call(self._refresh_fills, label="timer:fills")
         )
-        self._pilot_ui_timer = QTimer(self)
-        self._pilot_ui_timer.setInterval(750)
-        self._pilot_ui_timer.timeout.connect(
-            lambda: self._safe_call(self._update_pilot_panel, label="timer:pilot_ui")
-        )
+        self._pilot_ui_timer: QTimer | None = None
+        if self._pilot_feature_enabled:
+            self._pilot_ui_timer = QTimer(self)
+            self._pilot_ui_timer.setInterval(750)
+            self._pilot_ui_timer.timeout.connect(
+                lambda: self._safe_call(self._update_pilot_panel, label="timer:pilot_ui")
+            )
         self._market_kpi_timer = QTimer(self)
         self._market_kpi_timer.setInterval(500)
         self._market_kpi_timer.timeout.connect(
@@ -1232,12 +1234,13 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self._apply_trade_gate()
-        self._pilot_ui_timer.start()
+        if self._pilot_ui_timer is not None:
+            self._pilot_ui_timer.start()
         self._market_kpi_timer.start()
         self._registry_gc_timer.start()
         self._order_age_timer.start()
 
-        self._price_feed_manager.register_symbol(self._symbol)
+        self._price_feed_manager.ensure_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
         self._price_feed_manager.start()
@@ -1601,10 +1604,11 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _apply_micro_defaults(self, *, reason: str) -> None:
         self._settings_state = self._micro_grid_defaults()
         self._manual_grid_step_pct = self._settings_state.grid_step_pct
-        self._apply_pilot_defaults()
+        if self._pilot_feature_enabled:
+            self._apply_pilot_defaults()
         self._append_log(f"[SETTINGS] defaults applied reason={reason}", kind="INFO")
-        if self._is_micro_profile():
-            self._append_log("[PILOT] micro_defaults_applied=true", kind="INFO")
+        if self._pilot_feature_enabled and self._is_micro_profile():
+            self._append_log("[NC_MICRO] micro_defaults_applied=true", kind="INFO")
         self._save_settings_to_disk()
 
     def _apply_pilot_defaults(self) -> None:
@@ -1757,154 +1761,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         summary_layout.setColumnStretch(1, 1)
         layout.addWidget(summary_frame)
         layout.addWidget(self._rules_label)
-        algo_pilot_frame = QGroupBox("NC MICRO")
-        algo_pilot_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        algo_pilot_frame.setMinimumHeight(260)
-        algo_pilot_layout = QVBoxLayout(algo_pilot_frame)
-        algo_pilot_layout.setContentsMargins(6, 6, 6, 6)
-        algo_pilot_layout.setSpacing(4)
-
-        metrics_widget = QWidget(algo_pilot_frame)
-        metrics_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        metrics_widget.setMinimumHeight(220)
-        indicator_grid = QGridLayout(metrics_widget)
-        indicator_grid.setHorizontalSpacing(8)
-        indicator_grid.setVerticalSpacing(2)
-
-        self._pilot_state_value = QLabel(self._pilot_state_label(self._pilot_state))
-        self._pilot_regime_value = QLabel("Диапазон")
-        self._pilot_anchor_value = QLabel("—")
-        self._pilot_distance_value = QLabel("—")
-        self._pilot_threshold_value = QLabel(f"{RECENTER_THRESHOLD_PCT:.2f} %")
-        self._pilot_position_qty_value = QLabel("—")
-        self._pilot_avg_entry_value = QLabel("—")
-        self._pilot_break_even_value = QLabel("—")
-        self._pilot_unrealized_value = QLabel("—")
-        self._pilot_orders_total_value = QLabel("—")
-        self._pilot_orders_buy_value = QLabel("—")
-        self._pilot_orders_sell_value = QLabel("—")
-        self._pilot_orders_oldest_value = QLabel("—")
-        self._pilot_orders_threshold_value = QLabel("—")
-        self._pilot_orders_stale_value = QLabel("—")
-        self._pilot_orders_warning_value = QLabel("—")
-        self._pilot_orders_warning_value.setStyleSheet("color: #111827; font-weight: 600;")
-
-        def make_key_label(text: str) -> QLabel:
-            label = QLabel(text)
-            label.setFixedWidth(170)
-            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            return label
-
-        def configure_value_label(label: QLabel, wrap: bool = False) -> None:
-            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            label.setWordWrap(wrap)
-            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            label.setMinimumWidth(160)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            if hasattr(label, "setTextElideMode"):
-                label.setTextElideMode(Qt.ElideRight)
-
-        value_labels = [
-            self._pilot_state_value,
-            self._pilot_regime_value,
-            self._pilot_anchor_value,
-            self._pilot_distance_value,
-            self._pilot_threshold_value,
-            self._pilot_position_qty_value,
-            self._pilot_avg_entry_value,
-            self._pilot_break_even_value,
-            self._pilot_unrealized_value,
-            self._pilot_orders_total_value,
-            self._pilot_orders_buy_value,
-            self._pilot_orders_sell_value,
-            self._pilot_orders_oldest_value,
-            self._pilot_orders_threshold_value,
-            self._pilot_orders_stale_value,
-        ]
-        for value_label in value_labels:
-            configure_value_label(value_label)
-        configure_value_label(self._pilot_orders_warning_value, wrap=True)
-
-        indicator_rows = [
-            ("Состояние пилота:", self._pilot_state_value),
-            ("Режим рынка:", self._pilot_regime_value),
-            ("Якорная цена:", self._pilot_anchor_value),
-            ("Отклонение от якоря %:", self._pilot_distance_value),
-            ("Порог %:", self._pilot_threshold_value),
-            ("Размер позиции:", self._pilot_position_qty_value),
-            ("Средняя цена входа:", self._pilot_avg_entry_value),
-            ("Цена безубытка:", self._pilot_break_even_value),
-            ("Нереализованный PnL:", self._pilot_unrealized_value),
-            ("Открытых ордеров:", self._pilot_orders_total_value),
-            ("Покупка:", self._pilot_orders_buy_value),
-            ("Продажа:", self._pilot_orders_sell_value),
-            ("Самый старый ордер:", self._pilot_orders_oldest_value),
-            ("Порог устаревания:", self._pilot_orders_threshold_value),
-            ("Устаревшие:", self._pilot_orders_stale_value),
-            ("Предупреждение:", self._pilot_orders_warning_value),
-        ]
-
-        for row, (key_text, value_label) in enumerate(indicator_rows):
-            indicator_grid.addWidget(make_key_label(key_text), row, 0)
-            indicator_grid.addWidget(value_label, row, 1)
-
-        indicator_grid.setColumnStretch(1, 1)
-        algo_pilot_layout.addWidget(metrics_widget, stretch=0)
-        algo_pilot_layout.addSpacing(6)
-
-        self._pilot_status_label = QLabel(self._pilot_status_text())
-        self._pilot_status_label.setStyleSheet("color: #111827; font-weight: 600;")
-        self._pilot_enable_button = QPushButton("▶ Пилот ВКЛ")
-        self._pilot_enable_button.clicked.connect(self._handle_pilot_enable)
-        self._pilot_disable_button = QPushButton("⏹ Пилот ВЫКЛ")
-        self._pilot_disable_button.clicked.connect(self._handle_pilot_disable)
-        self._pilot_settings_button = QPushButton("⚙ Настройки пилота")
-        self._pilot_settings_button.clicked.connect(self._handle_pilot_settings)
-        self._pilot_settings_button.setVisible(False)
-        self._pilot_enable_button.setToolTip("Включить пилот (авто-действия активны).")
-        self._pilot_disable_button.setToolTip("Выключить пилот (авто-действия отключены).")
-        self._pilot_settings_button.setToolTip("Открыть настройки пилота.")
-        self._pilot_action_status_label = QLabel("Статус: —")
-        self._pilot_action_status_label.setStyleSheet("color: #6b7280; font-size: 11px;")
-
-        buttons_widget = QWidget(algo_pilot_frame)
-        buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        pilot_buttons_layout = QVBoxLayout(buttons_widget)
-        pilot_buttons_layout.setSpacing(6)
-        for button in (
-            self._pilot_enable_button,
-            self._pilot_disable_button,
-            self._pilot_settings_button,
-        ):
-            button.setMinimumHeight(34)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        pilot_buttons_layout.addWidget(self._pilot_status_label)
-        controls_row = QHBoxLayout()
-        controls_row.setSpacing(6)
-        controls_row.addWidget(self._pilot_enable_button)
-        controls_row.addWidget(self._pilot_disable_button)
-        controls_row.addWidget(self._pilot_settings_button)
-        pilot_buttons_layout.addLayout(controls_row)
-        pilot_buttons_layout.addSpacing(4)
-        pilot_buttons_layout.addWidget(self._pilot_action_status_label)
-        pilot_buttons_layout.addStretch(1)
-        algo_pilot_layout.addWidget(buttons_widget, stretch=0)
-
-        algo_scroll = QScrollArea(group)
-        algo_scroll.setWidgetResizable(True)
-        algo_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        algo_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        algo_scroll.setFrameShape(QFrame.NoFrame)
-        algo_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-        algo_container = QWidget(algo_scroll)
-        algo_container_layout = QVBoxLayout(algo_container)
-        algo_container_layout.setContentsMargins(0, 0, 0, 0)
-        algo_container_layout.setSpacing(0)
-        algo_container_layout.addWidget(algo_pilot_frame)
-        algo_scroll.setWidget(algo_container)
-
-        layout.addWidget(algo_scroll, stretch=1)
+        layout.addStretch(1)
         return group
 
     def _build_grid_panel(self) -> QWidget:
@@ -2254,12 +2111,14 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         dialog.exec()
 
     def _apply_pilot_config(self, config: PilotConfig) -> None:
+        if not self._pilot_feature_enabled:
+            return
         self.pilot_config = config
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(config.stale_policy)
         self._pilot_allow_market = config.allow_market_close
         self._append_log(
             (
-                "[PILOT] settings updated "
+                "[NC_MICRO] settings updated "
                 f"min_profit_bps={config.min_profit_bps:.2f} "
                 f"max_step_pct={config.max_step_pct:.2f} "
                 f"max_range_pct={config.max_range_pct:.2f} "
@@ -2281,6 +2140,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return mapping.get(value.upper(), StalePolicy.CANCEL_REPLACE_STALE)
 
     def _set_pilot_enabled(self, enabled: bool) -> None:
+        if not self._pilot_feature_enabled:
+            return
         if self.pilot_enabled == enabled:
             return
         self.pilot_enabled = enabled
@@ -2300,7 +2161,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
         return "Пилот: ON (MICRO)" if self.pilot_enabled else "Пилот: OFF"
 
     def _log_pilot_disabled(self) -> None:
-        self._append_log("[PILOT] disabled, guard=warn_only", kind="INFO")
+        if self._pilot_feature_enabled:
+            self._append_log("[NC_MICRO] guard=warn_only", kind="INFO")
 
     def _pilot_min_sell_qty(self) -> Decimal:
         step = self._rule_decimal(self._exchange_rules.get("step"))
@@ -3614,6 +3476,8 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         prev = self._pilot_state
         self._pilot_state = state
+        if not self._pilot_feature_enabled:
+            return
         reason_text = reason or "unknown"
         self._append_log(
             f"[PILOT] transition {prev.value} -> {state.value} reason={reason_text}",
@@ -6621,7 +6485,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
                 should_log = True
             if should_log:
                 self._append_log(
-                    f"[PILOT] budget capped {settings.budget:.2f} -> {max_budget:.2f} ({reason})",
+                    f"[NC_MICRO] budget capped {settings.budget:.2f} -> {max_budget:.2f} ({reason})",
                     kind="INFO",
                 )
                 self._pilot_budget_cap_last_value = max_budget
@@ -11078,7 +10942,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _stop_local_timers(self) -> None:
         if self._market_kpi_timer.isActive():
             self._market_kpi_timer.stop()
-        if self._pilot_ui_timer.isActive():
+        if self._pilot_ui_timer is not None and self._pilot_ui_timer.isActive():
             self._pilot_ui_timer.stop()
         if self._registry_gc_timer.isActive():
             self._registry_gc_timer.stop()
@@ -11099,7 +10963,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
     def _resume_local_timers(self) -> None:
         if not self._market_kpi_timer.isActive():
             self._market_kpi_timer.start()
-        if not self._pilot_ui_timer.isActive():
+        if self._pilot_ui_timer is not None and not self._pilot_ui_timer.isActive():
             self._pilot_ui_timer.start()
         if not self._registry_gc_timer.isActive():
             self._registry_gc_timer.start()
@@ -11128,7 +10992,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             return
         self._feed_active = True
         self._price_feed_manager.start()
-        self._price_feed_manager.register_symbol(self._symbol)
+        self._price_feed_manager.ensure_symbol(self._symbol)
         self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
         self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
 

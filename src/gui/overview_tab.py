@@ -238,6 +238,7 @@ class OverviewTab(QWidget):
         self._symbol_stream_timer.setSingleShot(True)
         self._symbol_stream_timer.timeout.connect(self._apply_pending_symbol_stream)
         self._pending_symbol: str | None = None
+        self._allow_streaming = False
         self._price_update_in_flight = False
         self._selected_symbol: str | None = None
         self._latest_price_updates: dict[str, PriceUpdate] = {}
@@ -295,7 +296,6 @@ class OverviewTab(QWidget):
         layout.addWidget(splitter)
 
         self.setLayout(layout)
-        self._sync_favorite_streams()
         self.refresh_account_status()
 
     def _build_status_row(self) -> QHBoxLayout:
@@ -645,6 +645,10 @@ class OverviewTab(QWidget):
         self._latest_price_updates[update.symbol] = update
 
     def _schedule_selected_symbol(self, symbol: str | None) -> None:
+        if not self._allow_streaming:
+            self._selected_symbol = None
+            self._stop_selected_symbol_stream()
+            return
         self._pending_symbol = symbol
         self._symbol_stream_timer.start()
 
@@ -657,6 +661,8 @@ class OverviewTab(QWidget):
             self._stop_selected_symbol_stream()
 
     def _start_selected_symbol_stream(self, symbol: str) -> None:
+        if not self._allow_streaming:
+            return
         if self._selected_symbol == symbol:
             return
         if self._selected_symbol:
@@ -680,6 +686,8 @@ class OverviewTab(QWidget):
         self._update_price_timer()
 
     def _subscribe_symbol(self, symbol: str, *, include_status: bool = False) -> None:
+        if not self._allow_streaming:
+            return
         if symbol not in self._active_streams:
             self._price_manager.register_symbol(symbol)
             self._price_manager.subscribe(symbol, self._handle_price_update)
@@ -696,6 +704,16 @@ class OverviewTab(QWidget):
         self._latest_price_updates.pop(symbol, None)
 
     def _sync_favorite_streams(self) -> None:
+        if not self._allow_streaming:
+            for symbol in list(self._status_streams):
+                self._price_manager.unsubscribe_status(symbol, self._emit_ws_status)
+            for symbol in list(self._active_streams):
+                self._price_manager.unsubscribe(symbol, self._handle_price_update)
+                self._price_manager.unregister_symbol(symbol)
+            self._status_streams.clear()
+            self._active_streams.clear()
+            self._update_price_timer()
+            return
         for symbol in sorted(self._favorite_symbols):
             self._subscribe_symbol(symbol)
         if self._favorite_symbols:

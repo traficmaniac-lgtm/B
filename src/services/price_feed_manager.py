@@ -1121,6 +1121,9 @@ class PriceFeedManager:
         self._schedule_symbol_update()
         self._ensure_exchange_info_loaded()
 
+    def ensure_symbol(self, symbol: str) -> None:
+        self.register_symbol(symbol)
+
     def unregister_symbol(self, symbol: str) -> None:
         if self._stopping or self._shutting_down:
             self._logger.debug("unregister_symbol ignored during stop: %s", symbol)
