@@ -8,6 +8,29 @@ from typing import Any, Iterable, Literal
 FamilyLiteral = Literal["SPREAD", "REBAL", "2LEG", "LOOP"]
 
 
+def resolve_leg_market(
+    from_asset: str,
+    to_asset: str,
+    available_symbols: Iterable[str] | None = None,
+) -> tuple[str | None, Literal["BUY", "SELL"], bool]:
+    base = str(from_asset).upper()
+    quote = str(to_asset).upper()
+    direct = (f"{base}{quote}", f"{base}/{quote}")
+    inverse = (f"{quote}{base}", f"{quote}/{base}")
+    if available_symbols is None:
+        return direct[0], "SELL", False
+    lookup = {str(symbol).upper(): str(symbol) for symbol in available_symbols}
+    for candidate in direct:
+        resolved = lookup.get(candidate.upper())
+        if resolved:
+            return resolved, "SELL", False
+    for candidate in inverse:
+        resolved = lookup.get(candidate.upper())
+        if resolved:
+            return resolved, "BUY", True
+    return None, "SELL", False
+
+
 @dataclass
 class PilotWindow:
     family: FamilyLiteral
@@ -334,10 +357,8 @@ class TwoLegFamilyScanner(BaseFamilyScanner):
         candidates: list[PilotWindow] = []
         reasons: list[str] = []
         start_usdt = 100.0
-        euri_quote = snapshot.quote("EURIUSDT")
-        euri_mid = None
-        if euri_quote and euri_quote.bid and euri_quote.ask:
-            euri_mid = (euri_quote.bid + euri_quote.ask) / 2
+
+        available_symbols = snapshot.quotes.keys()
 
         def _needs(symbol: str) -> PilotMarketQuote | None:
             quote = snapshot.quote(symbol)
@@ -352,22 +373,58 @@ class TwoLegFamilyScanner(BaseFamilyScanner):
                 return None
             return quote
 
-        usdc = _needs("USDCUSDT")
-        tusd = _needs("TUSDUSDT")
-        euri = _needs("EURIUSDT")
-        eureuri = _needs("EUREURI")
+        def _resolve_leg(
+            from_asset: str,
+            to_asset: str,
+        ) -> tuple[str, Literal["BUY", "SELL"], bool, float, float, float, float] | None:
+            symbol, side, invert = resolve_leg_market(from_asset, to_asset, available_symbols)
+            if not symbol:
+                reasons.append("no_data")
+                return None
+            quote = _needs(symbol)
+            if not quote or quote.bid is None or quote.ask is None:
+                return None
+            bid = float(quote.bid)
+            ask = float(quote.ask)
+            eff_bid = bid
+            eff_ask = ask
+            if invert:
+                if bid <= 0 or ask <= 0:
+                    reasons.append("no_bidask")
+                    return None
+                eff_bid = 1 / ask
+                eff_ask = 1 / bid
+            return symbol, side, invert, bid, ask, eff_bid, eff_ask
 
-        if usdc and tusd:
+        def _leg_amount(
+            amount_in: float,
+            side: Literal["BUY", "SELL"],
+            eff_bid: float,
+            eff_ask: float,
+        ) -> float:
+            if side == "SELL":
+                return amount_in * eff_bid
+            return amount_in / eff_ask
+
+        usdc_leg = _resolve_leg("USDC", "USDT")
+        tusd_leg = _resolve_leg("USDT", "TUSD")
+        euri_leg = _resolve_leg("EURI", "USDT")
+        eureuri_leg = _resolve_leg("EUR", "EURI")
+        euri_mid = None
+        if euri_leg:
+            euri_mid = (euri_leg[5] + euri_leg[6]) / 2
+
+        if usdc_leg and tusd_leg:
             amount_usdc = start_usdt
-            usdt = _apply_cost(amount_usdc * usdc.bid, self._cost_bps)
-            tusd_out = _apply_cost(usdt / tusd.ask, self._cost_bps)
+            usdt = _apply_cost(_leg_amount(amount_usdc, usdc_leg[1], usdc_leg[5], usdc_leg[6]), self._cost_bps)
+            tusd_out = _apply_cost(_leg_amount(usdt, tusd_leg[1], tusd_leg[5], tusd_leg[6]), self._cost_bps)
             end_usdt = tusd_out
             profit_bps = (end_usdt - start_usdt) / start_usdt * 10000
             candidates.append(
                 PilotWindow(
                     family="2LEG",
                     route="USDC→USDT→TUSD",
-                    symbols=["USDCUSDT", "TUSDUSDT"],
+                    symbols=[usdc_leg[0], tusd_leg[0]],
                     profit_abs=end_usdt - start_usdt,
                     profit_bps=profit_bps,
                     max_notional=start_usdt,
@@ -379,17 +436,17 @@ class TwoLegFamilyScanner(BaseFamilyScanner):
                     details={"start_usdt": start_usdt, "end_usdt": end_usdt},
                 )
             )
-        if usdc and tusd:
+        if usdc_leg and tusd_leg:
             amount_tusd = start_usdt
-            usdt = _apply_cost(amount_tusd * tusd.bid, self._cost_bps)
-            usdc_out = _apply_cost(usdt / usdc.ask, self._cost_bps)
+            usdt = _apply_cost(_leg_amount(amount_tusd, tusd_leg[1], tusd_leg[5], tusd_leg[6]), self._cost_bps)
+            usdc_out = _apply_cost(_leg_amount(usdt, usdc_leg[1], usdc_leg[5], usdc_leg[6]), self._cost_bps)
             end_usdt = usdc_out
             profit_bps = (end_usdt - start_usdt) / start_usdt * 10000
             candidates.append(
                 PilotWindow(
                     family="2LEG",
                     route="TUSD→USDT→USDC",
-                    symbols=["TUSDUSDT", "USDCUSDT"],
+                    symbols=[tusd_leg[0], usdc_leg[0]],
                     profit_abs=end_usdt - start_usdt,
                     profit_bps=profit_bps,
                     max_notional=start_usdt,
@@ -401,17 +458,17 @@ class TwoLegFamilyScanner(BaseFamilyScanner):
                     details={"start_usdt": start_usdt, "end_usdt": end_usdt},
                 )
             )
-        if euri and eureuri and euri_mid:
+        if euri_leg and eureuri_leg and euri_mid:
             start_eur = 100.0
-            euri_out = _apply_cost(start_eur * eureuri.bid, self._cost_bps)
-            end_usdt = _apply_cost(euri_out * euri.bid, self._cost_bps)
+            euri_out = _apply_cost(_leg_amount(start_eur, eureuri_leg[1], eureuri_leg[5], eureuri_leg[6]), self._cost_bps)
+            end_usdt = _apply_cost(_leg_amount(euri_out, euri_leg[1], euri_leg[5], euri_leg[6]), self._cost_bps)
             start_usdt_value = start_eur * euri_mid
             profit_bps = (end_usdt - start_usdt_value) / start_usdt_value * 10000
             candidates.append(
                 PilotWindow(
                     family="2LEG",
                     route="EUR→EURI→USDT",
-                    symbols=["EUREURI", "EURIUSDT"],
+                    symbols=[eureuri_leg[0], euri_leg[0]],
                     profit_abs=end_usdt - start_usdt_value,
                     profit_bps=profit_bps,
                     max_notional=start_usdt_value,
@@ -423,17 +480,17 @@ class TwoLegFamilyScanner(BaseFamilyScanner):
                     details={"start_usdt": start_usdt_value, "end_usdt": end_usdt},
                 )
             )
-        if euri and eureuri and euri_mid:
+        if euri_leg and eureuri_leg and euri_mid:
             start_usdt_value = start_usdt
-            euri_out = _apply_cost(start_usdt_value / euri.ask, self._cost_bps)
-            eur_out = _apply_cost(euri_out / eureuri.ask, self._cost_bps)
+            euri_out = _apply_cost(_leg_amount(start_usdt_value, euri_leg[1], euri_leg[5], euri_leg[6]), self._cost_bps)
+            eur_out = _apply_cost(_leg_amount(euri_out, eureuri_leg[1], eureuri_leg[5], eureuri_leg[6]), self._cost_bps)
             end_usdt = eur_out * euri_mid
             profit_bps = (end_usdt - start_usdt_value) / start_usdt_value * 10000
             candidates.append(
                 PilotWindow(
                     family="2LEG",
                     route="USDT→EURI→EUR",
-                    symbols=["EURIUSDT", "EUREURI"],
+                    symbols=[euri_leg[0], eureuri_leg[0]],
                     profit_abs=end_usdt - start_usdt_value,
                     profit_bps=profit_bps,
                     max_notional=start_usdt_value,
