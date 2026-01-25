@@ -92,7 +92,10 @@ class PilotRuntimeState:
     last_skip_log_ts: float | None = None
     last_route_log_ts: float | None = None
     last_exec_ts: float | None = None
+    last_hold_log_ts: float | None = None
     order_client_ids: set[str] = field(default_factory=set)
+    trade_enabled_families: set[str] = field(default_factory=lambda: {"2LEG"})
+    trade_block_log_ts: dict[str, float] = field(default_factory=dict)
     selected_symbols: set[str] = field(default_factory=lambda: set(PILOT_DEFAULT_SYMBOLS))
     symbol_aliases: dict[str, str] = field(default_factory=dict)
     invalid_symbols: dict[str, str] = field(default_factory=dict)

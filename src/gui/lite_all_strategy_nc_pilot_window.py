@@ -92,10 +92,11 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.9"
+NC_PILOT_VERSION = "v1.0.11"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
+PILOT_BALANCE_ASSETS = ("USDT", "USDC", "EURI", "EUR")
 
 
 @dataclass
@@ -1001,6 +1002,7 @@ class NcPilotTabWidget(QWidget):
         self._pilot_market_cache_ttls = {
             "book_ticker": 1.5,
             "orderbook_depth_50": 2.0,
+            "exchange_info": 3600.0,
         }
         if self._has_api_keys:
             self._account_client = BinanceAccountClient(
@@ -1029,6 +1031,7 @@ class NcPilotTabWidget(QWidget):
         self._open_orders_all = self._session.order_tracking.open_orders_all
         self._open_orders_loaded = False
         self._pilot_virtual_orders: list[dict[str, Any]] = []
+        self._pilot_order_symbols: dict[str, str] = {}
         self._bot_order_ids: set[str] = set()
         self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
@@ -1777,15 +1780,16 @@ class NcPilotTabWidget(QWidget):
             if normalized:
                 self.pilot_config.trade_allowed_families = normalized
         trade_min_profit = self._coerce_float(
-            pilot.get("trade_min_profit_bps", getattr(self.pilot_config, "trade_min_profit_bps", 8.0))
+            pilot.get("trade_min_profit_bps", getattr(self.pilot_config, "trade_min_profit_bps", 6.0))
         )
         if trade_min_profit is not None:
             self.pilot_config.trade_min_profit_bps = trade_min_profit
         trade_min_life = self._coerce_float(
-            pilot.get("trade_min_life_s", getattr(self.pilot_config, "trade_min_life_s", 3.0))
+            pilot.get("trade_min_life_s", getattr(self.pilot_config, "trade_min_life_s", 2.0))
         )
         if trade_min_life is not None:
             self.pilot_config.trade_min_life_s = trade_min_life
+        self._sync_pilot_trade_families(self.pilot_config.trade_allowed_families)
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         selected_symbols = pilot.get("selected_symbols")
@@ -1862,8 +1866,9 @@ class NcPilotTabWidget(QWidget):
         if hasattr(self.pilot_config, "allow_guard_autofix"):
             self.pilot_config.allow_guard_autofix = False
         self.pilot_config.trade_allowed_families = {"2LEG"}
-        self.pilot_config.trade_min_profit_bps = 8.0
-        self.pilot_config.trade_min_life_s = 3.0
+        self.pilot_config.trade_min_profit_bps = 6.0
+        self.pilot_config.trade_min_life_s = 2.0
+        self._sync_pilot_trade_families(self.pilot_config.trade_allowed_families)
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
 
@@ -2258,16 +2263,7 @@ class NcPilotTabWidget(QWidget):
         fixed_font.setStyleHint(QFont.Monospace)
         fixed_font.setFixedPitch(True)
 
-        self._balance_quote_label = QLabel(
-            tr(
-                "runtime_account_line",
-                quote="—",
-                base="—",
-                equity="—",
-                quote_asset="—",
-                base_asset="—",
-            )
-        )
+        self._balance_quote_label = QLabel("Pilot Balances: —")
         self._balance_quote_label.setFont(fixed_font)
         self._balance_bot_label = QLabel(
             tr("runtime_bot_line", used="—", free="—", locked="—")
@@ -2375,6 +2371,24 @@ class NcPilotTabWidget(QWidget):
         self._pilot_status_line = QLabel("state=IDLE | best=— | edge=— bps | last=—")
         self._pilot_status_line.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_status_line)
+
+        trade_title = QLabel("Торговать:")
+        trade_title.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
+        layout.addWidget(trade_title)
+        trade_layout = QGridLayout()
+        trade_layout.setHorizontalSpacing(6)
+        trade_layout.setVerticalSpacing(2)
+        self._pilot_trade_family_checkboxes: dict[str, QCheckBox] = {}
+        enabled_families = {family.upper() for family in self._session.pilot.trade_enabled_families}
+        for idx, family in enumerate(("2LEG", "SPREAD", "REBAL", "LOOP")):
+            checkbox = QCheckBox(family)
+            checkbox.setChecked(family in enabled_families)
+            checkbox.stateChanged.connect(self._update_pilot_trade_families)
+            self._pilot_trade_family_checkboxes[family] = checkbox
+            row = idx // 2
+            col = idx % 2
+            trade_layout.addWidget(checkbox, row, col)
+        layout.addLayout(trade_layout)
 
         pairs_title = QLabel("Пары пилота")
         pairs_title.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
@@ -2590,6 +2604,35 @@ class NcPilotTabWidget(QWidget):
         self._schedule_settings_save()
         self._update_arb_signals()
 
+    def _format_trade_families_log(self, families: set[str]) -> str:
+        formatted = ", ".join(f"'{family}'" for family in sorted(families))
+        return f"{{{formatted}}}"
+
+    def _sync_pilot_trade_families(self, families: set[str] | None = None, *, log: bool = False) -> None:
+        if families is None:
+            families = {str(item).upper() for item in self.pilot_config.trade_allowed_families if item}
+        normalized = {family.upper() for family in families if family}
+        self._session.pilot.trade_enabled_families = normalized
+        self.pilot_config.trade_allowed_families = set(normalized)
+        if hasattr(self, "_pilot_trade_family_checkboxes"):
+            for family, checkbox in self._pilot_trade_family_checkboxes.items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(family in normalized)
+                checkbox.blockSignals(False)
+        if log:
+            self._append_pilot_log(
+                f"[PILOT_CFG] trade_families={self._format_trade_families_log(normalized)}"
+            )
+
+    def _update_pilot_trade_families(self) -> None:
+        if not hasattr(self, "_pilot_trade_family_checkboxes"):
+            return
+        families = {
+            family for family, checkbox in self._pilot_trade_family_checkboxes.items() if checkbox.isChecked()
+        }
+        self._sync_pilot_trade_families(families, log=True)
+        self._save_settings_to_disk()
+
     def _update_pilot_status_line(self) -> None:
         if not hasattr(self, "_pilot_status_line"):
             return
@@ -2762,6 +2805,7 @@ class NcPilotTabWidget(QWidget):
                 }
             )
             self._session.pilot.order_client_ids.add(client_order_id)
+            self._pilot_order_symbols[client_order_id] = self._symbol
             return True
         response, error, status = self._place_limit(
             side,
@@ -2775,9 +2819,110 @@ class NcPilotTabWidget(QWidget):
         )
         if response:
             self._session.pilot.order_client_ids.add(client_order_id)
+            self._pilot_order_symbols[client_order_id] = self._symbol
             return True
         if error and status != "skip_duplicate_exchange":
             self._append_log(str(error), kind="WARN")
+        return False
+
+    def _send_pilot_order_for_symbol(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        price: Decimal,
+        qty: Decimal,
+        client_order_id: str,
+        arb_id: str,
+        leg_index: int,
+        leg_type: str,
+        dry_run: bool,
+    ) -> bool:
+        if symbol == self._symbol:
+            return self._send_pilot_order(
+                side=side,
+                price=price,
+                qty=qty,
+                client_order_id=client_order_id,
+                arb_id=arb_id,
+                leg_index=leg_index,
+                leg_type=leg_type,
+                dry_run=dry_run,
+            )
+        rules = self._pilot_exchange_rules(symbol)
+        if rules is None:
+            self._append_log(f"[PILOT] order skipped missing_rules symbol={symbol}", kind="WARN")
+            return False
+        tick = self._rule_decimal(rules.get("tick"))
+        step = self._rule_decimal(rules.get("step"))
+        min_notional = self._rule_decimal(rules.get("min_notional"))
+        min_qty = self._rule_decimal(rules.get("min_qty"))
+        max_qty = self._rule_decimal(rules.get("max_qty"))
+        price = self.q_price(price, tick)
+        qty = self.q_qty(qty, step)
+        if min_qty is not None and qty < min_qty:
+            self._append_log(
+                (
+                    f"[PILOT] order skipped minQty symbol={symbol} "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                ),
+                kind="WARN",
+            )
+            return False
+        if max_qty is not None and qty > max_qty:
+            qty = self.q_qty(max_qty, step)
+        notional = price * qty
+        if min_notional is not None and price > 0 and notional < min_notional:
+            self._append_log(
+                (
+                    f"[PILOT] order skipped minNotional symbol={symbol} "
+                    f"side={side} price={self.fmt_price(price, tick)} qty={self.fmt_qty(qty, step)}"
+                ),
+                kind="WARN",
+            )
+            return False
+        price_text = self.fmt_price(price, tick)
+        qty_text = self.fmt_qty(qty, step)
+        self._append_log(
+            (
+                f"[EXEC] arb_id={arb_id} leg={leg_index} {leg_type} symbol={symbol} "
+                f"side={side} price={price_text} qty={qty_text} dry={str(dry_run).lower()}"
+            ),
+            kind="INFO",
+        )
+        if dry_run:
+            self._append_pilot_virtual_order(
+                {
+                    "orderId": client_order_id,
+                    "clientOrderId": client_order_id,
+                    "symbol": symbol,
+                    "side": f"{side} [DRY]",
+                    "price": price_text,
+                    "origQty": qty_text,
+                    "executedQty": "[DRY]",
+                    "status": "NEW",
+                    "time": int(time_fn() * 1000),
+                }
+            )
+            self._session.pilot.order_client_ids.add(client_order_id)
+            self._pilot_order_symbols[client_order_id] = symbol
+            return True
+        try:
+            response = self._place_limit_order_sync(
+                symbol=symbol,
+                side=side,
+                price=price_text,
+                quantity=qty_text,
+                time_in_force="GTC",
+                new_client_order_id=client_order_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[PILOT] order error symbol={symbol} {exc}", kind="WARN")
+            return False
+        if response:
+            self._session.pilot.order_client_ids.add(client_order_id)
+            self._pilot_order_symbols[client_order_id] = symbol
+            return True
         return False
 
     def _append_pilot_virtual_order(self, order: dict[str, Any]) -> None:
@@ -2790,29 +2935,46 @@ class NcPilotTabWidget(QWidget):
             count = len(self._pilot_virtual_orders)
             self._pilot_virtual_orders.clear()
             self._session.pilot.order_client_ids.clear()
+            self._pilot_order_symbols.clear()
             snapshot = self._build_orders_snapshot(self._open_orders)
             self._set_orders_snapshot(snapshot, reason="pilot_cancel_dry_run")
             return count
         canceled = 0
+        seen_client_ids: set[str] = set()
         for order in list(self._open_orders):
             if not isinstance(order, dict):
                 continue
             client_id = str(order.get("clientOrderId", ""))
             if not client_id.startswith("PILOT|"):
                 continue
+            seen_client_ids.add(client_id)
             order_id = str(order.get("orderId", ""))
             if order_id:
                 ok, _error, _outcome = self._cancel_order_idempotent(order_id)
                 if ok:
                     canceled += 1
                     self._session.pilot.order_client_ids.discard(client_id)
+                    self._pilot_order_symbols.pop(client_id, None)
             else:
                 try:
                     self._cancel_order_sync(symbol=self._symbol, orig_client_order_id=client_id)
                     canceled += 1
                     self._session.pilot.order_client_ids.discard(client_id)
+                    self._pilot_order_symbols.pop(client_id, None)
                 except Exception:  # noqa: BLE001
                     continue
+        for client_id, symbol in list(self._pilot_order_symbols.items()):
+            if client_id in seen_client_ids:
+                continue
+            if not client_id.startswith("PILOT|"):
+                continue
+            try:
+                self._cancel_order_sync(symbol=symbol, orig_client_order_id=client_id)
+                canceled += 1
+                self._session.pilot.order_client_ids.discard(client_id)
+                self._pilot_order_symbols.pop(client_id, None)
+            except Exception:  # noqa: BLE001
+                continue
         return canceled
 
     def _apply_pilot_config(self, config: PilotConfig) -> None:
@@ -5756,16 +5918,12 @@ class NcPilotTabWidget(QWidget):
         label.setStyleSheet("color: #f3f4f6; font-size: 11px;")
 
     def _update_runtime_balances(self) -> None:
-        if self._balances_loaded and self._quote_asset and self._base_asset:
+        if self._balances_loaded:
+            balances_line = self._format_pilot_balances_line()
+        else:
+            balances_line = "Pilot Balances: —"
+        if self._balances_loaded and self._quote_asset:
             quote_total = self._asset_total(self._quote_asset)
-            base_total = self._asset_total(self._base_asset)
-            quote_text = f"{quote_total:.2f}"
-            base_text = f"{base_total:.8f}"
-            if self._last_price is None:
-                equity_text = "—"
-            else:
-                equity = quote_total + (base_total * self._last_price)
-                equity_text = f"{equity:.2f}"
             used = self._open_orders_value()
             locked = used
             free = max(quote_total - used, 0.0)
@@ -5773,25 +5931,11 @@ class NcPilotTabWidget(QWidget):
             free_text = f"{free:.2f}"
             locked_text = f"{locked:.2f}"
         else:
-            quote_text = "—"
-            base_text = "—"
-            equity_text = "—"
             used_text = "—"
             free_text = "—"
             locked_text = "—"
 
-        quote_asset = self._quote_asset or "—"
-        base_asset = self._base_asset or "—"
-        self._balance_quote_label.setText(
-            tr(
-                "runtime_account_line",
-                quote=quote_text,
-                base=base_text,
-                equity=equity_text,
-                quote_asset=quote_asset,
-                base_asset=base_asset,
-            )
-        )
+        self._balance_quote_label.setText(balances_line)
         self._balance_bot_label.setText(
             tr(
                 "runtime_bot_line",
@@ -5809,6 +5953,14 @@ class NcPilotTabWidget(QWidget):
     def _asset_total(self, asset: str) -> float:
         free, locked = self._balances.get(asset, (0.0, 0.0))
         return free + locked
+
+    def _pilot_balance_free(self, asset: str) -> Decimal:
+        free, _locked = self._balances.get(asset, (0.0, 0.0))
+        return self.as_decimal(free)
+
+    def _format_pilot_balances_line(self) -> str:
+        parts = [f"{asset}={self._asset_total(asset):.2f}" for asset in PILOT_BALANCE_ASSETS]
+        return f"Pilot Balances: {', '.join(parts)}"
 
     def _open_orders_value(self) -> float:
         return sum(self._extract_order_value(row) for row in range(self._orders_table.rowCount()))
@@ -7340,6 +7492,48 @@ class NcPilotTabWidget(QWidget):
             return None
         return self._price_feed_manager.get_exchange_symbols()
 
+    def _pilot_exchange_rules(self, symbol: str) -> dict[str, float | None] | None:
+        cached = self._pilot_market_cache.get(symbol, "exchange_info")
+        if cached:
+            data, saved_at = cached
+            ttl = self._pilot_market_cache_ttls.get("exchange_info")
+            if ttl is None or not self._pilot_market_cache.is_fresh(saved_at, ttl):
+                data = None
+            if isinstance(data, dict):
+                return data
+        try:
+            payload, _latency_ms = self._net_call_sync(
+                "exchange_info_symbol",
+                {"symbol": symbol},
+                timeout_ms=5000,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[PILOT] exchange rules fetch failed symbol={symbol} ({exc})", kind="WARN")
+            return None
+        if not isinstance(payload, dict):
+            return None
+        symbols = payload.get("symbols", []) if isinstance(payload.get("symbols"), list) else []
+        info = symbols[0] if symbols else {}
+        if not isinstance(info, dict):
+            return None
+        filters = info.get("filters", [])
+        tick_size = self._extract_filter_value(filters, "PRICE_FILTER", "tickSize")
+        step_size = self._extract_filter_value(filters, "LOT_SIZE", "stepSize")
+        min_qty = self._extract_filter_value(filters, "LOT_SIZE", "minQty")
+        max_qty = self._extract_filter_value(filters, "LOT_SIZE", "maxQty")
+        min_notional = self._extract_filter_value(filters, "MIN_NOTIONAL", "minNotional")
+        if min_notional is None:
+            min_notional = self._extract_filter_value(filters, "NOTIONAL", "minNotional")
+        data = {
+            "tick": tick_size,
+            "step": step_size,
+            "min_notional": min_notional,
+            "min_qty": min_qty,
+            "max_qty": max_qty,
+        }
+        self._pilot_market_cache.set(symbol, "exchange_info", data)
+        return data
+
     def _pilot_alias_summary(self) -> str:
         runtime = self._session.pilot
         aliases = runtime.symbol_aliases
@@ -7692,16 +7886,10 @@ class NcPilotTabWidget(QWidget):
         self._update_runtime_balances()
         self._grid_engine.sync_balances(self._balances)
         if valid_snapshot:
-            quote_asset = self._quote_asset or "—"
-            base_asset = self._base_asset or "—"
-            quote_total = self._asset_total(quote_asset)
-            base_total = self._asset_total(base_asset)
-            snapshot = (round(quote_total, 2), round(base_total, 8))
+            snapshot = tuple(round(self._asset_total(asset), 2) for asset in PILOT_BALANCE_ASSETS)
             if snapshot != self._balances_snapshot:
-                self._append_log(
-                    f"balances updated: {quote_asset}={quote_total:.2f}, {base_asset}={base_total:.8f}",
-                    kind="INFO",
-                )
+                balances_line = self._format_pilot_balances_line().replace("Pilot Balances: ", "")
+                self._append_log(f"balances updated: {balances_line}", kind="INFO")
                 self._balances_snapshot = snapshot
             self._refresh_trade_fees()
             self._signals.balances_refresh.emit(True)
