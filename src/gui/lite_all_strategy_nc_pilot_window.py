@@ -1010,7 +1010,7 @@ class NcPilotTabWidget(QWidget):
         self._pilot_route_snapshots: dict[str, object] = {}
         self._pilot_market_cache = DataCache()
         self._pilot_market_cache_ttls = {
-            "book_ticker": 1.5,
+            "book_ticker": 5.0,
             "orderbook_depth_50": 2.0,
             "exchange_info": 3600.0,
         }
@@ -1046,6 +1046,10 @@ class NcPilotTabWidget(QWidget):
         self._pilot_pair_status: dict[str, dict[str, object]] = {}
         self._pilot_http_ok = True
         self._pilot_ws_summary = "—"
+        self._multi_book_symbols: list[str] = []
+        self._multi_book_index = 0
+        self._multi_book_last_request_ts: float | None = None
+        self._multi_bidask_logged: set[str] = set()
         self._bot_order_ids: set[str] = set()
         self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
@@ -5627,6 +5631,10 @@ class NcPilotTabWidget(QWidget):
                 cooldown_sec=2.0,
             )
             return
+        if self._is_multi_symbol(self._symbol):
+            self._kpi_last_book_request_ts = now_ts
+            self._request_multi_book_ticker()
+            return
         self._kpi_last_book_request_ts = now_ts
         self._queue_net_request(
             "book_ticker",
@@ -5676,6 +5684,10 @@ class NcPilotTabWidget(QWidget):
                 cooldown_sec=2.0,
             )
             return
+        if self._is_multi_symbol(self._symbol):
+            self._bidask_last_request_ts = now_ts
+            self._request_multi_book_ticker()
+            return
         self._bidask_last_request_ts = now_ts
         self._queue_net_request(
             "book_ticker",
@@ -5709,6 +5721,81 @@ class NcPilotTabWidget(QWidget):
             self._notify_crash("_handle_success")
             self._pilot_force_hold(reason="exception:_handle_success")
             return
+
+    def _resolve_multi_symbols(self) -> list[str]:
+        raw_symbols = self._multi_context.enabled_pairs or []
+        symbols: list[str] = []
+        for item in raw_symbols:
+            symbol = str(item).strip().upper()
+            if not symbol or symbol in symbols:
+                continue
+            symbols.append(symbol)
+        return symbols
+
+    def _next_multi_book_symbol(self) -> str | None:
+        symbols = self._resolve_multi_symbols()
+        if not symbols:
+            return None
+        if symbols != self._multi_book_symbols:
+            self._multi_book_symbols = symbols
+            self._multi_book_index = 0
+        symbol = self._multi_book_symbols[self._multi_book_index % len(self._multi_book_symbols)]
+        self._multi_book_index = (self._multi_book_index + 1) % len(self._multi_book_symbols)
+        return symbol
+
+    def _request_multi_book_ticker(self) -> None:
+        now_ts = monotonic()
+        min_interval_ms = max(KPI_BOOK_REQUEST_INTERVAL_MS, BIDASK_POLL_MS)
+        if self._multi_book_last_request_ts and (
+            (now_ts - self._multi_book_last_request_ts) * 1000 < min_interval_ms
+        ):
+            return
+        symbol = self._next_multi_book_symbol()
+        if not symbol:
+            return
+        self._multi_book_last_request_ts = now_ts
+        self._queue_net_request(
+            "book_ticker",
+            {"symbol": symbol},
+            on_success=lambda payload, latency_ms: self._safe_call(
+                lambda: self._handle_multi_book_ticker_success(symbol, payload, latency_ms),
+                label="signal:book_ticker_multi_success",
+            ),
+            on_error=lambda error: self._handle_multi_book_ticker_error(symbol, error),
+        )
+
+    def _handle_multi_book_ticker_success(self, symbol: str, payload: object, _latency_ms: int) -> None:
+        assert isinstance(self, NcPilotTabWidget)
+        try:
+            if self._closing:
+                return
+            if not isinstance(payload, dict) or not payload:
+                return
+            bid = self._coerce_float(payload.get("bidPrice"))
+            ask = self._coerce_float(payload.get("askPrice"))
+            if bid is None or ask is None or not isfinite(bid) or not isfinite(ask) or ask <= bid or bid <= 0:
+                return
+            self._pilot_set_cache(symbol, "book_ticker", payload)
+            if symbol not in self._multi_bidask_logged:
+                self._append_log(
+                    f"[BIDASK] ok symbol={symbol} age_ms=0",
+                    kind="INFO",
+                )
+                self._multi_bidask_logged.add(symbol)
+        except Exception:
+            self._logger.exception("[NC_PILOT][CRASH] exception in _handle_multi_book_ticker_success")
+            self._notify_crash("_handle_multi_book_ticker_success")
+            self._pilot_force_hold(reason="exception:_handle_multi_book_ticker_success")
+            return
+
+    def _handle_multi_book_ticker_error(self, symbol: str, error: object) -> None:
+        message = self._format_account_error(error)
+        self._append_log_throttled(
+            f"[BIDASK] err symbol={symbol} status={message}",
+            kind="WARN",
+            key=f"book_ticker_error_{symbol}",
+            cooldown_sec=5.0,
+        )
 
     def update_market_kpis(self) -> None:
         if self._closing:
@@ -7489,6 +7576,19 @@ class NcPilotTabWidget(QWidget):
         return settings
 
     def get_anchor_price(self, symbol: str) -> float | None:
+        if self._is_multi_symbol(symbol):
+            for candidate in self._resolve_multi_symbols():
+                cached, _age_ms = self._pilot_get_cached(candidate, "book_ticker")
+                if isinstance(cached, dict):
+                    bid = self._coerce_float(cached.get("bidPrice"))
+                    ask = self._coerce_float(cached.get("askPrice"))
+                    if bid is not None and ask is not None and bid > 0 and ask > bid:
+                        self._append_log(
+                            f"PRICE: HTTP_BOOK age=cached symbol={candidate}",
+                            kind="INFO",
+                        )
+                        return (bid + ask) / 2
+            return None
         best_bid, best_ask, _source = self._resolve_book_bid_ask()
         if best_bid is not None and best_ask is not None:
             self._append_log("PRICE: HTTP_BOOK age=live", kind="INFO")
@@ -7547,6 +7647,8 @@ class NcPilotTabWidget(QWidget):
         cached, age_ms = self._pilot_get_cached(symbol, "book_ticker")
         if isinstance(cached, dict):
             return cached, age_ms
+        if self._is_multi_symbol(self._symbol):
+            return None, None
         try:
             payload, _latency_ms = self._net_call_sync(
                 "book_ticker",
