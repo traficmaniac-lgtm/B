@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 from src.core.config import Config, load_config
 from src.core.crash_guard import install_crash_guard
 from src.core.httpx_singleton import close_shared_client
+from src.services.net import shutdown_net_worker
 from src.core.logging import configure_logging, get_logger
 from src.gui.main_window import MainWindow
 from src.gui.models.app_state import AppState
@@ -94,6 +95,7 @@ def main() -> int:
     window.show()
     exit_code = app.exec()
     logger.info("application closed")
+    shutdown_net_worker()
     close_shared_client()
     return exit_code
 

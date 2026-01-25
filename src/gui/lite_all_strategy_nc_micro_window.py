@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import functools
 import httpx
 import faulthandler
 import json
@@ -21,7 +22,7 @@ from time import monotonic, perf_counter, sleep, time as time_fn
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, QEventLoop, QRunnable, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QEventLoop, QRunnable, Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (
 from src.ai.operator_math import compute_break_even_tp_pct, compute_fee_total_pct, evaluate_tp_profitability
 from src.ai.operator_profiles import get_profile_preset
 from src.binance.account_client import AccountStatus, BinanceAccountClient
+from src.binance.http_client import BinanceHttpClient
 from src.core.cancel_reconcile import CancelResult
 from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
@@ -78,7 +80,8 @@ from src.gui.lite_grid_math import (
 from src.gui.models.app_state import AppState
 from src.services.data_cache import DataCache
 from src.services.nc_micro.session import GridSettingsState, NcMicroSession
-from src.services.net_worker import BinanceNetWorker, NetRequest
+from src.services.net import get_net_worker, shutdown_net_worker
+from src.services.net.net_worker import NetWorker
 from src.services.price_feed_manager import (
     PriceFeedManager,
     PriceUpdate,
@@ -915,6 +918,7 @@ class NcMicroTabWidget(QWidget):
         self._close_pending = False
         self._close_finalizing = False
         self._shutdown_started = False
+        self._disposed = False
         self._feed_active = True
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
@@ -943,11 +947,11 @@ class NcMicroTabWidget(QWidget):
         self._apply_profile_defaults_if_pristine()
         self._grid_engine = GridEngine(self._set_engine_state, self._append_log)
         self._manual_grid_step_pct = self._settings_state.grid_step_pct
-        self._net_thread = QThread(self)
-        self._net_worker: BinanceNetWorker | None = None
+        self._net_worker: NetWorker | None = None
         self._net_pending: dict[str, tuple[Callable[[object, int], None] | None, Callable[[object], None] | None]] = {}
         self._net_request_counter = 0
         self._account_client: BinanceAccountClient | None = None
+        self._http_client: BinanceHttpClient | None = None
         api_key, api_secret = self._app_state.get_binance_keys()
         self._has_api_keys = bool(api_key and api_secret)
         self._can_read_account = False
@@ -970,7 +974,14 @@ class NcMicroTabWidget(QWidget):
                 backoff_base_s=self._config.http.backoff_base_s,
                 backoff_max_s=self._config.http.backoff_max_s,
             )
-        self._setup_net_worker(api_key, api_secret)
+        self._http_client = BinanceHttpClient(
+            base_url=self._config.binance.base_url,
+            timeout_s=self._config.http.timeout_s,
+            retries=self._config.http.retries,
+            backoff_base_s=self._config.http.backoff_base_s,
+            backoff_max_s=self._config.http.backoff_max_s,
+        )
+        self._setup_net_worker()
         if self._has_api_keys:
             self._sync_account_time()
         self._logger.info("binance keys present: %s", self._has_api_keys)
@@ -11047,29 +11058,15 @@ class NcMicroTabWidget(QWidget):
         )
         self._update_auto_values_label(self._settings_state.grid_step_mode == "AUTO_ATR")
 
-    def _setup_net_worker(self, api_key: str | None, api_secret: str | None) -> None:
-        self._net_worker = BinanceNetWorker(
-            base_url=self._config.binance.base_url,
-            api_key=api_key,
-            api_secret=api_secret,
-            recv_window=self._config.binance.recv_window,
-            timeout_s=self._config.http.timeout_s,
-            retries=self._config.http.retries,
-            backoff_base_s=self._config.http.backoff_base_s,
-            backoff_max_s=self._config.http.backoff_max_s,
-        )
-        self._net_worker.moveToThread(self._net_thread)
-        self._net_thread.started.connect(self._net_worker.initialize)
-        self._net_worker.request_finished.connect(self._handle_net_success)
-        self._net_worker.request_failed.connect(self._handle_net_error)
-        self._net_thread.start()
+    def _setup_net_worker(self) -> None:
+        self._net_worker = get_net_worker(timeout_s=self._config.http.timeout_s)
 
     def _shutdown_net_worker(self) -> None:
-        if not self._net_worker:
-            return
-        QTimer.singleShot(0, self._net_worker, self._net_worker.shutdown)
-        self._net_thread.quit()
-        self._net_thread.wait(1500)
+        parent = self.parent()
+        if isinstance(parent, NcMicroMainWindow):
+            if parent.has_active_tabs():
+                return
+        shutdown_net_worker()
 
     def _next_net_request_id(self, action: str) -> str:
         self._net_request_counter += 1
@@ -11083,13 +11080,90 @@ class NcMicroTabWidget(QWidget):
         on_success: Callable[[object, int], None] | None,
         on_error: Callable[[object], None] | None,
     ) -> None:
+        if self._disposed or self._closing:
+            self._logger.info("[NC_MICRO] drop net request (closing) name=%s", action)
+            return
         if not self._net_worker:
             if on_error:
                 on_error(RuntimeError("net worker not initialized"))
             return
         request_id = self._next_net_request_id(action)
         self._net_pending[request_id] = (on_success, on_error)
-        self._net_worker.request.emit(NetRequest(request_id=request_id, action=action, params=params))
+        fn = self._build_net_request_fn(action, params)
+        self._net_worker.submit(
+            action,
+            fn,
+            on_ok=functools.partial(self._handle_net_success, request_id, action),
+            on_err=functools.partial(self._handle_net_error, request_id, action),
+        )
+
+    def _build_net_request_fn(self, action: str, params: dict[str, Any]) -> Callable[[object], object]:
+        def _require_account() -> BinanceAccountClient:
+            if not self._account_client:
+                raise RuntimeError("Account client not initialized (missing API keys)")
+            return self._account_client
+
+        def _require_http() -> BinanceHttpClient:
+            if not self._http_client:
+                raise RuntimeError("HTTP client not initialized")
+            return self._http_client
+
+        def _dispatch(_client: object) -> object:
+            if action == "account_info":
+                return _require_account().get_account_info()
+            if action == "open_orders":
+                symbol = str(params.get("symbol", ""))
+                return _require_account().get_open_orders(symbol)
+            if action == "trade_fees":
+                symbol = str(params.get("symbol", ""))
+                return _require_account().get_trade_fees(symbol)
+            if action == "my_trades":
+                symbol = str(params.get("symbol", ""))
+                limit = int(params.get("limit", 50))
+                return _require_account().get_my_trades(symbol, limit=limit)
+            if action == "order":
+                symbol = str(params.get("symbol", ""))
+                order_id = params.get("order_id")
+                orig_client_order_id = params.get("orig_client_order_id")
+                return _require_account().get_order(
+                    symbol,
+                    order_id=str(order_id) if order_id is not None else None,
+                    orig_client_order_id=str(orig_client_order_id) if orig_client_order_id else None,
+                )
+            if action == "place_limit_order":
+                return _require_account().place_limit_order(
+                    symbol=str(params.get("symbol", "")),
+                    side=str(params.get("side", "")),
+                    price=str(params.get("price", "")),
+                    quantity=str(params.get("quantity", "")),
+                    time_in_force=str(params.get("time_in_force", "GTC")),
+                    new_client_order_id=params.get("new_client_order_id"),
+                )
+            if action == "cancel_order":
+                return _require_account().cancel_order(
+                    symbol=str(params.get("symbol", "")),
+                    order_id=str(params.get("order_id")) if params.get("order_id") else None,
+                    orig_client_order_id=params.get("orig_client_order_id"),
+                )
+            if action == "cancel_open_orders":
+                symbol = str(params.get("symbol", ""))
+                return _require_account().cancel_open_orders(symbol)
+            if action == "sync_time_offset":
+                return _require_account().sync_time_offset()
+            if action == "exchange_info_symbol":
+                symbol = str(params.get("symbol", ""))
+                return _require_http().get_exchange_info_symbol(symbol)
+            if action == "book_ticker":
+                symbol = str(params.get("symbol", ""))
+                return _require_http().get_book_ticker(symbol)
+            if action == "klines":
+                symbol = str(params.get("symbol", ""))
+                interval = str(params.get("interval", "1h"))
+                limit = int(params.get("limit", 120))
+                return _require_http().get_klines(symbol, interval=interval, limit=limit)
+            raise ValueError(f"Unknown net action: {action}")
+
+        return _dispatch
 
     def _net_call_sync(
         self,
@@ -11335,6 +11409,7 @@ class NcMicroTabWidget(QWidget):
                 event.ignore()
             except Exception:
                 return
+        self._disposed = True
         self._append_log("Lite Grid Terminal closed.", kind="INFO")
         self._shutdown_net_worker()
         close_shared_client()
@@ -11392,6 +11467,9 @@ class NcMicroMainWindow(QMainWindow):
         self._tab_widget.setCurrentIndex(index)
         self._logger.info("[NC_MICRO][UI] tab_added symbol=%s index=%s", normalized, index)
 
+    def has_active_tabs(self) -> bool:
+        return self._tab_widget.count() > 0
+
     def _close_tab(self, index: int) -> None:
         widget = self._tab_widget.widget(index)
         if widget is None:
@@ -11415,4 +11493,5 @@ class NcMicroMainWindow(QMainWindow):
             widget = self._tab_widget.widget(index)
             if widget is not None:
                 widget.close()
+        shutdown_net_worker()
         super().closeEvent(event)

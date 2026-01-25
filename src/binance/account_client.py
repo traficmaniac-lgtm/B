@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 import httpx
 
 from src.core.logging import get_logger
-from src.core.httpx_singleton import get_shared_client
+from src.services.net import get_net_worker
 
 
 @dataclass
@@ -196,7 +196,16 @@ class BinanceAccountClient:
         return [item for item in payload if isinstance(item, dict)]
 
     def get_server_time(self) -> dict[str, Any]:
-        client = self._client or get_shared_client()
+        if self._client is None:
+            worker = get_net_worker(timeout_s=self._timeout_s)
+            return worker.call(
+                "binance_signed:server_time",
+                lambda client: self._get_server_time_with_client(client),
+                timeout_s=self._timeout_s,
+            )
+        return self._get_server_time_with_client(self._client)
+
+    def _get_server_time_with_client(self, client: httpx.Client) -> dict[str, Any]:
         response = client.get(f"{self._base_url}/api/v3/time", timeout=self._timeout_s)
         response.raise_for_status()
         payload = response.json()
@@ -256,6 +265,36 @@ class BinanceAccountClient:
         params: dict[str, Any] | None = None,
         retry_on_timestamp: bool = False,
     ) -> Any:
+        if self._client is None:
+            worker = get_net_worker(timeout_s=self._timeout_s)
+            return worker.call(
+                f"binance_signed:{path}",
+                lambda client: self._request_signed_with_client(
+                    client,
+                    method=method,
+                    path=path,
+                    params=params,
+                    retry_on_timestamp=retry_on_timestamp,
+                ),
+                timeout_s=self._timeout_s,
+            )
+        return self._request_signed_with_client(
+            self._client,
+            method=method,
+            path=path,
+            params=params,
+            retry_on_timestamp=retry_on_timestamp,
+        )
+
+    def _request_signed_with_client(
+        self,
+        client: httpx.Client,
+        *,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        retry_on_timestamp: bool = False,
+    ) -> Any:
         if not self._api_key or not self._api_secret:
             raise RuntimeError("Binance API key/secret not configured")
         last_exc: Exception | None = None
@@ -273,7 +312,6 @@ class BinanceAccountClient:
                 signed_query = f"{query}&signature={signature}"
                 url = f"{path}?{signed_query}"
                 headers = {"X-MBX-APIKEY": self._api_key}
-                client = self._client or get_shared_client()
                 response = client.request(
                     method,
                     f"{self._base_url}{url}",
