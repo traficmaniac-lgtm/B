@@ -7563,9 +7563,14 @@ class NcPilotTabWidget(QWidget):
         )
 
     def _set_grid_step_input(self, value: float, update_setting: bool) -> None:
-        self._grid_step_input.blockSignals(True)
-        self._grid_step_input.setValue(value)
-        self._grid_step_input.blockSignals(False)
+        grid_step_input = getattr(self, "_grid_step_input", None)
+        if grid_step_input is None:
+            if update_setting:
+                self._update_setting("grid_step_pct", value)
+            return
+        grid_step_input.blockSignals(True)
+        grid_step_input.setValue(value)
+        grid_step_input.blockSignals(False)
         if update_setting:
             self._update_setting("grid_step_pct", value)
 
