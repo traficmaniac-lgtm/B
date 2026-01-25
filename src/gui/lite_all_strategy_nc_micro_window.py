@@ -55,11 +55,13 @@ from src.binance.http_client import BinanceHttpClient
 from src.core.cancel_reconcile import CancelResult, cancel_all_open_orders
 from src.core.config import Config
 from src.config.fee_overrides import FEE_OVERRIDES_ROUNDTRIP
+from src.core.httpx_singleton import close_shared_client
 from src.core.logging import get_logger
 from src.core.micro_edge import compute_expected_edge_bps
 from src.core.crash_guard import register_crash_log_path, register_panic_hold_callback, safe_qt
 from src.core.nc_micro_safe_call import safe_call
 from src.core.nc_micro_stop import finalize_stop_state
+from src.core.version import VERSION
 from src.core.nc_micro_exec_dedup import CumulativeFillTracker, TradeIdDeduper, should_block_new_orders
 from src.core.nc_micro_refresh import StaleRefreshLogLimiter, compute_refresh_allowed
 from src.gui.dialogs.pilot_settings_dialog import PilotConfig, PilotSettingsDialog
@@ -1248,7 +1250,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_MICRO] opened. version=NC MICRO v1.0.22 symbol={self._symbol}",
+            f"[NC_MICRO] opened. version={VERSION} symbol={self._symbol}",
             kind="INFO",
         )
 
@@ -10857,6 +10859,7 @@ class LiteAllStrategyNcMicroWindow(QMainWindow):
             except Exception:
                 return
         self._append_log("Lite Grid Terminal closed.", kind="INFO")
+        close_shared_client()
         super().closeEvent(event)
 
     def dump_settings(self) -> dict[str, Any]:

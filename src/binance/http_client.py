@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from src.core.logging import get_logger
+from src.core.httpx_singleton import get_shared_client
 
 
 class BinanceHttpClient:
@@ -100,8 +101,8 @@ class BinanceHttpClient:
         attempts = self._retries + 1
         for attempt in range(attempts):
             try:
-                with httpx.Client(base_url=self._base_url, timeout=self._timeout_s) as client:
-                    response = client.get(path)
+                client = get_shared_client()
+                response = client.get(f"{self._base_url}{path}", timeout=self._timeout_s)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise httpx.HTTPStatusError(
                         f"Retryable status {response.status_code}",
