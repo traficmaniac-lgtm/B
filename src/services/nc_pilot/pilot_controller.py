@@ -964,8 +964,7 @@ class PilotController:
             )
         )
 
-    @staticmethod
-    def _window_to_dict(window: PilotWindow, now: float) -> dict[str, object]:
+    def _window_to_dict(self, window: PilotWindow, now: float) -> dict[str, object]:
         return {
             "family": window.family,
             "route_text": window.route,
@@ -975,10 +974,24 @@ class PilotController:
             "life_s": window.life_s(),
             "ttl_ms": window.ttl_ms,
             "valid": window.valid,
-            "reason": window.reason,
+            "reason": self._normalize_window_reason(window),
             "details": window.details,
             "is_alive": window.is_alive(now),
         }
+
+    def _normalize_window_reason(self, window: PilotWindow) -> str:
+        reason = window.reason or "no_window"
+        if reason.startswith("invalid_symbol:"):
+            return reason
+        if reason in {"no_data", "no_bidask", "missing_bidask"}:
+            return "no_book"
+        if reason in {"no_window", "min_profit", "min_life"} and not window.valid:
+            min_window_life_s = float(self._get_2leg_config().get("min_window_life_s", self.DEFAULT_MIN_WINDOW_LIFE_S))
+            life_s = window.life_s()
+            if min_window_life_s > 0:
+                return f"warming_window:{life_s:.1f}/{min_window_life_s:.1f}s"
+            return "warming_window"
+        return reason
 
     @staticmethod
     def _invalid_window(*, family: str, reason: str, ttl_ms: int) -> PilotWindow:

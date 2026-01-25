@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
+_DISALLOWED_SYMBOLS = {"MULTI"}
 
 
 def _normalize_token(value: object) -> str | None:
@@ -18,6 +19,8 @@ def sanitize_symbol(symbol: object) -> str | None:
     cleaned = _normalize_token(symbol)
     if cleaned is None:
         return None
+    if cleaned in _DISALLOWED_SYMBOLS:
+        return None
     if not _SYMBOL_RE.fullmatch(cleaned):
         return None
     return cleaned
@@ -26,6 +29,8 @@ def sanitize_symbol(symbol: object) -> str | None:
 def validate_trade_symbol(symbol: str, exchange_symbols_set: set[str]) -> bool:
     cleaned = _normalize_token(symbol)
     if cleaned is None:
+        return False
+    if cleaned in _DISALLOWED_SYMBOLS:
         return False
     return cleaned in exchange_symbols_set
 

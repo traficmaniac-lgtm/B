@@ -7,3 +7,7 @@ def test_sanitize_symbol_rejects_unicode_and_spaces() -> None:
     assert sanitize_symbol("btc usdt") is None
     assert sanitize_symbol("BTCUSDT!") is None
     assert sanitize_symbol("A") is None
+
+
+def test_sanitize_symbol_rejects_multi_flag() -> None:
+    assert sanitize_symbol("MULTI") is None

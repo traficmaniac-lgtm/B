@@ -788,6 +788,7 @@ class PriceFeedManager:
         self._exchange_info_lock = threading.Lock()
         self._ws_disabled_until_ms = 0
         self._log_limiter: dict[tuple[str, str], int] = {}
+        self._router_switch_log_ms: dict[str, int] = {}
         self._invalid_symbols_logged: dict[str, int] = {}
         self._router_debug_enabled = os.getenv("NC_MICRO_ROUTER_DEBUG", "").strip() == "1"
         self._router_debug_last_ms = 0
@@ -1424,6 +1425,15 @@ class PriceFeedManager:
         self._log_limiter[key] = now_ms
         getattr(self._logger, level)(message)
 
+    def _log_router_switch_event(self, symbol: str, from_source: str, to_source: str, reason: str | None) -> None:
+        now_ms = self._now_ms()
+        last_ms = self._router_switch_log_ms.get(symbol, 0)
+        if now_ms - last_ms < 3000:
+            return
+        self._router_switch_log_ms[symbol] = now_ms
+        reason_text = reason or "unknown"
+        self._logger.info("[ROUTER] switch symbol=%s %s->%s reason=%s", symbol, from_source, to_source, reason_text)
+
     def _maybe_log_router_debug(self, symbols: list[str], now_ms: int) -> None:
         if not self._router_debug_enabled:
             return
@@ -1534,14 +1544,15 @@ class PriceFeedManager:
                 router.last_switch_ts == 0
                 or now_ms - router.last_switch_ts >= self._router_config.switch_cooldown_ms
             )
+            ws_ready = bool(ws_age_ms is not None and ws_age_ms <= self._router_config.ws_fresh_ms)
             if router.active_source == "WS":
                 if ws_age_ms is None or ws_age_ms >= self._router_config.ws_stale_ms:
-                    if router.ws_bad_count >= 2 and switch_allowed:
+                    if switch_allowed:
                         router.active_source = "HTTP"
                         router.last_switch_ts = now_ms
                         source_changed = True
             elif router.active_source == "HTTP":
-                if router.ws_good_count >= 3 and switch_allowed:
+                if ws_ready and router.ws_good_count >= 3 and switch_allowed:
                     router.active_source = "WS"
                     router.last_switch_ts = now_ms
                     source_changed = True
@@ -1602,16 +1613,7 @@ class PriceFeedManager:
             reason_text = router_reason or "unknown"
             age_text = age_ms if isinstance(age_ms, int) else "None"
             from_source = router.last_switch_from or ("HTTP" if router.active_source == "WS" else "WS")
-            self._log_rate_limited(
-                symbol,
-                "router_switch",
-                "info",
-                (
-                    f"[ROUTER] {symbol} switch {from_source}->{router.active_source} "
-                    f"reason={reason_text} bad_count={router.ws_bad_count} "
-                    f"good_count={router.ws_good_count} cooldown_ok={str(cooldown_left <= 0).lower()}"
-                ),
-            )
+            self._log_router_switch_event(symbol, from_source, router.active_source, reason_text)
 
     def _resolve_price_source(self, symbol: str, state: dict[str, Any]) -> PriceSource:
         router = state.get("router")
