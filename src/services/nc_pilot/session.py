@@ -77,6 +77,14 @@ class PilotAlgoState:
 
 
 PILOT_DEFAULT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
+PILOT_DEFAULT_QUOTES = ("USDT", "USDC", "EURI", "EUR", "TUSD")
+
+
+@dataclass(frozen=True)
+class MultiContext:
+    symbols: list[str]
+    quote_assets: list[str]
+    enabled_pairs: list[str]
 
 
 @dataclass
@@ -127,6 +135,13 @@ class NcPilotSession:
     order_tracking: OrderTrackingState = field(default_factory=OrderTrackingState)
     counters: NcPilotMinuteCounters = field(default_factory=NcPilotMinuteCounters)
     pilot: PilotRuntimeState = field(default_factory=PilotRuntimeState)
+    multi_context: MultiContext = field(
+        default_factory=lambda: MultiContext(
+            symbols=list(PILOT_DEFAULT_SYMBOLS),
+            quote_assets=list(PILOT_DEFAULT_QUOTES),
+            enabled_pairs=list(PILOT_DEFAULT_SYMBOLS),
+        )
+    )
 
     def should_emit_minute_summary(self, now: float, interval_s: float = 60.0) -> bool:
         if self.runtime.next_summary_ts is None:

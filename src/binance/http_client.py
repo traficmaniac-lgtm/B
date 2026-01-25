@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
 import httpx
 
-from src.core.logging import get_logger
+from src.core.logging import LogDeduper, get_logger
 from src.services.net import get_net_worker
 
 
@@ -26,12 +27,15 @@ class BinanceHttpClient:
         self._backoff_max_s = backoff_max_s
         self._client = client
         self._logger = get_logger("binance.http")
+        self._log_deduper = LogDeduper(cooldown_s=3.0)
 
     def get_exchange_info(self) -> dict[str, Any]:
         return self._request_json("/api/v3/exchangeInfo")
 
     def get_exchange_info_symbol(self, symbol: str) -> dict[str, Any]:
-        symbol_clean = symbol.strip().upper()
+        symbol_clean = symbol.strip().upper() if symbol else ""
+        if not symbol_clean or symbol_clean == "MULTI":
+            return self.get_exchange_info()
         return self._request_json(f"/api/v3/exchangeInfo?symbol={symbol_clean}")
 
     def get_ticker_price(self, symbol: str | None = None) -> dict[str, str] | str:
@@ -114,24 +118,40 @@ class BinanceHttpClient:
         for attempt in range(attempts):
             try:
                 response = client.get(f"{self._base_url}{path}", timeout=self._timeout_s)
-                if response.status_code == 429 or response.status_code >= 500:
+                status = response.status_code
+                if status in {418, 429} or status >= 500:
                     raise httpx.HTTPStatusError(
-                        f"Retryable status {response.status_code}",
+                        f"Retryable status {status}",
                         request=response.request,
                         response=response,
                     )
-                response.raise_for_status()
+                if status >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"Non-retryable status {status}",
+                        request=response.request,
+                        response=response,
+                    )
                 return response.json()
             except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as exc:
                 last_exc = exc
-                self._logger.warning(
+                status = None
+                retryable = isinstance(exc, (httpx.TimeoutException, httpx.RequestError))
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                    status = exc.response.status_code
+                    retryable = status in {418, 429} or status >= 500
+                message = str(exc)
+                dedup_key = (path, status, message)
+                self._log_deduper.log(
+                    self._logger,
+                    logging.WARNING,
+                    dedup_key,
                     "Binance HTTP error on %s (attempt %s/%s): %s",
                     path,
                     attempt + 1,
                     attempts,
                     exc,
                 )
-                if attempt < attempts - 1:
+                if retryable and attempt < attempts - 1:
                     backoff_s = min(self._backoff_base_s * (2**attempt), self._backoff_max_s)
                     time.sleep(backoff_s)
                     continue

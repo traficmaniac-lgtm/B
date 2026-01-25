@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import hashlib
 import hmac
 import threading
@@ -10,7 +11,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from src.core.logging import get_logger
+from src.core.logging import LogDeduper, get_logger
 from src.services.net import get_net_worker
 
 
@@ -44,6 +45,7 @@ class BinanceAccountClient:
         self._backoff_max_s = backoff_max_s
         self._client = client
         self._logger = get_logger("binance.account")
+        self._log_deduper = LogDeduper(cooldown_s=3.0)
         self._time_offset_ms = 0
         self._time_lock = threading.Lock()
 
@@ -82,8 +84,11 @@ class BinanceAccountClient:
         permissions = [str(item) for item in permissions_raw if isinstance(item, str)] if isinstance(permissions_raw, list) else []
         return AccountStatus(can_trade=can_trade, permissions=permissions, msg=None)
 
-    def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
-        params = {"symbol": symbol}
+    def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params = None
+        symbol_clean = symbol.strip().upper() if symbol else ""
+        if symbol_clean and symbol_clean != "MULTI":
+            params = {"symbol": symbol_clean}
         payload = self._request_signed("GET", "/api/v3/openOrders", params=params)
         if not isinstance(payload, list):
             raise ValueError("Unexpected open orders response format")
@@ -318,19 +323,20 @@ class BinanceAccountClient:
                     headers=headers,
                     timeout=self._timeout_s,
                 )
-                if response.status_code == 429 or response.status_code >= 500:
+                status = response.status_code
+                if status in {418, 429} or status >= 500:
                     raise httpx.HTTPStatusError(
-                        f"Retryable status {response.status_code}",
+                        f"Retryable status {status}",
                         request=response.request,
                         response=response,
                     )
-                if response.status_code >= 400:
+                if status >= 400:
                     payload = None
                     try:
                         payload = response.json()
                     except Exception:  # noqa: BLE001
                         payload = None
-                    if response.status_code == 400:
+                    if status == 400:
                         code = payload.get("code") if isinstance(payload, dict) else None
                         msg = payload.get("msg") if isinstance(payload, dict) else response.text
                         hint = " time sync likely wrong" if code == -1021 else ""
@@ -361,18 +367,32 @@ class BinanceAccountClient:
                                     next_window,
                                     self._get_time_offset_ms(),
                                 )
-                response.raise_for_status()
+                    raise httpx.HTTPStatusError(
+                        f"Non-retryable status {status}",
+                        request=response.request,
+                        response=response,
+                    )
                 return response.json()
             except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as exc:
                 last_exc = exc
-                self._logger.warning(
+                status = None
+                retryable = isinstance(exc, (httpx.TimeoutException, httpx.RequestError))
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                    status = exc.response.status_code
+                    retryable = status in {418, 429} or status >= 500
+                message = str(exc)
+                dedup_key = (path, status, message)
+                self._log_deduper.log(
+                    self._logger,
+                    logging.WARNING,
+                    dedup_key,
                     "Binance signed request error on %s (attempt %s/%s): %s",
                     path,
                     attempt + 1,
                     attempts,
                     exc,
                 )
-                if attempt < attempts - 1:
+                if retryable and attempt < attempts - 1:
                     backoff_s = min(self._backoff_base_s * (2**attempt), self._backoff_max_s)
                     time.sleep(backoff_s)
                     continue
