@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from src.core.logging import get_logger
-from src.core.httpx_singleton import get_shared_client
+from src.services.net import get_net_worker
 
 
 class BinanceHttpClient:
@@ -99,11 +99,20 @@ class BinanceHttpClient:
         return [item for item in data if isinstance(item, dict)]
 
     def _request_json(self, path: str) -> dict[str, Any] | list[Any]:
+        if self._client is None:
+            worker = get_net_worker(timeout_s=self._timeout_s)
+            return worker.call(
+                f"binance_http:{path}",
+                lambda client: self._request_json_with_client(client, path),
+                timeout_s=self._timeout_s,
+            )
+        return self._request_json_with_client(self._client, path)
+
+    def _request_json_with_client(self, client: httpx.Client, path: str) -> dict[str, Any] | list[Any]:
         last_exc: Exception | None = None
         attempts = self._retries + 1
         for attempt in range(attempts):
             try:
-                client = self._client or get_shared_client()
                 response = client.get(f"{self._base_url}{path}", timeout=self._timeout_s)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise httpx.HTTPStatusError(
