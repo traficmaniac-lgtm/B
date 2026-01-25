@@ -46,7 +46,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -92,11 +91,12 @@ from src.services.price_feed_manager import (
     WS_STALE_MS,
 )
 
-NC_PILOT_VERSION = "v1.0.12"
+NC_PILOT_VERSION = "v1.0.13"
 _NC_PILOT_CRASH_HANDLES: list[object] = []
 EXEC_DUP_LOG_COOLDOWN_SEC = 10.0
 PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
-PILOT_BALANCE_ASSETS = ("USDT", "USDC", "EURI", "EUR")
+PILOT_BALANCE_ASSETS = ("USDT", "USDC", "EURI", "EUR", "TUSD")
+PILOT_WINDOW_SYMBOL = "MULTI"
 
 
 @dataclass
@@ -870,7 +870,7 @@ class GridEngine:
 class NcPilotTabWidget(QWidget):
     def __init__(
         self,
-        symbol: str,
+        symbol: str | None,
         config: Config,
         app_state: AppState,
         price_feed_manager: PriceFeedManager,
@@ -879,12 +879,14 @@ class NcPilotTabWidget(QWidget):
         super().__init__(parent)
         self._config = config
         self._app_state = app_state
-        self._symbol = symbol.strip().upper()
+        normalized_symbol = symbol.strip().upper() if symbol else PILOT_WINDOW_SYMBOL
+        self._symbol = normalized_symbol or PILOT_WINDOW_SYMBOL
         self._logger = NcPilotLoggerAdapter(get_logger("gui.lite_all_strategy_nc_pilot"), self._symbol)
         self._price_feed_manager = price_feed_manager
         self._session = NcPilotSession(symbol=self._symbol)
         self.session = self._session
         self._pilot_controller = PilotController(self, self._session)
+        self._session.pilot.selected_symbols = set(PILOT_SYMBOLS)
         self.trade_source = "HTTP_ONLY"
         self._pending_trade_source: str | None = None
         self._last_trade_source_change_ms = 0
@@ -952,7 +954,7 @@ class NcPilotTabWidget(QWidget):
         self._close_finalizing = False
         self._shutdown_started = False
         self._disposed = False
-        self._feed_active = True
+        self._feed_active = False
         self._bootstrap_mode = False
         self._bootstrap_sell_enabled = False
         self._sell_side_enabled = False
@@ -961,6 +963,12 @@ class NcPilotTabWidget(QWidget):
         self._pending_tp_ids: set[str] = set()
         self._pending_restore_ids: set[str] = set()
         self._settings_state = self._session.config
+        self._pilot_family_budgets: dict[str, float] = {
+            "2LEG": float(self._settings_state.budget),
+            "SPREAD": 0.0,
+            "REBAL": 0.0,
+            "LOOP": 0.0,
+        }
         self._pilot_feature_enabled = False
         self.pilot_config = PilotConfig()
         self._pilot_allow_market = self.pilot_config.allow_market_close
@@ -1032,6 +1040,10 @@ class NcPilotTabWidget(QWidget):
         self._open_orders_loaded = False
         self._pilot_virtual_orders: list[dict[str, Any]] = []
         self._pilot_order_symbols: dict[str, str] = {}
+        self._pilot_latest_updates: dict[str, PriceUpdate] = {}
+        self._pilot_pair_status: dict[str, dict[str, object]] = {}
+        self._pilot_http_ok = True
+        self._pilot_ws_summary = "—"
         self._bot_order_ids: set[str] = set()
         self._bot_client_ids: set[str] = set()
         self._bot_order_keys: set[str] = set()
@@ -1291,7 +1303,7 @@ class NcPilotTabWidget(QWidget):
             lambda: self._safe_call(self._tick_order_ages, label="timer:order_ages")
         )
 
-        self.setWindowTitle(f"NC PILOT {NC_PILOT_VERSION} — {self._symbol}")
+        self.setWindowTitle(f"NC PILOT {NC_PILOT_VERSION}")
         self.resize(1050, 720)
 
         outer_layout = QVBoxLayout(self)
@@ -1307,9 +1319,7 @@ class NcPilotTabWidget(QWidget):
         self._registry_gc_timer.start()
         self._order_age_timer.start()
 
-        self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
-        self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
-        self._price_feed_manager.start()
+        self._start_price_feed_if_needed()
         self._refresh_exchange_rules()
         if self._account_client:
             self._balances_timer.start(self._balances_poll_ms)
@@ -1321,7 +1331,7 @@ class NcPilotTabWidget(QWidget):
             self._set_account_status("no_keys")
             self._apply_trade_gate()
         self._append_log(
-            f"[NC_PILOT] opened. version={NC_PILOT_VERSION} symbol={self._symbol}",
+            f"[NC_PILOT] opened. version={NC_PILOT_VERSION}",
             kind="INFO",
         )
         self.update_ui_lock_state()
@@ -1394,25 +1404,14 @@ class NcPilotTabWidget(QWidget):
         return [bool(field and field.isEnabled()) for field in fields]
 
     def _log_ui_tab_created(self) -> None:
-        form_enabled = bool(getattr(self, "_grid_panel", None) and self._grid_panel.isEnabled())
-        fields_enabled = self._ui_fields_enabled()
         self._append_log(
-            (
-                "[NC_PILOT][UI] tab_created "
-                f"symbol={self._symbol} widgets_id={hex(id(self))} "
-                f"form_enabled={str(form_enabled).lower()} "
-                f"fields_enabled={fields_enabled}"
-            ),
+            f"[NC_PILOT][UI] window_created widgets_id={hex(id(self))}",
             kind="INFO",
         )
 
     def _log_ui_tab_activated(self) -> None:
-        fields_enabled = self._ui_fields_enabled()
         self._append_log(
-            (
-                "[NC_PILOT][UI] tab_activated "
-                f"symbol={self._symbol} enabled={fields_enabled} engine_state={self._engine_state}"
-            ),
+            f"[NC_PILOT][UI] window_activated engine_state={self._engine_state}",
             kind="INFO",
         )
 
@@ -1524,96 +1523,55 @@ class NcPilotTabWidget(QWidget):
         wrapper = QVBoxLayout()
         wrapper.setSpacing(4)
 
-        row_top = QHBoxLayout()
-        row_top.setSpacing(8)
-        row_bottom = QHBoxLayout()
-        row_bottom.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
 
-        self._symbol_label = QLabel(self._symbol)
-        self._symbol_label.setStyleSheet("font-weight: 600; font-size: 16px;")
+        def _status_label(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
+            return label
 
-        self._last_price_label = QLabel(tr("last_price", price="—"))
-        self._last_price_label.setStyleSheet("font-weight: 600;")
+        self._status_engine_label = _status_label("ENGINE: IDLE")
+        self._status_mode_label = _status_label("MODE: DRY")
+        self._status_http_label = _status_label("HTTP: OK")
+        self._status_ws_label = _status_label("WS: —")
+        self._status_families_label = _status_label("ACTIVE FAMILIES: 2LEG")
+        self._status_windows_label = _status_label("WINDOWS: 0")
+        self._status_last_action_label = _status_label("LAST ACTION: —")
 
-        self._start_button = QPushButton(tr("start"))
-        self._pause_button = QPushButton(tr("pause"))
-        self._stop_button = QPushButton(tr("stop"))
-        self._start_button.clicked.connect(self._handle_start)
-        self._pause_button.clicked.connect(self._handle_pause)
-        self._stop_button.clicked.connect(self._handle_stop)
+        for label in (
+            self._status_engine_label,
+            self._status_mode_label,
+            self._status_http_label,
+            self._status_ws_label,
+            self._status_families_label,
+            self._status_windows_label,
+            self._status_last_action_label,
+        ):
+            row.addWidget(label)
 
-        self._dry_run_toggle = QPushButton(tr("dry_run"))
-        self._dry_run_toggle.setCheckable(True)
-        self._dry_run_toggle.setChecked(True)
-        self._dry_run_toggle.toggled.connect(self._handle_dry_run_toggle)
-        badge_base = (
-            "padding: 3px 8px; border-radius: 10px; border: 1px solid #d1d5db; "
-            "font-weight: 600; min-height: 20px;"
-        )
-        self._dry_run_toggle.setStyleSheet(
-            "QPushButton {"
-            f"{badge_base}"
-            "background: #f3f4f6;}"
-            "QPushButton:checked {background: #16a34a; color: white; border-color: #16a34a;}"
-            "QPushButton:disabled {background: #e5e7eb; color: #9ca3af;}"
-        )
-
-        self._state_badge = QLabel(f"{tr('state')}: {self._state}")
-        self._state_badge.setStyleSheet(
-            f"{badge_base} background: #111827; color: white;"
-        )
-
-        row_top.addWidget(self._symbol_label)
-        row_top.addWidget(self._last_price_label)
-        row_top.addStretch()
-        row_top.addWidget(self._start_button)
-        row_top.addWidget(self._pause_button)
-        row_top.addWidget(self._stop_button)
-        row_top.addWidget(self._dry_run_toggle)
-        row_top.addWidget(self._state_badge)
-
-        self._feed_indicator = QLabel("HTTP ✓ | WS — | CLOCK —")
-        self._feed_indicator.setStyleSheet("color: #6b7280; font-size: 11px;")
-
-        self._age_label = QLabel(tr("age", age="—"))
-        self._age_label.setStyleSheet("color: #6b7280; font-size: 11px;")
-        self._latency_label = QLabel(tr("latency", latency="—"))
-        self._latency_label.setStyleSheet("color: #6b7280; font-size: 11px;")
-        for label in (self._feed_indicator, self._age_label, self._latency_label):
-            label.setFixedHeight(18)
-            label.setMinimumWidth(150)
-            label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-        self._engine_state_label = QLabel(f"{tr('engine')}: {self._engine_state}")
-        self._apply_engine_state_style(self._engine_state)
-        self._trade_status_label = QLabel(tr("trade_status_disabled"))
-        self._trade_status_label.setStyleSheet("color: #dc2626; font-size: 11px; font-weight: 600;")
-        for label in (self._engine_state_label, self._trade_status_label):
-            label.setFixedHeight(18)
-            label.setMinimumWidth(160)
-            label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-        row_bottom.addWidget(self._feed_indicator)
-        row_bottom.addWidget(self._age_label)
-        row_bottom.addWidget(self._latency_label)
-        row_bottom.addStretch()
-        row_bottom.addWidget(self._trade_status_label)
-        row_bottom.addWidget(self._engine_state_label)
-
-        wrapper.addLayout(row_top)
-        wrapper.addLayout(row_bottom)
+        row.addStretch()
+        wrapper.addLayout(row)
         return wrapper
 
     def _build_body(self) -> QSplitter:
-        top_splitter = QSplitter(Qt.Horizontal)
-        top_splitter.setChildrenCollapsible(False)
-        top_splitter.addWidget(self._build_market_panel())
-        top_splitter.addWidget(self._build_grid_panel())
-        top_splitter.addWidget(self._build_right_panel())
-        top_splitter.setStretchFactor(0, 1)
-        top_splitter.setStretchFactor(1, 2)
-        top_splitter.setStretchFactor(2, 1)
-        return top_splitter
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+
+        left_stack = QSplitter(Qt.Vertical)
+        left_stack.setChildrenCollapsible(False)
+        left_stack.addWidget(self._build_pairs_overview_panel())
+        left_stack.addWidget(self._build_arb_indicators_panel())
+        left_stack.setStretchFactor(0, 2)
+        left_stack.setStretchFactor(1, 1)
+
+        main_splitter.addWidget(left_stack)
+        main_splitter.addWidget(self._build_pilot_control_panel())
+        main_splitter.addWidget(self._build_right_panel())
+        main_splitter.setStretchFactor(0, 2)
+        main_splitter.setStretchFactor(1, 2)
+        main_splitter.setStretchFactor(2, 2)
+        return main_splitter
 
     def _is_micro_profile(self) -> bool:
         return self._symbol.replace("/", "").upper() in MICRO_STABLECOIN_SYMBOLS
@@ -1995,6 +1953,64 @@ class NcPilotTabWidget(QWidget):
         self._right_splitter.setSizes([600, 320])
         return self._right_splitter
 
+    def _build_pairs_overview_panel(self) -> QWidget:
+        group = QGroupBox("PAIRS OVERVIEW")
+        group.setStyleSheet(
+            "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self._pairs_overview_table = QTableWidget(len(PILOT_SYMBOLS), 5, self)
+        self._pairs_overview_table.setHorizontalHeaderLabels(
+            ["Pair", "Source", "Age(ms)", "Spread(bps)", "Bid/Ask OK"]
+        )
+        self._pairs_overview_table.verticalHeader().setVisible(False)
+        header = self._pairs_overview_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        for column in range(4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self._pairs_overview_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._pairs_overview_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._pairs_overview_table.verticalHeader().setDefaultSectionSize(22)
+
+        for row, symbol in enumerate(PILOT_SYMBOLS):
+            initial = [symbol, "—", "—", "—", "—"]
+            for column, value in enumerate(initial):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignCenter)
+                self._pairs_overview_table.setItem(row, column, item)
+
+        layout.addWidget(self._pairs_overview_table)
+        return group
+
+    def _update_pairs_overview_table(self) -> None:
+        if not hasattr(self, "_pairs_overview_table"):
+            return
+        for row, symbol in enumerate(PILOT_SYMBOLS):
+            status = self._pilot_pair_status.get(symbol, {})
+            source = status.get("source", "—")
+            age_ms = status.get("age_ms")
+            spread_bps = status.get("spread_bps")
+            has_bidask = status.get("has_bidask")
+            row_values = [
+                symbol,
+                str(source),
+                f"{int(age_ms)}" if isinstance(age_ms, int) else "—",
+                f"{float(spread_bps):.2f}" if isinstance(spread_bps, (int, float)) else "—",
+                "OK" if has_bidask else "—",
+            ]
+            for column, value in enumerate(row_values):
+                item = self._pairs_overview_table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem(str(value))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self._pairs_overview_table.setItem(row, column, item)
+                else:
+                    item.setText(str(value))
+
     def _build_market_panel(self) -> QWidget:
         group = QGroupBox(tr("market"))
         group.setStyleSheet(
@@ -2310,6 +2326,10 @@ class NcPilotTabWidget(QWidget):
         self._account_status_label.setStyleSheet(account_style)
         self._account_status_label.setFont(fixed_font)
 
+        self._trade_status_label = QLabel(tr("trade_status_disabled"))
+        self._trade_status_label.setStyleSheet("color: #dc2626; font-size: 11px; font-weight: 600;")
+        self._trade_status_label.setFont(fixed_font)
+
         self._pnl_label = QLabel(tr("pnl_no_fills"))
         self._pnl_label.setFont(fixed_font)
         self._pnl_label.setTextFormat(Qt.RichText)
@@ -2319,6 +2339,7 @@ class NcPilotTabWidget(QWidget):
         self._orders_count_label.setFont(fixed_font)
 
         layout.addWidget(self._account_status_label)
+        layout.addWidget(self._trade_status_label)
         layout.addWidget(self._balance_quote_label)
         layout.addWidget(self._balance_bot_label)
         layout.addWidget(self._pnl_label)
@@ -2365,20 +2386,21 @@ class NcPilotTabWidget(QWidget):
         return group
 
     def _build_pilot_control_panel(self) -> QWidget:
-        group = QGroupBox("PILOT")
+        group = QGroupBox("FAMILY BUDGETS")
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
         layout = QVBoxLayout(group)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
         buttons = QHBoxLayout()
-        self._pilot_start_analysis_button = QPushButton("Старт анализ")
-        self._pilot_start_trading_button = QPushButton("Старт торговля")
+        self._pilot_start_analysis_button = QPushButton("Анализ")
+        self._pilot_start_trading_button = QPushButton("Старт")
         self._pilot_stop_trading_button = QPushButton("Стоп")
         self._pilot_log_button = QPushButton("Лог пилота")
+        self._start_button = self._pilot_start_trading_button
         for button in (
             self._pilot_start_analysis_button,
             self._pilot_start_trading_button,
@@ -2400,13 +2422,31 @@ class NcPilotTabWidget(QWidget):
         self._pilot_status_line.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self._pilot_status_line)
 
-        trade_title = QLabel("Торговать:")
+        badge_base = (
+            "padding: 3px 8px; border-radius: 10px; border: 1px solid #d1d5db; "
+            "font-weight: 600; min-height: 20px;"
+        )
+        self._dry_run_toggle = QPushButton(tr("dry_run"))
+        self._dry_run_toggle.setCheckable(True)
+        self._dry_run_toggle.setChecked(True)
+        self._dry_run_toggle.toggled.connect(self._handle_dry_run_toggle)
+        self._dry_run_toggle.setStyleSheet(
+            "QPushButton {"
+            f"{badge_base}"
+            "background: #f3f4f6;}"
+            "QPushButton:checked {background: #16a34a; color: white; border-color: #16a34a;}"
+            "QPushButton:disabled {background: #e5e7eb; color: #9ca3af;}"
+        )
+        layout.addWidget(self._dry_run_toggle, alignment=Qt.AlignLeft)
+
+        trade_title = QLabel("Trade family toggles")
         trade_title.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
         layout.addWidget(trade_title)
+
         trade_layout = QGridLayout()
         trade_layout.setHorizontalSpacing(6)
         trade_layout.setVerticalSpacing(2)
-        self._pilot_trade_family_checkboxes: dict[str, QCheckBox] = {}
+        self._pilot_trade_family_checkboxes = {}
         enabled_families = {family.upper() for family in self._session.pilot.trade_enabled_families}
         for idx, family in enumerate(("2LEG", "SPREAD", "REBAL", "LOOP")):
             checkbox = QCheckBox(family)
@@ -2418,23 +2458,26 @@ class NcPilotTabWidget(QWidget):
             trade_layout.addWidget(checkbox, row, col)
         layout.addLayout(trade_layout)
 
-        pairs_title = QLabel("Пары пилота")
-        pairs_title.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
-        layout.addWidget(pairs_title)
-        pairs_layout = QGridLayout()
-        pairs_layout.setHorizontalSpacing(6)
-        pairs_layout.setVerticalSpacing(2)
-        self._pilot_pair_checkboxes: dict[str, QCheckBox] = {}
-        selected_symbols = {symbol.upper() for symbol in self._session.pilot.selected_symbols}
-        for idx, symbol in enumerate(PILOT_SYMBOLS):
-            checkbox = QCheckBox(symbol)
-            checkbox.setChecked(symbol in selected_symbols)
-            checkbox.stateChanged.connect(self._update_pilot_selected_symbols)
-            self._pilot_pair_checkboxes[symbol] = checkbox
-            row = idx // 2
-            col = idx % 2
-            pairs_layout.addWidget(checkbox, row, col)
-        layout.addLayout(pairs_layout)
+        budgets_title = QLabel("Budget (USDT)")
+        budgets_title.setStyleSheet("color: #374151; font-size: 11px; font-weight: 600;")
+        layout.addWidget(budgets_title)
+
+        budget_layout = QGridLayout()
+        budget_layout.setHorizontalSpacing(6)
+        budget_layout.setVerticalSpacing(4)
+        self._pilot_family_budget_inputs: dict[str, QDoubleSpinBox] = {}
+        default_budget = float(self._settings_state.budget)
+        for row, family in enumerate(("2LEG", "SPREAD", "REBAL", "LOOP")):
+            label = QLabel(family)
+            input_box = QDoubleSpinBox()
+            input_box.setRange(0.0, 1_000_000.0)
+            input_box.setDecimals(2)
+            input_box.setValue(default_budget if family == "2LEG" else 0.0)
+            input_box.valueChanged.connect(self._update_pilot_family_budget)
+            self._pilot_family_budget_inputs[family] = input_box
+            budget_layout.addWidget(label, row, 0)
+            budget_layout.addWidget(input_box, row, 1)
+        layout.addLayout(budget_layout)
 
         self._pilot_cancel_on_stop_toggle = QCheckBox("Cancel pilot orders on Stop")
         self._pilot_cancel_on_stop_toggle.setChecked(True)
@@ -2661,6 +2704,13 @@ class NcPilotTabWidget(QWidget):
         self._sync_pilot_trade_families(families, log=True)
         self._save_settings_to_disk()
 
+    def _update_pilot_family_budget(self) -> None:
+        if not hasattr(self, "_pilot_family_budget_inputs"):
+            return
+        for family, widget in self._pilot_family_budget_inputs.items():
+            self._pilot_family_budgets[family] = float(widget.value())
+        self._schedule_settings_save()
+
     def _update_pilot_status_line(self) -> None:
         if not hasattr(self, "_pilot_status_line"):
             return
@@ -2673,6 +2723,30 @@ class NcPilotTabWidget(QWidget):
         self._pilot_status_line.setText(
             f"state={runtime.state} | best={best} | edge={edge} bps | last={last}{suffix}"
         )
+
+        engine_state = "RUNNING" if runtime.analysis_on else "IDLE"
+        mode_state = "DRY" if self._dry_run_toggle.isChecked() else "LIVE"
+        active_families = ", ".join(sorted(runtime.trade_enabled_families)) or "—"
+        windows_today = runtime.counters.windows_found_today
+        last_action = runtime.last_decision or "—"
+        http_status = "OK" if getattr(self, "_pilot_http_ok", True) else "LOST"
+        ws_status = getattr(self, "_pilot_ws_summary", "—")
+
+        if hasattr(self, "_status_engine_label"):
+            self._status_engine_label.setText(f"ENGINE: {engine_state}")
+        if hasattr(self, "_status_mode_label"):
+            self._status_mode_label.setText(f"MODE: {mode_state}")
+        if hasattr(self, "_status_http_label"):
+            self._status_http_label.setText(f"HTTP: {http_status}")
+        if hasattr(self, "_status_ws_label"):
+            self._status_ws_label.setText(f"WS: {ws_status}")
+        if hasattr(self, "_status_families_label"):
+            self._status_families_label.setText(f"ACTIVE FAMILIES: {active_families}")
+        if hasattr(self, "_status_windows_label"):
+            self._status_windows_label.setText(f"WINDOWS: {windows_today}")
+        if hasattr(self, "_status_last_action_label"):
+            self._status_last_action_label.setText(f"LAST ACTION: {last_action}")
+
         self._set_pilot_controls(analysis_on=runtime.analysis_on, trading_on=runtime.trading_on)
 
     def _update_pilot_dashboard_counters(self) -> None:
@@ -5327,6 +5401,11 @@ class NcPilotTabWidget(QWidget):
             self._pilot_force_hold(reason="exception:_emit_price_update")
             return
 
+    def _emit_pilot_price_update(self, update: PriceUpdate) -> None:
+        if not update or not hasattr(update, "symbol"):
+            return
+        self._pilot_latest_updates[update.symbol] = update
+
     def _emit_status_update(self, status: str, message: str) -> None:
         try:
             self._signals.status_update.emit(status, message)
@@ -5992,6 +6071,17 @@ class NcPilotTabWidget(QWidget):
     def _pilot_balance_free(self, asset: str) -> Decimal:
         free, _locked = self._balances.get(asset, (0.0, 0.0))
         return self.as_decimal(free)
+
+    def _pilot_budget_for_family(self, family: str) -> Decimal:
+        budget = self._pilot_family_budgets.get(family.upper())
+        if budget is None:
+            budget = float(self._settings_state.budget)
+        return self.as_decimal(budget)
+
+    def _pilot_2leg_budget(self) -> Decimal:
+        base_budget = self._pilot_budget_for_family("2LEG")
+        buffer_pct = Decimal("0.003")
+        return base_budget * (Decimal("1") - buffer_pct)
 
     def _format_pilot_balances_line(self) -> str:
         parts = [f"{asset}={self._asset_total(asset):.2f}" for asset in PILOT_BALANCE_ASSETS]
@@ -7138,10 +7228,10 @@ class NcPilotTabWidget(QWidget):
 
     def _change_state(self, new_state: str) -> None:
         self._state = new_state
-        self._state_badge.setText(f"{tr('state')}: {self._state_display_text(self._state)}")
         self._engine_state = self._engine_state_from_status(new_state)
         self._session.runtime.engine_state = self._engine_state
-        self._engine_state_label.setText(f"{tr('engine')}: {self._engine_state}")
+        if hasattr(self, "_status_engine_label"):
+            self._status_engine_label.setText(f"ENGINE: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
         self._update_orders_timer_interval()
         self._update_fills_timer()
@@ -7501,17 +7591,54 @@ class NcPilotTabWidget(QWidget):
 
     def _pilot_collect_market_data(self, symbols: set[str]) -> dict[str, dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}
+        now_ms = int(time_fn() * 1000)
+        http_ok = True
+        pair_status: dict[str, dict[str, object]] = {}
+
         for symbol in symbols:
-            book, age_ms = self._pilot_fetch_book_ticker(symbol)
-            bid = self._coerce_float(book.get("bidPrice")) if isinstance(book, dict) else None
-            ask = self._coerce_float(book.get("askPrice")) if isinstance(book, dict) else None
-            src = "HTTP" if isinstance(book, dict) else "NONE"
+            use_http_only = symbol in {"EURIUSDT", "EUREURI"}
+            bid = None
+            ask = None
+            age_ms = None
+            src = "NONE"
             ts_ms = None
-            if age_ms is not None:
-                ts_ms = int(time_fn() * 1000) - age_ms
-            elif isinstance(book, dict):
-                ts_ms = int(time_fn() * 1000)
+
+            if not use_http_only:
+                snapshot = self._price_feed_manager.get_snapshot(symbol)
+                if snapshot and snapshot.best_bid is not None and snapshot.best_ask is not None:
+                    bid = snapshot.best_bid
+                    ask = snapshot.best_ask
+                    src = snapshot.source or "HTTP"
+                    age_ms = snapshot.router_age_ms or snapshot.price_age_ms
+                    ts_ms = now_ms - age_ms if age_ms is not None else now_ms
+
+            if bid is None or ask is None:
+                book, age_ms = self._pilot_fetch_book_ticker(symbol)
+                bid = self._coerce_float(book.get("bidPrice")) if isinstance(book, dict) else None
+                ask = self._coerce_float(book.get("askPrice")) if isinstance(book, dict) else None
+                src = "HTTP" if isinstance(book, dict) else "NONE"
+                if age_ms is not None:
+                    ts_ms = now_ms - age_ms
+                elif isinstance(book, dict):
+                    ts_ms = now_ms
+            if use_http_only:
+                src = "HTTP" if bid is not None and ask is not None else src
+
             depth = self._pilot_fetch_orderbook_depth(symbol)
+            has_bidask = bid is not None and ask is not None and bid > 0 and ask > 0
+            spread_bps = None
+            if has_bidask:
+                mid = (bid + ask) / 2
+                if mid > 0:
+                    spread_bps = (ask - bid) / mid * 10_000
+            pair_status[symbol] = {
+                "source": src,
+                "age_ms": age_ms,
+                "spread_bps": spread_bps,
+                "has_bidask": has_bidask,
+            }
+            if src == "NONE":
+                http_ok = False
             results[symbol] = {
                 "bid": bid,
                 "ask": ask,
@@ -7520,7 +7647,29 @@ class NcPilotTabWidget(QWidget):
                 "src": src,
                 "depth": depth,
             }
+
+        self._pilot_pair_status = pair_status
+        self._pilot_http_ok = http_ok
+        self._pilot_ws_summary = self._resolve_pilot_ws_summary()
+        self._update_pairs_overview_table()
         return results
+
+    def _resolve_pilot_ws_summary(self) -> str:
+        states: list[str] = []
+        for symbol in PILOT_SYMBOLS:
+            if symbol in {"EURIUSDT", "EUREURI"}:
+                continue
+            health = self._price_feed_manager.get_ws_health(symbol)
+            if health is None:
+                continue
+            states.append(str(health.state))
+        if not states:
+            return "—"
+        if all(state == "OK" for state in states):
+            return "OK"
+        if any(state == "OK" for state in states):
+            return "MIXED"
+        return "LOST"
 
     def _pilot_exchange_symbols(self) -> set[str] | None:
         if not hasattr(self, "_price_feed_manager") or not self._price_feed_manager:
@@ -11675,14 +11824,16 @@ class NcPilotTabWidget(QWidget):
             "ERROR": "#dc2626",
         }
         color = color_map.get(state, "#6b7280")
-        self._engine_state_label.setStyleSheet(
-            f"color: {color}; font-size: 11px; font-weight: 600;"
-        )
+        if hasattr(self, "_status_engine_label"):
+            self._status_engine_label.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-weight: 600;"
+            )
 
     def _set_engine_state(self, state: str) -> None:
         self._engine_state = state
         self._session.runtime.engine_state = state
-        self._engine_state_label.setText(f"{tr('engine')}: {self._engine_state}")
+        if hasattr(self, "_status_engine_label"):
+            self._status_engine_label.setText(f"ENGINE: {self._engine_state}")
         self._apply_engine_state_style(self._engine_state)
         self.update_ui_lock_state()
 
@@ -12238,8 +12389,8 @@ class NcPilotTabWidget(QWidget):
             return
         self._feed_active = False
         try:
-            self._price_feed_manager.unsubscribe(self._symbol, self._emit_price_update)
-            self._price_feed_manager.unsubscribe_status(self._symbol, self._emit_status_update)
+            for symbol in PILOT_SYMBOLS:
+                self._price_feed_manager.unsubscribe(symbol, self._emit_pilot_price_update)
             should_stop = not self._price_feed_manager.has_active_subscribers()
             if should_stop and shutdown and not self._price_feed_manager.is_shutting_down:
                 self._price_feed_manager.shutdown()
@@ -12254,8 +12405,8 @@ class NcPilotTabWidget(QWidget):
             return
         self._feed_active = True
         self._price_feed_manager.start()
-        self._price_feed_manager.subscribe(self._symbol, self._emit_price_update)
-        self._price_feed_manager.subscribe_status(self._symbol, self._emit_status_update)
+        for symbol in PILOT_SYMBOLS:
+            self._price_feed_manager.subscribe(symbol, self._emit_pilot_price_update)
 
     def _begin_shutdown(self, *, reason: str) -> None:
         if self._shutdown_started:
@@ -12314,75 +12465,21 @@ class NcPilotMainWindow(QMainWindow):
         self._app_state = app_state
         self._price_feed_manager = price_feed_manager
         self._logger = get_logger("gui.nc_pilot_main_window")
-        self._tabs_by_symbol: dict[str, NcPilotTabWidget] = {}
         self.setWindowTitle(f"NC PILOT {NC_PILOT_VERSION}")
         self.resize(1150, 760)
 
-        self._tab_widget = QTabWidget(self)
-        self._tab_widget.setTabsClosable(True)
-        self._tab_widget.tabCloseRequested.connect(self._close_tab)
-        self._tab_widget.currentChanged.connect(self._handle_tab_changed)
-        self.setCentralWidget(self._tab_widget)
-
-    def add_or_activate_symbol(self, symbol: str) -> None:
-        normalized = symbol.strip().upper()
-        if not normalized:
-            return
-        existing = self._tabs_by_symbol.get(normalized)
-        if existing is not None:
-            index = self._tab_widget.indexOf(existing)
-            if index >= 0:
-                if self._tab_widget.currentIndex() != index:
-                    self._tab_widget.setCurrentIndex(index)
-                else:
-                    existing.on_tab_activated()
-                self._set_window_title(normalized)
-            return
-        tab = NcPilotTabWidget(
-            symbol=normalized,
+        self._panel = NcPilotTabWidget(
+            symbol=None,
             config=self._config,
             app_state=self._app_state,
             price_feed_manager=self._price_feed_manager,
             parent=self,
         )
-        self._tabs_by_symbol[normalized] = tab
-        index = self._tab_widget.addTab(tab, normalized)
-        self._tab_widget.setCurrentIndex(index)
-        self._set_window_title(normalized)
-        self._logger.info("[NC_PILOT][UI] tab_added symbol=%s index=%s", normalized, index)
-
-    def has_active_tabs(self) -> bool:
-        return self._tab_widget.count() > 0
-
-    def _close_tab(self, index: int) -> None:
-        widget = self._tab_widget.widget(index)
-        if widget is None:
-            return
-        symbol = getattr(widget, "symbol", None)
-        self._tab_widget.removeTab(index)
-        if isinstance(widget, QWidget):
-            widget.close()
-            widget.deleteLater()
-        if symbol:
-            self._tabs_by_symbol.pop(symbol, None)
-        self._logger.info("[NC_PILOT][UI] tab_closed symbol=%s index=%s", symbol, index)
-
-    def _handle_tab_changed(self, index: int) -> None:
-        widget = self._tab_widget.widget(index)
-        if isinstance(widget, NcPilotTabWidget):
-            widget.on_tab_activated()
-            self._set_window_title(widget.symbol)
-
-    def _set_window_title(self, symbol: str | None) -> None:
-        if symbol:
-            self.setWindowTitle(f"NC PILOT {NC_PILOT_VERSION} — {symbol}")
-        else:
-            self.setWindowTitle(f"NC PILOT {NC_PILOT_VERSION}")
+        self.setCentralWidget(self._panel)
+        self._logger.info("[NC_PILOT][UI] window_opened")
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
-        for index in reversed(range(self._tab_widget.count())):
-            widget = self._tab_widget.widget(index)
-            if widget is not None:
-                widget.close()
+        if hasattr(self, "_panel") and isinstance(self._panel, QWidget):
+            self._panel.close()
         shutdown_net_worker()
         super().closeEvent(event)

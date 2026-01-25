@@ -251,3 +251,8 @@ Acceptance checklist:
 4. ✅ Exec dedup: per-symbol caches; exec_dup logs are DEBUG + counted in 1m summary.
 5. ✅ 1-minute summary log per symbol using monotonic time (heartbeat even on no bid/ask).
 6. ✅ Log tagging: session logs prefixed with [NC_MICRO][symbol].
+
+### NC_PILOT v1.0.13 — Desktop multi-pair module
+- Moved NC_PILOT to Desktop Terminal launcher (multi-pair controller) and removed pair-dialog entry.
+- Rebuilt NC_PILOT UI with multi-pair status, family budgets, filtered balances, and pilot-centric panels.
+- Enforced 2LEG-only execution with deterministic HOLD/TRADE_BLOCK reasons and 2LEG budget sizing.

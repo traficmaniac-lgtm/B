@@ -18,6 +18,7 @@ from src.services.net import shutdown_net_worker
 from src.core.logging import get_logger
 from src.gui.models.app_state import AppState
 from src.gui.lite_grid_window import LiteGridWindow
+from src.gui.lite_all_strategy_nc_pilot_window import NcPilotMainWindow
 from src.gui.overview_tab import OverviewTab
 from src.gui.pair_mode_manager import PairModeManager
 from src.gui.settings_dialog import SettingsDialog
@@ -47,10 +48,12 @@ class MainWindow(QMainWindow):
             self._config,
             app_state=self._app_state,
             on_open_pair=self._pair_mode_manager.open_pair_dialog,
+            on_open_nc_pilot=self.open_nc_pilot_window,
             price_feed_manager=self._price_feed_manager,
         )
         self.setCentralWidget(self._overview_tab)
         self._lite_grid_windows: list[LiteGridWindow] = []
+        self._nc_pilot_window: NcPilotMainWindow | None = None
 
         self._log_dock = LogDock(self)
         self._log_dock.handler.setFormatter(
@@ -88,6 +91,22 @@ class MainWindow(QMainWindow):
         window.show()
         self._lite_grid_windows.append(window)
         window.destroyed.connect(lambda _: self._remove_lite_window(window))
+
+    def open_nc_pilot_window(self) -> None:
+        if self._nc_pilot_window is None:
+            self._nc_pilot_window = NcPilotMainWindow(
+                config=self._config,
+                app_state=self._app_state,
+                price_feed_manager=self._price_feed_manager,
+                parent=self,
+            )
+            self._nc_pilot_window.destroyed.connect(lambda _: self._reset_nc_pilot_window())
+        self._nc_pilot_window.show()
+        self._nc_pilot_window.raise_()
+        self._nc_pilot_window.activateWindow()
+
+    def _reset_nc_pilot_window(self) -> None:
+        self._nc_pilot_window = None
 
     def _build_status_left(self) -> QLabel:
         return QLabel("Ready")

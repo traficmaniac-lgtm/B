@@ -127,22 +127,7 @@ class PairModeManager:
             self._nc_micro_main_window.activateWindow()
             return
         if mode == PAIR_MODE_NC_PILOT:
-            self._logger.info("[MODE] open window=NC_PILOT symbol=%s", symbol)
-            if self._config is None or self._app_state is None or self._price_feed_manager is None:
-                self._logger.error("Lite All Strategy NC Pilot unavailable: missing runtime dependencies.")
-                return
-            if self._nc_pilot_main_window is None:
-                self._nc_pilot_main_window = NcPilotMainWindow(
-                    config=self._config,
-                    app_state=self._app_state,
-                    price_feed_manager=self._price_feed_manager,
-                    parent=window_parent,
-                )
-                self._nc_pilot_main_window.destroyed.connect(self._reset_nc_pilot_window)
-            self._nc_pilot_main_window.add_or_activate_symbol(symbol)
-            self._nc_pilot_main_window.show()
-            self._nc_pilot_main_window.raise_()
-            self._nc_pilot_main_window.activateWindow()
+            self._logger.warning("[MODE] NC_PILOT is now a desktop module (multi-pair); use Desktop Terminal launcher.")
             return
         self._logger.warning("[MODE] unsupported mode=%s symbol=%s", mode.name, symbol)
 

@@ -59,6 +59,7 @@ class PilotController:
     COOLDOWN_AFTER_TRADE_S = 2.0
     DEFAULT_MIN_PROFIT_BPS_2LEG = 6.0
     DEFAULT_MAX_WINDOW_LIFE_S = 10.0
+    DEFAULT_MIN_WINDOW_LIFE_S = 3.0
     DEFAULT_MAX_PRICE_AGE_MS = 1500
     DEFAULT_COOLDOWN_AFTER_TRADE_S = 2.0
     PILOT_SYMBOLS = ("EURIUSDT", "EUREURI", "USDCUSDT", "TUSDUSDT")
@@ -207,19 +208,12 @@ class PilotController:
         self._window._update_arb_signals()
         self._window._update_pilot_status_line()
         self._window._update_pilot_dashboard_counters()
-        if pilot.trading_on and pilot.trade_enabled_families:
-            allowed_families = {family.upper() for family in pilot.trade_enabled_families}
-            if best_window and best_window.family not in allowed_families:
-                self._log_trade_block(best_window.family, now)
-            if "2LEG" in allowed_families:
-                trade_window = next((item for item in windows if item.family == "2LEG"), None)
-                self._maybe_execute_window_trade(trade_window, snapshot, now)
-            else:
-                trade_window = self._select_best_window(
-                    [item for item in windows if item.family in allowed_families],
-                    now,
-                )
-                self._maybe_execute_window_trade(trade_window, snapshot, now)
+        if pilot.trading_on:
+            execute_allowed = {"2LEG"}
+            if best_window and best_window.family not in execute_allowed:
+                self._log_trade_block(best_window.family, now, reason="not_allowed")
+            trade_window = next((item for item in windows if item.family == "2LEG"), None)
+            self._maybe_execute_window_trade(trade_window, snapshot, now)
 
     def _maybe_execute_window_trade(
         self,
@@ -256,11 +250,11 @@ class PilotController:
             if balance_issue:
                 asset, need, free = balance_issue
                 self._log_2leg_hold(
-                    "insufficient_balance",
+                    "balances",
                     window,
                     {"asset": asset, "need": need, "free": free},
                 )
-                pilot.last_decision = "insufficient_balance"
+                pilot.last_decision = "balances"
             else:
                 self._log_2leg_hold("missing_bidask", window, {})
                 pilot.last_decision = "missing_bidask"
@@ -299,13 +293,13 @@ class PilotController:
             pilot.last_exec_ts = now
             pilot.arb_id_active = f"2LEG:{window.route}"
 
-    def _log_trade_block(self, family: str, now: float) -> None:
+    def _log_trade_block(self, family: str, now: float, *, reason: str) -> None:
         pilot = self._session.pilot
         last_log = pilot.trade_block_log_ts.get(family)
         if last_log is not None and now - last_log < self.TRADE_BLOCK_COOLDOWN_SEC:
             return
         pilot.trade_block_log_ts[family] = now
-        self._window._append_pilot_log(f"[TRADE_BLOCK] family={family} reason=family_disabled")
+        self._window._append_pilot_log(f"[TRADE_BLOCK] family={family} reason={reason}")
 
     def _log_2leg_hold(
         self,
@@ -319,11 +313,15 @@ class PilotController:
             return
         info = details or {}
         message = f"[2LEG] HOLD reason={reason}"
-        if reason == "profit_below_min":
+        if reason == "min_profit":
             profit = window.profit_bps if window else 0.0
             min_profit = info.get("min_profit_bps", 0.0)
             message += f" profit={profit:.2f} min={float(min_profit):.2f}"
-        elif reason == "window_expired":
+        elif reason == "min_life":
+            life_s = info.get("life_s", window.life_s() if window else 0.0)
+            min_life = info.get("min_window_life_s", 0.0)
+            message += f" life_s={float(life_s):.1f} min={float(min_life):.1f}"
+        elif reason == "max_life":
             life_s = info.get("life_s", window.life_s() if window else 0.0)
             max_life = info.get("max_window_life_s", 0.0)
             message += f" life_s={float(life_s):.1f} max={float(max_life):.1f}"
@@ -336,7 +334,7 @@ class PilotController:
             symbol = info.get("symbol")
             if symbol:
                 message += f" symbol={symbol}"
-        elif reason == "insufficient_balance":
+        elif reason in {"balances", "min_qty", "min_notional"}:
             asset = info.get("asset")
             need = info.get("need")
             free = info.get("free")
@@ -348,7 +346,7 @@ class PilotController:
                 message += f" min_qty={float(min_qty):.6f}"
             if min_notional is not None:
                 message += f" min_notional={float(min_notional):.2f}"
-        elif reason == "cooldown_active":
+        elif reason == "cooldown":
             remaining = info.get("remaining_s")
             block = info.get("block")
             if remaining is not None:
@@ -357,6 +355,20 @@ class PilotController:
                 message += f" block={block}"
         self._window._append_pilot_log(message)
         pilot.last_hold_log_ts = now
+
+    def _resolve_2leg_budget(self, window: PilotWindow) -> Decimal:
+        base_budget = self._window._pilot_2leg_budget()
+        budget = base_budget
+        route_limit = Decimal(str(max(window.max_notional, 0.0)))
+        if route_limit > 0:
+            budget = min(budget, route_limit)
+        legs = self.TWO_LEG_ROUTE_MAP.get(window.route)
+        if legs:
+            start_asset = legs[0][0]
+            available = self._window._pilot_balance_free(start_asset)
+            if available > 0:
+                budget = min(budget, available)
+        return budget
 
     def _build_2leg_plan(
         self,
@@ -367,7 +379,7 @@ class PilotController:
         legs = self.TWO_LEG_ROUTE_MAP.get(route)
         if not legs:
             return None, None
-        required_notional = Decimal(str(max(window.max_notional, 0.0)))
+        required_notional = self._resolve_2leg_budget(window)
         if required_notional <= 0:
             return None, None
         available_symbols = snapshot.quotes.keys()
@@ -427,12 +439,14 @@ class PilotController:
         if config is None:
             return {
                 "min_profit_bps": self.DEFAULT_MIN_PROFIT_BPS_2LEG,
+                "min_window_life_s": self.DEFAULT_MIN_WINDOW_LIFE_S,
                 "max_window_life_s": self.DEFAULT_MAX_WINDOW_LIFE_S,
                 "max_price_age_ms": self.DEFAULT_MAX_PRICE_AGE_MS,
                 "cooldown_after_trade_s": self.DEFAULT_COOLDOWN_AFTER_TRADE_S,
             }
         return {
             "min_profit_bps": getattr(config, "min_profit_bps_2leg", self.DEFAULT_MIN_PROFIT_BPS_2LEG),
+            "min_window_life_s": getattr(config, "min_window_life_s", self.DEFAULT_MIN_WINDOW_LIFE_S),
             "max_window_life_s": getattr(config, "max_window_life_s", self.DEFAULT_MAX_WINDOW_LIFE_S),
             "max_price_age_ms": getattr(config, "max_price_age_ms", self.DEFAULT_MAX_PRICE_AGE_MS),
             "cooldown_after_trade_s": getattr(
@@ -484,12 +498,13 @@ class PilotController:
         pilot = self._session.pilot
         config = self._get_2leg_config()
         min_profit_bps = float(config["min_profit_bps"])
+        min_window_life_s = float(config.get("min_window_life_s", self.DEFAULT_MIN_WINDOW_LIFE_S))
         max_window_life_s = float(config["max_window_life_s"])
         max_price_age_ms = int(config["max_price_age_ms"])
         cooldown_after_trade_s = float(config["cooldown_after_trade_s"])
         allowed_families = {family.upper() for family in pilot.trade_enabled_families}
         if "2LEG" not in allowed_families:
-            return False, "family_disabled", {}
+            return False, "not_allowed", {}
         if snapshot is None:
             return False, "missing_bidask", {}
         if not window.symbols:
@@ -519,18 +534,24 @@ class PilotController:
         if window.profit_bps < min_profit_bps:
             return (
                 False,
-                "profit_below_min",
+                "min_profit",
                 {"profit_bps": window.profit_bps, "min_profit_bps": min_profit_bps},
+            )
+        if life_s < min_window_life_s:
+            return (
+                False,
+                "min_life",
+                {"life_s": life_s, "min_window_life_s": min_window_life_s},
             )
         if life_s > max_window_life_s:
             return (
                 False,
-                "window_expired",
+                "max_life",
                 {"life_s": life_s, "max_window_life_s": max_window_life_s},
             )
-        required_notional = Decimal(str(max(window.max_notional, 0.0)))
+        required_notional = self._resolve_2leg_budget(window)
         if required_notional <= 0:
-            return False, "insufficient_balance", {"required_notional": float(required_notional)}
+            return False, "balances", {"required_notional": float(required_notional)}
         for symbol, side, require_asset, _output_asset in resolved_legs:
             quote = snapshot.quote(symbol)
             if quote is None or quote.bid is None or quote.ask is None:
@@ -544,7 +565,7 @@ class PilotController:
             if free < required_notional:
                 return (
                     False,
-                    "insufficient_balance",
+                    "balances",
                     {"asset": require_asset, "need": required_notional, "free": free},
                 )
             rules = self._window._pilot_exchange_rules(symbol)
@@ -556,7 +577,7 @@ class PilotController:
                     if qty < min_qty:
                         return (
                             False,
-                            "insufficient_balance",
+                            "min_qty",
                             {"asset": require_asset, "need": min_qty, "free": free, "min_qty": min_qty},
                         )
                 if min_notional_raw is not None:
@@ -564,7 +585,7 @@ class PilotController:
                     if qty * price < min_notional:
                         return (
                             False,
-                            "insufficient_balance",
+                            "min_notional",
                             {
                                 "asset": require_asset,
                                 "need": min_notional,
@@ -576,7 +597,7 @@ class PilotController:
             elapsed = now - pilot.last_exec_ts
             return (
                 False,
-                "cooldown_active",
+                "cooldown",
                 {
                     "elapsed_s": elapsed,
                     "cooldown_after_trade_s": cooldown_after_trade_s,
@@ -584,14 +605,14 @@ class PilotController:
                 },
             )
         if not self._trade_gate_ready():
-            return False, "cooldown_active", {"block": "trade_gate"}
+            return False, "cooldown", {"block": "trade_gate"}
         open_orders = getattr(self._window, "_open_orders", [])
         virtual_orders = getattr(self._window, "_pilot_virtual_orders", [])
         open_total = len(open_orders) + len(virtual_orders)
         if pilot.arb_id_active:
-            return False, "cooldown_active", {"block": "active_route", "open_orders": open_total}
+            return False, "cooldown", {"block": "active_route", "open_orders": open_total}
         if open_total > 2:
-            return False, "cooldown_active", {"block": "open_orders", "open_orders": open_total}
+            return False, "cooldown", {"block": "open_orders", "open_orders": open_total}
         return True, "ok", {}
 
     def _panic_hold(self, reason: str) -> None:
