@@ -65,7 +65,16 @@ class PilotController:
         self._window._update_pilot_status_line()
 
     def start_trading(self) -> None:
-        self._window._append_pilot_log("[PILOT] trading disabled (analysis-only)")
+        pilot = self._session.pilot
+        if not pilot.analysis_on:
+            self.start_analysis()
+        if pilot.trading_on:
+            return
+        pilot.trading_on = True
+        pilot.state = "TRADING"
+        self._window._append_pilot_log("[PILOT] TRADING_START")
+        self._window._set_pilot_controls(analysis_on=pilot.analysis_on, trading_on=True)
+        self._window._update_pilot_status_line()
 
     def stop(self, *, cancel_orders: bool) -> None:
         pilot = self._session.pilot
@@ -153,12 +162,99 @@ class PilotController:
         best_window = self._select_best_window(windows, now)
         pilot.last_best_route = best_window.route if best_window else None
         pilot.last_best_edge_bps = best_window.profit_bps if best_window else None
-        pilot.last_decision = "analysis_only"
-        pilot.state = "ANALYZE"
+        if not pilot.trading_on:
+            pilot.last_decision = "analysis_only"
+        pilot.state = "TRADING" if pilot.trading_on else "ANALYZE"
         self._window._update_pilot_routes_table(ui_snapshots)
         self._window._update_arb_signals()
         self._window._update_pilot_status_line()
         self._window._update_pilot_dashboard_counters()
+        if pilot.trading_on:
+            self._maybe_execute_window_trade(best_window, snapshot, now)
+
+    def _maybe_execute_window_trade(
+        self,
+        window: PilotWindow | None,
+        snapshot: PilotMarketSnapshot,
+        now: float,
+    ) -> None:
+        pilot = self._session.pilot
+        if window is None or not window.valid:
+            return
+        config = getattr(self._window, "pilot_config", None)
+        allowed_families = {"2LEG"}
+        if config is not None and hasattr(config, "trade_allowed_families"):
+            allowed_families = {str(item).upper() for item in config.trade_allowed_families if item}
+        family = window.family
+        route = window.route
+        if family not in allowed_families:
+            self._window._append_pilot_log(
+                f"[TRADE_BLOCK] family={family} route={route} reason=family_not_allowed"
+            )
+            pilot.last_decision = "family_not_allowed"
+            return
+        if family != "2LEG":
+            return
+        min_profit_bps = getattr(config, "trade_min_profit_bps", 8.0) if config is not None else 8.0
+        min_life_s = getattr(config, "trade_min_life_s", 3.0) if config is not None else 3.0
+        if window.profit_bps < min_profit_bps:
+            pilot.last_decision = "profit_below_min"
+            return
+        if window.life_s() < min_life_s:
+            pilot.last_decision = "life_below_min"
+            return
+        if pilot.last_exec_ts and now - pilot.last_exec_ts < 3.0:
+            pilot.last_decision = "cooldown"
+            return
+        open_orders = getattr(self._window, "_open_orders", [])
+        virtual_orders = getattr(self._window, "_pilot_virtual_orders", [])
+        if (
+            pilot.arb_id_active
+            and pilot.last_exec_ts
+            and now - pilot.last_exec_ts >= 3.0
+            and len(open_orders) + len(virtual_orders) == 0
+        ):
+            pilot.arb_id_active = None
+        if pilot.arb_id_active:
+            pilot.last_decision = "max_active_routes"
+            return
+        if len(open_orders) + len(virtual_orders) > 2:
+            pilot.last_decision = "max_open_orders"
+            return
+        for symbol in window.symbols:
+            quote = snapshot.quote(symbol)
+            if quote is None or quote.bid is None or quote.ask is None:
+                self._panic_hold("no_bidask")
+                return
+            if snapshot.is_stale(symbol):
+                self._panic_hold("data_stale")
+                return
+        balances = self._window._balance_snapshot()
+        base_free = self._window.as_decimal(balances.get("base_free", Decimal("0")))
+        quote_free = self._window.as_decimal(balances.get("quote_free", Decimal("0")))
+        if base_free <= 0 and quote_free <= 0:
+            pilot.last_decision = "no_balance"
+            return
+        min_notional = self._window._rule_decimal(self._window._exchange_rules.get("min_notional"))
+        if min_notional and Decimal(str(window.max_notional)) < min_notional:
+            pilot.last_decision = "min_notional"
+            return
+        self._window._append_pilot_log(
+            (
+                "[2LEG] trade allowed "
+                f"profit_bps={window.profit_bps:+.2f} life_s={window.life_s():.1f} -> placing orders"
+            )
+        )
+        pilot.last_decision = "trade_allowed"
+        pilot.last_exec_ts = now
+        pilot.arb_id_active = f"{family}:{route}"
+
+    def _panic_hold(self, reason: str) -> None:
+        self._window._append_pilot_log(f"[PANIC] hold reason={reason} -> cancel_all")
+        canceled = self._window._cancel_pilot_orders()
+        if canceled:
+            self._window._append_pilot_log(f"[PANIC] cancel_all count={canceled}")
+        self._window.panic_hold(reason)
 
     def _execute_trading(self, now: float) -> None:
         pilot = self._session.pilot

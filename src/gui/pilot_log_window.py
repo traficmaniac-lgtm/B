@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLayout
 
 
 class PilotLogWindow(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._logger = logging.getLogger("gui.pilot_log_window")
         self.setWindowTitle("Pilot Log")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setMinimumSize(520, 320)
@@ -39,6 +42,9 @@ class PilotLogWindow(QDialog):
         self._log_view.appendPlainText(message)
 
     def _copy_all(self) -> None:
-        self._log_view.selectAll()
-        self._log_view.copy()
-        self._log_view.moveCursor(self._log_view.textCursor().End)
+        try:
+            self._log_view.selectAll()
+            self._log_view.copy()
+            self._log_view.moveCursor(QTextCursor.End)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("[UI] copy_all failed: %s", exc)

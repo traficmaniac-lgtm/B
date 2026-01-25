@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from PySide6.QtWidgets import (
@@ -24,6 +24,9 @@ class PilotConfig:
     stale_policy: str = "CANCEL_REPLACE"
     allow_market_close: bool = True
     allow_guard_autofix: bool = False
+    trade_allowed_families: set[str] = field(default_factory=lambda: {"2LEG"})
+    trade_min_profit_bps: float = 8.0
+    trade_min_life_s: float = 3.0
 
 
 class PilotSettingsDialog(QDialog):

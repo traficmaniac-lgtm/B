@@ -1771,6 +1771,21 @@ class NcPilotTabWidget(QWidget):
             self.pilot_config.allow_guard_autofix = bool(
                 pilot.get("allow_guard_autofix", getattr(self.pilot_config, "allow_guard_autofix", False))
             )
+        trade_families = pilot.get("trade_allowed_families")
+        if isinstance(trade_families, list):
+            normalized = {str(item).upper() for item in trade_families if item}
+            if normalized:
+                self.pilot_config.trade_allowed_families = normalized
+        trade_min_profit = self._coerce_float(
+            pilot.get("trade_min_profit_bps", getattr(self.pilot_config, "trade_min_profit_bps", 8.0))
+        )
+        if trade_min_profit is not None:
+            self.pilot_config.trade_min_profit_bps = trade_min_profit
+        trade_min_life = self._coerce_float(
+            pilot.get("trade_min_life_s", getattr(self.pilot_config, "trade_min_life_s", 3.0))
+        )
+        if trade_min_life is not None:
+            self.pilot_config.trade_min_life_s = trade_min_life
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
         selected_symbols = pilot.get("selected_symbols")
@@ -1846,6 +1861,9 @@ class NcPilotTabWidget(QWidget):
         self.pilot_config.allow_market_close = True
         if hasattr(self.pilot_config, "allow_guard_autofix"):
             self.pilot_config.allow_guard_autofix = False
+        self.pilot_config.trade_allowed_families = {"2LEG"}
+        self.pilot_config.trade_min_profit_bps = 8.0
+        self.pilot_config.trade_min_life_s = 3.0
         self._pilot_allow_market = self.pilot_config.allow_market_close
         self._pilot_stale_policy = self._resolve_pilot_stale_policy(self.pilot_config.stale_policy)
 
@@ -1882,6 +1900,9 @@ class NcPilotTabWidget(QWidget):
             "stale_policy": self.pilot_config.stale_policy,
             "allow_market_close": self.pilot_config.allow_market_close,
             "allow_guard_autofix": getattr(self.pilot_config, "allow_guard_autofix", False),
+            "trade_allowed_families": sorted(self.pilot_config.trade_allowed_families),
+            "trade_min_profit_bps": self.pilot_config.trade_min_profit_bps,
+            "trade_min_life_s": self.pilot_config.trade_min_life_s,
             "selected_symbols": sorted(self._session.pilot.selected_symbols),
             "slippage_bps": PILOT_SLIPPAGE_BPS,
             "pad_bps": PILOT_PAD_BPS,
