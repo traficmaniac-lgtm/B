@@ -252,6 +252,7 @@ class OverviewTab(QWidget):
         self._account_client: BinanceAccountClient | None = None
         self._account_balances: list[dict[str, object]] = []
         self._account_last_error: str | None = None
+        self._account_fetch_inflight = False
         self._account_timer = QTimer(self)
         self._account_timer.setInterval(10_000)
         self._account_timer.timeout.connect(self._refresh_account_balances)
@@ -468,6 +469,7 @@ class OverviewTab(QWidget):
         if not api_key or not api_secret:
             self._account_client = None
             self._account_timer.stop()
+            self._account_fetch_inflight = False
             self._set_status_badge("Account", "✖", "NOT CONNECTED", "#dc2626")
             return
         self._account_client = BinanceAccountClient(
@@ -487,12 +489,17 @@ class OverviewTab(QWidget):
     def _refresh_account_balances(self) -> None:
         if not self._account_client:
             return
+        if self._account_fetch_inflight:
+            self._logger.info("[OVERVIEW] account fetch skipped: inflight")
+            return
+        self._account_fetch_inflight = True
         worker = _Worker(self._account_client.get_account_info)
         worker.signals.success.connect(self._handle_account_info)
         worker.signals.error.connect(self._handle_account_error)
         self._thread_pool.start(worker)
 
     def _handle_account_info(self, result: object, _: int) -> None:
+        self._account_fetch_inflight = False
         if not isinstance(result, dict):
             self._handle_account_error("Unexpected account response")
             return
@@ -516,6 +523,7 @@ class OverviewTab(QWidget):
         self._account_last_error = None
 
     def _handle_account_error(self, message: str) -> None:
+        self._account_fetch_inflight = False
         summary = self._summarize_error(message)
         self._logger.error("Account read-only error: %s", summary)
         self._account_last_error = summary
