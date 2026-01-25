@@ -37,11 +37,18 @@
 │   │   ├── account_client.py — signed account/trading endpoints.
 │   │   ├── http_client.py — HTTP API client for public endpoints.
 │   │   └── ws_client.py — websocket client for streaming prices.
+│   ├── config
+│   │   └── fee_overrides.py — fee override tables for guard calculations.
 │   ├── core
 │   │   ├── __init__.py — package marker for core utilities.
+│   │   ├── cancel_reconcile.py — cancel/reconcile helpers for open orders.
 │   │   ├── config.py — configuration models and loader.
 │   │   ├── logging.py — logging setup and adapters.
+│   │   ├── micro_edge.py — edge/expected profit calculation helpers.
 │   │   ├── models.py — core domain models (pairs/prices/etc.).
+│   │   ├── nc_micro_exec_dedup.py — trade ID dedup + cumulative fill tracking.
+│   │   ├── nc_micro_refresh.py — stale refresh gating and log limiting.
+│   │   ├── nc_micro_stop.py — shared STOP finalization helpers.
 │   │   ├── symbols.py — symbol validation/sanitization helpers.
 │   │   ├── timeutil.py — time/TTL/backoff utilities.
 │   │   └── strategies
@@ -52,6 +59,9 @@
 │   ├── gui
 │   │   ├── __init__.py — package marker for GUI.
 │   │   ├── ai_operator_grid_window.py — AI operator grid window.
+│   │   ├── dialogs
+│   │   │   ├── __init__.py — package marker for dialogs.
+│   │   │   └── pilot_settings_dialog.py — NC MICRO/ALGO PILOT settings dialog.
 │   │   ├── i18n.py — GUI translations/localization helpers.
 │   │   ├── lite_all_strategy_algo_pilot_window.py — Lite All Strategy Terminal with ALGO PILOT (v1.6.5).
 │   │   ├── lite_all_strategy_nc_micro_window.py — Lite All Strategy Terminal with NC MICRO mode.
@@ -59,6 +69,11 @@
 │   │   ├── lite_grid_math.py — math helpers for lite grid UI and fills.
 │   │   ├── lite_grid_window.py — lite grid trading window.
 │   │   ├── main_window.py — main application window and menu.
+│   │   ├── modes
+│   │   │   └── ai_full_strateg_v2
+│   │   │       ├── __init__.py — package marker for AI full strategy mode v2.
+│   │   │       ├── controller.py — controller for AI full strategy mode.
+│   │   │       └── window.py — window for AI full strategy mode.
 │   │   ├── overview_tab.py — overview tab with market list.
 │   │   ├── pair_action_dialog.py — dialog for pair action selection.
 │   │   ├── pair_mode_manager.py — opens specific pair mode windows.
@@ -137,14 +152,16 @@ These files are created at runtime and are not tracked in the repo:
 
 ## Modules overview (expanded)
 
-- **core**: configuration loading/validation, logging setup, shared models, time utilities, and strategy registry helpers.
+- **core**: configuration loading/validation, logging setup, shared models, time utilities, cancel/reconcile helpers, and NC MICRO support helpers (refresh gating, dedup, stop finalize).
 - **core/strategies**: manual strategy definitions and runtime helpers used by advanced/manual modes.
+- **config**: fee override data used by profit-guard logic.
 - **app**: GUI entry point (`python -m src.app.main`) and startup state wiring.
 - **gui**: main window, dialogs, tabs, widgets, and UI state models for the PySide6 UI.
-- **gui/models**: UI state containers such as `AppState` and pair/workspace models.
+- **gui/dialogs**: shared modal dialogs (pilot settings).
+- **gui/modes**: specialized mode packages (AI full strategy v2).
 - **gui/lite_all_strategy_terminal_window.py**: Lite All Strategy Terminal (grid experimentation and trade gating).
 - **gui/lite_all_strategy_algo_pilot_window.py**: ALGO PILOT v1.6.5 (grid automation, KPI checks, stale handling, profit guard).
-- **gui/lite_all_strategy_nc_micro_window.py**: NC MICRO mode (HTTP-only trade source, crash catcher, stale policies, profit guard).
+- **gui/lite_all_strategy_nc_micro_window.py**: NC MICRO mode (HTTP-only trade source, crash catcher, stale policies, refresh gating, dedup).
 - **services**: application services for prices, markets, caching, and rate limiting.
 - **services/price_feed_manager.py**: WS/HTTP price orchestration and status reporting.
 - **services/price_feed_service.py**: per‑symbol feed used by the manager.
@@ -161,9 +178,11 @@ These files are created at runtime and are not tracked in the repo:
 4. Selecting a pair opens one of:
    - `LiteGridWindow` (legacy grid terminal),
    - `LiteAllStrategyTerminalWindow` (multi-strategy grid experiments),
-   - `LiteAllStrategyAlgoPilotWindow` (ALGO PILOT automation + grid runtime).
+   - `LiteAllStrategyAlgoPilotWindow` (ALGO PILOT automation + grid runtime),
+   - `LiteAllStrategyNcMicroWindow` (NC MICRO).
 5. ALGO PILOT pulls KPIs, validates market state, builds grid plans, and applies stale policies before placing/refreshing orders.
-6. Optional AI modes build datapacks in `ai/operator_datapack.py` and validate patches in `ai/operator_validation.py`.
+6. NC MICRO relies on HTTP‑priority pricing, guard rails (trade gate, profit/break‑even/thin‑edge), refresh gating, and deduplication before trading.
+7. Optional AI modes build datapacks in `ai/operator_datapack.py` and validate patches in `ai/operator_validation.py`.
 
 ## Run
 
