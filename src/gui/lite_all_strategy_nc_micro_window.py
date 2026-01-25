@@ -4643,6 +4643,8 @@ class NcMicroTabWidget(QWidget):
             if price is not None and price > 0:
                 self._ws_last_price = price
                 self._session.market.last_price = price
+            if isinstance(update.best_bid, (int, float)) and isinstance(update.best_ask, (int, float)):
+                self._update_ws_book_snapshot(update.best_bid, update.best_ask)
             self._session.market.source = update.source
             self._session.market.age_ms = update.price_age_ms
             self._session.runtime.last_ui_update_ts = monotonic()
@@ -4684,6 +4686,31 @@ class NcMicroTabWidget(QWidget):
         self._bidask_src = "HTTP_BOOK"
         self.bidask_ready = True
         return bid, ask
+
+    def _update_ws_book_snapshot(self, bid: float, ask: float) -> None:
+        if not self._validate_bid_ask(bid, ask, source="WS_BOOK"):
+            return
+        now_ts = monotonic()
+        self.book_snapshot = {"bid": bid, "ask": ask, "ts": now_ts}
+        self._bidask_last = (bid, ask)
+        self._bidask_ts = now_ts
+        self._bidask_src = "WS_BOOK"
+        self.bidask_ready = True
+
+    def _should_skip_http_book_ticker(self) -> bool:
+        if not hasattr(self, "_price_feed_manager") or not self._price_feed_manager:
+            return False
+        snapshot = self._price_feed_manager.get_snapshot(self._symbol)
+        if snapshot is None:
+            return False
+        if snapshot.source != "WS":
+            return False
+        if snapshot.best_bid is None or snapshot.best_ask is None:
+            return False
+        age_ms = snapshot.router_age_ms if snapshot.router_age_ms is not None else snapshot.price_age_ms
+        if age_ms is None or age_ms >= 1000:
+            return False
+        return True
 
     def _maybe_log_no_bidask(self, reason: str) -> None:
         now = monotonic()
@@ -4798,6 +4825,14 @@ class NcMicroTabWidget(QWidget):
             (now_ts - self._kpi_last_book_request_ts) * 1000 < KPI_BOOK_REQUEST_INTERVAL_MS
         ):
             return
+        if self._should_skip_http_book_ticker():
+            self._append_log_throttled(
+                "[FEED] ws fresh -> skip http",
+                kind="INFO",
+                key="skip_http_book",
+                cooldown_sec=2.0,
+            )
+            return
         self._kpi_last_book_request_ts = now_ts
         self._queue_net_request(
             "book_ticker",
@@ -4838,6 +4873,14 @@ class NcMicroTabWidget(QWidget):
         if self._bidask_last_request_ts and (
             (now_ts - self._bidask_last_request_ts) * 1000 < BIDASK_POLL_MS
         ):
+            return
+        if self._should_skip_http_book_ticker():
+            self._append_log_throttled(
+                "[FEED] ws fresh -> skip http",
+                kind="INFO",
+                key="skip_http_book",
+                cooldown_sec=2.0,
+            )
             return
         self._bidask_last_request_ts = now_ts
         self._queue_net_request(
@@ -11090,11 +11133,16 @@ class NcMicroTabWidget(QWidget):
         request_id = self._next_net_request_id(action)
         self._net_pending[request_id] = (on_success, on_error)
         fn = self._build_net_request_fn(action, params)
+        dedup_key = None
+        if action == "book_ticker":
+            symbol = str(params.get("symbol", ""))
+            dedup_key = f"{action}:{symbol}"
         self._net_worker.submit(
             action,
             fn,
             on_ok=functools.partial(self._handle_net_success, request_id, action),
             on_err=functools.partial(self._handle_net_error, request_id, action),
+            dedup_key=dedup_key,
         )
 
     def _build_net_request_fn(self, action: str, params: dict[str, Any]) -> Callable[[object], object]:
