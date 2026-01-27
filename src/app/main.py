@@ -85,12 +85,12 @@ def main() -> int:
     app_state = _load_app_state(config, root_path)
     logging.getLogger().setLevel(app_state.log_level)
 
-    app = QApplication(sys.argv)
-    window = MainWindow(config, app_state)
-    logging.getLogger().addHandler(window.log_handler)
     crash_path = _install_crash_catcher(logger, root_path)
     install_crash_guard(logger, crash_log_path=crash_path)
 
+    app = QApplication(sys.argv)
+    window = MainWindow(config, app_state)
+    logging.getLogger().addHandler(window.log_handler)
     logger.info("application starting")
     window.show()
     exit_code = app.exec()
